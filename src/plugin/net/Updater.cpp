@@ -238,6 +238,26 @@ std::string sha256Hex(const void* data, size_t n) {
     return out;
 }
 
+// Hash the on-disk DLL. FILE_SHARE_* so this works while the image is mapped.
+std::string sha256File(const std::string& path) {
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (f == INVALID_HANDLE_VALUE) return std::string();
+    DWORD sz = GetFileSize(f, 0);
+    if (sz == INVALID_FILE_SIZE || sz == 0 || sz > 32 * 1024 * 1024) {
+        CloseHandle(f);
+        return std::string();
+    }
+    std::string buf;
+    buf.resize((size_t)sz);
+    DWORD got = 0;
+    BOOL ok = ReadFile(f, &buf[0], sz, &got, 0);
+    CloseHandle(f);
+    if (!ok || got != sz) return std::string();
+    return sha256Hex(buf.data(), buf.size());
+}
+
 std::string lower(const std::string& s) {
     std::string o = s;
     for (size_t i = 0; i < o.size(); ++i)
@@ -309,8 +329,20 @@ DWORD WINAPI threadEntry(LPVOID) {
         return 0;
     }
     if (ver == g_buildVersion) {
-        setStatus("up to date (%s, proto %u)", g_buildVersion.c_str(), g_proto);
-        return 0;
+        // Same release id, but the GitHub asset may have been replaced in place
+        // (a tiny fix that did not deserve a new tag). If our on-disk hash
+        // matches the manifest we really are current; if it differs, fall
+        // through and download the same version's newer file.
+        std::string local = sha256File(selfDllPath());
+        if (!local.empty() && local == sha) {
+            setStatus("up to date (%s, proto %u)", g_buildVersion.c_str(), g_proto);
+            return 0;
+        }
+        if (local.empty()) {
+            setStatus("up to date (%s, proto %u)", g_buildVersion.c_str(), g_proto);
+            return 0;
+        }
+        setStatus("same version, newer file on GitHub ...");
     }
     if (!g_settings.autoApply) {
         setStatus("update available: %s%s%s - autoApply off, install by hand",

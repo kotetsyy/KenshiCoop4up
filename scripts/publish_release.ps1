@@ -13,6 +13,12 @@
 #
 # It does NOT push or create the GitHub release - it prints the two commands to
 # run, so nothing leaves the machine without you typing it.
+#
+# -Amend: same version/tag, replace the assets on the EXISTING GitHub release
+# (window-size, label copy, tiny fixes). Use a new COOP_BUILD_VERSION / tag
+# only for a real feature or a protocol bump. Order is still: upload the DLL
+# first, then push dist/UPDATE.txt (new sha256, same version=). The updater
+# re-downloads when the hash changes even if version= matches.
 
 [CmdletBinding()]
 param(
@@ -23,6 +29,7 @@ param(
     [string]$Json   = "dist\mods\KenshiCoop\RE_Kenshi.json",
     [string]$Out    = "dist\UPDATE.txt",
     [string]$Notes  = "",
+    [switch]$Amend,
     [switch]$WhatIf
 )
 
@@ -101,8 +108,14 @@ $manifestLf = ($manifest -replace "`r`n", "`n")
 Write-Host "wrote $Out"
 Write-Host ""
 Write-Host "Next, in order (the manifest must not go live before the asset it names):"
-Write-Host "  1. gh release create $tag `"$Dll`" `"$Mod`" `"$Json`" --title `"$tag`" --notes `"$Notes`""
-Write-Host "  2. git add $Out && git commit -m `"release $tag`" && git push"
+if ($Amend) {
+    Write-Host "  AMEND $tag (same version, replace assets):"
+    Write-Host "  1. gh release upload $tag `"$Dll`" `"$Mod`" `"$Json`" --clobber"
+    Write-Host "  2. git add $Out && git commit -m `"amend $tag`" && git push"
+} else {
+    Write-Host "  1. gh release create $tag `"$Dll`" `"$Mod`" `"$Json`" --title `"$tag`" --notes `"$Notes`""
+    Write-Host "  2. git add $Out && git commit -m `"release $tag`" && git push"
+}
 Write-Host ""
 Write-Host "Order matters: clients read the manifest first and download the url it"
 Write-Host "names. Pushing the manifest before the release asset exists gives every"

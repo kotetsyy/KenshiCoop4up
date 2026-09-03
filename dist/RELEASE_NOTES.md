@@ -1,3 +1,32 @@
+# v0.57 — in-place release edits reach the updater
+
+Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
+author wrote the mod. Protocol **58**.
+
+Tiny fixes (window size, labels) now **replace the files on the same GitHub
+release** instead of minting v0.58, v0.59, … The updater still checks
+`version=`, and if that matches it also compares SHA-256 of the DLL on disk
+to the manifest. A replaced asset with a new hash is downloaded even though
+the version string did not change.
+
+First install still needs `KenshiCoop.dll` + `RE_Kenshi.json` + `KenshiCoop.mod`
+from the release. Later updates are DLL-only.
+
+---
+
+# v0.57 — мелкие правки без новой версии (Русский)
+
+Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**. Протокол **58**.
+
+Мелкие фиксы (размер окна, подписи) теперь **подменяют файлы в том же релизе**,
+а не плодят v0.58, v0.59. Апдейтер смотрит `version=` и, если она совпала, ещё
+SHA-256 DLL на диске. Подменённый файл с новым хешем скачивается, даже если
+номер версии не менялся.
+
+Первая установка: DLL + `RE_Kenshi.json` + `KenshiCoop.mod`. Дальше — только DLL.
+
+---
+
 # v0.56 — clearer F2 nick + UDP address field
 
 Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose

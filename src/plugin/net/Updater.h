@@ -27,6 +27,8 @@
 // line, '#' comments, unknown keys ignored so the format can grow:
 //
 //   version=0.52          # release id; compared against the built-in build tag
+//                         # A same-version SHA change (in-place GitHub asset
+//                         # replace for a tiny fix) is also treated as an update.
 //   proto=59              # PROTOCOL_VERSION that build speaks (display only)
 //   sha256=<64 hex>       # of the DLL at `url`
 //   url=https://github.com/<owner>/<repo>/releases/download/v0.52/KenshiCoop.dll
