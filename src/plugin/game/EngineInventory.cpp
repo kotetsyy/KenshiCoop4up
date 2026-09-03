@@ -33,6 +33,36 @@ namespace {
 using coop::sectionNameHash;
 using coop::invEntryHash;
 
+// After removeItemAutoDestroy the loot GUI can leave 0xFFF... in a section
+// slot. Walking that Item* is the APPLY-empty crash (READ of -1).
+static bool itemPtrLive(Item* it) {
+    if (!it) return false;
+    unsigned long long p = (unsigned long long)(size_t)it;
+    if (p < 0x10000ull) return false;
+    if ((p + 1ull) == 0ull) return false;
+    return true;
+}
+
+// True while an inventory PANEL is open on this container (loot window, trade
+// window, a character sheet, an opened backpack). The engine hands every icon in
+// that panel a raw Item*, and it never revalidates them: destroying a stack under
+// a live window leaves the panel pointing at freed memory, and the next repaint
+// dereferences it on the RENDER thread - outside every __except we own. That is
+// the APPLY-empty crash, and it is why itemPtrLive/SEH could not fix it: they
+// only caught OUR three first-chance reads of -1, while the fatal one belonged to
+// kenshi_x64.exe on another thread. So the destructive half of the reconcile asks
+// this first and defers instead. Unresolved lever (CAP_INV_GUI off) reports "not
+// open": that restores the pre-guard behaviour rather than freezing all looting,
+// and the missing lever is already visible in the [engine] CAPS line.
+bool inventoryGuiOpen(Inventory* inv) {
+    if (!inv || !g_getInvGuiFn) return false;
+    __try {
+        return g_getInvGuiFn(inv) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // SEH-guarded helper: copy an item's manufacturer + material GameData stringIDs into the
 // snapshot entry. WEAPONS need them to be reconstructable on the peer (createItem requires
 // the manufacturer/mesh GameData); armour/items leave them empty (the pointers are null).
@@ -101,7 +131,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                 unsigned int ni = (unsigned int)its.size();
                 for (unsigned int i = 0; i < ni; ++i) {
                     Item* it = its[i].item;
-                    if (!it) continue;
+                    if (!itemPtrLive(it)) continue;
                     GameData* gd = it->getGameData();
                     if (!gd) continue;
                     if (n >= maxOut) { trunc = true; break; }
@@ -145,7 +175,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
             wpns[1] = g_getSecondaryWeaponFn ? g_getSecondaryWeaponFn(inv) : 0;
             for (int w = 0; w < 2; ++w) {
                 Item* it = wpns[w];
-                if (!it) continue;
+                if (!itemPtrLive(it)) continue;
                 GameData* gd = it->getGameData();
                 if (!gd) continue;
                 const char* sid = gd->stringID.c_str();
@@ -190,7 +220,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
         unsigned int total = all.size();
         for (unsigned int i = 0; i < total; ++i) {
             Item* it = all[i];
-            if (!it) continue;
+            if (!itemPtrLive(it)) continue;
             GameData* gd = it->getGameData();
             if (!gd) continue;
             if (it->isEquipped) continue; // worn gear was captured above, from equip sections
@@ -462,7 +492,7 @@ int removeByKey(Inventory* inv, Item** items, InvItemEntry* meta, unsigned int n
     int removed = 0;
     __try {
         for (unsigned int i = 0; i < n && removed < qty; ++i) {
-            if (!items[i]) continue;
+            if (!itemPtrLive(items[i])) continue;
             if (meta[i].itemType != typeCat) continue;
             if ((int)meta[i].equipped != wantEquipped) continue;
             if (strcmp(meta[i].stringID, sid) != 0) continue;
@@ -666,6 +696,11 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     static int dbg = -1;
     if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
 
+    // Destroying a stack that an OPEN panel still lists is the loot crash (see
+    // inventoryGuiOpen). Read the window state ONCE, up front: the loop below must
+    // not change its mind about it half way through a container.
+    const bool guiOpen = inventoryGuiOpen(inv);
+
     bool changed = false;
     for (unsigned int k = 0; k < ng; ++k) {
         if (dbg) {
@@ -763,6 +798,21 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
                 truncated ? 1 : 0, curTruncated ? 1 : 0,
                 g[k].sid, g[k].curLoose - g[k].desiredLoose, g[k].curEq - g[k].desiredEq);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            continue;
+        }
+        //    SKIPPED while a PANEL is open on this container. removeItemAutoDestroy frees a
+        //    stack the window still holds an InventoryIcon for, and the engine repaints that
+        //    icon on the RENDER thread - a use-after-free none of our __except frames are on
+        //    the stack for. Callers that can retry (applyInventories defers the whole
+        //    snapshot and re-runs it when the window closes) make this a delay; a caller that
+        //    cannot degrades to additive-only, the same recoverable divergence a truncated
+        //    snapshot already produces. Never destroy under a live window.
+        if (guiOpen && (g[k].curLoose > g[k].desiredLoose || g[k].curEq > g[k].desiredEq)) {
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "[recon]   REMOVE-SKIP-GUI sid='%s' surplusLoose=%d surplusEq=%d (panel open; "
+                "destroying under it is the loot UAF)",
+                g[k].sid, g[k].curLoose - g[k].desiredLoose, g[k].curEq - g[k].desiredEq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
         }
         if (g[k].curLoose > g[k].desiredLoose) {
@@ -940,6 +990,8 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
     Inventory* inv = invOf(ro);
     if (!inv) return false;
 
+    bool changed = false;
+    __try {
     // Split the snapshot by its parent reference (protocol 48). The TOP level describes this
     // container; entries with parentIdx > 0 describe what is inside one of those items. They
     // must be reconciled separately or the two would fight: a bagged item counted at the top
@@ -954,7 +1006,7 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         topSrcIdx[nTop] = (unsigned char)i;
         top[nTop++] = items[i];
     }
-    bool changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated);
+    changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated);
     if (nNested == 0) return changed;
 
     // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about
@@ -1053,7 +1105,37 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
             nNested - claimed, nNested);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return changed;
+    }
     return changed;
+}
+
+// True while ANY inventory panel is open on this container - its own window, or a
+// window on a container it carries (an opened backpack is its own panel, and the
+// nested reconcile destroys stacks in there too, which is the 5.10 bag surface).
+// The replicator asks this BEFORE applying a snapshot so it can defer the whole
+// thing rather than half-apply it: a create-now/destroy-later split would leave the
+// two sides diverged in a way no later snapshot describes.
+bool containerGuiOpen(GameWorld* gw, const unsigned int cHand[5]) {
+    if (!gw || !cHand) return false;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return false;
+    Inventory* inv = invOf(ro);
+    if (!inv) return false;
+    if (inventoryGuiOpen(inv)) return true;
+    // Carried containers: their private inventories each get their own panel.
+    InvItemEntry cur[INV_ITEMS_MAX];
+    Item* curItems[INV_ITEMS_MAX];
+    unsigned int n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX, 0);
+    for (unsigned int i = 0; i < n; ++i) {
+        if (!itemPtrLive(curItems[i])) continue;
+        Inventory* sub = 0;
+        __try { sub = curItems[i]->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { sub = 0; }
+        if (!sub || sub == inv) continue;
+        if (inventoryGuiOpen(sub)) return true;
+    }
+    return false;
 }
 
 namespace {

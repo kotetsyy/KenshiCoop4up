@@ -3,6 +3,8 @@ dist/public-export/
 
 # Build outputs (all configs: Debug / Harness / Release)
 src/plugin/x64/
+# Stray IDE build output: an out-of-tree v143 build once wrote objs/pdb here.
+src/plugin/KenshiCoop/
 build/
 dist/*.exe
 # Generated packages + mutable DLL artifacts under dist/ (the canonical shipped
@@ -11,6 +13,10 @@ dist/*.exe
 # template) stays tracked - it is a packaging SOURCE, not an output.
 dist/*.zip
 dist/*.dll
+# The shipped DLL is published as a GitHub Release asset (that is what the
+# in-DLL updater downloads); tracking mutable copies here only bloats the repo.
+dist/mods/KenshiCoop/*.dll
+dist/mod-kit/KenshiCoop/*.dll
 dist/mod-kit/
 dist/remote-kit/
 dist/KenshiCoop-remote-kit-*.zip

@@ -1913,31 +1913,26 @@ function Test-NpcCarry {
     return (Add-GateResult -Name "npc_carry" -Status PASS -Metrics $m)
 }
 
-# speed_sync (consensus game speed): both clients must render the SAME effective
-# speed, arbitrated as min(requests) - a raise needs BOTH players, a lowering
-# needs either, combat caps at 1x. Parses each side's "SCENARIO SPEED t=..
-# mult=.. paused=.." series (~2 Hz, CLOCKSYNC-corrected into the host clock
-# frame; effective = 0 when paused) plus the HOST's arbitration markers
-# ("[speed] SET mult=X paused=N combat=N (my=..." - logged only on CHANGE).
-# NB: loop variables deliberately avoid $h/$j/$s - PowerShell variable names
-# are case-INSENSITIVE, so `foreach ($h in $H)` silently DESTROYS $H (first
-# run of this oracle: every nearest-sample lookup after the first came up
-# empty because $H had become one sample).
+# speed_sync (last-write-wins game speed): both clients must render the SAME
+# effective speed; any click (host or join) becomes the common effective, pause
+# is an independent flag, combat does NOT cap at 1x. Parses each side's
+# "SCENARIO SPEED t=.. mult=.. paused=.." series (~2 Hz, CLOCKSYNC-corrected
+# into the host clock frame; effective = 0 when paused) plus the HOST's
+# arbitration markers ("[speed] SET mult=X paused=N combat=N ..." - logged
+# only on CHANGE). NB: loop variables deliberately avoid $h/$j/$s - PowerShell
+# names are case-INSENSITIVE, so `foreach ($h in $H)` silently DESTROYS $H.
 # Gates:
-#   transitions   - the host arbitrated >= MinTransitions speed CHANGES (the
-#                   scenario drives 1x seed -> 3x -> 1x -> 3x -> combat 1x),
-#                   including >= 1 combat demotion (combat=1 at mult=1)
-#   denied raise  - the HOST's lone 3x click must NOT produce a 3x SET before
-#                   the JOIN's first 3x click (min semantics: both must raise)
+#   transitions   - the host arbitrated >= MinTransitions speed CHANGES
+#                   (seed 1x -> host 3x -> host 1x -> host 3x)
+#   lone raise    - the HOST's lone 3x click MUST produce a 3x SET before
+#                   the JOIN's first 3x click (LWW: no agreement required)
 #   follow        - after each transition the JOIN's series reaches the new
-#                   multiplier within MaxFollowMs (2 Hz sampling + reliable
-#                   delivery; WAN 'bad' adds ~120 ms + retransmits)
+#                   multiplier within MaxFollowMs
 #   match         - of the join samples OUTSIDE +/-TransitionWinMs of every
-#                   transition (and inside the host series' time range), the
-#                   fraction whose multiplier equals the nearest-in-time host
-#                   sample (within 600 ms) is >= MinMatch
-#   combat window - for [Tc+2s, Tc+8s] after the combat demotion, BOTH series
-#                   sit at 1x for >= MinMatch of their samples
+#                   transition, the fraction matching the nearest host sample
+#                   (within 600 ms) is >= MinMatch
+#   combat window - after combat starts, BOTH series stay at 3x (last LWW);
+#                   a combat demotion SET (combat=1 mult=1) is a FAIL
 function Test-SpeedSync {
     param([string]$HostFile, [string]$JoinFile,
           [double]$MinMatch = 0.80, [int]$MaxFollowMs = 2500,
@@ -1982,28 +1977,28 @@ function Test-SpeedSync {
     if ($sets.Count -lt $MinTransitions) {
         $bad += "only $($sets.Count) arbitrated speed change(s) (need >= $MinTransitions - scenario clicks not detected?)"
     }
-    $combatSet = @($sets | Where-Object { $_.combat -eq 1 -and $_.mult -le 1.01 -and $_.mult -ge 0.99 }) | Select-Object -First 1
-    if ($null -eq $combatSet) { $bad += "no combat demotion (no SET with combat=1 mult=1)" }
+    $combatDemote = @($sets | Where-Object { $_.combat -eq 1 -and $_.mult -le 1.01 -and $_.mult -ge 0.99 }) | Select-Object -First 1
+    if ($null -ne $combatDemote) { $bad += "combat demotion SET at t=$([long]$combatDemote.t) (combat must not cap speed to 1x)" }
 
-    # Denied raise: min semantics say the host's lone 3x click (T+10) must not
-    # change the effective speed; the first 3x SET must come at/after the
-    # JOIN's first 3x click.
+    # Lone raise: LWW says the host's 3x click (T+10) MUST change the effective
+    # before the JOIN's first 3x click.
     $tHostClick = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO SPEEDSYNC host click mult=3'
     $tJoinClick = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO SPEEDSYNC join click mult=3'
     $first3 = @($sets | Where-Object { [Math]::Abs([double]$_.mult - 3.0) -le 0.01 }) | Select-Object -First 1
-    if ($null -ne $tHostClick -and $null -ne $first3) {
-        if ($null -eq $tJoinClick -or [double]$first3.t -lt ([double]$tJoinClick - 1000)) {
-            $bad += "host's lone 3x click propagated (3x SET at t=$([long]$first3.t) before the join's 3x click - min arbitration broken)"
+    if ($null -ne $tHostClick) {
+        if ($null -eq $first3) {
+            $bad += "host's lone 3x click produced no 3x SET (last-write-wins broken)"
+        } elseif ($null -ne $tJoinClick -and [double]$first3.t -ge ([double]$tJoinClick - 200)) {
+            $bad += "first 3x SET at t=$([long]$first3.t) waited for the join's 3x click (min() still holding back a lone raise)"
         } else {
-            $m.deniedRaise = $true
+            $m.loneRaise = $true
         }
     }
 
     # Same-value vote (the stuck-vote fix): the join clicks 1x while the
-    # effective is ALREADY 1x (its own stale vote is 3x). Engine state doesn't
-    # change, so only hook-captured intent can see it - the host must log a
-    # REQ RECV mult=1.00 shortly after, and the host's later re-raise click
-    # must NOT produce a 3x SET before the join's own second 3x click.
+    # effective is ALREADY 1x. Engine state doesn't change, so only hook-
+    # captured intent can see it - the host must log a REQ RECV mult=1.00
+    # shortly after. Host re-raise MUST produce a 3x SET (LWW).
     $tSame = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO SPEEDSYNC join click mult=1\.0 ok=1 tag=samevalue'
     if ($null -ne $tSame) {
         $gotVote = $false
@@ -2015,13 +2010,12 @@ function Test-SpeedSync {
         if (-not $gotVote) { $bad += "same-value 1x click never arrived as a vote (no host REQ RECV mult=1.00 within 4s - stuck-vote bug back)" }
         else { $m.sameValueVote = $true }
         $tReraise = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO SPEEDSYNC host click mult=3\.0 ok=1 tag=reraise'
-        $tRaise2  = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO SPEEDSYNC join click mult=3\.0 ok=1 tag=raise2'
         if ($null -ne $tReraise) {
-            $limit = if ($null -ne $tRaise2) { [double]$tRaise2 - 1000 } else { [double]::MaxValue }
-            $leak = @($sets | Where-Object { [Math]::Abs([double]$_.mult - 3.0) -le 0.01 -and
-                                             [double]$_.t -ge [double]$tReraise -and [double]$_.t -lt $limit }) | Select-Object -First 1
-            if ($null -ne $leak) { $bad += "host re-raise propagated to 3x at t=$([long]$leak.t) despite the join's lowered vote (min arbitration ignored the same-value vote)" }
-            else { $m.reraiseDenied = $true }
+            $got = @($sets | Where-Object { [Math]::Abs([double]$_.mult - 3.0) -le 0.01 -and
+                                            [double]$_.t -ge ([double]$tReraise - 500) -and
+                                            [double]$_.t -le ([double]$tReraise + 4000) }) | Select-Object -First 1
+            if ($null -eq $got) { $bad += "host re-raise produced no 3x SET (last-write-wins ignored the host click)" }
+            else { $m.reraiseApplied = $true }
         }
     }
 
@@ -2074,16 +2068,17 @@ function Test-SpeedSync {
     if ($consider -lt 10)        { $bad += "only $consider aligned steady-state samples (need >= 10)" }
     elseif ($frac -lt $MinMatch) { $bad += "join matched the host multiplier for $frac of aligned samples (need >= $MinMatch)" }
 
-    # Combat window: both sides at 1x shortly after the demotion.
-    if ($null -ne $combatSet) {
-        $c0 = [double]$combatSet.t + 2000; $c1 = [double]$combatSet.t + 8000
+    # Combat window: both sides stay at last LWW (3x), not capped to 1x.
+    $tCombat = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO SPEEDSYNC combat issued'
+    if ($null -ne $tCombat) {
+        $c0 = [double]$tCombat + 2000; $c1 = [double]$tCombat + 8000
         foreach ($side in @(@{ n = "host"; S = $H }, @{ n = "join"; S = $J })) {
             $w = @($side.S | Where-Object { [double]$_.t -ge $c0 -and [double]$_.t -le $c1 })
             if ($w.Count -lt 3) { $bad += "$($side.n): only $($w.Count) sample(s) in the combat window"; continue }
-            $at1 = @($w | Where-Object { [Math]::Abs([double]$_.mult - 1.0) -le 0.01 }).Count
-            $r = [Math]::Round($at1 / $w.Count, 3)
-            $m[($side.n + "Combat1x")] = $r
-            if ($r -lt $MinMatch) { $bad += "$($side.n) at 1x for only $r of the combat window (need >= $MinMatch)" }
+            $at3 = @($w | Where-Object { [Math]::Abs([double]$_.mult - 3.0) -le 0.01 }).Count
+            $r = [Math]::Round($at3 / $w.Count, 3)
+            $m[($side.n + "Combat3x")] = $r
+            if ($r -lt $MinMatch) { $bad += "$($side.n) at 3x for only $r of the combat window (need >= $MinMatch - combat cap still on?)" }
         }
     }
 
@@ -2112,8 +2107,8 @@ function Test-SpeedSync {
         Write-Host ("  SPEED-SYNC FAIL - " + ($bad -join "; "))
         return (Add-GateResult -Name "speed_sync" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
     }
-    Write-Host ("  SPEED-SYNC PASS - $($sets.Count) transitions (max follow $($m.maxFollowMs)ms, lone raise denied), " +
-                "match $frac over $consider samples, combat window 1x host=$($m.hostCombat1x) join=$($m.joinCombat1x), " +
+    Write-Host ("  SPEED-SYNC PASS - $($sets.Count) transitions (max follow $($m.maxFollowMs)ms, lone raise applied), " +
+                "match $frac over $consider samples, combat window 3x host=$($m.hostCombat3x) join=$($m.joinCombat3x), " +
                 "indicator blank host=$($m.hostIndicatorBlank) join=$($m.joinIndicatorBlank)")
     return (Add-GateResult -Name "speed_sync" -Status PASS -Metrics $m)
 }

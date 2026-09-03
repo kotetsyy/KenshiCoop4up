@@ -66,16 +66,20 @@ Replicator::Replicator()
       attnFlips_(0), attnWinMs_(0), attnBaseSupp_(0), attnBaseCull_(0),
       attnBaseProxy_(0), attnVetoMs_(0), attnVetoRawN_(0), attnVetoMask_(0),
       auditRows_(false), jailProbe_(false), jailObserve_(false),
-      speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
+      speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedMyPaused_(false),
+      speedPeerReq_(-1.0f),
       speedCombatCap_(true),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
+      speedEffMult_(-1.0f), speedEffPaused_(false), speedLastReqOwner_(0),
       speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
+      speedDebounceUntilMs_(0), speedPendHave_(false),
+      speedPendMult_(1.0f), speedPendPaused_(false), speedPendOwner_(0),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), adoptRadius_(0.0f), censusAdopts_(0),
       censusScanMs_(0),
       poolSeen_(-1), poolSent_(-1), poolSentMs_(0), poolTotal_(-1),
-      poolSeq_(0), poolAcked_(0),
+      poolSeq_(0), poolAcked_(0), poolAckedByOwner_(),
       moneySync_(true), recruitSync_(true),
       squadSync_(true), tabsSeeded_(0),
       cellAuth_(false), cellCollapse_(false), collapsed_(false),
@@ -201,6 +205,7 @@ void Replicator::resetSession() {
         engine::markerDestroy(mi->second.label);
     debugMarkers_.clear();
     hostBody_.clear();
+    thrown_.clear();
     attackerOf_.clear();
     combatCapMs_.clear();
     authCount_.clear();
@@ -253,6 +258,10 @@ void Replicator::resetSession() {
     invRecv_.clear();
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
+    lootRemain_.clear();
+    lootAdopt_.clear();
+    guiDefer_.clear();
+    guiDeferSaid_.clear();
     worldTrack_.clear();
     worldProxies_.clear();
     worldSeeded_ = false; // re-baseline the reloaded world's save-native items
@@ -281,10 +290,13 @@ void Replicator::resetSession() {
     // measured in.
     poolSeen_ = -1; poolSent_ = -1; poolSentMs_ = 0; poolTotal_ = -1;
     poolSeq_ = 0; poolAcked_ = 0;
+    poolAckedByOwner_.clear();
     poolPending_.clear();
     stealthPub_.clear();
     pinOwned_.clear();
     pinPeer_.clear();
+    publishAsWire_.clear();
+    peerTabAlias_.clear();
     moveEcho_.clear();
     exitedOwn_.clear();
     // Protocol 35: the rank latch + the engine's pointer->hand baseline both
@@ -297,23 +309,33 @@ void Replicator::resetSession() {
     engine::clearSquadRoster();
     probed_.clear();
     spawnReq_.clear();
+    spawnInfoPend_.clear();
     unresolvedHands_.clear();
     forceReqHands_.clear();
     spawnLogged_.clear();
     spawnReplyMs_.clear();
     censusScanMs_ = 0;
-    // Speed/time consensus: re-seed from the fresh world's live state (the
-    // save's speed becomes the new baseline; the join's slew re-measures).
+    // Speed/time: re-seed from the fresh world's live state (the save's
+    // speed becomes the new baseline; the join's slew re-measures).
     speedLastApplied_ = -1.0f;
     speedMyReq_       = -1.0f;
+    speedMyPaused_    = false;
     speedPeerReq_     = -1.0f;
     speedMyCombat_    = false;
     speedPeerCombat_  = false;
     speedLastSet_     = -1.0f;
+    speedEffMult_     = -1.0f;
+    speedEffPaused_   = false;
+    speedLastReqOwner_ = 0;
     speedSeqSeen_     = 0;
     speedLastSendMs_  = 0;
     speedCombatSampleMs_ = 0;
     speedCombatHoldMs_ = 0;
+    speedDebounceUntilMs_ = 0;
+    speedPendHave_    = false;
+    speedPendMult_    = 1.0f;
+    speedPendPaused_  = false;
+    speedPendOwner_   = 0;
     timeSlew_         = 1.0f;
     timeSeqSeen_      = 0;
     timeLastSendMs_   = 0;
@@ -397,6 +419,10 @@ void Replicator::ingest(Inbound& in) {
         // player movement). Mapping = sendMs + min-tracked offset (see
         // PeerClock); clamped to 'now' so a stamp can never land in the future.
         unsigned long t = now;
+        // While a body is thrown, the HOST sim is the pose authority - ignore
+        // the owner's ragdoll stream so it cannot fight the throw.
+        if (isHostRole() && thrown_.find(keyOf(it->e)) != thrown_.end())
+            continue;
         if (sendStamp_) {
             PeerClock& pc = peerClock_[it->ownerId];
             long off = (long)(now - (unsigned long)it->sendMs);
@@ -452,6 +478,21 @@ void Replicator::ingestInv(Inbound& in) {
                 k.cs = pb->second.localHand[2]; k.i = pb->second.localHand[3];
                 k.s = pb->second.localHand[4];
             }
+        }
+        unsigned int inUnits = 0;
+        for (unsigned int i = 0; i < it->items.size(); ++i) {
+            int q = it->items[i].quantity; if (q < 1) q = 1;
+            inUnits += (unsigned int)q;
+        }
+        std::map<Key, LootCap>::iterator lr = lootRemain_.find(k);
+        if (lr != lootRemain_.end() && inUnits > lr->second.units) {
+            // Stale host snapshot of a corpse the join already emptied (open
+            // loot GUI on the host). Do not dirty-apply it back onto the join.
+            continue;
+        }
+        if (lr != lootRemain_.end() && inUnits <= lr->second.units) {
+            lr->second.units = inUnits;
+            if (inUnits == 0) lootRemain_.erase(lr);
         }
         InvRecv& r = invRecv_[k];
         r.ownerId   = it->ownerId;

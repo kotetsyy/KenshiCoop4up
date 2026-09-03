@@ -1,8 +1,9 @@
 ﻿{
   // KenshiCoop config. For a normal Steam game you do NOT need to edit this file:
-  // your friend's Steam ID is entered in-game (press F2, click "Copy my Steam ID"
-  // to share yours, then "Paste friend's Steam ID" to enter theirs), and nothing
-  // is written back to disk.
+  // Steam IDs are entered in-game (F2: Copy my Steam ID / Paste friend's Steam ID).
+  // Host may paste several join IDs (up to 3 joins, 4 players total). What you
+  // paste IS written back here, so a relaunch pre-fills the panel instead of
+  // asking for the clipboard again. Optional: "steamPeer": "id1,id2,id3"
   //
   // This file only matters for a LAN / direct-UDP game: set "transport": "udp"
   // and put the host's address in "ip" (and "port" if you changed it). ip/port are
@@ -10,5 +11,24 @@
   "transport": "steam",
   "ip": "127.0.0.1",
   "port": 27800,
-  "autoConnect": false
+  "autoConnect": false,
+
+  // ---- Self-update ---------------------------------------------------------
+  // Every player must run the SAME DLL: the protocol version is a hard gate at
+  // handshake, so one stale copy just fails to connect. With this on, the mod
+  // checks a manifest on GitHub at startup (on its own thread - it never delays
+  // the game), and if a newer build exists it downloads it, verifies its SHA-256
+  // against the manifest, and swaps it into place. The running session keeps the
+  // OLD code; the update takes effect the NEXT time you launch, and the F2 panel
+  // says so.
+  //
+  // Leave updateEnabled false unless you trust whoever controls updateOwner/
+  // updateRepo: they can put code on this machine. Set updateAutoApply false to
+  // be TOLD about updates without anything being downloaded or replaced.
+  "updateEnabled": false,
+  "updateOwner": "",
+  "updateRepo": "",
+  "updateBranch": "main",
+  "updateManifest": "dist/UPDATE.txt",
+  "updateAutoApply": true
 }

@@ -135,9 +135,17 @@ RootObject* resolveObject(const ObjectHand& h);
 // SEH-guarded RAW apply: teleport the body to the entity transform via the
 // movement controller (no interpolation). Stage 1 apply path.
 bool applyRaw(Character* c, const EntityState& e);
+// Visual-only teleport (Character::teleportVisuallyOnly) - ragdoll mesh follows
+// this even when CharMovement/Havok locomotion is down. Absolute world pose.
+bool teleportVisual(Character* c, float x, float y, float z, float heading);
+// Write HavokCharacter::position (world units; stored as world/10). False if
+// there is no physics character.
+bool applyHavokPos(Character* c, float x, float y, float z);
 
 // SEH-guarded: read a character's current world position (for SCENARIO logging).
 bool readPos(Character* c, float* x, float* y, float* z);
+// SEH-guarded: position + yaw (radians). False on fault / null.
+bool readPose(Character* c, float* x, float* y, float* z, float* heading);
 
 // SEH-guarded: read a character's hand into out[5] = {index, serial, type,
 // container, containerSerial} (the SCENARIO hand-key field order).
@@ -593,6 +601,16 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                             const InvItemEntry* items, unsigned int count,
                             bool truncated = false);
+
+// SEH-guarded: is an inventory PANEL currently open on this container (its own loot/
+// trade/character window, or a window on a backpack it carries)? An open panel holds
+// raw Item* icons the engine never revalidates, so destroying a stack under one is a
+// use-after-free that lands on the RENDER thread - past every __except we own. Callers
+// that are about to run a DESTRUCTIVE reconcile must defer while this is true; the
+// reconcile itself refuses to destroy under a panel regardless (REMOVE-SKIP-GUI), so
+// this is the "wait and retry" half, not the safety half. False when CAP_INV_GUI is
+// unavailable - the lever is reported in the [engine] CAPS line.
+bool containerGuiOpen(GameWorld* gw, const unsigned int cHand[5]);
 
 // SEH-guarded (protocol 48): create `qty` of (sid,type) INSIDE the container the character at
 // cHand carries - a worn backpack's own private inventory, which is a different Inventory from
@@ -1203,6 +1221,11 @@ bool recruitNpc(GameWorld* gw, Character* c);
 // body is a player-squad member afterwards.
 bool joinPlayerSquadAt(GameWorld* gw, Character* c, const unsigned int newHand[5]);
 
+// SEH-guarded: drop 'c' out of the local player's squad (setFaction to a
+// non-player faction). Used when the OWNER dismissed the body. Returns true
+// if the call was issued.
+bool leavePlayerSquad(GameWorld* gw, Character* c);
+
 // AI decision-layer suspension (the faction-safe alternative to recruit): detour
 // Character::periodicUpdate so that, for NPCs in the suspended set, the AI "think"
 // tick is skipped (no autonomous re-tasking) while the body keeps animating and
@@ -1240,6 +1263,10 @@ unsigned int damageGuardCount();
 // oracle's engagement signal: guarded>0 proves local swings really targeted driven
 // bodies AND the hook stopped them).
 void         damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed);
+// Cosmetic floating damage number (ForgottenGUI ScreenLabel, RS_NORMAL).
+// Used when hitByMelee is intercepted (join damage-guard): orig never runs so
+// the engine never mints its own floater, but the amount is already in-hand.
+void         spawnDamageFloater(Character* c, float amount);
 
 // ---- Join-dealt authoritative damage report (protocol 45) -------------------
 // The damage guard suppresses the join PC's melee on driven NPC copies (cosmetic
@@ -2035,12 +2062,17 @@ struct ContRead {
     char  sid[48];        // template GameData stringID
 };
 // SEH-guarded enumeration of COMPLETE container-bearing buildings (STORAGE +
-// the machine classes) within radius of the interest centers (dual-interest,
-// deduped). Per row the contents are captured (up to 64 entries) into the
-// count/qty/hash summary - the capacity question's measuring stick. Returns
-// the count written.
+// the machine classes) within radius of EVERY player-squad member plus camera
+// anchors (deduped). If more than maxOut match, the nearest to any center
+// win. Per row the contents are captured (up to 64 entries). Returns the
+// count written.
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                                 unsigned int maxOut);
+// World-NPC corpses (down/dead, not player-squad). Same ContRead shape;
+// classType = -1. Hand is the character's save-stable object hand (the
+// entity-stream key). Nearest-first if over maxOut. Returns count written.
+unsigned int enumCorpseInventoriesNear(GameWorld* gw, float radius,
+                                       ContRead* out, unsigned int maxOut);
 // SEH-guarded single-container read by local hand. Returns false when the hand
 // does not resolve locally or is not a container-bearing building class.
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out);
@@ -2163,8 +2195,16 @@ bool writeGameSpeed(GameWorld* gw, float mult, bool paused);
 // GameWorld::setFrameSpeedMultiplier + userPause WITHOUT updating the UI speed
 // buttons and WITHOUT registering as user intent (reentrancy-guarded against
 // the intent hooks). The buttons keep showing the player's last click (their
-// VOTE); the replicator enforces the arbitrated min(host, join) underneath.
+// VOTE); the replicator enforces the host last-write-wins effective underneath.
 bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused);
+
+// Kind of a captured speed intent. Pause/unpause are independent of the
+// numeric multiplier (last-write-wins treats them as a separate flag).
+enum SpeedIntentKind {
+    SPEED_INTENT_LEVEL   = 0, // 1x / 2x / 5x (or any other multiplier)
+    SPEED_INTENT_PAUSE   = 1,
+    SPEED_INTENT_UNPAUSE = 2
+};
 
 // Speed-intent capture (the vote source). Two complementary detectors,
 // because the MainBar click handler writes the speed INLINE (2026-07-08
@@ -2178,8 +2218,10 @@ bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused);
 //     doesn't move, but the UI highlight does).
 // consumeSpeedIntent returns true once per new intent and fills the
 // requested state (intent pause preserves the requested multiplier,
-// mirroring the engine's model).
-bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused);
+// mirroring the engine's model). kind is optional; when non-NULL it
+// receives SPEED_INTENT_* so the replicator can LWW pause separately
+// from a speed-tier click.
+bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused, int* kind = 0);
 
 // Install the three intent detours (setGameSpeed / userPause / togglePause)
 // and seed the intent state from the live engine so the first vote reflects
@@ -2192,8 +2234,9 @@ bool installSpeedIntentHooks(GameWorld* gw);
 // cap n-1 buttons). Returns the button count read, -1 when the GUI isn't up.
 int readSpeedButtons(char* out, int n);
 
-// Phase 5: publish the combat-cap-active state (from syncSpeed) so the
-// speed-path diagnostics can attribute an engine-forced cap vs a user click.
+// Phase 5: publish own-squad-in-combat (from syncSpeed) so the speed-path
+// diagnostics can attribute an engine-forced change vs a user click. The
+// combat detector still runs; it no longer caps game speed.
 void setSpeedCombatHint(bool inCombat);
 
 // Phase 5: force the MyGUI speed buttons back onto the captured vote when the

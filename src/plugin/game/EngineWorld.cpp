@@ -259,11 +259,8 @@ bool joinPlayerSquadAt(GameWorld* gw, Character* c, const unsigned int newHand[5
                 break;
             }
         }
-        // Case B fallback: the reported tab is a runtime-minted platoon not
-        // present locally - drop into the leader's default tab so the body is
-        // still a panel member (control still follows the peer-owned pin).
-        if (!target && pc > 0 && gw->player->playerCharacters[0])
-            target = g_getPlatoonFn(gw->player->playerCharacters[0]);
+        // No leader-tab dump. Dumping a peer-owned body into Безымянные_0
+        // is how dismissing someone else's unit "gives" them to player 1/2.
         if (!target) return false;
         // setFaction (probe lever 1, the header-documented re-platoon path):
         // moves 'c' into the player faction + target platoon WITHOUT touching
@@ -274,6 +271,19 @@ bool joinPlayerSquadAt(GameWorld* gw, Character* c, const unsigned int newHand[5
         // false negative); reaching setFaction with a resolved platoon IS the
         // success signal.
         c->setFaction(f, target);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool leavePlayerSquad(GameWorld* gw, Character* c) {
+    if (!gw || !c) return false;
+    __try {
+        if (!isPlayerSquad(gw, static_cast<RootObject*>(c))) return true;
+        Faction* other = findNearbyNonPlayerFaction(gw);
+        if (!other) return false;
+        c->setFaction(other, 0);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1517,10 +1527,82 @@ static bool isContainerClassType(int t) {
     return t == (int)BCTYPE_STORAGE || isMachineClassType(t);
 }
 
+// Every player-squad body (not just two tab leaders) plus camera anchors.
+// Does NOT change interestCenters (NPC stream / combat stay as they were).
+static unsigned int lootCenters(GameWorld* gw, Ogre::Vector3* outC,
+                                unsigned int maxC) {
+    unsigned int nc = 0;
+    PlayerInterface* pl = gw->player;
+    if (!pl) return 0;
+    unsigned int total = (unsigned int)pl->playerCharacters.size();
+    for (unsigned int i = 0; i < total && nc < maxC; ++i) {
+        Character* m = pl->playerCharacters[i];
+        if (!m) continue;
+        Ogre::Vector3 p = m->getPosition();
+        bool dup = false;
+        for (unsigned int k = 0; k < nc && !dup; ++k) {
+            float dx = outC[k].x - p.x, dy = outC[k].y - p.y, dz = outC[k].z - p.z;
+            dup = (dx * dx + dy * dy + dz * dz) <= 25.0f * 25.0f;
+        }
+        if (dup) continue;
+        outC[nc++] = p;
+    }
+    if (nc == 0) return 0;
+    Ogre::Vector3 extra[4];
+    unsigned int ne = interestCenters(gw, extra);
+    for (unsigned int i = 0; i < ne && nc < maxC; ++i) {
+        bool dup = false;
+        for (unsigned int k = 0; k < nc && !dup; ++k) {
+            float dx = outC[k].x - extra[i].x;
+            float dy = outC[k].y - extra[i].y;
+            float dz = outC[k].z - extra[i].z;
+            dup = (dx * dx + dy * dy + dz * dz) <= 100.0f * 100.0f;
+        }
+        if (dup) continue;
+        outC[nc++] = extra[i];
+    }
+    return nc;
+}
+
+static float minDist2ToCenters(float x, float y, float z,
+                               const Ogre::Vector3* centers, unsigned int nc) {
+    float best = 1.0e30f;
+    for (unsigned int i = 0; i < nc; ++i) {
+        float dx = x - centers[i].x, dy = y - centers[i].y, dz = z - centers[i].z;
+        float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < best) best = d2;
+    }
+    return best;
+}
+
+struct ContCand { ContRead r; float d2; };
+static int contCandCmp(const void* a, const void* b) {
+    float da = ((const ContCand*)a)->d2, db = ((const ContCand*)b)->d2;
+    return (da < db) ? -1 : (da > db) ? 1 : 0;
+}
+
+static void fillInvSummary(RootObject* ro, ContRead* r) {
+    Inventory* inv = invOf(ro);
+    r->hasInv = inv ? 1 : 0;
+    if (!inv) return;
+    InvItemEntry ent[64];
+    unsigned int n = readInvItems(inv, ent, 0, 64);
+    r->nEntries = (int)n;
+    unsigned int h = 0; int qt = 0;
+    for (unsigned int i = 0; i < n; ++i) {
+        h += invEntryHash(ent[i]);
+        qt += (int)ent[i].quantity;
+    }
+    r->hash = h; r->qtyTotal = qt;
+    if (n > 0) {
+        strncpy(r->firstSid, ent[0].stringID, sizeof(r->firstSid) - 1);
+        r->firstSid[sizeof(r->firstSid) - 1] = '\0';
+        r->firstQty = (int)ent[0].quantity;
+    }
+}
+
 // Fill a ContRead from a live container-bearing Building. Callers hold the
 // SEH frame and have already verified isContainerClassType(b->classType).
-// The contents summary reads up to 64 entries (readInvItems carries its own
-// SEH) - the census's capacity measuring stick vs INV_ITEMS_MAX.
 static void fillContRead(Building* b, ContRead* r) {
     memset(r, 0, sizeof(*r));
     RootObject* ro = static_cast<RootObject*>(b);
@@ -1529,24 +1611,25 @@ static void fillContRead(Building* b, ContRead* r) {
     r->x = p.x; r->y = p.y; r->z = p.z;
     r->classType = (int)b->classType;
     r->complete  = b->_buildState.isComplete ? 1 : 0;
-    Inventory* inv = ro->getInventory();
-    r->hasInv = inv ? 1 : 0;
-    if (inv) {
-        InvItemEntry ent[64];
-        unsigned int n = readInvItems(inv, ent, 0, 64);
-        r->nEntries = (int)n;
-        unsigned int h = 0; int qt = 0;
-        for (unsigned int i = 0; i < n; ++i) {
-            h += invEntryHash(ent[i]);
-            qt += (int)ent[i].quantity;
-        }
-        r->hash = h; r->qtyTotal = qt;
-        if (n > 0) {
-            strncpy(r->firstSid, ent[0].stringID, sizeof(r->firstSid) - 1);
-            r->firstSid[sizeof(r->firstSid) - 1] = '\0';
-            r->firstQty = (int)ent[0].quantity;
-        }
+    fillInvSummary(ro, r);
+    GameData* gd = ro->getGameData();
+    if (gd) {
+        strncpy(r->sid, gd->stringID.c_str(), sizeof(r->sid) - 1);
+        r->sid[sizeof(r->sid) - 1] = '\0';
+        strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
     }
+}
+
+static void fillContReadFromChar(Character* ch, ContRead* r) {
+    memset(r, 0, sizeof(*r));
+    RootObject* ro = static_cast<RootObject*>(ch);
+    readObjectHand(ro, r->hand);
+    Ogre::Vector3 p = ch->getPosition();
+    r->x = p.x; r->y = p.y; r->z = p.z;
+    r->classType = -1; // corpse, not a BuildingClassType
+    r->complete  = 1;
+    fillInvSummary(ro, r);
     GameData* gd = ro->getGameData();
     if (gd) {
         strncpy(r->sid, gd->stringID.c_str(), sizeof(r->sid) - 1);
@@ -1559,34 +1642,81 @@ static void fillContRead(Building* b, ContRead* r) {
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                                 unsigned int maxOut) {
     if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
-    unsigned int n = 0;
+    static ContCand cand[256]; // main-thread only
+    unsigned int nCand = 0;
     __try {
-        Ogre::Vector3 centers[4];
-        unsigned int nc = interestCenters(gw, centers);
+        Ogre::Vector3 centers[8];
+        unsigned int nc = lootCenters(gw, centers, 8);
         if (nc == 0) return 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {
             g_npcQuery.clear();
-            g_getObjsFn(gw, &g_npcQuery, &centers[ci], radius, BUILDING, 256, 0);
+            g_getObjsFn(gw, &g_npcQuery, &centers[ci], radius, BUILDING, 512, 0);
             unsigned int total = g_npcQuery.size();
-            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            for (unsigned int i = 0; i < total && nCand < 256; ++i) {
                 RootObject* o = g_npcQuery[i];
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
                 if (!isContainerClassType((int)b->classType)) continue;
-                // Incomplete sites ride protocol 27 until finished.
                 if (!b->_buildState.isComplete) continue;
                 unsigned int h[5];
                 if (!readObjectHand(o, h)) continue;
-                bool dup = false; // the two interest spheres can overlap
-                for (unsigned int k = 0; k < n; ++k)
-                    if (out[k].hand[3] == h[3] && out[k].hand[4] == h[4] &&
-                        out[k].hand[1] == h[1]) { dup = true; break; }
+                bool dup = false;
+                for (unsigned int k = 0; k < nCand; ++k)
+                    if (cand[k].r.hand[3] == h[3] && cand[k].r.hand[4] == h[4] &&
+                        cand[k].r.hand[1] == h[1]) { dup = true; break; }
                 if (dup) continue;
-                fillContRead(b, &out[n]);
-                ++n;
+                fillContRead(b, &cand[nCand].r);
+                cand[nCand].d2 = minDist2ToCenters(cand[nCand].r.x, cand[nCand].r.y,
+                                                   cand[nCand].r.z, centers, nc);
+                ++nCand;
             }
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (nCand > 1) std::qsort(cand, nCand, sizeof(cand[0]), contCandCmp);
+    unsigned int n = (nCand < maxOut) ? nCand : maxOut;
+    for (unsigned int i = 0; i < n; ++i) out[i] = cand[i].r;
+    return n;
+}
+
+unsigned int enumCorpseInventoriesNear(GameWorld* gw, float radius,
+                                       ContRead* out, unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0 || !g_getCharsFn) return 0;
+    static ContCand cand[128]; // main-thread only
+    unsigned int nCand = 0;
+    __try {
+        Ogre::Vector3 centers[8];
+        unsigned int nc = lootCenters(gw, centers, 8);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], radius, radius, radius,
+                         512, 512, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && nCand < 128; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                if (isPlayerSquad(gw, o)) continue;
+                Character* ch = static_cast<Character*>(o);
+                unsigned short bs = readBodyState(ch);
+                if (!bodyIsDown(bs)) continue;
+                unsigned int h[5];
+                if (!readObjectHand(o, h)) continue;
+                bool dup = false;
+                for (unsigned int k = 0; k < nCand; ++k)
+                    if (cand[k].r.hand[3] == h[3] && cand[k].r.hand[4] == h[4] &&
+                        cand[k].r.hand[1] == h[1]) { dup = true; break; }
+                if (dup) continue;
+                fillContReadFromChar(ch, &cand[nCand].r);
+                if (!cand[nCand].r.hasInv) continue;
+                cand[nCand].d2 = minDist2ToCenters(cand[nCand].r.x, cand[nCand].r.y,
+                                                   cand[nCand].r.z, centers, nc);
+                ++nCand;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (nCand > 1) std::qsort(cand, nCand, sizeof(cand[0]), contCandCmp);
+    unsigned int n = (nCand < maxOut) ? nCand : maxOut;
+    for (unsigned int i = 0; i < n; ++i) out[i] = cand[i].r;
     return n;
 }
 

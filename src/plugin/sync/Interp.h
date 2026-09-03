@@ -100,6 +100,10 @@ public:
 
     bool empty() const { return count_ == 0; }
 
+    // Drop the ring so the next push is a fresh rest pose (carry drop: old
+    // walk samples must not smear from the new ground point).
+    void clear();
+
     // Ring fill (0..CAP). A young ring (< CAP) means this entity was (re-)
     // acquired within the last ~16 samples - its first reconciliation snap
     // is a coverage event, not steady-state tracking noise (Phase 2).

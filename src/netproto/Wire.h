@@ -25,7 +25,22 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+const u16 PROTOCOL_VERSION = 58;
+
+// RELEASE id - a different axis from PROTOCOL_VERSION, and the two are routinely
+// confused. PROTOCOL_VERSION is the WIRE contract: peers with different values
+// refuse to connect. This is the BUILD identity: what the updater compares
+// against the published manifest's `version=` to decide whether a newer DLL
+// exists. Two builds can share a protocol (a bug fix that changes no packet) and
+// still differ here; a protocol bump should always come with a bump here, since
+// it is the thing that makes everyone else's copy stale.
+// Bump this in the same commit as the git tag, and put the same string in
+// dist/UPDATE.txt when publishing.
+const char* const COOP_BUILD_VERSION = "0.52";
+
+// Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
+const u32 MAX_PLAYERS = 4;
+const u32 MAX_JOINS   = 3;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -93,8 +108,9 @@ enum EventType {
     EVT_CRUSH    = 5, // subject's limb was crushed (LimbState -> CRUSHED edge); arg = limb
     // Carried-body sync (protocol 18). subject = the CARRIED body, actor = the
     // CARRIER (both resolve locally on each machine; the receiver performs the
-    // same pickup/drop between its LOCAL pair). arg: 0 for pickup; for drop,
-    // 1 = ragdoll the body on release (the normal ground drop), 0 = gentle.
+    // same pickup/drop between its LOCAL pair). arg for DROP:
+    //   0 = gentle release, 1 = ragdoll release (start of thrown/flight),
+    //   2 = landing settle (end of thrown; pose is the rest pose, no applyDrop).
     EVT_PICKUP_BODY = 6, // carrier lifted the subject onto its shoulder
     EVT_DROP_BODY   = 7, // carrier released the subject
     // Furniture occupancy (protocol 19). subject = the OCCUPANT, actor slots =
@@ -165,7 +181,13 @@ struct EventPacket {
     u32 aContainerSerial;
     u32 aIndex;
     u32 aSerial;
-    f32 arg;     // event-specific payload (damage, etc.); 0 for KO/death
+    f32 arg;     // event-specific payload (damage, ragdoll/landing flag, etc.)
+    // v57: drop-pose of the CARRIED body (EVT_DROP_BODY). Other events leave
+    // these zero / poseValid=0. Receiver parks the passenger here immediately
+    // so nametag (CharMovement) and mesh (Havok) do not diverge after drop.
+    // arg=2 (landing) reuses the same fields for the rest pose after a throw.
+    f32 x, y, z, heading;
+    u8  poseValid; // 1 = xyz/heading filled
 };
 
 // ObjectHand - the canonical identity of a Kenshi engine object (the game's
@@ -299,6 +321,11 @@ inline bool taskIsCombatWait(u16 t) { return t == TASK_COMBAT_WAIT; }
 // pickup). Priority sits below combat, above rest poses.
 const u16 TASK_CARRY_BODY = 0xFE02u;
 inline bool taskIsCarry(u16 t) { return t == TASK_CARRY_BODY; }
+
+// EVT_DROP_BODY arg values (still a float on the wire).
+const float DROP_ARG_GENTLE  = 0.0f;
+const float DROP_ARG_RAGDOLL = 1.0f;
+const float DROP_ARG_LANDING = 2.0f;
 
 // bodyState bit-flags. A body is "down" (on the ground, not upright) when any of
 // BODY_DOWN / BODY_RAGDOLL / BODY_DEAD is set; BODY_CRAWL is an upright-ish stealth/
@@ -916,13 +943,14 @@ struct CombatHitPacket {
     f32 blood;   // accumulated blood loss to apply
 };
 
-// Consensus game speed (pause/1x/2x/3x). As PKT_SPEED_REQ it carries one
-// client's REQUESTED speed (what its player last clicked) plus an IN_COMBAT
-// bit for that client's own squad; as PKT_SPEED_SET it carries the host's
-// arbitrated EFFECTIVE speed both engines must apply. Pause travels as
-// speed 0 (so min() gives "either can pause, both must raise"); the PAUSED
-// flag is kept explicit for log clarity. seq is per-sender monotonic so a
-// late retransmit never rolls back a newer decision.
+// Last-write-wins game speed (pause / 1x / 2x / 5x / any multiplier). As
+// PKT_SPEED_REQ it carries one client's last click (level and/or pause) plus
+// an IN_COMBAT bit for diagnostics; as PKT_SPEED_SET it carries the host's
+// last accepted EFFECTIVE (multiplier + independent SPEED_PAUSED). Pause is
+// the PAUSED flag, not min() with 0; the speed field keeps the multiplier
+// even while paused (speed <= 0 is still accepted as pause for old packets).
+// seq is per-sender monotonic so a late retransmit never rolls back a newer
+// decision. Combat no longer caps the multiplier.
 enum SpeedFlags {
     SPEED_PAUSED    = 1,
     SPEED_IN_COMBAT = 2
@@ -995,9 +1023,10 @@ struct MoneyPacket {
 
 // Join -> host: one signed change the join's LOCAL economy already applied
 // (purchase, sale, loot, bounty, hire). Reliable + ordered, so the host folds
-// each delta exactly once; seq is monotonic per session and comes back as
-// MoneyPacket::ackSeq. A single ackSeq assumes ONE remote peer (the two-player
-// design target) - a third player would need a per-peer ack.
+// each delta exactly once; seq is monotonic per SENDER and is tracked per
+// ownerId on the host (3-4 player). ackSeq on the broadcast total is 0:
+// joins adopt the host total as-is (pending re-apply was a 2-player smoothness
+// hack and mis-acks a third player's seq space).
 struct MoneyDeltaPacket {
     u8  type;    // = PKT_MONEY_DELTA
     u32 ownerId; // network player id of the sender (the join)
@@ -1334,13 +1363,22 @@ struct SpawnInfoPacket {
     f32 z;
     f32 heading;      // radians (yaw)
     u8  found;        // 1 = resolved + described; 0 = negative (stop retrying)
-    u8  dead;         // body was dead at reply time (join spawns + death-latches)
+    u8  dead;         // SPAWN_BODY_*: 0 upright, 1 dead (death-latch), 2 KO
+                      // (ko-latch). Layout unchanged since v39; v58 assigns KO
+                      // its own value so an unconscious mint does not stand.
     // Host body's age (protocol 39). Animals derive body SCALE from age
     // (CharacterAnimal ageSizeMin/Max), so the join must mint with the host's
     // value or every proxy creature spawns full-grown ("giant goats", manual
     // session 2026-07-12). <= 0 = unreadable -> join uses its adult default.
     f32 age;
 };
+
+// SpawnInfoPacket.dead (v58). 1 used to mean only "dead"; unconscious mints
+// arrived standing because the join never saw EVT_KNOCKOUT (attention-gated
+// off the stream, census has no down bit).
+const u8 SPAWN_BODY_ALIVE = 0;
+const u8 SPAWN_BODY_DEAD  = 1;
+const u8 SPAWN_BODY_KO    = 2;
 
 // ---- Protocol 31: coordinated save + session resume --------------------------
 // The HOST's save is authoritative. Any local save on the HOST (menu save,

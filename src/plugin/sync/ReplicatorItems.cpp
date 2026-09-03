@@ -12,8 +12,21 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../../netproto/ContentHash.h"
 
 namespace coop {
+
+bool Replicator::resolveInvLocalHand(const Key& k, unsigned int cHand[5]) const {
+    handForContainerKey(k, cHand);
+    if (engine::resolveObjectByHand(cHand) != 0) return true;
+    std::map<Key, Character*>::const_iterator pit = proxyByKey_.find(k);
+    if (pit == proxyByKey_.end() || !pit->second) return false;
+    unsigned int lh[5];
+    if (!engine::readObjectHand(reinterpret_cast<RootObject*>(pit->second), lh))
+        return false;
+    memcpy(cHand, lh, sizeof(lh[0]) * 5);
+    return engine::resolveObjectByHand(cHand) != 0;
+}
 
 void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     // Author the inventory of every container we OWN. ownHands_ is the per-tick set of
@@ -36,17 +49,36 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned long cnow = nowMs();
         if (contCensusMs_ == 0 || (cnow - contCensusMs_) >= 1000) {
             contCensusMs_ = cnow;
-            const unsigned int MAX_CONT = 48;
-            static engine::ContRead rows[MAX_CONT]; // main-thread only
-            unsigned int n = engine::enumContainersNear(gw, 100.0f, rows, MAX_CONT);
+            const unsigned int MAX_STORE  = 96;
+            const unsigned int MAX_CORPSE = 32;
+            const float STORE_R  = 400.0f;
+            const float CORPSE_R = 400.0f;
+            static engine::ContRead stores[MAX_STORE];   // main-thread only
+            static engine::ContRead corpses[MAX_CORPSE];
+            unsigned int ns = engine::enumContainersNear(gw, STORE_R, stores, MAX_STORE);
+            unsigned int nc = engine::enumCorpseInventoriesNear(gw, CORPSE_R,
+                                                                corpses, MAX_CORPSE);
             censusContainers_.clear();
-            for (unsigned int i = 0; i < n; ++i) {
-                if (!rows[i].hasInv) continue; // no Inventory = nothing to author
-                Key k; k.t = rows[i].hand[0]; k.c = rows[i].hand[1];
-                k.cs = rows[i].hand[2]; k.i = rows[i].hand[3];
-                k.s = rows[i].hand[4];
+            for (unsigned int i = 0; i < ns; ++i) {
+                if (!stores[i].hasInv) continue;
+                Key k; k.t = stores[i].hand[0]; k.c = stores[i].hand[1];
+                k.cs = stores[i].hand[2]; k.i = stores[i].hand[3];
+                k.s = stores[i].hand[4];
                 censusContainers_.insert(k);
             }
+            for (unsigned int i = 0; i < nc; ++i) {
+                if (!corpses[i].hasInv) continue;
+                Key k; k.t = corpses[i].hand[0]; k.c = corpses[i].hand[1];
+                k.cs = corpses[i].hand[2]; k.i = corpses[i].hand[3];
+                k.s = corpses[i].hand[4];
+                if (ownHands_.count(k)) continue; // squad pocket already authored
+                censusContainers_.insert(k);
+            }
+            char cb[128];
+            _snprintf(cb, sizeof(cb) - 1,
+                      "[inv] CENSUS store=%u corpse=%u authored=%u",
+                      ns, nc, (unsigned)censusContainers_.size());
+            cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
         }
         owned.insert(censusContainers_.begin(), censusContainers_.end());
     }
@@ -114,6 +146,16 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned long resendMs = (n >= INV_RESEND_BIG_N) ? INV_RESEND_BIG_MS : INV_RESEND_MS;
         bool periodic = sent && !differs && (now - pub.lastSendMs >= resendMs);
         if (!changed && !periodic) continue;
+        // Host loot GUI still listing items the join already took: local capture
+        // is LARGER than the adopted remaining list. Publishing it puts the
+        // loot back on the join when they reopen the corpse.
+        std::map<Key, LootCap>::iterator la = lootAdopt_.find(*it);
+        if (la != lootAdopt_.end()) {
+            const unsigned long LOOT_ADOPT_MS = 8000;
+            if (units > la->second.units && (now - la->second.ms) < LOOT_ADOPT_MS)
+                continue;
+            if (units <= la->second.units) lootAdopt_.erase(la);
+        }
         // W2 race guard: while the gear census has an unresolved DECREASE pending for this
         // container, a drop intent for it may still be debouncing (the spatial ground query
         // fails in towns, so detectAndPublishWeaponDrops retries for up to MAX_RETRY ticks).
@@ -174,6 +216,56 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (dumpInv) { coop::logLine("[inv] SEND-state:"); engine::dumpInventory(gw, cHand); }
         }
     }
+    // Loot echo: JOIN ONLY. World chests/NPC corpses are HOST-authored, so a
+    // join take never entered the owned loop above. The host must NOT echo
+    // snapshots back (open loot GUI vs join remaining is a ping-pong that
+    // restores items on reopen and crashed APPLY-empty under the GUI).
+    // Join sends remaining contents; host applies + republishes. Own pockets
+    // stay on the owned loop (Doctrine 8).
+    if (isHostRole()) return;
+    for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin();
+         ri != invRecv_.end(); ++ri) {
+        const Key& k = ri->first;
+        if (ownHands_.count(k) || ownedContainers_.count(k)) continue;
+        unsigned int cHand[5];
+        if (!resolveInvLocalHand(k, cHand)) continue;
+        u32 hash = 0;
+        bool trunc = false;
+        unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX,
+                                                          &hash, &trunc, /*includeNested=*/true);
+        u32 recvHash = 0;
+        for (unsigned int i = 0; i < ri->second.items.size(); ++i)
+            recvHash += invEntryHash(ri->second.items[i]);
+        if (hash == recvHash) continue;
+        unsigned int units = 0;
+        for (unsigned int ui = 0; ui < n; ++ui)
+            units += (items[ui].quantity < 1) ? 1u : (unsigned int)items[ui].quantity;
+        std::map<Key, InvPub>::iterator pit = invPub_.find(k);
+        if (pit == invPub_.end()) {
+            InvPub p; p.hash = recvHash; p.lastSendMs = 0; p.pendingHash = hash;
+            p.pendingSince = now; p.lastSentN = 0; p.lastSentUnits = 0;
+            invPub_[k] = p;
+            pit = invPub_.find(k);
+        }
+        InvPub& pub = pit->second;
+        if (hash != pub.pendingHash) { pub.pendingHash = hash; pub.pendingSince = now; }
+        if (now - pub.pendingSince < INV_SETTLE_MS) continue;
+        if (pub.hash == hash && pub.lastSendMs != 0) continue;
+        u8 keyKind = 0;
+        u32 wireKey[5] = { k.t, k.c, k.cs, k.i, k.s };
+        u8 sflags = trunc ? INV_FLAG_TRUNCATED : (u8)0;
+        net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n, sflags);
+        pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n; pub.lastSentUnits = units;
+        LootCap cap; cap.units = units; cap.hash = hash; cap.ms = now;
+        lootRemain_[k] = cap;
+        ri->second.items.assign(items, items + n);
+        ri->second.dirty = false;
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+            "[inv] SEND-LOOT hand=%u,%u,%u,%u,%u items=%u hash=%u (was %u)",
+            k.t, k.c, k.cs, k.i, k.s, n, hash, recvHash);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
 }
 
 void Replicator::applyInventories(GameWorld* gw) {
@@ -190,9 +282,46 @@ void Replicator::applyInventories(GameWorld* gw) {
         // the node's building, which names nothing here - reconciling it
         // verbatim was a silent no-op, so the mine's output never crossed.
         unsigned int cHand[5];
-        handForContainerKey(k, cHand);
+        resolveInvLocalHand(k, cHand);
         const InvItemEntry* items = it->second.items.empty() ? 0 : &it->second.items[0];
         unsigned int n = (unsigned int)it->second.items.size();
+        // An OPEN inventory panel on this container makes the reconcile unsafe: the
+        // window holds raw Item* icons the engine never revalidates, so destroying a
+        // stack under it faults on the RENDER thread, outside every __except we own.
+        // That is the loot crash - three swallowed first-chance READs of -1 in our own
+        // capture, then a fatal one inside kenshi_x64.exe. Defer the WHOLE snapshot
+        // (not just its removals): a half-applied reconcile that creates now and
+        // destroys later leaves a divergence no later snapshot describes. The channel
+        // is RELIABLE and re-asserts, and `dirty` re-visits every tick, so closing the
+        // window applies the newest snapshot immediately - which is exactly the
+        // documented outcome ("close the host's GUI -> the corpse is empty on both").
+        // Held open indefinitely, the host's own panel keeps showing ghosts; that is
+        // the accepted compromise, and the peer stays authoritative for what is left.
+        if (engine::containerGuiOpen(gw, cHand)) {
+            it->second.dirty = true; // re-visit next tick
+            unsigned long now = nowMs();
+            unsigned long& since = guiDefer_[k];
+            if (since == 0) since = now;
+            // One line per container per second: this runs at main-loop cadence.
+            unsigned long& said = guiDeferSaid_[k];
+            if (said == 0 || now - said >= 1000) {
+                said = now;
+                char b[190]; _snprintf(b, sizeof(b) - 1,
+                    "[inv] GUI-DEFER hand=%u,%u,%u,%u,%u items=%u heldMs=%lu (panel open)",
+                    k.t, k.c, k.cs, k.i, k.s, n, (unsigned long)(now - since));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            continue;
+        }
+        if (guiDefer_.count(k) != 0) {
+            unsigned long now = nowMs();
+            char b[190]; _snprintf(b, sizeof(b) - 1,
+                "[inv] GUI-RESUME hand=%u,%u,%u,%u,%u items=%u heldMs=%lu",
+                k.t, k.c, k.cs, k.i, k.s, n, (unsigned long)(now - guiDefer_[k]));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            guiDefer_.erase(k);
+            guiDeferSaid_.erase(k);
+        }
         // Protocol 37 (the race that blinded the detector in run 141024): if this
         // peer container's LOCAL contents differ from the transfer detector's
         // baseline, a user mutation (possibly one end of a cross-owner drag) has not
@@ -307,7 +436,31 @@ void Replicator::applyInventories(GameWorld* gw) {
             items = adj.empty() ? 0 : &adj[0];
             n = (unsigned int)adj.size();
         }
+        // Join already reported remaining loot: a larger incoming list is the
+        // host's open-GUI echo. Keep the local remaining contents.
+        if (!isHostRole()) {
+            std::map<Key, LootCap>::iterator lr = lootRemain_.find(k);
+            unsigned int wantU = 0;
+            for (unsigned int ui = 0; ui < n; ++ui) {
+                int q = items[ui].quantity; if (q < 1) q = 1;
+                wantU += (unsigned int)q;
+            }
+            if (lr != lootRemain_.end() && wantU > lr->second.units) continue;
+        }
         engine::applyContainerContents(gw, cHand, items, n, it->second.truncated);
+        if (isHostRole() && censusContainers_.count(k) != 0) {
+            unsigned int au = 0; u32 ah = 0;
+            for (unsigned int ui = 0; ui < n; ++ui) {
+                int q = items[ui].quantity; if (q < 1) q = 1;
+                au += (unsigned int)q;
+                ah += invEntryHash(items[ui]);
+            }
+            LootCap cap; cap.units = au; cap.hash = ah; cap.ms = nowMs();
+            lootAdopt_[k] = cap;
+            InvPub& pub = invPub_[k];
+            pub.hash = ah; pub.pendingHash = ah; pub.lastSendMs = cap.ms;
+            pub.lastSentN = n; pub.lastSentUnits = au;
+        }
         // Keep the transfer detector blind to the reconcile we just performed.
         xferRebase(gw, k);
         char b[160];
@@ -1505,7 +1658,7 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
 
 void Replicator::xferRebase(GameWorld* gw, const Key& k) {
     unsigned int cHand[5];
-    handForContainerKey(k, cHand);
+    resolveInvLocalHand(k, cHand);
     std::map<XKey, int>& base = xferBase_[k];
     base.clear();
     if (engine::resolveObjectByHand(cHand) != 0) {
@@ -1572,10 +1725,12 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     static int dumpX = -1;
     if (dumpX < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpX = (e && e[0] == '1') ? 1 : 0; }
 
-    // Tracked set: every container we author + every peer container we have received a
-    // snapshot for. Both ends of any drag a player can perform live in this union.
+    // Tracked set: every container we author + census chests/corpses (host) +
+    // every peer container we have received a snapshot for. Both ends of any
+    // drag a player can perform live in this union (corpse take included).
     std::set<Key> tracked = ownedContainers_;
     tracked.insert(ownHands_.begin(), ownHands_.end());
+    tracked.insert(censusContainers_.begin(), censusContainers_.end());
     for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin(); ri != invRecv_.end(); ++ri)
         tracked.insert(ri->first);
     if (tracked.empty()) return;
@@ -1585,8 +1740,7 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     std::map<Key, std::map<XKey, int> > cur;
     for (std::set<Key>::iterator it = tracked.begin(); it != tracked.end(); ++it) {
         unsigned int cHand[5];
-        handForContainerKey(*it, cHand);
-        if (engine::resolveObjectByHand(cHand) == 0) continue;
+        if (!resolveInvLocalHand(*it, cHand)) continue;
         std::map<XKey, int>& tot = cur[*it];
         unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
         for (unsigned int i = 0; i < n; ++i) {
@@ -1640,36 +1794,44 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     // invalidates the pend iterators), then act.
     struct Fire { Key src; Key dst; XKey key; int qty; };
     std::vector<Fire> fires;
-    std::set<Key> consumed;
+    // Per (container, item-key), not whole containers: take-all from a corpse
+    // is many sid pairs at once; consuming src+dst after the first item left
+    // the rest unpaired until the 3 s snapshot defer put them back.
+    std::set<std::pair<Key, XKey> > usedLoss;
+    std::set<std::pair<Key, XKey> > usedGain;
     for (std::map<Key, std::map<XKey, XferPend> >::iterator li = xferPend_.begin();
          li != xferPend_.end(); ++li) {
-        if (consumed.count(li->first) || cur.find(li->first) == cur.end()) continue;
+        if (cur.find(li->first) == cur.end()) continue;
         for (std::map<XKey, XferPend>::iterator le = li->second.begin();
              le != li->second.end(); ++le) {
             if (le->second.delta >= 0) continue;
             if (now - le->second.sinceMs < XFER_SETTLE_MS) continue;
+            if (usedLoss.count(std::make_pair(li->first, le->first))) continue;
             for (std::map<Key, std::map<XKey, XferPend> >::iterator gi = xferPend_.begin();
                  gi != xferPend_.end(); ++gi) {
-                if (gi == li || consumed.count(gi->first) || cur.find(gi->first) == cur.end())
+                if (gi == li || cur.find(gi->first) == cur.end())
                     continue;
                 std::map<XKey, XferPend>::iterator ge = gi->second.find(le->first);
                 if (ge == gi->second.end() || ge->second.delta <= 0) continue;
                 if (now - ge->second.sinceMs < XFER_SETTLE_MS) continue;
+                if (usedGain.count(std::make_pair(gi->first, ge->first))) continue;
                 Fire f; f.src = li->first; f.dst = gi->first; f.key = le->first;
                 f.qty = -le->second.delta;
                 if (ge->second.delta < f.qty) f.qty = ge->second.delta;
                 fires.push_back(f);
-                consumed.insert(f.src); consumed.insert(f.dst);
+                usedLoss.insert(std::make_pair(f.src, f.key));
+                usedGain.insert(std::make_pair(f.dst, f.key));
                 break;
             }
-            if (consumed.count(li->first)) break;
         }
     }
 
     for (unsigned int i = 0; i < fires.size(); ++i) {
         const Fire& f = fires[i];
-        bool srcOwn = ownedContainers_.count(f.src) != 0 || ownHands_.count(f.src) != 0;
-        bool dstOwn = ownedContainers_.count(f.dst) != 0 || ownHands_.count(f.dst) != 0;
+        bool srcOwn = ownedContainers_.count(f.src) != 0 || ownHands_.count(f.src) != 0
+                   || censusContainers_.count(f.src) != 0;
+        bool dstOwn = ownedContainers_.count(f.dst) != 0 || ownHands_.count(f.dst) != 0
+                   || censusContainers_.count(f.dst) != 0;
         if (!srcOwn || !dstOwn) {
             // At least one end is peer-authored: the single-writer snapshots cannot
             // carry this move - author the reliable transfer intent.
@@ -1754,8 +1916,8 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         Key dk; dk.t = p.dType; dk.c = p.dContainer; dk.cs = p.dContainerSerial;
         dk.i = p.dIndex; dk.s = p.dSerial;
         // Either end may be a mine the peer emptied, whose hand is its own.
-        unsigned int sHand[5]; handForContainerKey(sk, sHand);
-        unsigned int dHand[5]; handForContainerKey(dk, dHand);
+        unsigned int sHand[5]; resolveInvLocalHand(sk, sHand);
+        unsigned int dHand[5]; resolveInvLocalHand(dk, dHand);
         // Relocate OUR copy of the real item between the same two containers - the
         // conservation move (never fabricates or destroys), so gear survives.
         int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
@@ -1782,8 +1944,10 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         XKey key(std::string(p.stringID), p.itemType);
         // Latch OUR peer end(s) too: an in-flight stale snapshot (captured by its
         // owner before this transfer) must not reconcile the relocation away.
-        bool srcOwn = ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0;
-        bool dstOwn = ownedContainers_.count(dk) != 0 || ownHands_.count(dk) != 0;
+        bool srcOwn = ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0
+                   || censusContainers_.count(sk) != 0;
+        bool dstOwn = ownedContainers_.count(dk) != 0 || ownHands_.count(dk) != 0
+                   || censusContainers_.count(dk) != 0;
         int applied = moved + fab;
         if (applied > 0) {
             if (!srcOwn) {

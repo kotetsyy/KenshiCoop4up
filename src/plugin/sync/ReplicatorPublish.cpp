@@ -13,6 +13,72 @@
 
 namespace coop {
 
+// v57: stamp the carried body's world pose onto EVT_DROP_BODY so the peer
+// parks nametag+mesh immediately instead of waiting for the next entity tick.
+static bool fillDropPose(EventPacket& ev) {
+    Character* who = engine::resolveCharByHand(
+        ev.sIndex, ev.sSerial, ev.sType, ev.sContainer, ev.sContainerSerial);
+    float x = 0.0f, y = 0.0f, z = 0.0f, h = 0.0f;
+    if (who && engine::readPose(who, &x, &y, &z, &h)) {
+        ev.x = x; ev.y = y; ev.z = z; ev.heading = h; ev.poseValid = 1;
+        return true;
+    }
+    ev.poseValid = 0;
+    return false;
+}
+
+void Replicator::emitBodyStateEdges(NetLink& net, u32 ownerId, const Key& k,
+                                    u16 cur, unsigned long nowPub, bool touchSeen) {
+    std::map<Key, HostBody>::iterator pit = hostBody_.find(k);
+    u16 prev = (pit != hostBody_.end()) ? pit->second.bs : 0;
+    if (cur != prev) {
+        // Protocol 53: the KO/REVIVE edges are computed on "down and NOT
+        // crawling". A crippled body sets BODY_DOWN while fully conscious
+        // (measured: bs 0->1033, unc=0), so on plain bodyIsDown losing a leg
+        // emitted EVT_KNOCKOUT and the peer latched KO permanently - which
+        // pins the body down for good, since the recovery edge (PS_KO ->
+        // PS_CRIPPLED) is down->down and emitted no REVIVE to clear it.
+        // With the carve-out all four transitions read correctly: upright ->
+        // crawl and crawl -> upright are non-events, crawl -> PS_KO is a real
+        // KNOCKOUT, and PS_KO -> crawl is a REVIVE (it regained consciousness).
+        bool wasDown = bodyDownNotCrawling(prev), isDownNow = bodyDownNotCrawling(cur);
+        bool wasDead = (prev & BODY_DEAD) != 0, isDeadNow = (cur & BODY_DEAD) != 0;
+        u8 evType = EVT_NONE;
+        if (isDeadNow && !wasDead)       evType = EVT_DEATH;
+        else if (isDownNow && !wasDown)  evType = EVT_KNOCKOUT;
+        else if (!isDownNow && wasDown)  evType = EVT_REVIVE;
+        if (evType != EVT_NONE) {
+            EventPacket ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = (u8)PKT_EVENT; ev.event = evType;
+            ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+            ev.sType = k.t; ev.sContainer = k.c;
+            ev.sContainerSerial = k.cs;
+            ev.sIndex = k.i; ev.sSerial = k.s;
+            std::map<Key, std::pair<Key, unsigned long> >::iterator ait = attackerOf_.find(k);
+            bool haveActor = (ait != attackerOf_.end());
+            if (haveActor) {
+                const Key& a = ait->second.first;
+                ev.aType = a.t; ev.aContainer = a.c; ev.aContainerSerial = a.cs;
+                ev.aIndex = a.i; ev.aSerial = a.s;
+            }
+            net.queueEvent(ev);
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u actor=%u,%u bs %u->%u",
+                ev.eventId, (unsigned)evType, k.t, k.c, k.cs, k.i, k.s,
+                haveActor ? ev.aIndex : 0u, haveActor ? ev.aSerial : 0u,
+                (unsigned)prev, (unsigned)cur);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    HostBody& hb = hostBody_[k];
+    hb.bs = cur;
+    // Stream ticks refresh seenMs (carry-gone / stale prune). Census must
+    // NOT: a carrier that walked out of the stream would stay "seen" forever
+    // on the 1 Hz existence list and never author its DROP.
+    if (touchSeen || hb.seenMs == 0) hb.seenMs = nowPub;
+}
+
 void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     localId_ = ownerId;   // the drive path reads it; see the host-side guard
     // Capture the OWNED squad subset first, then (Stage 4) the nearby world NPCs.
@@ -89,8 +155,21 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 owned = false;
         }
         if (!owned) continue;
-        buf[n++] = raw[i];
         ownHands_.insert(hk);
+        // Join-owned body in flight: host streams the pose; skip our ragdoll
+        // snapshot so the two sims cannot fight.
+        if (thrown_.find(hk) != thrown_.end()) continue;
+        buf[n++] = raw[i];
+        {
+            std::map<Key, Key>::const_iterator wt = publishAsWire_.find(hk);
+            if (wt != publishAsWire_.end()) {
+                buf[n - 1].hType = wt->second.t;
+                buf[n - 1].hContainer = wt->second.c;
+                buf[n - 1].hContainerSerial = wt->second.cs;
+                buf[n - 1].hIndex = wt->second.i;
+                buf[n - 1].hSerial = wt->second.s;
+            }
+        }
     }
     // Jail put-to-work desync spike (KENSHICOOP_JAIL_PROBE, read-only): the
     // OWNED view of any captive body (the join's real, authoritative PC while it
@@ -290,7 +369,12 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                     }
                     continue;
                 }
-                if (nPeerAnch > 0 &&
+                // Down/dead bodies always stream: the join's local AI stands a
+                // corpse the host is not driving, and EVT_KNOCKOUT only fires
+                // from this buffer. Attention still gates upright NPCs.
+                bool downish = coop::bodyDownNotCrawling(buf[n + i].bodyState) ||
+                               (buf[n + i].bodyState & BODY_DEAD) != 0;
+                if (nPeerAnch > 0 && !downish &&
                     !observedByPeer(keyOf(buf[n + i]), peerAnch, nPeerAnch,
                                     buf[n + i].x, buf[n + i].y, buf[n + i].z))
                     continue;
@@ -447,7 +531,36 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
         }
     }
+    // Host-authoritative thrown corpses (join-owned PC included): force them
+    // into this snapshot so the join can puppet the flight.
+    if (isHostRole() && !thrown_.empty() && n < MAX_PUBLISH) {
+        for (std::map<Key, ThrownState>::const_iterator ti = thrown_.begin();
+             ti != thrown_.end() && n < MAX_PUBLISH; ++ti) {
+            const Key& tk = ti->first;
+            bool have = false;
+            for (unsigned int bi = 0; bi < n && !have; ++bi)
+                have = (buf[bi].hIndex == tk.i && buf[bi].hSerial == tk.s &&
+                        buf[bi].hType == tk.t && buf[bi].hContainer == tk.c);
+            if (have) continue;
+            bool got = false;
+            for (unsigned int si = 0; si < nSquad && !got; ++si) {
+                if (raw[si].hIndex == tk.i && raw[si].hSerial == tk.s &&
+                    raw[si].hType == tk.t && raw[si].hContainer == tk.c) {
+                    buf[n] = raw[si];
+                    got = true;
+                }
+            }
+            if (!got &&
+                engine::captureNpcByHand(gw, tk.i, tk.s, tk.t, tk.c, tk.cs, &buf[n]))
+                got = true;
+            if (got) ++n;
+        }
+    }
     net.setOwnedEntities(ownerId, buf, n);
+    // v57: passenger hands whose DROP packed no XYZ - force them into this
+    // tick's owned snapshot as fallback (overwrites the snapshot above; the
+    // net thread has not sampled yet). Filled below when poseValid=0.
+    std::vector<Key> dropFallback;
 
     // Refresh the (sticky) attacker map from this tick's combat intents: a captured
     // entity with a combat-stance task carries its target in the subject fields, so it
@@ -522,53 +635,8 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     for (unsigned int i = 0; i < n; ++i) {
         const EntityState& e = buf[i];
         Key k = keyOf(e);
-        std::map<Key, HostBody>::iterator pit = hostBody_.find(k);
-        u16 prev = (pit != hostBody_.end()) ? pit->second.bs : 0;
-        u16 cur  = e.bodyState;
-        if (cur != prev) {
-            // Protocol 53: the KO/REVIVE edges are computed on "down and NOT
-            // crawling". A crippled body sets BODY_DOWN while fully conscious
-            // (measured: bs 0->1033, unc=0), so on plain bodyIsDown losing a leg
-            // emitted EVT_KNOCKOUT and the peer latched KO permanently - which
-            // pins the body down for good, since the recovery edge (PS_KO ->
-            // PS_CRIPPLED) is down->down and emitted no REVIVE to clear it.
-            // With the carve-out all four transitions read correctly: upright ->
-            // crawl and crawl -> upright are non-events, crawl -> PS_KO is a real
-            // KNOCKOUT, and PS_KO -> crawl is a REVIVE (it regained consciousness).
-            bool wasDown = bodyDownNotCrawling(prev), isDownNow = bodyDownNotCrawling(cur);
-            bool wasDead = (prev & BODY_DEAD) != 0, isDeadNow = (cur & BODY_DEAD) != 0;
-            u8 evType = EVT_NONE;
-            if (isDeadNow && !wasDead)       evType = EVT_DEATH;
-            else if (isDownNow && !wasDown)  evType = EVT_KNOCKOUT;
-            else if (!isDownNow && wasDown)  evType = EVT_REVIVE;
-            if (evType != EVT_NONE) {
-                EventPacket ev;
-                memset(&ev, 0, sizeof(ev));
-                ev.type = (u8)PKT_EVENT; ev.event = evType;
-                ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
-                ev.sType = e.hType; ev.sContainer = e.hContainer;
-                ev.sContainerSerial = e.hContainerSerial;
-                ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
-                // Causality: if this victim was being meleed within the recency window,
-                // stamp the attacker as the ACTOR (combat KO/death "downed BY X"). A
-                // KO/death from a non-combat cause (scaffold kill, fall) leaves it zeroed.
-                std::map<Key, std::pair<Key, unsigned long> >::iterator ait = attackerOf_.find(k);
-                bool haveActor = (ait != attackerOf_.end());
-                if (haveActor) {
-                    const Key& a = ait->second.first;
-                    ev.aType = a.t; ev.aContainer = a.c; ev.aContainerSerial = a.cs;
-                    ev.aIndex = a.i; ev.aSerial = a.s;
-                }
-                net.queueEvent(ev);
-                char b[200]; _snprintf(b, sizeof(b) - 1,
-                    "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u actor=%u,%u bs %u->%u",
-                    ev.eventId, (unsigned)evType, e.hType, e.hContainer,
-                    e.hContainerSerial, e.hIndex, e.hSerial,
-                    haveActor ? ev.aIndex : 0u, haveActor ? ev.aSerial : 0u,
-                    (unsigned)prev, (unsigned)cur);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            }
-        }
+        u16 cur = e.bodyState;
+        emitBodyStateEdges(net, ownerId, k, cur, nowPub, true);
         HostBody& hb = hostBody_[k];
         // Carried-body sync (protocol 18): emit reliable pickup/drop edges on
         // carryingObject transitions of OWNED members AND (host only) streamed
@@ -597,12 +665,35 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 ev.aType = e.hType; ev.aContainer = e.hContainer;
                 ev.aContainerSerial = e.hContainerSerial;
                 ev.aIndex = e.hIndex; ev.aSerial = e.hSerial;
-                ev.arg = 1.0f; // ragdoll ground drop (the body is KO'd)
+                ev.arg = DROP_ARG_RAGDOLL; // ragdoll release (start thrown/flight)
+                if (!fillDropPose(ev)) {
+                    Key fk; fk.t = ev.sType; fk.c = ev.sContainer; fk.cs = ev.sContainerSerial;
+                    fk.i = ev.sIndex; fk.s = ev.sSerial;
+                    dropFallback.push_back(fk);
+                }
+                {
+                    Key pk; pk.t = ev.sType; pk.c = ev.sContainer; pk.cs = ev.sContainerSerial;
+                    pk.i = ev.sIndex; pk.s = ev.sSerial;
+                    beginThrown(pk);
+                }
                 net.queueEvent(ev);
-                char b[176]; _snprintf(b, sizeof(b) - 1,
-                    "[carry] SEND DROP id=%u carrier=%u,%u carried=%u,%u",
-                    ev.eventId, e.hIndex, e.hSerial, hb.carried[3], hb.carried[4]);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                {
+                    Character* who = engine::resolveCharByHand(
+                        ev.sIndex, ev.sSerial, ev.sType, ev.sContainer, ev.sContainerSerial);
+                    engine::DriveProbe pr; memset(&pr, 0, sizeof(pr));
+                    if (who) engine::readDriveProbe(who, &pr);
+                    unsigned short bs = who ? engine::readBodyState(who) : 0;
+                    char b[320]; _snprintf(b, sizeof(b) - 1,
+                        "[carry] SEND DROP id=%u carrier=%u,%u carried=%u,%u "
+                        "pose=%u xyz=%.1f,%.1f,%.1f h=%.2f ragdoll=%d dead=%d down=%d "
+                        "hk=%d mv=%.1f,%.1f,%.1f havok=%.1f,%.1f,%.1f",
+                        ev.eventId, e.hIndex, e.hSerial, hb.carried[3], hb.carried[4],
+                        (unsigned)ev.poseValid, ev.x, ev.y, ev.z, ev.heading,
+                        1, (bs & BODY_DEAD) ? 1 : 0, coop::bodyIsDown(bs) ? 1 : 0,
+                        pr.haveHk ? 1 : 0, pr.mvX, pr.mvY, pr.mvZ,
+                        pr.hkX * 10.0f, pr.hkY * 10.0f, pr.hkZ * 10.0f);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
             }
             if (carryNow && !sameBody) {
                 // Pickup edge: subject = the carried body, actor = us.
@@ -616,6 +707,11 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 ev.aContainerSerial = e.hContainerSerial;
                 ev.aIndex = e.hIndex; ev.aSerial = e.hSerial;
                 net.queueEvent(ev);
+                {
+                    Key pk; pk.t = ev.sType; pk.c = ev.sContainer; pk.cs = ev.sContainerSerial;
+                    pk.i = ev.sIndex; pk.s = ev.sSerial;
+                    clearThrown(pk, "pickup");
+                }
                 char b[176]; _snprintf(b, sizeof(b) - 1,
                     "[carry] SEND PICKUP id=%u carrier=%u,%u carried=%u,%u",
                     ev.eventId, e.hIndex, e.hSerial, e.sIndex, e.sSerial);
@@ -699,7 +795,6 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 }
             }
         }
-        hb.bs = cur; hb.seenMs = nowPub;
     }
     // Carried-body sync: a carrier that VANISHED from the stream mid-carry
     // (hauled the body out of interest, despawned) can never author its drop
@@ -727,14 +822,60 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             ev.sIndex = hb.carried[3]; ev.sSerial = hb.carried[4];
             ev.aType = ck.t; ev.aContainer = ck.c; ev.aContainerSerial = ck.cs;
             ev.aIndex = ck.i; ev.aSerial = ck.s;
-            ev.arg = 1.0f; // ragdoll ground drop (the body is KO'd)
+            ev.arg = DROP_ARG_RAGDOLL;
+            if (!fillDropPose(ev)) {
+                Key fk; fk.t = ev.sType; fk.c = ev.sContainer; fk.cs = ev.sContainerSerial;
+                fk.i = ev.sIndex; fk.s = ev.sSerial;
+                dropFallback.push_back(fk);
+            }
+            {
+                Key pk; pk.t = ev.sType; pk.c = ev.sContainer; pk.cs = ev.sContainerSerial;
+                pk.i = ev.sIndex; pk.s = ev.sSerial;
+                beginThrown(pk);
+            }
             net.queueEvent(ev);
             hb.carrying = false;
-            char b[176]; _snprintf(b, sizeof(b) - 1,
-                "[carry] SEND DROP id=%u carrier=%u,%u carried=%u,%u (carrier left stream)",
-                ev.eventId, ck.i, ck.s, hb.carried[3], hb.carried[4]);
+            char b[240]; _snprintf(b, sizeof(b) - 1,
+                "[carry] SEND DROP id=%u carrier=%u,%u carried=%u,%u "
+                "(carrier left stream) pose=%u xyz=%.1f,%.1f,%.1f h=%.2f",
+                ev.eventId, ck.i, ck.s, hb.carried[3], hb.carried[4],
+                (unsigned)ev.poseValid, ev.x, ev.y, ev.z, ev.heading);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
+    }
+    // Fallback: DROP went out without XYZ (resolve/readPose failed). Re-push
+    // the passenger on this tick's entity snapshot so the peer has a pose
+    // even if the reliable event is missing the v57 fields. Only bodies we
+    // author (owned squad already in `raw`, or a host-streamed NPC).
+    if (!dropFallback.empty() && n < MAX_PUBLISH) {
+        unsigned int n0 = n;
+        for (unsigned int fi = 0; fi < dropFallback.size() && n < MAX_PUBLISH; ++fi) {
+            const Key& fk = dropFallback[fi];
+            bool have = false;
+            for (unsigned int bi = 0; bi < n && !have; ++bi)
+                have = (buf[bi].hIndex == fk.i && buf[bi].hSerial == fk.s &&
+                        buf[bi].hType == fk.t && buf[bi].hContainer == fk.c);
+            if (have) continue;
+            bool got = false;
+            for (unsigned int si = 0; si < nSquad && !got; ++si) {
+                if (raw[si].hIndex == fk.i && raw[si].hSerial == fk.s &&
+                    raw[si].hType == fk.t && raw[si].hContainer == fk.c) {
+                    if (ownHands_.find(keyOf(raw[si])) == ownHands_.end()) continue;
+                    buf[n] = raw[si];
+                    got = true;
+                }
+            }
+            if (!got && streamNpcs_ &&
+                engine::captureNpcByHand(gw, fk.i, fk.s, fk.t, fk.c, fk.cs, &buf[n]))
+                got = true;
+            if (!got) continue;
+            char rb[192]; _snprintf(rb, sizeof(rb) - 1,
+                "[carry] FALLBACK entity hand=%u,%u xyz=%.1f,%.1f,%.1f",
+                buf[n].hIndex, buf[n].hSerial, buf[n].x, buf[n].y, buf[n].z);
+            rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+            ++n;
+        }
+        if (n != n0) net.setOwnedEntities(ownerId, buf, n);
     }
     // Furniture occupancy: an occupant that VANISHED from the stream mid-
     // occupancy (left interest, despawned) can never author its exit edge from
@@ -806,6 +947,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (nowPub - hit->second.seenMs > HOSTBODY_STALE_MS) hostBody_.erase(hit++);
         else ++hit;
     }
+    tickThrown(gw, net, ownerId);
 }
 
 // world_parity roster row: legacy WNPC schema (hand/pos/cls/name - the
@@ -1022,6 +1164,10 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         poss[m * 3 + 1]  = states[i].y;
         poss[m * 3 + 2]  = states[i].z;
         ++m;
+        // Census is 1 Hz and covers bodies the attention gate dropped from
+        // the stream. Feeding the same KO/DEATH/REVIVE detector here is how
+        // a join who never looked at the fight still gets the corpse down.
+        emitBodyStateEdges(net, ownerId, k, states[i].bodyState, now, false);
     }
     pruneAttention(censusKeys);
     net.queueNpcCensus(ownerId, hands, poss, m);
@@ -1055,7 +1201,9 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (best < 0.0f || best <= MID_NEAR_EDGE) continue; // near tier
             // Same ownership rule as the near band: we drive what we author.
             if (cellAuth_ && !weAuthor(gw, ownerId, states[i].x, states[i].z)) continue;
-            if (cellAuth_ && nPeerAnch > 0 &&
+            bool downish = coop::bodyDownNotCrawling(states[i].bodyState) ||
+                           (states[i].bodyState & BODY_DEAD) != 0;
+            if (cellAuth_ && nPeerAnch > 0 && !downish &&
                 !observedByPeer(keyOf(states[i]), peerAnch, nPeerAnch,
                                 states[i].x, states[i].y, states[i].z)) continue;
             MidBandEntry e;

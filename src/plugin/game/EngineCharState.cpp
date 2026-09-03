@@ -669,7 +669,7 @@ bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused) {
     return ok;
 }
 
-bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused) {
+bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused, int* kind) {
     if (!mult || !paused) return false;
     // 1) Hook-captured intent (simulated writeGameSpeed clicks and any code
     //    path that does route through the public setters).
@@ -677,13 +677,22 @@ bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused) {
         g_speedIntentFresh = false;
         *mult   = g_speedIntentMult;
         *paused = g_speedIntentPaused;
-        // Mark the current engine state EXPLAINED so the poll below doesn't
-        // re-report this same action next tick.
+        int knd = g_speedIntentKind;
+        // MainBar 1x/2x/5x often hits userPause(false) without setGameSpeed.
+        // That arrives as UNPAUSE with a STALE intent mult; the engine already
+        // holds the clicked speed. Promote to LEVEL so LWW can leave 5x.
         float em = 0.0f; bool ep = false;
         if (readGameSpeed(gw, &em, &ep)) {
+            if (knd == SPEED_INTENT_UNPAUSE && !ep && em > 0.0f &&
+                fabsf(em - g_speedIntentMult) > 0.01f) {
+                *mult = em;
+                knd = SPEED_INTENT_LEVEL;
+                g_speedIntentMult = em;
+            }
             g_quietHave = true; g_quietPaused = ep;
             if (!ep && em > 0.0f) g_quietMult = em;
         }
+        if (kind) *kind = knd;
         snapshotVoteButtons();
         return true;
     }
@@ -733,6 +742,10 @@ bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused) {
         bool multMoved = (!ep && em > 0.0f && fabsf(em - g_quietMult) > 0.01f);
         *mult   = multMoved ? em : g_speedIntentMult;
         *paused = ep;
+        if (kind) {
+            if (multMoved) *kind = SPEED_INTENT_LEVEL;
+            else *kind = ep ? SPEED_INTENT_PAUSE : SPEED_INTENT_UNPAUSE;
+        }
     } else {
         // Button-only diff: the engine state did NOT move, so the click's
         // meaning comes from WHICH button lit up. A speed click while PAUSED
@@ -747,15 +760,18 @@ bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused) {
         if (newIdx == 0) {
             *paused = true;
             *mult   = g_speedIntentMult; // pause preserves the requested mult
+            if (kind) *kind = SPEED_INTENT_PAUSE;
         } else if (newIdx > 0) {
             *paused = false;
             // The clicked speed: the engine mult when it equals the click (the
             // same-value case), else the best value the engine holds.
             *mult   = (em > 0.0f) ? em : g_speedIntentMult;
+            if (kind) *kind = SPEED_INTENT_LEVEL;
         } else {
             // Selection only turned OFF (shouldn't happen) - engine state wins.
             *paused = ep;
             *mult   = (em > 0.0f) ? em : g_speedIntentMult;
+            if (kind) *kind = ep ? SPEED_INTENT_PAUSE : SPEED_INTENT_LEVEL;
         }
     }
     g_speedIntentMult   = *mult;

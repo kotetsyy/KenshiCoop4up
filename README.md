@@ -79,8 +79,8 @@ in-game, so the joining player doesn't need to load anything first.
 2. **Swap Steam IDs.** Each player clicks **"Copy my Steam ID"** and sends it to
    the other (Steam chat, Discord, ...). When you receive your friend's ID, copy
    it, then click **"Paste friend's Steam ID"** - the panel shows the ID it
-   captured. This is per-session (nothing is written to disk), so re-paste it if
-   you relaunch Kenshi.
+   captured. The last Steam ID (and last UDP host:port) is remembered in
+   `coop_config.json` next to the DLL, so a relaunch pre-fills F2.
 3. Leave **Transport** on **STEAM**.
 4. **Host:** load the save you want to play, or start a new game - pick
    **Multiplayer (Wanderer x2)** from the start list for a ready-made two-squad
@@ -96,11 +96,11 @@ in-game, so the joining player doesn't need to load anything first.
    player can watch the transfer before the world loads. Toggle **Connection** to
    **OFFLINE** to leave.
 
-**LAN / direct-UDP (advanced):** skip the Steam ID swap. Open
-`<Kenshi>\mods\KenshiCoop\coop_config.json`, set `"transport": "udp"`, and put
-the host's address in `"ip"` / `"port"`. Then in the panel set **Transport: UDP**
-and go ONLINE. The `ip`/`port` are re-read whenever you go ONLINE, so no restart
-is needed after an edit.
+**LAN / direct-UDP (advanced):** skip the Steam ID swap. In F2 set
+**Transport: UDP**, click the **Host UDP** row and paste `ip:port` (for example
+`192.168.1.10:27800`). Go ONLINE. The address is remembered for the next
+launch. You can still edit `<Kenshi>\mods\KenshiCoop\coop_config.json` by hand;
+it is re-read whenever you go ONLINE.
 
 ### Good to know
 

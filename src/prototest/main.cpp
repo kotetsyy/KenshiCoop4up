@@ -28,6 +28,7 @@
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
+#include "../plugin/core/UdpEndpoint.h"
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
@@ -74,7 +75,7 @@ static void testSizes() {
     std::printf("== wire struct sizes (the packed contract both clients memcpy) ==\n");
     CHECK_EQ("sizeof(HelloPacket)",             sizeof(HelloPacket),             4);
     CHECK_EQ("sizeof(WelcomePacket)",           sizeof(WelcomePacket),           7);
-    CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             54);
+    CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             71); // v57: +xyz/heading/poseValid
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
     CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            159); // v42: +locked, v48: reserved byte became parentIdx (size unchanged), v51: +level (craft grade)
@@ -162,6 +163,8 @@ static void testSizes() {
     CHECK("EVT_DROP_BODY distinct",
           EVT_DROP_BODY != EVT_PICKUP_BODY && EVT_DROP_BODY != EVT_NONE &&
           EVT_DROP_BODY != EVT_CRUSH);
+    CHECK("DROP_ARG landing distinct",
+          DROP_ARG_LANDING > DROP_ARG_RAGDOLL && DROP_ARG_RAGDOLL > DROP_ARG_GENTLE);
 
     // Furniture occupancy (protocol 19): the new bodyState bits are distinct
     // and EXCLUDED from bodyIsDown (the receiver checks bodyInFurniture FIRST,
@@ -310,8 +313,13 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v55: runtime-fixture identity)",
-             (int)PROTOCOL_VERSION, 55);
+    CHECK_EQ("PROTOCOL_VERSION (v58: spawn KO latch + census KO edges)",
+             (int)PROTOCOL_VERSION, 58);
+    CHECK_EQ("SPAWN_BODY_KO", (int)SPAWN_BODY_KO, 2);
+    CHECK("SPAWN_BODY values distinct",
+          SPAWN_BODY_ALIVE != SPAWN_BODY_DEAD &&
+          SPAWN_BODY_DEAD  != SPAWN_BODY_KO &&
+          SPAWN_BODY_ALIVE != SPAWN_BODY_KO);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -1125,6 +1133,18 @@ static void testOwnRanks() {
         resolveOwnRanks(r, false, fromEnv);       // no env -> JOIN default {1}
         CHECK("empty env -> JOIN default {1}", !fromEnv && ranksAre(r, 1, -1));
     }
+
+    {
+        std::set<unsigned int> r;
+        resolveOwnRanksForPlayer(r, false, false, 2u);
+        CHECK("join playerId 2 owns {2}", ranksAre(r, 2, -1));
+        r.clear();
+        resolveOwnRanksForPlayer(r, false, false, 3u);
+        CHECK("join playerId 3 owns {3}", ranksAre(r, 3, -1));
+        r.clear();
+        resolveOwnRanksForPlayer(r, true, false, 2u);
+        CHECK("host ignores playerId, owns {0}", ranksAre(r, 0, -1));
+    }
 }
 
 // ---- 7. SteamID64 parse + mask (SteamId.h) --------------------------------------
@@ -1170,6 +1190,39 @@ static void testSteamIdParse() {
     // Not real ids, but steamPeer from the config is never length-checked.
     CHECK("short value masked, not padded", coop::maskSteamId64(42ull) == "****42");
     CHECK("zero masked", coop::maskSteamId64(0ull) == "****0");
+}
+
+static void testUdpEndpointParse() {
+    std::printf("== UDP endpoint parse (UdpEndpoint.h) ==\n");
+    std::string ip;
+    int port = 27800;
+
+    ip.clear(); port = 27800;
+    CHECK("ipv4:port accepted",
+          coop::parseUdpEndpoint("192.168.1.10:27800", ip, port) &&
+          ip == "192.168.1.10" && port == 27800);
+    ip.clear(); port = 9;
+    CHECK("ipv4 alone keeps default port",
+          coop::parseUdpEndpoint("10.0.0.2", ip, port) &&
+          ip == "10.0.0.2" && port == 9);
+    ip.clear(); port = 1;
+    CHECK("host port space-separated",
+          coop::parseUdpEndpoint("play.example.com 12345", ip, port) &&
+          ip == "play.example.com" && port == 12345);
+    ip.clear(); port = 27800;
+    CHECK("whitespace/newline stripped",
+          coop::parseUdpEndpoint("  127.0.0.1:9000 \r\n", ip, port) &&
+          ip == "127.0.0.1" && port == 9000);
+
+    ip = "keep"; port = 7;
+    CHECK("empty rejected", !coop::parseUdpEndpoint("", ip, port) &&
+          ip == "keep" && port == 7);
+    CHECK("port 0 rejected", !coop::parseUdpEndpoint("1.2.3.4:0", ip, port) &&
+          ip == "keep" && port == 7);
+    CHECK("port too high rejected",
+          !coop::parseUdpEndpoint("1.2.3.4:70000", ip, port) && port == 7);
+    CHECK("junk rejected", !coop::parseUdpEndpoint("not an address!", ip, port) &&
+          ip == "keep");
 }
 
 // ---- 8. Pose-fixture acceptance (WorkPose.h) ------------------------------------
@@ -1783,6 +1836,7 @@ int main() {
     testInterp();
     testOwnRanks();
     testSteamIdParse();
+    testUdpEndpointParse();
     testWorkPoseMatch();
     testTaskClear();
     testDeathRekey();

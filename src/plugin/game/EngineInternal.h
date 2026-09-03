@@ -317,6 +317,9 @@ typedef Item* (__fastcall* CreateItemFn)(
 typedef bool (__fastcall* EquipItemFn)(Inventory* self, Item* item);
 typedef lektor<InventorySection*>* (__fastcall* GetAllSectionsFn)(Inventory* self);
 typedef Item* (__fastcall* GetWeaponFn)(Inventory* self);
+// Inventory::getInventoryGUI: the OPEN window holding this container, or null.
+// Backs CAP_INV_GUI; see the loot-GUI UAF note in EngineInternal.cpp.
+typedef InventoryGUI* (__fastcall* GetInvGuiFn)(Inventory* self);
 typedef Faction*  (__fastcall* FacBySidFn)(FactionManager* self, const std::string* sid);
 typedef GameData* (__fastcall* FacGetDataFn)(const Faction* self);
 typedef float (__fastcall* RelGetFn)(FactionRelations* self, Faction* p);
@@ -446,15 +449,16 @@ extern bool  g_speedGuardWrite;
 extern bool  g_speedIntentFresh;
 extern float g_speedIntentMult;
 extern bool  g_speedIntentPaused;
+extern int   g_speedIntentKind; // SPEED_INTENT_*
 extern bool  g_speedIntentSeeded;
 extern bool  g_quietHave;
 extern float g_quietMult;
 extern bool  g_quietPaused;
 extern char g_voteBtn[15];
 extern int  g_voteBtnN;
-// Phase 5 spike (KENSHICOOP_DEBUG_SPEED): combat-cap-active hint, set by
+// Phase 5 spike (KENSHICOOP_DEBUG_SPEED): own-squad-in-combat hint, set by
 // Replicator::syncSpeed each tick so the speed-setter diagnostics can tell an
-// engine-forced (combat) change from a user click by context.
+// engine-forced change from a user click by context. No longer a speed cap.
 extern bool g_speedCombatHint;
 // True when KENSHICOOP_DEBUG_SPEED=1 (cached). Gates the speed-path diagnostics.
 bool speedDbgOn();
@@ -555,6 +559,7 @@ extern GetDataOfTypeFn  g_getDataOfTypeFn;
 extern CreateItemFn     g_createItemFn;
 extern EquipItemFn      g_equipItemFn;
 extern GetAllSectionsFn g_getSectionsFn;
+extern GetInvGuiFn      g_getInvGuiFn;
 extern GetWeaponFn      g_getPrimaryWeaponFn;
 extern GetWeaponFn      g_getSecondaryWeaponFn;
 extern FacBySidFn       g_facBySidFn;

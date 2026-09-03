@@ -12,6 +12,7 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include <string.h> // memset (drop-settle EntityState)
 
 namespace coop {
 
@@ -26,14 +27,201 @@ void Replicator::logHardSnap(Character* c, const EntityState& out, const char* k
     tick = now;
     char nm[48];
     engine::charName(c, nm, sizeof(nm));
-    char b[240];
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    engine::readPos(c, &ax, &ay, &az);
+    char b[320];
     _snprintf(b, sizeof(b) - 1,
               "[snap] %s hand=%u,%u name='%s' gap=%.1f gate=%.1f srcVel=%.1f "
-              "cSpeed=%.1f mult=%.2f slew=%.2f dest=%d skipped=%lu",
+              "cSpeed=%.1f at=%.1f,%.1f,%.1f to=%.1f,%.1f,%.1f "
+              "mult=%.2f slew=%.2f dest=%d skipped=%lu",
               kind, out.hIndex, out.hSerial, nm, gap, gate, srcVel, out.cSpeed,
+              ax, ay, az, out.x, out.y, out.z,
               speedLastSet_, timeSlew_, hadDest ? 1 : 0, skipped);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     skipped = 0;
+}
+
+// Squad freeze probe: newest-arrival age vs applied pose vs skip/halt.
+// Throttled ~5 Hz so a freeze episode is visible without drowning the log.
+void Replicator::logSquadFreeze(Character* c, const EntityState& out, const Driven& d,
+                                const char* why, bool haveActual,
+                                float ax, float ay, float az,
+                                unsigned long now, float gap) {
+    static unsigned long tick = 0;
+    if (tick != 0 && (now - tick) < 200) return;
+    tick = now;
+    float hx = ax, hy = ay, hz = az, hh = 0.0f;
+    engine::readPose(c, &hx, &hy, &hz, &hh);
+    unsigned long age = 0;
+    unsigned long arr = d.interp.lastArrivalMs();
+    if (arr != 0) age = now - arr;
+    char b[360];
+    _snprintf(b, sizeof(b) - 1,
+              "[drive] freeze why=%s hand=%u,%u age=%lu gap=%.1f "
+              "at=%.1f,%.1f,%.1f h=%.2f newest=%.1f,%.1f,%.1f nh=%.2f "
+              "mode=%d halted=%d dest=%d fresh=%d spd=%.1f",
+              why ? why : "?", out.hIndex, out.hSerial, age, gap,
+              hx, hy, hz, hh, out.x, out.y, out.z, out.heading,
+              d.interp.lastMode(), d.walkHalted ? 1 : 0, d.haveDest ? 1 : 0,
+              d.fresh ? 1 : 0, out.cSpeed);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+    (void)haveActual;
+}
+
+void Replicator::settleDroppedBody(const Key& k, Character* who,
+                                   bool havePose, float x, float y, float z, float heading,
+                                   const char* why) {
+    Driven& d = targets_[k];
+    d.interp.clear();
+    d.parked = false;
+    d.haveDest = false;
+    d.carryNoSeeTick = 0;
+    d.hadCarry = false;
+    float px = x, py = y, pz = z, ph = heading;
+    bool pose = havePose;
+    if (!pose && who)
+        pose = engine::readPose(who, &px, &py, &pz, &ph) ? true : false;
+    int parkOk = 0, rawOk = 0, restOk = 0, visOk = 0, hkOk = 0;
+    unsigned short bs0 = who ? engine::readBodyState(who) : 0;
+    bool downish = coop::bodyIsDown(bs0) || ((bs0 & BODY_DEAD) != 0);
+    if (who && pose) {
+        parkOk = engine::park(who, px, py, pz, ph) ? 1 : 0;
+        EntityState es;
+        memset(&es, 0, sizeof(es));
+        es.x = px; es.y = py; es.z = pz; es.heading = ph;
+        rawOk = engine::applyRaw(who, es) ? 1 : 0;
+        visOk = engine::teleportVisual(who, px, py, pz, ph) ? 1 : 0;
+        hkOk = engine::applyHavokPos(who, px, py, pz) ? 1 : 0;
+        d.haveActual = true; d.lx = px; d.ly = py; d.lz = pz;
+        d.visFollowMs = nowMs() + 4000;
+    }
+    // Living passenger with no Havok (carry tore it down): recreate. A
+    // KO/corpse already has a ragdoll - restoreMovement() minted a walking
+    // capsule at the packet pose while the mesh stayed at applyDrop (host
+    // log SETTLE restore=1, corpse in the wrong place).
+    if (who && !downish) restOk = engine::restoreMovement(who) ? 1 : 0;
+    if (who && pose && restOk) {
+        engine::park(who, px, py, pz, ph);
+        EntityState es2;
+        memset(&es2, 0, sizeof(es2));
+        es2.x = px; es2.y = py; es2.z = pz; es2.heading = ph;
+        engine::applyRaw(who, es2);
+        engine::teleportVisual(who, px, py, pz, ph);
+        engine::applyHavokPos(who, px, py, pz);
+    }
+    engine::DriveProbe pr; memset(&pr, 0, sizeof(pr));
+    if (who) engine::readDriveProbe(who, &pr);
+    unsigned short bs = who ? engine::readBodyState(who) : 0;
+    char b[400];
+    _snprintf(b, sizeof(b) - 1,
+              "[carry] SETTLE %s hand=%u,%u pose=%d xyz=%.1f,%.1f,%.1f h=%.2f "
+              "park=%d raw=%d vis=%d hkset=%d restore=%d dead=%d down=%d hk=%d "
+              "mv=%.1f,%.1f,%.1f havok=%.1f,%.1f,%.1f",
+              why ? why : "?", k.i, k.s, pose ? 1 : 0,
+              px, py, pz, ph, parkOk, rawOk, visOk, hkOk, restOk,
+              (bs & BODY_DEAD) ? 1 : 0, coop::bodyIsDown(bs) ? 1 : 0,
+              pr.haveHk ? 1 : 0, pr.mvX, pr.mvY, pr.mvZ,
+              pr.hkX * 10.0f, pr.hkY * 10.0f, pr.hkZ * 10.0f);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void Replicator::beginThrown(const Key& k) {
+    ThrownState ts;
+    ts.startMs = nowMs();
+    ts.stillMs = ts.startMs;
+    ts.havePos = false;
+    thrown_[k] = ts;
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[carry] THROWN START hand=%u,%u", k.i, k.s);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void Replicator::clearThrown(const Key& k, const char* why) {
+    if (thrown_.erase(k) == 0) return;
+    char b[112];
+    _snprintf(b, sizeof(b) - 1, "[carry] THROWN END hand=%u,%u why=%s",
+              k.i, k.s, why ? why : "?");
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void Replicator::tickThrown(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    if (thrown_.empty()) return;
+    const float         REST_DIST   = 0.40f;
+    const unsigned long REST_MS     = 250;
+    const unsigned long LANDING_MS  = 2500;
+    const unsigned long SAFETY_MS   = 5000;
+    unsigned long now = nowMs();
+    std::vector<std::pair<Key, const char*> > done;
+    for (std::map<Key, ThrownState>::iterator it = thrown_.begin();
+         it != thrown_.end(); ++it) {
+        const Key& k = it->first;
+        ThrownState& ts = it->second;
+        Character* who = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        if (who) {
+            engine::CarryRead cr;
+            if (engine::readCarry(who, &cr) && cr.valid && cr.beingCarried) {
+                done.push_back(std::make_pair(k, "pickup"));
+                continue;
+            }
+            unsigned short bs = engine::readBodyState(who);
+            if (!coop::bodyIsDown(bs) && (bs & BODY_DEAD) == 0) {
+                // Stood up mid-flight: snap mesh to nametag and restore walk
+                // Havok or the model stays at the drop while the tag runs.
+                settleDroppedBody(k, who, false, 0, 0, 0, 0, "thrown-up");
+                if (who) engine::restoreMovement(who);
+                done.push_back(std::make_pair(k, "revive"));
+                continue;
+            }
+        }
+        float x = 0, y = 0, z = 0, h = 0;
+        bool pose = who && engine::readPose(who, &x, &y, &z, &h);
+        if (pose) {
+            if (ts.havePos) {
+                float dx = x - ts.lx, dy = y - ts.ly, dz = z - ts.lz;
+                float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > REST_DIST * REST_DIST) ts.stillMs = now;
+            } else {
+                ts.stillMs = now;
+            }
+            ts.lx = x; ts.ly = y; ts.lz = z; ts.havePos = true;
+        }
+        bool rest    = ts.havePos && (now - ts.stillMs) >= REST_MS;
+        bool landTo  = (now - ts.startMs) >= LANDING_MS;
+        bool safety  = (now - ts.startMs) >= SAFETY_MS;
+        if (!isHostRole()) {
+            if (safety) {
+                settleDroppedBody(k, who, pose, x, y, z, h, "thrown-safety");
+                done.push_back(std::make_pair(k, "safety"));
+            }
+            continue;
+        }
+        if (!rest && !landTo && !safety) continue;
+        EventPacket ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_DROP_BODY;
+        ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+        ev.sType = k.t; ev.sContainer = k.c; ev.sContainerSerial = k.cs;
+        ev.sIndex = k.i; ev.sSerial = k.s;
+        ev.arg = DROP_ARG_LANDING;
+        if (pose) {
+            ev.x = x; ev.y = y; ev.z = z; ev.heading = h; ev.poseValid = 1;
+        }
+        net.queueEvent(ev);
+        settleDroppedBody(k, who, pose, x, y, z, h, "thrown-land");
+        {
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                "[carry] THROWN LANDING hand=%u,%u rest=%d timeout=%d safety=%d "
+                "xyz=%.1f,%.1f,%.1f",
+                k.i, k.s, rest ? 1 : 0, landTo ? 1 : 0, safety ? 1 : 0, x, y, z);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        done.push_back(std::make_pair(k, rest ? "rest" : (safety ? "safety" : "timeout")));
+    }
+    for (unsigned int i = 0; i < done.size(); ++i)
+        clearThrown(done[i].first, done[i].second);
 }
 
 void Replicator::applyTargets(GameWorld* gw) {
@@ -76,6 +264,47 @@ void Replicator::applyTargets(GameWorld* gw) {
     static EntityState oracleSquad[16]; // main-thread only
     unsigned int oracleSquadN = engine::captureSquad(gw, false, oracleSquad, 16);
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
+        // Thrown ragdoll: host sim is the pose authority (even for a join-owned
+        // PC). Host skips apply (local physics). Join puppets newest host pose
+        // onto the local body, including ownHands_, until landing settle.
+        if (thrown_.find(it->first) != thrown_.end()) {
+            if (isHostRole()) continue;
+            Driven& d = it->second;
+            EntityState out;
+            if (!d.interp.latest(&out, 0, 0, 0)) continue;
+            Character* c = engine::resolve(out);
+            if (!c) {
+                std::map<Key, Character*>::iterator pit = proxyByKey_.find(it->first);
+                if (pit != proxyByKey_.end()) c = pit->second;
+            }
+            if (!c) continue;
+            engine::applyRaw(c, out);
+            engine::teleportVisual(c, out.x, out.y, out.z, out.heading);
+            engine::applyHavokPos(c, out.x, out.y, out.z);
+            bool pktDown = coop::bodyIsDown(out.bodyState) ||
+                           ((out.bodyState & BODY_DEAD) != 0);
+            unsigned short lbs = engine::readBodyState(c);
+            // Never force the KO timer on a body we OWN (the Unconscious GUI
+            // is that character's medical). Pose-only puppet while thrown.
+            bool own = ownHands_.find(it->first) != ownHands_.end();
+            if (!own) {
+                if (pktDown) {
+                    if (!coop::bodyIsDown(lbs)) engine::knockDown(c, true);
+                    else engine::holdDown(c);
+                } else {
+                    if (coop::bodyIsDown(lbs)) engine::knockDown(c, false);
+                    if (!engine::hasPhysicsBody(c)) engine::restoreMovement(c);
+                }
+            } else if (!pktDown && !engine::hasPhysicsBody(c)) {
+                engine::restoreMovement(c);
+            }
+            d.visFollowMs = now + 4000;
+            if (aiSuspend_) engine::addAiSuspend(c);
+            if (dmgGuard_) engine::addDamageGuard(c);
+            d.haveActual = true; d.lx = out.x; d.ly = out.y; d.lz = out.z;
+            d.parked = false; d.haveDest = false; d.fresh = true;
+            continue;
+        }
         // Never drive a body WE own: we control + stream it locally, the peer drives
         // its copy from our stream. The disjoint partition + no local loopback means
         // our own hand shouldn't appear in targets_, but guard regardless (a stray
@@ -143,6 +372,12 @@ void Replicator::applyTargets(GameWorld* gw) {
                     // World NPCs: damage guard only - AI, suppression and
                     // census treat them exactly as the pre-hold release did.
                     ++starveHeldNow_;
+                    if (engine::isLocalPlayerChar(gw, c)) {
+                        float px = 0, py = 0, pz = 0;
+                        bool hp = engine::readPos(c, &px, &py, &pz);
+                        float gp = hp ? dist3(px, py, pz, out.x, out.y, out.z) : 0.0f;
+                        logSquadFreeze(c, out, d, "stale-skip", hp, px, py, pz, now, gp);
+                    }
                 }
             }
             continue;
@@ -167,9 +402,34 @@ void Replicator::applyTargets(GameWorld* gw) {
         // (Protocol 23 reuses the same translation point for RE-KEYED recruit
         // bodies, so the lookup also runs when only recruit sync is on.)
         bool viaProxy = false;
-        if (!c && (spawnSync_ || recruitSync_)) {
+        if (!c) {
             std::map<Key, Character*>::iterator pit = proxyByKey_.find(it->first);
             if (pit != proxyByKey_.end()) { c = pit->second; viaProxy = true; }
+        }
+        // Join-authored squad tab: the owner's streamed container is not the
+        // local platoon (each engine numbers independently). Without this the
+        // 3rd player's units resolve to nothing, get suppressed, and vanish.
+        if (!c && squadSync_) {
+            std::pair<u32, u32> wireTab(out.hContainer, out.hContainerSerial);
+            std::map<std::pair<u32, u32>, std::pair<u32, u32> >::iterator al =
+                peerTabAlias_.find(wireTab);
+            if (al != peerTabAlias_.end()) {
+                Character* pcs[80];
+                unsigned int np = engine::listPlayerChars(gw, pcs, 80);
+                for (unsigned int pi = 0; pi < np; ++pi) {
+                    if (!pcs[pi]) continue;
+                    unsigned int mh[5];
+                    if (!engine::readObjectHand(
+                            reinterpret_cast<RootObject*>(pcs[pi]), mh))
+                        continue;
+                    if (mh[1] == al->second.first && mh[2] == al->second.second) {
+                        c = pcs[pi];
+                        viaProxy = true;
+                        proxyByKey_[it->first] = c;
+                        break;
+                    }
+                }
+            }
         }
         // Phase 2 crash hardening: a minted proxy pointer can be freed by the
         // engine in the window between the ~1 Hz syncSpawns liveness sweep and
@@ -278,6 +538,19 @@ void Replicator::applyTargets(GameWorld* gw) {
         drivenSeen_[c] = now; // recently-driven grace for the authority passes
         canonicalOf_[c] = it->first; // capture translation (combat subjects)
         debugMark(c, 0, "DRV");
+        // A rest/combat detach re-containers the body; census then misses the
+        // NEW hand and suppressNpc setVisible(false)'s it. Driving a hidden
+        // copy is the "enemies blink in a fight" report - un-hide immediately.
+        {
+            for (std::map<Key, Character*>::iterator si = suppressed_.begin();
+                 si != suppressed_.end(); ++si) {
+                if (si->second == c) {
+                    engine::restoreNpc(gw, c);
+                    suppressed_.erase(si);
+                    break;
+                }
+            }
+        }
 
         // Say the translation out loud. A driven town NPC gets re-keyed the
         // moment a fight starts (separateIntoMyOwnSquad moves it into a fresh
@@ -303,6 +576,11 @@ void Replicator::applyTargets(GameWorld* gw) {
                         it->first.i, it->first.s, lk.i, lk.s, lk.c, lk.cs);
                     rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
                 }
+                // Keep driving THIS pointer under the streamed key. Otherwise
+                // the next tick's resolve(old hand) fails, a proxy mints, and
+                // the original is hidden - two meshes, one blinking.
+                std::map<Key, Character*>::iterator px = proxyByKey_.find(it->first);
+                if (px == proxyByKey_.end()) proxyByKey_[it->first] = c;
             }
         }
 
@@ -364,7 +642,7 @@ void Replicator::applyTargets(GameWorld* gw) {
         // still drain it so the engine-side accumulator stays bounded.
         if (reportCombat_) {
             float rf = 0.0f, rb = 0.0f;
-            if (engine::takeReportedDamage(c, &rf, &rb) && !isSquad &&
+            if (engine::takeReportedDamage(c, &rf, &rb) &&
                 (rf > 0.0f || rb > 0.0f)) {
                 PendingHit& ph = pendingHits_[it->first];
                 ph.flesh += rf; ph.blood += rb;
@@ -484,6 +762,10 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (aiSuspend_) engine::addAiSuspend(c);
                 d.parked = false; d.haveDest = false;
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                if (isSquad) {
+                    float gp = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
+                    logSquadFreeze(c, out, d, "carry-skip", haveActual, ax, ay, az, now, gp);
+                }
                 continue;
             }
         }
@@ -830,16 +1112,30 @@ void Replicator::applyTargets(GameWorld* gw) {
             // AI may have walked the body elsewhere before the down state arrived),
             // so co-locate it with the host's down position when it has drifted.
             // Teleport (not walk) - a limp body has no gait to preserve.
-            if (haveActual && dist3(ax, ay, az, out.x, out.y, out.z) > 2.0f)
+            if (haveActual && dist3(ax, ay, az, out.x, out.y, out.z) > 2.0f) {
                 engine::applyRaw(c, out);
+                engine::teleportVisual(c, out.x, out.y, out.z, out.heading);
+                engine::applyHavokPos(c, out.x, out.y, out.z);
+            }
             d.downApplied = true;
             d.parked = false; d.haveDest = false;
             if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+            if (isSquad) {
+                float gp = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
+                logSquadFreeze(c, out, d, "down-skip", haveActual, ax, ay, az, now, gp);
+            }
             continue;
         }
         if (d.downApplied) {
             engine::knockDown(c, false); // host says upright again -> stand back up
             d.downApplied = false;
+            // Carry/ragdoll tore the walk capsule; without restore the nametag
+            // (CharMovement) runs and the mesh stays at the last drop.
+            engine::restoreMovement(c);
+            engine::applyRaw(c, out);
+            engine::teleportVisual(c, out.x, out.y, out.z, out.heading);
+            engine::applyHavokPos(c, out.x, out.y, out.z);
+            d.visFollowMs = now + 4000;
         }
 
         // ---- Stealth posture (protocol 20) -------------------------------------
@@ -915,12 +1211,12 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (coop::taskIsCombat(out.task)) {
             bool hostWaiting = coop::taskIsCombatWait(out.task);
             d.combatSeenTick = now; // feeds the disarm debounce below
-            // Detach only WORLD NPCs from their town AI. A driven SQUAD member must
-            // NEVER be detached: separateIntoMyOwnSquad changes its hand CONTAINER,
-            // which breaks the cross-client identity (the standers lesson, doctrine
-            // asymmetry rule) - found when player_combat first drove a peer-owned
-            // player character into a fight.
-            if (!isSquad && !d.detached) d.detached = engine::detachFromTownAI(c);
+            // Do NOT separateIntoMyOwnSquad here. Re-containering the body
+            // breaks the streamed hand: resolve() misses, a proxy mints on
+            // top of the original, and suppressNpc hides the first copy -
+            // enemies blink in and out of the brawl. applyCombat's unprovoked
+            // melee order already outranks town AI; the re-issue loop covers
+            // a steal. Squad members were already never detached (hand identity).
             engine::CombatRead lc;
             // modeActive is the STABLE engaged read; isInCombatMode flickers off
             // between combo sections and slot rotations (the crowd lesson).
@@ -1094,15 +1390,15 @@ void Replicator::applyTargets(GameWorld* gw) {
                     d.haveDest = false; // position jumped: force a fresh slide dest
                     ++d.combatSnapCount; ++combatSnapTotal_;
                     if (wrongLocalTgt) ++combatWrongTgt_;
-                    { char b[224]; _snprintf(b, sizeof(b) - 1,
-                        "[combat] snap hand=%u,%u drift=%.1f srcVel=%.1f "
+                    { char b[256]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] snap hand=%u,%u isSquad=%d drift=%.1f srcVel=%.1f "
                         "localFight=%d wrongTgt=%d arming=%d wait=%d seg=%lu n=%lu",
-                        out.hIndex, out.hSerial, drift, srcVel,
+                        out.hIndex, out.hSerial, isSquad ? 1 : 0, drift, srcVel,
                         localFighting ? 1 : 0, wrongLocalTgt ? 1 : 0,
                         arming ? 1 : 0, hostWaiting ? 1 : 0,
                         d.interp.lastSegMs(), d.combatSnapCount);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-                } else if (drift > leaveBand) {
+                } else if (!correctFight && drift > leaveBand) {
                     // Fast catch-up slide: speed scales with drift (~1 s to close),
                     // clamped so a big gap glides quickly without a teleport. walkTo
                     // floors sub-1 speeds to RUN, so small converges stay a walk.
@@ -1139,7 +1435,21 @@ void Replicator::applyTargets(GameWorld* gw) {
                 }
             }
             d.parked = false;
+            // Peer PC in combat: walkTo is stomped by the attack goal (host log:
+            // combat-skip dest=0, then combat snap at 20u). Place the interp
+            // sample so the copy tracks; native footwork stays on the owner.
+            if (isSquad) {
+                engine::applyRaw(c, out);
+                engine::applyMotion(c, true, out.cSpeed,
+                                    out.cMotionX, out.cMotionY, out.cMotionZ);
+            }
             if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+            if (isSquad && haveActual) {
+                float gp = dist3(ax, ay, az, out.x, out.y, out.z);
+                float step = d.haveActual ? dist3(ax, ay, az, d.lx, d.ly, d.lz) : 1.0f;
+                if (gp > 6.0f && step < 0.35f)
+                    logSquadFreeze(c, out, d, "combat-skip", haveActual, ax, ay, az, now, gp);
+            }
             continue;
         }
         // Host no longer reports combat for this body. The stance rides the LOSSY
@@ -1165,7 +1475,14 @@ void Replicator::applyTargets(GameWorld* gw) {
                 ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
             if ((now - d.combatSeenTick) < COMBAT_DISARM_MS &&
                 heldDrift <= combatBigSnapDist_) {
+                if (isSquad) {
+                    engine::applyRaw(c, out);
+                    engine::applyMotion(c, true, out.cSpeed,
+                                        out.cMotionX, out.cMotionY, out.cMotionZ);
+                }
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                if (isSquad && heldDrift > 6.0f)
+                    logSquadFreeze(c, out, d, "combat-hold", haveActual, ax, ay, az, now, heldDrift);
                 continue;
             }
             if (heldDrift > combatBigSnapDist_) {
@@ -1203,6 +1520,12 @@ void Replicator::applyTargets(GameWorld* gw) {
                 bool carryingRight = haveCr && lcr.carrying &&
                                      lcr.carried[3] == out.sIndex &&
                                      lcr.carried[4] == out.sSerial;
+                if (haveCr && lcr.carrying) {
+                    d.hadCarry = true;
+                    for (int ci = 0; ci < 5; ++ci) d.lastCarried[ci] = lcr.carried[ci];
+                } else {
+                    d.hadCarry = false;
+                }
                 if (haveCr && !carryingRight &&
                     (now - d.carryHealTick) >= CARRY_HEAL_MS) {
                     d.carryHealTick = now;
@@ -1247,15 +1570,25 @@ void Replicator::applyTargets(GameWorld* gw) {
             } else {
                 engine::CarryRead lcr;
                 if (engine::readCarry(c, &lcr) && lcr.carrying) {
+                    d.hadCarry = true;
+                    for (int ci = 0; ci < 5; ++ci) d.lastCarried[ci] = lcr.carried[ci];
                     if (d.carryNoSeeTick == 0) {
                         d.carryNoSeeTick = now;
                     } else if ((now - d.carryNoSeeTick) > CARRY_DROP_MS) {
                         d.carryNoSeeTick = 0;
+                        unsigned int ch[5];
+                        for (int ci = 0; ci < 5; ++ci) ch[ci] = lcr.carried[ci];
                         bool ok = engine::applyDrop(c, true);
                         char b[144]; _snprintf(b, sizeof(b) - 1,
                             "[carry] HEAL DROP carrier=%u,%u ok=%d",
                             out.hIndex, out.hSerial, ok ? 1 : 0);
                         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        Key pk; pk.t = ch[0]; pk.c = ch[1]; pk.cs = ch[2];
+                        pk.i = ch[3]; pk.s = ch[4];
+                        Character* who = engine::resolveCharByHand(
+                            ch[3], ch[4], ch[0], ch[1], ch[2]);
+                        settleDroppedBody(pk, who, false, 0, 0, 0, 0, "heal");
+                        beginThrown(pk);
                     }
                 } else {
                     d.carryNoSeeTick = 0;
@@ -1584,16 +1917,11 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     the host's cMoving flag is trustworthy; an NPC's flag flaps on
         //     fidgets/turns, so NPCs classify by debounced stream VELOCITY
         //     (npcMoving, the walk-hold above). Both feed the same tree.
-        //   * SNAP permission - PCs keep the validated instant absolute gate
-        //     (the other player's characters are the user-facing rubber
-        //     banding; falling behind must reconcile immediately). NPCs are
-        //     divergence-gated at 3x the velocity-scaled gate (run 115656:
-        //     a max-speed chase holds a STABLE trailing gap catch-up can
-        //     never close - re-snapping it every few hundred ms was the
-        //     storm; a stable trail is faithful-if-late rendering, and every
-        //     genuine warp measured >= 3x anyway), with the mid-tier
-        //     cooldown on top (far teleports routinely fail to stick - seat
-        //     anchors, unloaded terrain - and must not re-fire per frame).
+        //   * SNAP permission - PCs and NPCs share the velocity-scaled gate
+        //     (max(snapDist*speed, velPeak*gateSec)) at 3x. A fixed 35 u
+        //     squad floor teleported every sprint stride. NPCs keep the
+        //     mid-tier cooldown (far teleports fail to stick); squad uses
+        //     the same 3 s cooldown so a steady sprint cannot micro-snap.
         //   * at REST - both kinds reproduce the host's pose via applyRest
         //     (per-kind inside: squad members are never town-AI-detached).
         // Walk mechanics are IDENTICAL: lead-point walk along the source
@@ -1608,7 +1936,12 @@ void Replicator::applyTargets(GameWorld* gw) {
         // the movement controller (walk + teleport both no-op).
         bool snapOk;
         if (isSquad) {
-            snapOk = haveNewest;
+            // Same adaptive 3x velPeak*gateSec as NPCs - no separate distance
+            // floor. Cooldown always (sprint is near-tier, so the NPC mid-only
+            // cool would not apply): lag-spike/reconnect teleports once, a
+            // stable trail walk-converges.
+            snapOk = haveNewest && gapNewest > snapGate * 3.0f &&
+                     (now - d.npcSnapTick) >= NPC_SNAP_COOL_MS;
         } else {
             // (A grow-vs-own-EMA ratio trigger was tried for the divergence
             // gate first and kept firing on melee-lunge jitter - srcVel 0,
@@ -1619,13 +1952,31 @@ void Replicator::applyTargets(GameWorld* gw) {
             snapOk = gapNewest > snapGate * 3.0f &&
                      (!midTier || (now - d.npcSnapTick) >= NPC_SNAP_COOL_MS);
         }
+        if (isSquad && haveNewest && haveActual && gapNewest > snapGate && !snapOk) {
+            static unsigned long holdTick = 0; // main-thread only
+            if (holdTick == 0 || (now - holdTick) >= 500) {
+                holdTick = now;
+                float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+                engine::readPos(c, &lx, &ly, &lz);
+                char hb[280]; _snprintf(hb, sizeof(hb) - 1,
+                    "[snap] decide squad hand=%u,%u isSquad=1 snapOk=0 gap=%.1f gate=%.1f "
+                    "srcVel=%.1f at=%.1f,%.1f,%.1f to=%.1f,%.1f,%.1f",
+                    out.hIndex, out.hSerial, gapNewest, snapGate, vlen,
+                    lx, ly, lz, newest.x, newest.y, newest.z);
+                hb[sizeof(hb) - 1] = '\0'; coop::logLine(hb);
+            }
+        }
         if (genuinelyMoving && haveActual && gapNewest > snapGate && snapOk) {
             // Fell behind / source warped: hard-snap to the true position
             // (no-halt teleport keeps the clip phase advancing).
             engine::applyRaw(c, newest);
             if (isSquad) {
+                if (!engine::hasPhysicsBody(c)) engine::restoreMovement(c);
+                engine::teleportVisual(c, newest.x, newest.y, newest.z, newest.heading);
+                engine::applyHavokPos(c, newest.x, newest.y, newest.z);
                 ++hardSnapSquad_;
-                logHardSnap(c, out, "squad", gapNewest, vlen, snapGate, d.haveDest);
+                d.npcSnapTick = now;
+                logHardSnap(c, newest, "squad", gapNewest, vlen, snapGate, d.haveDest);
             } else {
                 // Accounting: a snap on a YOUNG ring (< 16 samples, ~0.8 s of
                 // 20 Hz coverage) is the one-time divergence reconciliation
@@ -1777,7 +2128,13 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (atDest || d.walkStallF >= WALK_STALL_FRAMES) {
                     engine::haltMovement(c);
                     d.walkHalted = true; d.walkStallF = 0;
+                    if (isSquad && gapNewest > 6.0f)
+                        logSquadFreeze(c, newest, d, "walk-halt",
+                                       haveActual, ax, ay, az, now, gapNewest);
                 }
+            } else if (isSquad && d.walkHalted && gapNewest > 6.0f) {
+                logSquadFreeze(c, newest, d, "walk-halted-hold",
+                               haveActual, ax, ay, az, now, gapNewest);
             }
             d.parked = false;
             // Locomotion mirror for a DRIVEN SQUAD member (Phase 1b gait fix):
@@ -1791,9 +2148,29 @@ void Replicator::applyTargets(GameWorld* gw) {
             // setDesiredSpeed on the CharMovement path, so they keep the
             // no-mirror behavior (the engine picks their clip from the locomotion
             // it actually performs); mirroring an NPC here would fight that.
-            if (isSquad)
+            if (isSquad) {
+                // Host log (Кат): walkTo dest=1, packets age~0, feet do not
+                // move (unselected peer PC ignores player-order setDestination).
+                // Place the interpolated sample each tick; walkTo still runs
+                // above for clip/pathing. applyPhysMotion feeds Havok velocity
+                // so the mesh is not a frozen run-pose slide.
+                if (!engine::hasPhysicsBody(c)) engine::restoreMovement(c);
+                engine::applyRaw(c, out);
+                if (d.visFollowMs != 0 && now < d.visFollowMs) {
+                    engine::teleportVisual(c, out.x, out.y, out.z, out.heading);
+                    engine::applyHavokPos(c, out.x, out.y, out.z);
+                }
                 engine::applyMotion(c, true, out.cSpeed,
                                     out.cMotionX, out.cMotionY, out.cMotionZ);
+                engine::applyPhysMotion(c, out.cMotionX, out.cMotionY, out.cMotionZ,
+                                        out.cSpeed);
+            }
+            if (isSquad && haveActual) {
+                float step = d.haveActual ? dist3(ax, ay, az, d.lx, d.ly, d.lz) : 1.0f;
+                if (step < 0.25f && gapNewest > 6.0f)
+                    logSquadFreeze(c, newest, d, "walk-stuck",
+                                   haveActual, ax, ay, az, now, gapNewest);
+            }
         } else {
             // At rest, task-authoritative: reproduce the host's sit/idle pose
             // at the same fixture, else quiet + park. Bar patrons sit
@@ -2100,28 +2477,51 @@ void Replicator::ageOutStaleTargets(unsigned long now) {
 }
 
 void Replicator::sweepCarries(GameWorld* gw) {
+    thrown_.clear();
     if (!carrySync_ && !furnSync_) return;
     // The departed peer's stream will never author its drop/exit edges, so any
     // driven (non-owned) copy still carrying gets a local ragdoll drop here
     // (the carried body then returns to the ordinary KO/down channels), and
     // any driven copy still occupying furniture (protocol 19) gets a local
-    // release the same way.
+    // release the same way. Passengers are then parked + restoreMovement so a
+    // disconnect-with-body-on-shoulder cannot leave Havok dead forever.
+    std::vector<Key> passengers;
     for (std::map<Key, Driven>::iterator it = targets_.begin();
          it != targets_.end(); ++it) {
         const Key& k = it->first;
         if (ownHands_.find(k) != ownHands_.end()) continue;
         Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
-        if (!c) continue;
+        Driven& d = it->second;
         if (carrySync_) {
-            engine::CarryRead cr;
-            if (engine::readCarry(c, &cr) && cr.carrying) {
-                bool ok = engine::applyDrop(c, true);
+            unsigned int ch[5] = { 0, 0, 0, 0, 0 };
+            bool havePass = false;
+            if (c) {
+                engine::CarryRead cr;
+                if (engine::readCarry(c, &cr) && cr.carrying) {
+                    for (int ci = 0; ci < 5; ++ci) ch[ci] = cr.carried[ci];
+                    havePass = true;
+                    bool ok = engine::applyDrop(c, true);
+                    char b[128]; _snprintf(b, sizeof(b) - 1,
+                        "[carry] SWEEP DROP carrier=%u,%u ok=%d", k.i, k.s, ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            } else if (d.hadCarry) {
+                for (int ci = 0; ci < 5; ++ci) ch[ci] = d.lastCarried[ci];
+                havePass = true;
                 char b[128]; _snprintf(b, sizeof(b) - 1,
-                    "[carry] SWEEP DROP carrier=%u,%u ok=%d", k.i, k.s, ok ? 1 : 0);
+                    "[carry] SWEEP DROP carrier=%u,%u (gone, remembered passenger)",
+                    k.i, k.s);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
-            it->second.carryNoSeeTick = 0;
+            if (havePass) {
+                Key pk; pk.t = ch[0]; pk.c = ch[1]; pk.cs = ch[2];
+                pk.i = ch[3]; pk.s = ch[4];
+                passengers.push_back(pk);
+            }
+            d.hadCarry = false;
+            d.carryNoSeeTick = 0;
         }
+        if (!c) continue;
         if (furnSync_) {
             engine::FurnitureRead fr;
             if (engine::readFurniture(c, &fr) && fr.valid && fr.kind != 0) {
@@ -2132,6 +2532,42 @@ void Replicator::sweepCarries(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
             it->second.furnNoSeeTick = 0;
+        }
+    }
+    for (unsigned int pi = 0; pi < passengers.size(); ++pi) {
+        const Key& pk = passengers[pi];
+        Character* who = engine::resolveCharByHand(pk.i, pk.s, pk.t, pk.c, pk.cs);
+        settleDroppedBody(pk, who, false, 0, 0, 0, 0, "sweep");
+    }
+    // Owned / still-local passengers whose carrier Character* never resolved:
+    // still flagged beingCarried, but no living body is carrying them.
+    if (carrySync_ && gw) {
+        Character* pcs[64];
+        unsigned int np = engine::listPlayerChars(gw, pcs, 64);
+        for (unsigned int i = 0; i < np; ++i) {
+            engine::CarryRead cr;
+            if (!engine::readCarry(pcs[i], &cr) || !cr.beingCarried) continue;
+            unsigned int h[5];
+            if (!engine::readHand(pcs[i], h)) continue;
+            bool held = false;
+            for (unsigned int j = 0; j < np && !held; ++j) {
+                engine::CarryRead cc;
+                if (engine::readCarry(pcs[j], &cc) && cc.carrying &&
+                    cc.carried[3] == h[0] && cc.carried[4] == h[1])
+                    held = true;
+            }
+            for (std::map<Key, Driven>::iterator it = targets_.begin();
+                 it != targets_.end() && !held; ++it) {
+                Character* car = engine::resolveCharByHand(
+                    it->first.i, it->first.s, it->first.t, it->first.c, it->first.cs);
+                engine::CarryRead cc;
+                if (car && engine::readCarry(car, &cc) && cc.carrying &&
+                    cc.carried[3] == h[0] && cc.carried[4] == h[1])
+                    held = true;
+            }
+            if (held) continue;
+            Key pk; pk.i = h[0]; pk.s = h[1]; pk.t = h[2]; pk.c = h[3]; pk.cs = h[4];
+            settleDroppedBody(pk, pcs[i], false, 0, 0, 0, 0, "sweep-orphan");
         }
     }
 }

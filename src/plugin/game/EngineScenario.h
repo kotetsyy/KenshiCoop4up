@@ -96,6 +96,17 @@ int  rearmDownScene(GameWorld* gw);
 // to split (host owns tab 0, join owns tab 1). Host-only; user SAVEs the result.
 bool setupSquadScene(GameWorld* gw);
 
+// Join-side live claim: if the loaded save has only the host's squad tab (rank 0),
+// pull this join's share of player characters (never the leader) into a NEW
+// player platoon via separateIntoMyOwnSquad + setFaction. Same faction, different
+// tab: the join controls that tab, first-aid / jobs between tabs still work.
+// playerId is the WELCOME id (1..3). nPlayers (2..4) sizes the round-robin share
+// so two-player sessions split ~half, three-player sessions split thirds.
+// Never spawns new characters. Returns true if at least one detach/move was issued.
+bool claimJoinSquadTab(GameWorld* gw, unsigned int playerId, unsigned int nPlayers,
+                       unsigned int wireHands[][5], unsigned int localHands[][5],
+                       unsigned int* outN);
+
 // split_far fixture bake: relocate every player-squad member that is NOT in the
 // LEADER's squad tab to (x,y,z) and halt it there, so the baked save opens with
 // the two tabs in two different regions. Host-only, single client - doing this

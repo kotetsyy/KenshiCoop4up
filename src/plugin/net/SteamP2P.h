@@ -12,13 +12,15 @@
 // via enet_set_socket_hooks() (patch 0002), so every ENet datagram rides one
 // unreliable Steam P2P packet on channel 0. UDP stays the default transport.
 //
-// Two-player assumption (mirrors NetLink): ONE tunnel peer, configured up front
-// with the other player's steamid64 (two-code exchange; sending to a SteamID
-// implicitly accepts its inbound session, so no Steam callback plumbing needed).
+// Star topology: the HOST may tunnel to up to 3 joins; each JOIN tunnels to
+// one host. Sending to a SteamID implicitly accepts its inbound session.
+// Host can setAllowAny(true) and accept inbound peers as they send (F2 ONLINE
+// with no pasted ids, or extra lobby members after the session is up).
 //
-// Threading: init()/setPeer()/setPingPeer() are called on the main thread before
-// the net thread launches; the ENet hooks and tick() run on the net thread. The
-// flat ISteamNetworking calls are thread-safe (IPC into the Steam client).
+// Threading: init()/setPeer()/addPeer()/setPingPeer() are called on the main
+// thread; the ENet hooks and tick() run on the net thread. The peer list is
+// guarded by a CRITICAL_SECTION. The flat ISteamNetworking calls are
+// thread-safe (IPC into the Steam client).
 
 #ifndef KENSHICOOP_STEAMP2P_H
 #define KENSHICOOP_STEAMP2P_H
@@ -35,9 +37,15 @@ bool init();
 bool ready();
 SteamId selfId();
 
-// Configure the single tunnel peer. Proactively accepts its inbound session
-// and allows Valve-relay fallback. Call before the net thread starts.
+// Configure / add a tunnel peer. Proactively accepts its inbound session.
+// Host calls this for each join SteamID; join calls it once for the host.
+// Thread-safe; extra peers may be added after the net thread is running.
 void setPeer(SteamId id);
+void addPeer(SteamId id);
+
+// Host: accept inbound P2P from senders not yet on the allow-list (up to
+// MAX_JOINS). Join should leave this false.
+void setAllowAny(bool on);
 
 // Accept an inbound P2P session from a specific SteamID. Used by the Steam
 // invite layer's P2PSessionRequest_t callback so a session opens even if the

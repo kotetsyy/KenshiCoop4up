@@ -82,6 +82,9 @@ public:
     // squad. On a single-tab save only rank 0 exists -> the join owns nothing and the
     // prior one-directional behaviour is preserved.
     void setOwnRanks(const std::set<unsigned int>& r) { ownRanks_ = r; }
+    // Count of squad members publishOwned currently streams. 0 on a join that
+    // loaded a single-tab save (ownRanks_={1..} but only rank 0 exists).
+    unsigned int ownedSquadCount() const { return (unsigned int)ownHands_.size(); }
 
     // Cross-owner trade veto classifier (engine InvOwnerClassFn). Given a
     // save-stable owner hand (readObjectHand layout [type,container,
@@ -143,8 +146,9 @@ public:
     void setCarrySync(bool v) { carrySync_ = v; }
 
     // Peer-left sweep (carried-body sync): any driven (peer-owned) copy still
-    // carrying a body after its owner disconnected gets a local drop, so the
-    // carried body is released back to the ordinary KO/down channels.
+    // carrying a body after its owner disconnected gets a local drop, then the
+    // passenger is parked and restoreMovement()'d so Havok is not left dead
+    // (nametag/mesh split) forever if the carrier vanished mid-carry.
     void sweepCarries(GameWorld* gw);
 
     // Furniture occupancy sync (protocol 19, default ON): reliable enter/exit
@@ -392,6 +396,9 @@ public:
     // rank its new container latched to. The receive half (shared EVT_RECRUIT
     // re-key) lives in applyEvents.
     void publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId);
+    void announceSquadClaim(NetLink& net, u32 ownerId,
+                            const unsigned int wire[][5],
+                            const unsigned int local[][5], unsigned n);
 
     // Squad management sync master enable (KENSHICOOP_SQUAD_SYNC). Also gates
     // the container-rank LATCH: with it on, tab ranks are assigned once at
@@ -610,15 +617,14 @@ public:
     // owner's screen. Never applied to driven copies.
     void applyStealthFeedback(GameWorld* gw, Inbound& in);
 
-    // BEFORE engine (consensus game-speed sync, runs on BOTH clients):
-    //  * detect a LOCAL user speed click (current state != what WE last applied)
-    //    and turn it into a request (pause = speed 0);
+    // BEFORE engine (last-write-wins game-speed, runs on BOTH clients):
+    //  * detect a LOCAL user speed click and turn it into a request; pause is
+    //    an independent flag, not speed 0 in the aggregator;
     //  * join: send PKT_SPEED_REQ (change-gated + 3 s safety resend) and apply
     //    any received PKT_SPEED_SET;
-    //  * host: consume its own request locally, drain peer requests, arbitrate
-    //    effective = min(requests) capped at 1x while either player squad is in
-    //    combat (own flag from ownHands_+readCombat, peer flag from its REQ),
-    //    apply locally and broadcast PKT_SPEED_SET on change (+ safety resend).
+    //  * host: last valid REQ (or host click) becomes effective immediately,
+    //    pause last-write-wins separately, no combat 1x cap; broadcast SET
+    //    (plus a short debounce so near-simultaneous clicks do not flicker).
     void syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
 
     // BEFORE engine, AFTER syncSpeed (protocol 25 game-clock sync). Both sides
@@ -830,6 +836,7 @@ private:
                                      //   carryNoSeeTick/furnNoSeeTick)
         bool         detached;       // I9: detached from town-AI (separateIntoMyOwnSquad) once
         bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
+        unsigned long visFollowMs;    // after carry/drop: teleportVisual with applyRaw until this
         bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
         bool         deathLatched;    // a reliable EVT_DEATH pinned this body down PERMANENTLY
         bool         carriedDown;     // a KO'd passenger, remembered ACROSS the drop. Leaving a
@@ -862,6 +869,10 @@ private:
                                       //   NPC whose teleport can't stick (seat AI, unloaded
                                       //   terrain) walk-converges between snaps instead of
                                       //   teleporting every frame
+        // Last local carry (driven CARRIER): sweepCarries still names the
+        // passenger if the carrier Character* is already gone on peer leave.
+        bool         hadCarry;
+        unsigned int lastCarried[5];
         bool         goalsCleared;    // rest-entry AI-goal clear done (once per rest episode;
                                       // re-cleared only after the body genuinely moves again)
         // Step 4 divergence-gated authority (world NPCs, behind gateAuthority_):
@@ -948,11 +959,12 @@ private:
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
                    taskTick(0), taskRetries(0), fixtureXlateLogged(false),
                    taskNoneTick(0), detached(false), downApplied(false),
+                   visFollowMs(0),
                    koLatched(false), deathLatched(false), carriedDown(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
-                   combatOverTick(0), npcSnapTick(0),
+                   combatOverTick(0), npcSnapTick(0), hadCarry(false),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
@@ -965,6 +977,7 @@ private:
                    oracleActivePrev(false), oracleOnsetMs(0),
                    prevInterpMode(-1), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
+            lastCarried[0] = lastCarried[1] = lastCarried[2] = lastCarried[3] = lastCarried[4] = 0;
         }
     };
 
@@ -1416,15 +1429,29 @@ private:
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
-    // Protocol 34: the host's ~1 Hz container census result (LOCAL hands of
-    // complete STORAGE/machine-class buildings in the interest spheres).
-    // Folded into the authored set each publishInventories pass while
-    // storeSync_ is on; per-container change-gate state lives in invPub_ as
-    // usual. Refreshed wholesale each census (leaving interest just stops
-    // the captures; the invPub_ baseline survives for the return).
+    // Protocol 34: the host's ~1 Hz container census (STORAGE/machine buildings
+    // plus down/dead world-NPC inventories). Folded into the authored set each
+    // publishInventories pass while storeSync_ is on. Refreshed wholesale each
+    // census (leaving interest just stops the captures; invPub_ survives).
     bool           storeSync_;
     unsigned long  contCensusMs_;
     std::set<Key>  censusContainers_;
+    // Join remaining-loot cap after SEND-LOOT: a host snapshot with MORE units
+    // is the open-GUI echo (host window still lists items the join already
+    // took). Ignore it so reopen does not restore the corpse. Host lootAdopt_
+    // is the same cap on the publisher: skip SEND while local capture (open
+    // loot GUI) still has more units than the join reported.
+    struct LootCap { unsigned int units; u32 hash; unsigned long ms; };
+    std::map<Key, LootCap> lootRemain_;
+    std::map<Key, LootCap> lootAdopt_;
+    // Containers whose apply is parked because a local inventory PANEL is open on
+    // them (destroying a stack under a live window is the loot use-after-free; see
+    // engine::containerGuiOpen). Value = when the hold started, for the log only -
+    // the hold itself has no deadline, because there is no safe way to expire it:
+    // the window is still open when it expires. guiDeferSaid_ rate-limits the line
+    // to ~1 Hz per container, since applyInventories runs at main-loop cadence.
+    std::map<Key, unsigned long> guiDefer_;
+    std::map<Key, unsigned long> guiDeferSaid_;
 
     // Phase W1 world-item state.
     // HOST: worldTrack_ maps a ground item's LOCAL engine hand (Key) to its assigned
@@ -1859,6 +1886,17 @@ private:
 
     // Carried-body sync (protocol 18): master enable (KENSHICOOP_CARRY_SYNC).
     bool                 carrySync_;
+    // Host-authoritative ragdoll flight after EVT_DROP_BODY arg=1. Keyed by
+    // the PASSENGER. Cleared on landing settle, pickup, revive, or safety
+    // timeout so a stuck ragdoll cannot stay host-possessed forever.
+    struct ThrownState {
+        unsigned long startMs;
+        unsigned long stillMs;
+        float         lx, ly, lz;
+        bool          havePos;
+        ThrownState() : startMs(0), stillMs(0), lx(0), ly(0), lz(0), havePos(false) {}
+    };
+    std::map<Key, ThrownState> thrown_;
     bool                 furnSync_;
     // Chained/pole prisoner sync (protocol 41): master enable
     // (KENSHICOOP_CHAIN_SYNC). Sub-gate within the furniture pipeline.
@@ -1942,6 +1980,7 @@ private:
     int  poolTotal_;
     u32  poolSeq_;
     u32  poolAcked_;
+    std::map<u32, u32> poolAckedByOwner_; // host: last folded seq per join
     std::deque<PoolDelta> poolPending_;
     bool moneySync_;
     // Protocol 24 faction-relation sync state, per faction sid.
@@ -2148,6 +2187,9 @@ private:
             return;
         out[0] = k.t; out[1] = k.c; out[2] = k.cs; out[3] = k.i; out[4] = k.s;
     }
+    // Same as handForContainerKey, then the entity-proxy remap applyInventories
+    // already uses for runtime NPC corpses (host hand -> join-local mint).
+    bool resolveInvLocalHand(const Key& k, unsigned int cHand[5]) const;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the
@@ -2159,6 +2201,13 @@ private:
     // (mid-session) tab inherits its authoring side's ownership.
     std::set<Key> pinOwned_;
     std::set<Key> pinPeer_;
+    // Local captured hand -> save-stable wire hand (join claim rewrite).
+    std::map<Key, Key> publishAsWire_;
+    // Wire container (the author's platoon) -> THIS client's local container.
+    // A join-minted tab has a host-unknown serial, so joinPlayerSquadAt used to
+    // dump the body into Безымянные_0 (the leader tab). First member mints a
+    // local tab; later members of the same wire tab follow via this alias.
+    std::map<std::pair<u32, u32>, std::pair<u32, u32> > peerTabAlias_;
     // Roster edges WE caused. insertPeerMember re-containers a peer's body into
     // our squad so we can drive it, and the engine cannot tell that apart from
     // the user dragging a member between tabs - so publishSquadMoves echoed the
@@ -2253,6 +2302,25 @@ private:
     // counted into the next line.
     void logHardSnap(Character* c, const EntityState& out, const char* kind,
                      float gap, float srcVel, float gate, bool hadDest);
+    void logSquadFreeze(Character* c, const EntityState& out, const Driven& d,
+                        const char* why, bool haveActual,
+                        float ax, float ay, float az,
+                        unsigned long now, float gap);
+    // After a local drop (reliable EVT_DROP_BODY, heal, or peer-leave sweep):
+    // clear the passenger's interp ring, park/applyRaw at the packet (or
+    // local) pose, restoreMovement so Havok matches the nametag.
+    void settleDroppedBody(const Key& k, Character* who,
+                           bool havePose, float x, float y, float z, float heading,
+                           const char* why);
+    // Thrown/flight (NPC or player ragdoll DROP): host-authoritative pose
+    // until the ragdoll rests (or a timeout). beginThrown arms the flag;
+    // clearThrown returns ownership to the normal model. tickThrown (host)
+    // watches rest/timeout and sends DROP_ARG_LANDING; join uses it as a
+    // safety unstick if the landing event never arrives.
+    void beginThrown(const Key& k);
+    void clearThrown(const Key& k, const char* why);
+    bool isThrown(const Key& k) const { return thrown_.find(k) != thrown_.end(); }
+    void tickThrown(GameWorld* gw, NetLink& net, u32 ownerId);
 
     // ---- Phase 3: unified entity lifecycle (join side) ---------------------
     // One explicit, logged state per hand replacing the implicit union of
@@ -2418,6 +2486,15 @@ private:
     // to four centers into out[12]; returns the count. Zero means we know
     // nothing about the peer, and every caller must fail OPEN on that.
     unsigned int peerAnchors(GameWorld* gw, float* out);
+    // KO/death/revive edges from a bodyState sample. The 20 Hz stream used to
+    // be the only emitter; an unobserved down NPC never left the attention
+    // gate, so the join's local AI stood the corpse. Census (1 Hz) now feeds
+    // the same edge detector. k is the hand the peer knows (proxy bind key).
+    void emitBodyStateEdges(NetLink& net, u32 ownerId, const Key& k, u16 cur,
+                            unsigned long nowPub, bool touchSeen);
+    // SpawnInfo.dead -> Driven latches, and knockDown immediately so a mint
+    // does not stand for a frame waiting on applyTargets.
+    void applySpawnDeadFlag(const Key& k, u8 dead);
 public:
     // Presence authority (protocol 49). Publish a claim for each cell our own
     // tabs stand in and drain the peer's, both at ~1 Hz on the reliable
@@ -2426,10 +2503,9 @@ public:
     void syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId);
     void setCellAuth(bool on) { cellAuth_ = on; }
     void setCellCollapse(bool on) { cellCollapse_ = on; }
-    // Defeat the 1x-during-combat leg of speed arbitration. See Config::
-    // speedCombatCap: run_apart's subject is distance, and the cap turned its
-    // crossing of bandit country into a five-fold slower run for no benefit,
-    // since the squad is fleeing the fight rather than resolving it.
+    // DEPRECATED no-op. Combat no longer clamps game speed; the detector still
+    // runs for SPEED_IN_COMBAT diagnostics. Kept so Plugin.cpp / env parsing
+    // do not need a parallel change.
     void setSpeedCombatCap(bool on) { speedCombatCap_ = on; }
     // Who authors the region containing (x,z)? The claimant, or the HOST when
     // the feature is off, the cell is unclaimed, or the mapping is unavailable.
@@ -2503,6 +2579,11 @@ private:
     // the last over-threshold tick so the position park can't oscillate it back
     // into fleeing. Divergence-gated: leaves well-tracking census NPCs alone.
     void censusFreezeDivergedAi(Character* c, const Key& k, float drift);
+    // Host last-write-wins apply + PKT_SPEED_SET. Pause is independent of
+    // `mult` (the pre-pause multiplier is preserved). `reqOwner` is who issued
+    // the winning click (future "who sped up" UI).
+    void commitSpeedSet(GameWorld* gw, NetLink& net, u32 ownerId,
+                        float mult, bool paused, u32 reqOwner, unsigned long now);
     // Phase B: combat-scoped world-NPC vitals (host side). Keys of streamed
     // NPCs that are fighting / being fought / down, with last-qualified time;
     // publishMedical streams their vitals at ~1 Hz while fresh. The join's
@@ -2511,21 +2592,31 @@ private:
     // bandaging a downed host NPC forwards here).
     std::map<Key, unsigned long> medNpc_;
 
-    // Consensus game-speed sync state. Requests and applied values use ONE
-    // number: the multiplier, with 0 meaning paused (min() then gives "either
-    // can pause, both must raise"). -1 = not yet known.
+    // Last-write-wins game-speed. Pause is an independent flag (not min() with
+    // 0). speedPeerReq_ is the last join REQ multiplier (log/debug only).
+    // speedLastReqOwner_ is who issued the last accepted command (future UI).
+    // -1 = not yet known.
     float         speedLastApplied_;   // what WE last wrote (own-write vs user-click detector)
-    float         speedMyReq_;         // this client's current request
-    float         speedPeerReq_;       // host only: the join's latest request (-1 = none yet)
-    bool          speedCombatCap_;     // false = do NOT pin to 1x while fighting
+    float         speedMyReq_;         // last local LEVEL multiplier (never 0; -1 = none)
+    bool          speedMyPaused_;      // last local pause command
+    float         speedPeerReq_;       // host only: last join REQ multiplier (-1 = none)
+    bool          speedCombatCap_;     // DEPRECATED: stored, never applied to effective
     bool          speedMyCombat_;      // own-squad in-combat flag (~1 Hz sample)
     bool          speedPeerCombat_;    // host only: the join's reported combat bit
-    float         speedLastSet_;       // host: last broadcast effective; join: last received
+    float         speedLastSet_;       // 0 if paused else multiplier (slew/interp consumers)
+    float         speedEffMult_;       // last LWW multiplier (survives pause)
+    bool          speedEffPaused_;     // last LWW pause
+    u32           speedLastReqOwner_;  // ownerId of last accepted LWW command
     u32           speedSeqOut_;        // per-sender monotonic seq for REQ/SET we send
     u32           speedSeqSeen_;       // newest seq accepted from the peer (stale guard)
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
-    unsigned long speedCombatHoldMs_;  // last time own-squad combat read TRUE (cap hysteresis)
+    unsigned long speedCombatHoldMs_;  // last TRUE own-squad combat (hint hysteresis)
+    unsigned long speedDebounceUntilMs_; // host: coalesce clicks until this tick
+    bool          speedPendHave_;
+    float         speedPendMult_;
+    bool          speedPendPaused_;
+    u32           speedPendOwner_;
 
     // Protocol 25 game-clock sync state. timeSlew_ is the join's correction
     // multiplier (1.0 = no correction); the speed layer applies effective *
@@ -2615,6 +2706,9 @@ private:
                           fromCensus(false), firstMissMs(0), forceReq(false) {}
     };
     std::map<Key, SpawnReqState> spawnReq_;
+    // Spawn INFO replies waiting on the per-tick mint budget. Drain keeps
+    // leftovers so a raid does not appear as 4 bodies in one frame.
+    std::deque<InboundSpawnInfo> spawnInfoPend_;
     // JOIN: hands applyTargets failed to resolve this tick, with the streamed
     // position (the request-authoring queue; proximity-gated in syncSpawns so
     // a far unloaded BAKED zone doesn't breed duplicate proxies). fromCensus

@@ -35,15 +35,23 @@ inline bool parseRankList(const std::string& csv, std::set<unsigned int>& out) {
     return any;
 }
 
+// Join playerId 1 owns tab 1, playerId 2 owns tab 2, etc. Host always tab 0.
+inline void resolveOwnRanksForPlayer(std::set<unsigned int>& ranks, bool isHost,
+                                     bool fromEnv, unsigned int playerId) {
+    if (fromEnv) return;
+    ranks.clear();
+    if (isHost) ranks.insert(0u);
+    else        ranks.insert(playerId == 0u ? 1u : playerId);
+}
+
 // Resolve the ownership ranks a session should hold for a given role.
 //   fromEnv == true : ranks came from an explicit env override - preserve them.
-//   fromEnv == false: use the role default (host owns {0}, join owns {1}).
+//   fromEnv == false: use the role default (host owns {0}, join owns {1} until
+//                     WELCOME assigns playerId 1..3 as the squad-tab rank).
 // Safe to call repeatedly; on a role switch the default is recomputed so the
 // client can never keep the host's rank (see the header note above).
 inline void resolveOwnRanks(std::set<unsigned int>& ranks, bool isHost, bool fromEnv) {
-    if (fromEnv) return;
-    ranks.clear();
-    ranks.insert(isHost ? 0u : 1u);
+    resolveOwnRanksForPlayer(ranks, isHost, fromEnv, 1u);
 }
 
 } // namespace coop

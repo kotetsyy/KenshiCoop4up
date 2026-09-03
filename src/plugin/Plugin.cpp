@@ -34,6 +34,7 @@
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
+#include "net/Updater.h"
 #include "game/Engine.h"
 #include "game/EngineUi.h"       // Phase 5a: F2 co-op panel + status overlay
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
@@ -104,6 +105,7 @@ struct SessionController {
     bool         autoLoadDone;     // title auto-load fired (settle gate)
     DWORD        titleFirstTick;   // first title tick (settle gate base)
     bool         peerPresent;      // a peer is connected right now
+    int          peerCount;        // connected remotes (host may have 1-3)
     // Coordinated save (protocol 31).
     std::string  savePending;      // host: save name awaiting quiescence
     coop::u32    saveReqId;        // join: monotonic PKT_SAVE_REQ counter
@@ -137,7 +139,7 @@ struct SessionController {
 
     SessionController()
       : gameStarted(false), gameStartTick(0), autoLoadDone(false),
-        titleFirstTick(0), peerPresent(false),
+        titleFirstTick(0), peerPresent(false), peerCount(0),
         saveReqId(0), bootstrapArmed(false),
         swapStartTick(0), swapHookTicks(0),
         loadSuppressOn(false), loadIdOut(0), loadIdSeen(0), loadReqId(0),
@@ -150,6 +152,7 @@ DWORD&       g_gameStartTick   = g_session.gameStartTick;
 bool&        g_autoLoadDone    = g_session.autoLoadDone;
 DWORD&       g_titleFirstTick  = g_session.titleFirstTick;
 bool&        g_peerPresent     = g_session.peerPresent;
+int&         g_peerCount       = g_session.peerCount;
 std::string& g_savePending     = g_session.savePending;
 coop::u32&   g_saveReqId       = g_session.saveReqId;
 bool&        g_bootstrapArmed  = g_session.bootstrapArmed;
@@ -189,6 +192,10 @@ const float       WPX2_STAT_LEVEL = 50.0f;
 // Test-scene setup (host-only): one-shot world spawn the user then saves.
 bool            g_setupDone     = false;
 const DWORD     SETUP_DELAY_MS  = 4000; // let the world settle before spawning
+// Join auto-claim: once per live world, after the settle delay, if this join
+// still owns zero squad members (single-tab save), eject one body into a new tab.
+bool            g_joinTabClaimed = false;
+int             g_joinTabTries   = 0;
 DWORD           g_lastCraftRearmTick = 0; // throttle host craft re-arm
 DWORD           g_bakeSaveTick  = 0;     // != 0: auto-bake save armed at this tick
 const DWORD     CRAFT_REARM_MS  = 3000; // re-issue the work goal at most this often
@@ -208,6 +215,7 @@ void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 void startNetworking();
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
 void coopUiDisconnect();
+void persistPanelMemory(bool isHost, bool useSteam);
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
 // and the engine's kenshi.log (handy when attached live).
@@ -241,6 +249,9 @@ void warnIfNoPortraits(const std::string& name) {
 // into the next save. Falls back to a plain map reset if no world has ticked yet.
 void sessionResetForUi() {
     g_peerPresent = false;
+    g_peerCount = 0;
+    g_joinTabClaimed = false;
+    g_joinTabTries = 0;
     if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
     else          g_repl.resetSession();
     g_inbound.flushWorldState();
@@ -256,6 +267,8 @@ void sessionResetForWorldReload() {
     g_repl.resetSession();
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: post-reload batches supersede the old session
+    g_joinTabClaimed = false;
+    g_joinTabTries = 0;
     coopLog("[load] inbound world-state queues flushed");
 }
 
@@ -299,7 +312,18 @@ void processNetEvents(GameWorld* gw) {
         // per-channel safety resends (or never minting a pre-connect build).
         if (g_cfg.latejoinSync) g_repl.onPeerConnected(g_net, g_net.localId());
         else coopLog("[latejoin] connect edge seen, resync OFF (gate)");
+        ++g_peerCount;
         g_peerPresent = true;
+        // Join learns its squad-tab rank from WELCOME playerId (1, 2 or 3).
+        if (!g_cfg.isHost && !g_cfg.ownRanksFromEnv) {
+            unsigned int lid = (unsigned int)g_net.localId();
+            coop::resolveOwnRanksForPlayer(g_cfg.ownRanks, false, false, lid);
+            g_repl.setOwnRanks(g_cfg.ownRanks);
+            char r[80];
+            _snprintf(r, sizeof(r) - 1, "[coop] join ownRanks={%u} (playerId)", lid);
+            r[sizeof(r) - 1] = '\0';
+            coopLog(r);
+        }
         // Coordinated save (protocol 31): while connected under save-sync,
         // the JOIN never writes a save locally - the host's save is
         // authoritative and a local save press forwards as PKT_SAVE_REQ.
@@ -323,20 +347,18 @@ void processNetEvents(GameWorld* gw) {
         // the departed peer's stream will never author its drop/exit edges -
         // release any carry or occupancy its driven copies still hold.
         if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw);
-        g_peerPresent = false;
+        if (*it == coop::OWNER_ID_ALL) g_peerCount = 0;
+        else if (g_peerCount > 0) --g_peerCount;
+        g_peerPresent = g_peerCount > 0;
         // Coordinated save: disconnected = solo again; local saves must work.
-        if (!g_cfg.isHost && g_cfg.saveSync) {
+        if (!g_cfg.isHost && g_cfg.saveSync && g_peerCount == 0) {
             coop::engine::setSaveSuppress(false);
             coopLog("[save] JOIN save suppression OFF (peer left)");
         }
     }
-    // Phase 2 crash hardening: a peer drop leaves this side's minted proxies
-    // standing AND its drive maps pointing at bodies with no fresh authority
-    // (the engine will eventually reap them, and the next drive touches a freed
-    // pointer - the "join crash -> host follow-on crash" chain). Despawn the
-    // minted proxies and clear the peer maps, mirroring coopUiDisconnect(). Runs
-    // once per leave batch (we support a single peer).
-    if (!leaves.empty()) {
+    // Full proxy wipe only when nobody remains. A 3rd/4th player leaving must
+    // not despawn the still-connected joins' driven copies.
+    if (!leaves.empty() && g_peerCount == 0) {
         g_repl.clearPeerReplicationState(gw);
         g_inbound.flushWorldState();
     }
@@ -748,6 +770,10 @@ void coopPanelDrive() {
     coop::engine::CoopPanelState ps;
     ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
     ps.peerSteamId  = g_cfg.steamPeer;
+    ps.peerSteamId2 = (g_cfg.steamPeers.size() > 0) ? g_cfg.steamPeers[0] : 0ull;
+    ps.peerSteamId3 = (g_cfg.steamPeers.size() > 1) ? g_cfg.steamPeers[1] : 0ull;
+    ps.udpIp        = g_cfg.ip.c_str();
+    ps.udpPort      = g_cfg.port;
     ps.running      = g_net.isRunning();
     ps.peerPresent  = g_peerPresent;
     ps.isHost       = g_cfg.isHost;
@@ -755,10 +781,17 @@ void coopPanelDrive() {
     std::string detail;
     int ostate;
     if (g_peerPresent) {
-        detail = g_cfg.isHost ? "Connected - peer joined" : "Connected to host";
+        if (g_cfg.isHost) {
+            char d[64];
+            _snprintf(d, sizeof(d) - 1, "Connected - %d join(s)", g_peerCount);
+            d[sizeof(d) - 1] = '\0';
+            detail = d;
+        } else {
+            detail = "Connected to host";
+        }
         ostate = 2;
     } else if (g_net.isRunning()) {
-        detail = g_cfg.isHost ? "Hosting - waiting for peer..." : "Connecting...";
+        detail = g_cfg.isHost ? "Hosting - waiting for players..." : "Connecting...";
         ostate = 1;
     } else {
         detail = "Offline - press F2, then set Connection to ONLINE";
@@ -791,11 +824,25 @@ void coopPanelDrive() {
     }
     ps.transferDetail = transfer.empty() ? (const char*)0 : transfer.c_str();
 
+    // Self-update line. Only surfaced when there is something to DO about it -
+    // an installed update waiting on a restart, or a failure. "Up to date" and
+    // "checking..." would just push the connection status off the one debug line
+    // the panel has, every launch, for no decision.
+    ps.updateDetail = 0;
+    if (coop::updater::restartRequired()) ps.updateDetail = coop::updater::status();
+    else {
+        const char* us = coop::updater::status();
+        if (us && (strstr(us, "failed") || strstr(us, "REJECTED") ||
+                   strstr(us, "available") || strstr(us, "incomplete")))
+            ps.updateDetail = us;
+    }
+
     // Still pump Steam callbacks so an inbound "Join Game" (a friend inviting
     // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
     coop::steaminvite::tick();
 
-    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
+    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect,
+                                &persistPanelMemory);
     coop::engine::coopOverlayTick(detail.c_str(), ostate, g_net.isRunning());
 }
 
@@ -970,6 +1017,49 @@ void tickSetupScene(GameWorld* gw) {
             }
         }
         coopLog("SETUP: scene ready - arrange the pose and SAVE the game now");
+    }
+}
+
+void tickEnsureJoinSquadTab(GameWorld* gw) {
+    if (g_cfg.isHost || g_joinTabClaimed || !gw) return;
+    if (!g_gameStarted || !g_peerPresent) return;
+    if (g_cfg.ownRanksFromEnv) { g_joinTabClaimed = true; return; }
+    unsigned int lid = (unsigned int)g_net.localId();
+    if (lid == 0u) return;
+    if ((GetTickCount() - g_gameStartTick) < SETUP_DELAY_MS) return;
+    if (!coop::engine::gameplayLive(gw)) return;
+
+    if (g_repl.ownedSquadCount() > 0u) {
+        g_joinTabClaimed = true;
+        char b[96];
+        _snprintf(b, sizeof(b) - 1,
+                  "[squad] join already owns %u member(s), skip auto-claim",
+                  g_repl.ownedSquadCount());
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+        return;
+    }
+
+    unsigned int nPlayers = (unsigned int)g_peerCount + 1u;
+    if (nPlayers < 2u) nPlayers = 2u;
+    if (nPlayers > coop::MAX_PLAYERS) nPlayers = coop::MAX_PLAYERS;
+    unsigned int wireH[16][5];
+    unsigned int localH[16][5];
+    unsigned int nClaim = 0;
+    bool ok = coop::engine::claimJoinSquadTab(gw, lid, nPlayers, wireH, localH, &nClaim);
+    if (ok && nClaim > 0)
+        g_repl.announceSquadClaim(g_net, g_net.localId(), wireH, localH, nClaim);
+    ++g_joinTabTries;
+    if (ok) {
+        g_joinTabClaimed = true;
+        char b[80];
+        _snprintf(b, sizeof(b) - 1,
+                  "[squad] join auto-claim issued (playerId=%u)", lid);
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+    } else if (g_joinTabTries >= 3) {
+        g_joinTabClaimed = true;
+        coopLog("[squad] join auto-claim stopped (will not spawn replacements)");
     }
 }
 
@@ -1188,10 +1278,10 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
                 g_repl.publishStealth(gw, g_net, g_net.localId());
             g_repl.applyStealthFeedback(gw, g_inbound);
         }
-        // Consensus game-speed sync: detect local speed clicks as REQUESTS,
-        // host arbitrates effective = min(requests) (capped at 1x while either
-        // player squad fights) and broadcasts; the join applies the SET. Runs
-        // after publishOwned (the combat flag samples the ownHands_ set).
+        // Game-speed sync: detect local speed clicks as REQUESTS; the host
+        // last-write-wins the multiplier and an independent pause flag, then
+        // broadcasts SET. Combat is sampled for diagnostics only (no 1x cap).
+        // Runs after publishOwned (the combat flag samples the ownHands_ set).
         if (g_cfg.speedSync)
             g_repl.syncSpeed(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
         // Phase 6 (6a evidence spike): env-gated ([shackledbg]) per-character
@@ -1201,8 +1291,8 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // Game-clock sync (protocol 25): the host broadcasts its absolute
         // in-game clock ~1 Hz; the join measures the offset and SLEWS - a
         // multiplier the speed layer's quiet writes fold in on top of the
-        // arbitrated consensus effective. AFTER syncSpeed so a slew change
-        // applies against this tick's consensus state.
+        // last-write-wins effective. AFTER syncSpeed so a slew change
+        // applies against this tick's speed state.
         if (g_cfg.timeSync)
             g_repl.syncTime(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
         // Runtime-spawn proxy replication (protocol 21): the join asks about
@@ -1625,6 +1715,11 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // the pose and SAVE (baking save-stable hands that resolve on both clients).
     tickSetupScene(gw);
 
+    // Join: a single-tab save leaves ownRanks_ pointing at an empty rank, so the
+    // friend is connected (world streamed) but cannot issue orders. After the
+    // world settles, claim one body into a new tab; protocol 35 carries it.
+    tickEnsureJoinSquadTab(gw);
+
     // Deferred auto-bake: write the fixture save once the armed settle window
     // elapses (one-shot); the self-exit timer then ends the bake run.
     tickAutoBake();
@@ -1791,12 +1886,15 @@ void startNetworking() {
     // UDP loudly when Steam is unavailable so a misconfigured session still
     // behaves like the stock build instead of silently doing nothing.
     if (g_cfg.transport == "steam") {
-        if (g_cfg.steamPeer == 0) {
-            coopErr("[steam] KENSHICOOP_TRANSPORT=steam requires KENSHICOOP_STEAM_PEER=<partner steamid64>; falling back to UDP");
+        if (!g_cfg.isHost && g_cfg.steamPeer == 0) {
+            coopErr("[steam] join over steam needs the host Steam ID (paste it in F2); falling back to UDP");
         } else if (!coop::steamp2p::init()) {
             coopErr("[steam] init failed (Steam not running / offline?); falling back to UDP");
         } else {
-            coop::steamp2p::setPeer(g_cfg.steamPeer);
+            coop::steamp2p::setAllowAny(g_cfg.isHost);
+            if (g_cfg.steamPeer != 0) coop::steamp2p::setPeer(g_cfg.steamPeer);
+            for (size_t i = 0; i < g_cfg.steamPeers.size(); ++i)
+                coop::steamp2p::addPeer(g_cfg.steamPeers[i]);
             g_net.setSteamTransport(g_cfg.steamPeer);
             coopLog("[steam] transport=steam armed (connect by SteamID; no port forwarding)");
         }
@@ -1817,7 +1915,41 @@ void startNetworking() {
 // config from the panel's choices, and restarts via the shared startNetworking()
 // path (NetLink cleanly supports stop() then start again; Steam is re-armed and
 // the Replicator/Inbound session state is reset for a clean handshake).
+void persistPanelMemory(bool isHost, bool useSteam) {
+    g_cfg.isHost    = isHost;
+    g_cfg.transport = useSteam ? "steam" : "udp";
+    unsigned long long first = 0;
+    g_cfg.steamPeers.clear();
+    for (int i = 0; i < 3; ++i) {
+        unsigned long long id = coop::engine::coopPanelPastedId(i);
+        if (id == 0) continue;
+        if (first == 0) first = id;
+        else g_cfg.steamPeers.push_back(id);
+    }
+    if (first != 0) g_cfg.steamPeer = first;
+    const char* ip = coop::engine::coopPanelUdpIp();
+    if (ip && ip[0]) g_cfg.ip = ip;
+    int port = coop::engine::coopPanelUdpPort();
+    if (port > 0) g_cfg.port = port;
+    coop::saveConnectMemory(g_cfg);
+    char b[176];
+    _snprintf(b, sizeof(b) - 1,
+              "[coop-ui] remembered role=%s transport=%s peer=%llu ip=%s port=%d",
+              isHost ? "HOST" : "JOIN", g_cfg.transport.c_str(),
+              (unsigned long long)g_cfg.steamPeer, g_cfg.ip.c_str(), g_cfg.port);
+    b[sizeof(b) - 1] = '\0';
+    coopLog(b);
+}
+
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
+    // Already hosting on Steam: extra lobby members / extra pasted IDs just
+    // join the tunnel. Do not tear the live session down.
+    if (g_net.isRunning() && isHost && useSteam && peerId != 0) {
+        coop::steamp2p::addPeer(peerId);
+        persistPanelMemory(true, true);
+        coopLog("[coop-ui] add steam peer to live host session");
+        return;
+    }
     if (g_net.isRunning()) g_net.stop();
     coop::steamp2p::shutdown();
     // World is live here (reconnect from within a running game): despawn minted
@@ -1834,6 +1966,13 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // normal flow is Copy my Steam ID -> friend Pastes it -> Connect, with no file
     // editing. peerId is 0 when nothing was pasted, so the config value stands.
     if (peerId != 0) g_cfg.steamPeer = peerId;
+    {
+        const char* ip = coop::engine::coopPanelUdpIp();
+        if (ip && ip[0]) g_cfg.ip = ip;
+        int port = coop::engine::coopPanelUdpPort();
+        if (port > 0) g_cfg.port = port;
+    }
+    persistPanelMemory(isHost, useSteam);
     // Host streams world NPCs; join drives. Under presence authority both do,
     // each for the cells it claims.
     g_repl.setStreamNpcs(isHost || g_cfg.cellAuth);
@@ -1861,6 +2000,14 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
     startNetworking();
+    if (isHost && useSteam) {
+        for (int i = 0; i < 3; ++i) {
+            unsigned long long id = coop::engine::coopPanelPastedId(i);
+            if (id != 0) coop::steamp2p::addPeer(id);
+        }
+        for (size_t i = 0; i < g_cfg.steamPeers.size(); ++i)
+            coop::steamp2p::addPeer(g_cfg.steamPeers[i]);
+    }
 }
 
 void coopUiDisconnect() {
@@ -2131,9 +2278,11 @@ void installEngineDetours() {
             // natively). Enabling report mode on the join makes the guard accumulate
             // the damage its player-squad melee WOULD have dealt to driven world-NPC
             // copies; publishCombatHits forwards it and the host wounds the real body.
-            g_repl.setReportCombat(!g_cfg.isHost);
+            // Both sides accumulate guarded hits: join→NPC wounds (host applies
+            // HP) and hits on a driven peer-squad body (owner shows a floater).
+            g_repl.setReportCombat(true);
             coopLog(g_cfg.isHost
-                ? "[dmg] hitByMeleeAttack detour installed; damage guard ON (host, driven peer-squad bodies)"
+                ? "[dmg] hitByMeleeAttack detour installed; damage guard ON + hit report ON (host)"
                 : "[dmg] hitByMeleeAttack detour installed; damage guard ON + combat-hit report ON (join)");
         } else {
             coopLog("[dmg] FAILED to install hitByMeleeAttack detour; damage guard disabled");
@@ -2328,6 +2477,15 @@ __declspec(dllexport) void startPlugin() {
     }
 
     logStartupBanner();
+
+    // Self-update. sweepOldImage FIRST: the previous DLL an earlier update moved
+    // aside could not be deleted while it was still mapped, and this is the first
+    // moment in the next session where it is not. Then kick the check off on its
+    // own thread - it must never sit in front of the game's startup, and whatever
+    // it finds only takes effect on the NEXT launch anyway.
+    coop::updater::sweepOldImage();
+    coop::updater::start(coop::updater::settingsFromConfig(),
+                         coop::COOP_BUILD_VERSION, (unsigned)coop::PROTOCOL_VERSION);
 
     // Hook the main-thread tick FIRST (early-return on failure), then wire the
     // replicator, engine detours and UI hooks as named install phases.

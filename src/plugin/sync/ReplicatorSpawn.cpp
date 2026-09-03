@@ -30,6 +30,20 @@ bool Replicator::destroyIfMinted(GameWorld* gw, Character* c) {
     return engine::despawnProxyNpc(gw, c);
 }
 
+void Replicator::applySpawnDeadFlag(const Key& k, u8 dead) {
+    if (dead != SPAWN_BODY_DEAD && dead != SPAWN_BODY_KO) return;
+    Driven& d = targets_[k];
+    if (dead == SPAWN_BODY_DEAD) { d.deathLatched = true; d.koLatched = true; }
+    else                         { d.koLatched = true; }
+    if (ownHands_.find(k) != ownHands_.end()) return;
+    Character* who = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+    if (!who) {
+        std::map<Key, Character*>::iterator px = proxyByKey_.find(k);
+        if (px != proxyByKey_.end()) who = px->second;
+    }
+    if (who) engine::knockDown(who, true);
+}
+
 void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                             bool isHost) {
     // Request pacing: per-hand debounce (the reliable channel guarantees
@@ -143,9 +157,30 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 c, pkt.charSid, sizeof(pkt.charSid), pkt.facSid, sizeof(pkt.facSid),
                 &pkt.x, &pkt.y, &pkt.z, &pkt.heading, &dead, &age);
             pkt.found = found ? 1 : 0;
-            pkt.dead  = dead ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
+            u16 bs = c ? engine::readBodyState(c) : 0;
+            bool isDead = dead || (bs & BODY_DEAD) != 0;
+            bool isKo   = !isDead && bodyDownNotCrawling(bs);
+            pkt.dead = isDead ? SPAWN_BODY_DEAD : (isKo ? SPAWN_BODY_KO : SPAWN_BODY_ALIVE);
             net.queueSpawnInfo(pkt);
+            // Late join: hostBody_ already holds the down bits so the stream/
+            // census edge detector stays silent. Pin the new replica with the
+            // same reliable KO/DEATH the live edge would have sent.
+            if (found && pkt.dead != SPAWN_BODY_ALIVE) {
+                EventPacket ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = (u8)PKT_EVENT;
+                ev.event = isDead ? (u8)EVT_DEATH : (u8)EVT_KNOCKOUT;
+                ev.ownerId = ownerId; ev.eventId = nextEventId_++;
+                ev.sType = k.t; ev.sContainer = k.c; ev.sContainerSerial = k.cs;
+                ev.sIndex = k.i; ev.sSerial = k.s;
+                net.queueEvent(ev);
+                char eb[200]; _snprintf(eb, sizeof(eb) - 1,
+                    "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u actor=%u,%u bs %u->%u",
+                    ev.eventId, (unsigned)ev.event, k.t, k.c, k.cs, k.i, k.s,
+                    0u, 0u, 0u, (unsigned)bs);
+                eb[sizeof(eb) - 1] = '\0'; coop::logLine(eb);
+            }
             char b[224]; _snprintf(b, sizeof(b) - 1,
                 "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
@@ -246,10 +281,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     const unsigned int MAX_SQUAD = 32;
     static EntityState squad[MAX_SQUAD]; // main-thread only
     unsigned int nSquad = 0;
-    if (!got.empty() || !unresolvedHands_.empty())
+    if (!got.empty() || !spawnInfoPend_.empty() || !unresolvedHands_.empty())
         nSquad = engine::captureSquad(gw, false, squad, MAX_SQUAD);
 
-    const unsigned int MINT_BUDGET_PER_TICK = 4;
+    const unsigned int MINT_BUDGET_PER_TICK = 1;
     // Adoption is bounded by its spatial query, not by body creation, so it gets a
     // looser budget than the mint: a town answers ~100 census rows and adopting 4
     // per tick would take most of the approach to converge. Not unlimited though -
@@ -258,8 +293,11 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     const unsigned int ADOPT_BUDGET_PER_TICK = 8;
     unsigned int mintedThisTick = 0;
     unsigned int adoptedThisTick = 0;
-    for (std::deque<InboundSpawnInfo>::iterator it = got.begin();
-         it != got.end(); ++it) {
+    for (std::deque<InboundSpawnInfo>::iterator git = got.begin();
+         git != got.end(); ++git)
+        spawnInfoPend_.push_back(*git);
+    for (std::deque<InboundSpawnInfo>::iterator it = spawnInfoPend_.begin();
+         it != spawnInfoPend_.end(); ) {
         const SpawnInfoPacket& p = it->pkt;
         Key k; k.t = p.hType; k.c = p.hContainer; k.cs = p.hContainerSerial;
         k.i = p.hIndex; k.s = p.hSerial;
@@ -270,18 +308,28 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 "[spawn] INFO negative hand=%u,%u,%u,%u,%u (host can't resolve)",
                 k.t, k.c, k.cs, k.i, k.s);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            it = spawnInfoPend_.erase(it);
             continue;
         }
-        if (proxyByKey_.find(k) != proxyByKey_.end()) continue; // duplicate reply
+        if (proxyByKey_.find(k) != proxyByKey_.end()) {
+            applySpawnDeadFlag(k, p.dead);
+            it = spawnInfoPend_.erase(it);
+            continue;
+        }
         // Phase 1b (phantom fix): a hand we PIN owned must never be minted - it
         // is ours (a control-flip claim), and a reply for it is a stale tail.
-        if (pinOwned_.find(k) != pinOwned_.end()) continue;
+        if (pinOwned_.find(k) != pinOwned_.end()) {
+            it = spawnInfoPend_.erase(it);
+            continue;
+        }
         // A hand re-keyed away (recruit/squad move) between our REQ and this
         // reply is DEAD - minting it would resurrect the duplicate the re-key
         // just cleaned up (protocol 35 run 192211).
         std::map<Key, unsigned long>::iterator rko = rekeyedOld_.find(k);
-        if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS)
+        if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS) {
+            it = spawnInfoPend_.erase(it);
             continue;
+        }
         // Mint gate (census-mint fix + Phase 1 spawn parity): the reply
         // position is the host's authority. Inside spawnMintRadius_ of our
         // own squad, always mint (a baked NPC this close sits in a loaded
@@ -426,7 +474,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 ++adoptedThisTick;
                 ++censusAdopts_;
                 lifeSet(k, LIFE_RESOLVED, "adopt");
-                if (p.dead) targets_[k].deathLatched = true;
+                applySpawnDeadFlag(k, p.dead);
                 char b[240]; _snprintf(b, sizeof(b) - 1,
                     "[spawn] proxy ADOPT hand=%u,%u,%u,%u,%u sid='%s' fac='%s' "
                     "d=%.0f radius=%.0f hidden=%d dead=%d mintDist=%.0f "
@@ -435,6 +483,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     adoptD, adoptRadius_, wasHidden ? 1 : 0, p.dead ? 1 : 0,
                     mintDist, (unsigned)proxyByKey_.size(), censusAdopts_);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                it = spawnInfoPend_.erase(it);
                 continue;
             }
         }
@@ -458,6 +507,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     k.t, k.c, k.cs, k.i, k.s, mintDist, spawnMintRadius_,
                     rq.fromCensus ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                it = spawnInfoPend_.erase(it);
                 continue;
             }
         } else if (mintDist >= 0.0f && !engine::isZoneLoadedAt(gw, p.x, p.y, p.z)) {
@@ -475,24 +525,26 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 "[spawn] INFO deferred (near-unloaded) hand=%u,%u,%u,%u,%u dist=%.0f",
                 k.t, k.c, k.cs, k.i, k.s, mintDist);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            it = spawnInfoPend_.erase(it);
             continue;
         }
         // Per-tick mint budget: a raid arriving all at once answers a burst
         // of REQs with a burst of INFOs - creating many bodies in one engine
-        // tick is a visible hitch. Overflow re-judges in ~1 s via farMs.
+        // tick is a visible hitch (1 then a clump of 3-4). Overflow stays in
+        // spawnInfoPend_ and mints on later ticks, one body per frame.
         if (mintedThisTick >= MINT_BUDGET_PER_TICK) {
-            rq.farMs = (now > FAR_RETRY_MS) ? (now - FAR_RETRY_MS + 1000) : now;
-            rq.sends = 0;
-            // Phase 0 crash breadcrumb: town/camp approach can answer a burst of
-            // REQs and defer many mints per tick. The overflow was SILENT; log it
-            // (throttled ~1 Hz/hand by the farMs re-judge above) so a pre-crash
-            // mint storm is visible in the flushed trail.
-            char bd[176]; _snprintf(bd, sizeof(bd) - 1,
-                "[spawn] INFO deferred (budget) hand=%u,%u,%u,%u,%u minted=%u/%u",
-                k.t, k.c, k.cs, k.i, k.s, (unsigned)mintedThisTick,
-                (unsigned)MINT_BUDGET_PER_TICK);
-            bd[sizeof(bd) - 1] = '\0'; coop::logLine(bd);
-            continue;
+            // Keep this INFO (and the rest of the queue) for the next tick so
+            // a raid appears one body per frame instead of 1 then a clump of 4.
+            static unsigned long budgetLogMs = 0; // main-thread only
+            if (now - budgetLogMs >= 1000) {
+                budgetLogMs = now;
+                char bd[176]; _snprintf(bd, sizeof(bd) - 1,
+                    "[spawn] INFO deferred (budget) hand=%u,%u,%u,%u,%u minted=%u/%u",
+                    k.t, k.c, k.cs, k.i, k.s, (unsigned)mintedThisTick,
+                    (unsigned)MINT_BUDGET_PER_TICK);
+                bd[sizeof(bd) - 1] = '\0'; coop::logLine(bd);
+            }
+            break;
         }
         // Mint duplicate guard (2026-07-11): a VISIBLE body of the same
         // template already near the reply position means the census-missing
@@ -541,6 +593,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     k.t, k.c, k.cs, k.i, k.s, p.charSid, MINT_DUPE_RADIUS,
                     rq.fromCensus ? 1 : 0, rq.forceReq ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                it = spawnInfoPend_.erase(it);
                 continue;
             }
         }
@@ -554,6 +607,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 "[spawn] proxy FAILED hand=%u,%u,%u,%u,%u sid='%s'",
                 k.t, k.c, k.cs, k.i, k.s, p.charSid);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            it = spawnInfoPend_.erase(it);
             continue;
         }
         // Phase 2 crash hardening (post-mint liveness): prove the just-minted
@@ -574,6 +628,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     "[spawn] proxy FAILED hand=%u,%u,%u,%u,%u sid='%s' (post-mint liveness)",
                     k.t, k.c, k.cs, k.i, k.s, p.charSid);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                it = spawnInfoPend_.erase(it);
                 continue;
             }
         }
@@ -581,10 +636,9 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         mintedBodies_.insert(proxy);
         ++mintedThisTick;
         lifeSet(k, LIFE_RESOLVED, "mint");
-        // Dead on arrival: latch the down state now (the same reliable-latch
-        // path an EVT_DEATH would take) so the proxy spawns INTO ragdoll
+        // Dead/KO on arrival: latch now so the proxy spawns into ragdoll
         // instead of standing up for a frame. Latched entries never age out.
-        if (p.dead) targets_[k].deathLatched = true;
+        applySpawnDeadFlag(k, p.dead);
         // mintDist (Phase 1 telemetry): how far from our squad the proxy
         // appeared - the spawn-parity oracle gates its distribution.
         char b[224]; _snprintf(b, sizeof(b) - 1,
@@ -601,6 +655,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         // census mint must NOT be dropped into the player squad.
         if (forceReqHands_.erase(k))
             insertPeerMember(gw, proxy, k, "recruit");
+        it = spawnInfoPend_.erase(it);
     }
 
     // Force-REQ injection (protocol 23 interest-split recruit fix): a recruit/
@@ -752,9 +807,42 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
         k.i = ev.sIndex; k.s = ev.sSerial;
         Driven& d = targets_[k]; // creates a placeholder if the body isn't streamed yet
         switch (ev.event) {
-            case EVT_DEATH:    d.deathLatched = true;  d.koLatched = true;  break;
-            case EVT_KNOCKOUT: d.koLatched = true;                          break;
-            case EVT_REVIVE:   d.deathLatched = false; d.koLatched = false; break;
+            case EVT_DEATH:
+            case EVT_KNOCKOUT: {
+                if (ev.event == EVT_DEATH) { d.deathLatched = true; d.koLatched = true; }
+                else d.koLatched = true;
+                // Latch used to wait for applyTargets, which never ran on an
+                // unstreamed NPC - join local AI stood the host's corpse.
+                if (ownHands_.find(k) == ownHands_.end()) {
+                    Character* who = engine::resolveCharByHand(
+                        k.i, k.s, k.t, k.c, k.cs);
+                    if (!who) {
+                        std::map<Key, Character*>::iterator px = proxyByKey_.find(k);
+                        if (px != proxyByKey_.end()) who = px->second;
+                    }
+                    if (who) engine::knockDown(who, true);
+                }
+                break;
+            }
+            case EVT_REVIVE: {
+                d.deathLatched = false; d.koLatched = false;
+                clearThrown(k, "revive");
+                Character* who = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                if (who) {
+                    engine::knockDown(who, false);
+                    engine::restoreMovement(who);
+                    float x = 0, y = 0, z = 0, h = 0;
+                    if (engine::readPose(who, &x, &y, &z, &h)) {
+                        EntityState es; memset(&es, 0, sizeof(es));
+                        es.x = x; es.y = y; es.z = z; es.heading = h;
+                        engine::applyRaw(who, es);
+                        engine::teleportVisual(who, x, y, z, h);
+                        engine::applyHavokPos(who, x, y, z);
+                    }
+                    d.visFollowMs = nowMs() + 4000;
+                }
+                break;
+            }
             case EVT_AMPUTATE:
             case EVT_CRUSH: {
                 // Reliable limb-loss transition (protocol 16): apply the same
@@ -794,6 +882,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 unsigned int ch[5] = { ev.sType, ev.sContainer, ev.sContainerSerial,
                                        ev.sIndex, ev.sSerial };
                 bool ok = carrier && engine::applyPickup(0, carrier, ch);
+                clearThrown(k, "pickup");
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
                     "[carry] RECV PICKUP id=%u carrier=%u,%u carried=%u,%u ok=%d",
                     ev.eventId, ev.aIndex, ev.aSerial, ev.sIndex, ev.sSerial,
@@ -803,17 +892,37 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
             }
             case EVT_DROP_BODY: {
                 // The inverse: release the local carrier's carried body (arg =
-                // ragdoll flag). Idempotent - a carrier that never picked up
-                // locally (lost/late pickup) is a no-op success.
+                // ragdoll / landing). Idempotent applyDrop if not carrying.
+                // arg=2 is the post-flight landing settle (no applyDrop).
                 if (!carrySync_) break;
+                Character* who = engine::resolveCharByHand(
+                    ev.sIndex, ev.sSerial, ev.sType, ev.sContainer, ev.sContainerSerial);
+                if (ev.arg >= DROP_ARG_LANDING) {
+                    char cb[240]; _snprintf(cb, sizeof(cb) - 1,
+                        "[carry] RECV LANDING id=%u carried=%u,%u "
+                        "pose=%u xyz=%.1f,%.1f,%.1f h=%.2f",
+                        ev.eventId, ev.sIndex, ev.sSerial,
+                        (unsigned)ev.poseValid, ev.x, ev.y, ev.z, ev.heading);
+                    cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
+                    settleDroppedBody(k, who, ev.poseValid != 0,
+                                      ev.x, ev.y, ev.z, ev.heading, "landing");
+                    clearThrown(k, "landing");
+                    break;
+                }
                 Character* carrier = engine::resolveCharByHand(
                     ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
-                bool ok = carrier && engine::applyDrop(carrier, ev.arg != 0.0f);
-                char cb[160]; _snprintf(cb, sizeof(cb) - 1,
-                    "[carry] RECV DROP id=%u carrier=%u,%u carried=%u,%u ok=%d",
+                bool ragdoll = ev.arg >= DROP_ARG_RAGDOLL;
+                bool ok = carrier && engine::applyDrop(carrier, ragdoll);
+                char cb[240]; _snprintf(cb, sizeof(cb) - 1,
+                    "[carry] RECV DROP id=%u carrier=%u,%u carried=%u,%u ok=%d "
+                    "pose=%u xyz=%.1f,%.1f,%.1f h=%.2f",
                     ev.eventId, ev.aIndex, ev.aSerial, ev.sIndex, ev.sSerial,
-                    ok ? 1 : 0);
+                    ok ? 1 : 0, (unsigned)ev.poseValid,
+                    ev.x, ev.y, ev.z, ev.heading);
                 cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
+                settleDroppedBody(k, who, ev.poseValid != 0,
+                                  ev.x, ev.y, ev.z, ev.heading, "recv");
+                if (ragdoll) beginThrown(k);
                 break;
             }
             case EVT_ENTER_FURNITURE: {
@@ -898,14 +1007,33 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (!squadSync_) break;
                 Key nk; nk.t = ev.aType; nk.c = ev.aContainer;
                 nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
+                // Identity claim: join keeps a local tab but streams the
+                // PRE-claim save-stable hand so we can resolve and drive it.
+                if (nk.t == k.t && nk.c == k.c && nk.cs == k.cs &&
+                    nk.i == k.i && nk.s == k.s) {
+                    pinPeer_.insert(k);
+                    char cb[128];
+                    _snprintf(cb, sizeof(cb) - 1,
+                              "[squad] CLAIM-PIN recv hand=%u,%u (peer-owned, no rekey)",
+                              k.i, k.s);
+                    cb[sizeof(cb) - 1] = '\0';
+                    coop::logLine(cb);
+                    break;
+                }
                 if ((nk.t | nk.c | nk.cs | nk.i | nk.s) == 0) {
+                    Character* left = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                    if (!left) {
+                        std::map<Key, Character*>::iterator px = proxyByKey_.find(k);
+                        if (px != proxyByKey_.end()) left = px->second;
+                    }
+                    if (left) engine::leavePlayerSquad(gw, left);
                     pinPeer_.erase(k);
                     pinOwned_.erase(k);
                     proxyByKey_.erase(k);
                     targets_.erase(k);
                     rekeyedOld_[k] = nowMs(); // no REQ for the dead key's tail
                     char xb[128]; _snprintf(xb, sizeof(xb) - 1,
-                        "[squad] RECV EXIT old=%u,%u,%u,%u,%u (pins cleared)",
+                        "[squad] RECV EXIT old=%u,%u,%u,%u,%u (left squad)",
                         k.t, k.c, k.cs, k.i, k.s);
                     xb[sizeof(xb) - 1] = '\0'; coop::logLine(xb);
                     break;
@@ -1165,7 +1293,63 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
                                   const char* tag, bool ownIt) {
     if (!c) return;
     unsigned int nh[5] = { newK.t, newK.c, newK.cs, newK.i, newK.s };
-    bool ok = engine::joinPlayerSquadAt(gw, c, nh);
+    bool mintedTab = false;
+    if (!ownIt) {
+        // Peer-authored tab: never dump into Безымянные_0. Reuse a local tab
+        // already minted for this wire container, or separate a new one.
+        std::pair<u32, u32> wireTab(newK.c, newK.cs);
+        Character* mate = 0;
+        std::map<std::pair<u32, u32>, std::pair<u32, u32> >::iterator al =
+            peerTabAlias_.find(wireTab);
+        if (al != peerTabAlias_.end()) {
+            Character* pcs[80];
+            unsigned int n = engine::listPlayerChars(gw, pcs, 80);
+            for (unsigned int i = 0; i < n; ++i) {
+                if (!pcs[i] || pcs[i] == c) continue;
+                unsigned int mh[5];
+                if (!engine::readObjectHand(reinterpret_cast<RootObject*>(pcs[i]), mh))
+                    continue;
+                if (mh[1] == al->second.first && mh[2] == al->second.second) {
+                    mate = pcs[i];
+                    memcpy(nh, mh, sizeof(nh));
+                    break;
+                }
+            }
+        }
+        if (!mate) {
+            Character* ld = engine::leader(gw);
+            unsigned int leadH[5];
+            bool haveLead = ld && engine::readObjectHand(
+                reinterpret_cast<RootObject*>(ld), leadH);
+            bool wireIsLeader = haveLead &&
+                newK.c == leadH[1] && newK.cs == leadH[2];
+            bool haveLocalTab = false;
+            Character* pcs2[80];
+            unsigned int n2 = engine::listPlayerChars(gw, pcs2, 80);
+            for (unsigned int i = 0; i < n2; ++i) {
+                unsigned int mh[5];
+                if (!pcs2[i] || !engine::readObjectHand(
+                        reinterpret_cast<RootObject*>(pcs2[i]), mh))
+                    continue;
+                if (mh[1] == newK.c && mh[2] == newK.cs) {
+                    haveLocalTab = true;
+                    break;
+                }
+            }
+            if (!haveLocalTab && !wireIsLeader)
+                mintedTab = engine::detachFromTownAI(c);
+        }
+    }
+    bool ok = mintedTab || engine::joinPlayerSquadAt(gw, c, nh);
+    // Control-flip into a tab WE own: if the owner's streamed container is
+    // not present here, land in our leader tab — only for ownIt, never for
+    // a peer body (that was the Nameless_0 dump).
+    if (!ok && ownIt) {
+        Character* ld = engine::leader(gw);
+        unsigned int leadH[5];
+        if (ld && engine::readObjectHand(reinterpret_cast<RootObject*>(ld), leadH))
+            ok = engine::joinPlayerSquadAt(gw, c, leadH);
+    }
     // Pin the body's ACTUAL local hand. setFaction assigns a local platoon index
     // that usually DIFFERS from the owner's streamed hand (each engine numbers
     // its platoon independently), and publishOwned keys ownership by the captured
@@ -1198,6 +1382,10 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
         else       { pinOwned_.erase(lk); pinPeer_.insert(lk); }
         if (ok) moveEcho_[lk.s] = nowMs();  // the engine may renumber the serial
         pinnedLocal = true;
+    }
+    if (!ownIt && haveLh) {
+        peerTabAlias_[std::make_pair(newK.c, newK.cs)] =
+            std::make_pair(lh[1], lh[2]);
     }
     int inSquad = -1;
     __try {

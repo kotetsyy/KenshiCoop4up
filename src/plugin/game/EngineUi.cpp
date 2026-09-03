@@ -20,10 +20,12 @@
 // digit entry.
 #include <kenshi/gui/DatapanelGUI.h>
 #include <kenshi/gui/DataPanelLine.h>
+#include <kenshi/OptionsHolder.h> // options->damageFloaters
 #include <mygui/MyGUI_Delegate.h> // MyGUI::newDelegate + CDelegate* (free-fn callbacks)
 #include <windows.h>
 
 #include "../core/SteamId.h" // parseSteamId64 (paste button) + maskSteamId64 (id rows)
+#include "../core/UdpEndpoint.h" // parseUdpEndpoint (join UDP paste)
 
 namespace coop {
 namespace engine {
@@ -150,13 +152,56 @@ void markerDestroy(void* label) {
     markerDestroySeh(g, (ScreenLabel*)label);
 }
 
+namespace {
+ScreenLabel* floaterCreateSeh(ForgottenGUI* g, Character* c,
+                              const std::string* text, const MyGUI::Colour* col,
+                              const Ogre::Vector3* off) {
+    __try {
+        ScreenLabel* l = g->createScreenLabel(*text, *col, ScreenLabel::LS_MEDIUM,
+                                              ScreenLabel::RS_NORMAL);
+        if (l) l->_NV_setTracking(c->handle, *off);
+        return l;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+} // namespace
+
+void spawnDamageFloater(Character* c, float amount) {
+    const char* skip = 0;
+    if (!c) skip = "no-char";
+    else if (amount < 0.05f) skip = "amt-low";
+    else if (::options && ::options->damageFloaters == 0) skip = "opt-off";
+    ForgottenGUI* g = skip ? 0 : ::gui;
+    if (!skip && !g) skip = "no-gui";
+    if (skip) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "[dmg] FLOATER skip=%s amt=%.2f", skip, amount);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+        return;
+    }
+    int n = (int)(amount + 0.5f);
+    if (n < 1) n = 1;
+    char cap[24];
+    _snprintf(cap, sizeof(cap) - 1, "%d", n);
+    cap[sizeof(cap) - 1] = '\0';
+    std::string text(cap);
+    MyGUI::Colour col(1.00f, 0.28f, 0.12f, 1.0f);
+    Ogre::Vector3 off(0.0f, 1.9f, 0.0f);
+    ScreenLabel* l = floaterCreateSeh(g, c, &text, &col, &off);
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[dmg] FLOATER n=%d ok=%d", n, l ? 1 : 0);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+}
+
 // ---- In-game co-op session panel (config-driven, spike-50 DatapanelGUI stack) -
 // A native DatapanelGUI window toggled with F2. The player picks role + transport
 // (toggle BUTTONS - the only DatapanelGUI control with a callable RVA callback;
 // MyGUI comboboxes/editboxes have no reachable getters and never receive keyboard
 // focus during gameplay) and connects/leaves via a bound checkbox. The friend code
-// (peer SteamID) + UDP endpoint come from coop_config.json and are shown READ-ONLY;
-// a "Copy my Steam ID" button puts the player's own id on the clipboard to share.
+// (peer SteamID) + UDP endpoint come from coop_config.json as the last-remembered
+// values (a paste or Connect writes them back); a "Copy my Steam ID" button puts
+// the player's own id on the clipboard to share.
 // The GUI layer is session-agnostic: live status arrives via *st; the user's
 // actions leave via the onConnect/onDisconnect callbacks (the plugin root owns the
 // net/session/config wiring).
@@ -242,6 +287,7 @@ struct CoopPanelUi {
     bool          f2Down;        // F2 held last tick (rising-edge toggle)
     std::string   lastStatus;    // last status text shown (refresh gate)
     std::string   lastTransfer;  // last save-transfer line shown (refresh gate)
+    std::string   lastUpdate;    // last self-update line shown (refresh gate)
     CoopPanelUi()
         : panel(0), open(false), built(false), hostFlag(true), steamFlag(true),
           connectedFlag(false), lastConnected(false), lastChkVal(false),
@@ -253,18 +299,25 @@ DataPanelLine_Button*   g_roleBtn      = 0;
 DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
-DataPanelLine_Button*   g_pasteIdBtn   = 0; // "Paste friend's Steam ID" from clipboard
+DataPanelLine_Button*   g_pasteBtns[3] = {0, 0, 0}; // one paste slot per friend
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
-DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
 std::string             g_selfIdStr;   // self SteamID as digits (set each tick; "" = none)
 
-// Friend's SteamID pasted in-panel this session (0 = none). Per-session by
-// design: it lives only in memory, so relaunching Kenshi clears it and the
-// friend's id is re-pasted (nothing is written to disk). Passed to onConnect,
-// where it overrides the (usually empty) config steamPeer.
-unsigned long long      g_pastedPeer   = 0;
-bool                    g_pasteFailed  = false; // last paste wasn't a valid Steam ID
+// Up to 3 friend SteamIDs pasted this session (slot 0 = first friend / join's host).
+unsigned long long      g_pastedPeers[3] = {0, 0, 0};
+int                     g_pasteFailedSlot = -1; // which slot last failed, or -1
+std::string             g_udpIp;         // join UDP host (pasted or seeded)
+int                     g_udpPort = 0;   // 0 = not set this session
+bool                    g_udpPasteFailed = false;
+bool                    g_memorySeeded = false; // config fallback applied once
+CoopConnectFn           g_onConnectCb  = 0;
+CoopRememberFn          g_onRememberCb = 0;
+
+void fireRemember() {
+    if (g_onRememberCb)
+        g_onRememberCb(g_panel.hostFlag, g_panel.steamFlag);
+}
 
 // Button callbacks (free functions - MyGUI::newDelegate wraps them without any
 // raw-MyGUI link). A press flips the armed flag and requests a rebuild so the
@@ -273,11 +326,13 @@ void onRoleBtn(DataPanelLine*) {
     g_panel.hostFlag = !g_panel.hostFlag;
     g_panel.needsRebuild = true;
     coop::logLine(g_panel.hostFlag ? "[coop-ui] role -> Host" : "[coop-ui] role -> Join");
+    fireRemember();
 }
 void onTransBtn(DataPanelLine*) {
     g_panel.steamFlag = !g_panel.steamFlag;
     g_panel.needsRebuild = true;
     coop::logLine(g_panel.steamFlag ? "[coop-ui] transport -> Steam" : "[coop-ui] transport -> UDP");
+    fireRemember();
 }
 // Online/Offline toggle: flip the desired connection state. The connect/disconnect
 // edge (connectedFlag vs lastChkVal) is handled in coopPanelTick, same as before.
@@ -301,33 +356,68 @@ void onCopyIdBtn(DataPanelLine*) {
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
 }
-// Paste the friend's SteamID from the clipboard: read text, extract + validate a
-// SteamID64, and store it as the session peer (used on the next Connect). No
-// typing, no config edit. Rejects arbitrary clipboard junk (g_pasteFailed drives
-// the peer-row hint).
-void onPasteIdBtn(DataPanelLine*) {
+void pasteIntoSlot(int slot) {
+    if (slot < 0 || slot > 2) return;
     std::string clip;
     unsigned long long id = 0;
-    if (clipboardGetText(clip) && coop::parseSteamId64(clip, id)) {
-        g_pastedPeer  = id;
-        g_pasteFailed = false;
-        char b[64];
-        _snprintf(b, sizeof(b) - 1, "[coop-ui] paste friend id=%llu ok=1", id);
+    bool ok = clipboardGetText(clip) && coop::parseSteamId64(clip, id);
+    if (!ok) {
+        unsigned long long ids[4];
+        int n = coop::parseSteamId64List(clip, ids, 4);
+        if (n > 0) { id = ids[0]; ok = true; }
+    }
+    if (ok && id != 0) {
+        g_pastedPeers[slot] = id;
+        g_pasteFailedSlot = -1;
+        char b[80];
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] paste slot %d id=%llu", slot + 1, id);
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
+        fireRemember();
+        // Host already ONLINE: add this tunnel peer without restarting.
+        if (g_panel.connectedFlag && g_panel.hostFlag && g_panel.steamFlag && g_onConnectCb)
+            g_onConnectCb(true, true, id);
     } else {
-        g_pasteFailed = true;
-        coop::logLine("[coop-ui] paste friend id=0 ok=0 (clipboard not a Steam ID)");
+        g_pasteFailedSlot = slot;
+        coop::logLine("[coop-ui] paste failed (clipboard not a Steam ID)");
     }
     g_panel.needsRebuild = true;
 }
+void pasteUdpEndpoint() {
+    std::string clip;
+    std::string ip;
+    int port = g_udpPort > 0 ? g_udpPort : 27800;
+    bool ok = clipboardGetText(clip) && coop::parseUdpEndpoint(clip, ip, port);
+    if (ok && !ip.empty()) {
+        g_udpIp = ip;
+        g_udpPort = port;
+        g_udpPasteFailed = false;
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] paste udp %s:%d",
+                  g_udpIp.c_str(), g_udpPort);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+        fireRemember();
+    } else {
+        g_udpPasteFailed = true;
+        coop::logLine("[coop-ui] paste failed (clipboard not an IP:port)");
+    }
+    g_panel.needsRebuild = true;
+}
+void onPasteSlot0(DataPanelLine*) {
+    if (!g_panel.hostFlag && !g_panel.steamFlag) pasteUdpEndpoint();
+    else pasteIntoSlot(0);
+}
+void onPasteSlot1(DataPanelLine*) { pasteIntoSlot(1); }
+void onPasteSlot2(DataPanelLine*) { pasteIntoSlot(2); }
 
 // POD-only pointer bundle so the row-build SEH frame constructs no std::string.
 struct PanelStrings {
     const std::string *title, *roleKey, *roleCap, *transKey, *transCap;
     const std::string *connKey, *connCap;
     const std::string *dbgKey, *dbgVal;
-    const std::string *peerKey, *peerVal, *pasteKey, *pasteCap;
+    const std::string *pasteKey[3], *pasteCap[3];
+    int nSlots;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
     const std::string *empty;
 };
@@ -340,13 +430,13 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
         g_connBtn  = p->setLineButton(*s->connKey,  *s->connCap,  0);
         p->addSpace(0, 0.35f);
-        // Connection-status debug line (coloured white below, outside SEH).
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
-        p->addSpace(0, 0.35f);
-        // Friend's SteamID: pasted in-panel (Copy on their side -> Paste here).
-        g_peerLine = p->setLine(*s->peerKey, *s->peerVal, *s->empty, 0, false, true);
-        g_pasteIdBtn = p->setLineButton(*s->pasteKey, *s->pasteCap, 0);
-        p->addSpace(0, 0.35f);
+        p->addSpace(0, 0.25f);
+        int i;
+        for (i = 0; i < 3; ++i) g_pasteBtns[i] = 0;
+        for (i = 0; i < s->nSlots && i < 3; ++i)
+            g_pasteBtns[i] = p->setLineButton(*s->pasteKey[i], *s->pasteCap[i], 0);
+        p->addSpace(0, 0.25f);
         g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
         g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
         p->_NV_update();
@@ -393,9 +483,27 @@ void panelDestroySeh(ForgottenGUI* g, DatapanelGUI* p) {
 
 } // namespace
 
+int coopPanelPastedCount() { return 3; }
+unsigned long long coopPanelPastedId(int i) {
+    if (i < 0 || i > 2) return 0;
+    return g_pastedPeers[i];
+}
+const char* coopPanelUdpIp() { return g_udpIp.c_str(); }
+int coopPanelUdpPort() { return g_udpPort; }
+
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect) {
+                   CoopDisconnectFn onDisconnect, CoopRememberFn onRemember) {
     if (!st) return;
+    g_onConnectCb = onConnect;
+    g_onRememberCb = onRemember;
+    if (!g_memorySeeded) {
+        if (g_pastedPeers[0] == 0) g_pastedPeers[0] = st->peerSteamId;
+        if (g_pastedPeers[1] == 0) g_pastedPeers[1] = st->peerSteamId2;
+        if (g_pastedPeers[2] == 0) g_pastedPeers[2] = st->peerSteamId3;
+        if (g_udpIp.empty() && st->udpIp && st->udpIp[0]) g_udpIp = st->udpIp;
+        if (g_udpPort <= 0 && st->udpPort > 0) g_udpPort = st->udpPort;
+        g_memorySeeded = true;
+    }
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
     { static void* s_last = (void*)-1;
       if ((void*)g != s_last) { s_last = (void*)g;
@@ -429,8 +537,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
-            g_pasteIdBtn = 0;
-            g_debugLine = 0; g_peerLine = 0; g_selfLine = 0;
+            g_pasteBtns[0] = g_pasteBtns[1] = g_pasteBtns[2] = 0;
+            g_debugLine = 0; g_selfLine = 0;
             g_panel.open = false;
             coop::logLine("[coop-ui] panel closed");
         }
@@ -459,13 +567,17 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                                                : std::string();
     if (transfer != g_panel.lastTransfer) g_panel.needsRebuild = true;
 
+    // Self-update line (null unless actionable - see CoopPanelState::updateDetail).
+    std::string update = st->updateDetail ? std::string(st->updateDetail) : std::string();
+    if (update != g_panel.lastUpdate) g_panel.needsRebuild = true;
+
     // Create the window once (outside SEH - see the header note on C2712).
     // Layer MUST be "Info": spike 48 proved createFloatingLabel renders non-null
     // there. "Windows" is not a visible MyGUI layer here - the panel is minted
     // and armed but attaches to nothing, so F2 logs open/close yet nothing draws.
     if (!g_panel.panel) {
         std::string layer = "Info";
-        g_panel.panel = g->createDatapanel(0.22f, 0.30f, 0.30f, 0.44f, false, layer, true);
+        g_panel.panel = g->createDatapanel(0.20f, 0.16f, 0.34f, 0.62f, false, layer, true);
         g_panel.built = false;
         if (!g_panel.panel) {
             coop::logErrLine("[coop-ui] createDatapanel FAILED");
@@ -492,9 +604,9 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (st->running) {
             if (st->peerPresent)
                 dbgVal = (st->isHost ? std::string("Hosting") : std::string("Joining")) +
-                         " over " + transStr + " - peer connected";
+                         " over " + transStr + " - player(s) connected";
             else if (st->isHost)
-                dbgVal = std::string("Hosting over ") + transStr + " - waiting for peer...";
+                dbgVal = std::string("Hosting over ") + transStr + " - waiting for players (max 4)...";
             else
                 dbgVal = std::string("Joining over ") + transStr + " - connecting to host...";
         } else {
@@ -504,25 +616,58 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         // A join streaming the host's world at the menu has no leader for the
         // screen overlay, so surface the live progress here instead (amber).
         if (!transfer.empty()) { dbgVal = transfer; dbgKey = "World transfer"; }
+        // A stale DLL cannot connect at all (PROTOCOL_VERSION is a hard gate), so
+        // an actionable update outranks both of the lines above.
+        if (!update.empty()) { dbgVal = update; dbgKey = "Update"; }
 
-        // Friend's SteamID: prefer the value pasted in-panel this session; fall
-        // back to the config (steamPeer, mainly for advanced/back-compat use).
-        // Both id rows show only the last 4 digits - the panel is often on screen
-        // while streaming. Nothing needs the full digits by eye: Copy puts the
-        // real id on the clipboard and Paste takes it back off.
-        std::string peerKey = "Friend's Steam ID";
-        std::string peerVal;
-        unsigned long long peerShown = g_pastedPeer ? g_pastedPeer
-                                                     : (unsigned long long)st->peerSteamId;
-        if (peerShown != 0) {
-            peerVal = coop::maskSteamId64(peerShown);
-        } else if (g_pasteFailed) {
-            peerVal = "(clipboard was not a Steam ID - copy theirs and retry)";
-        } else {
-            peerVal = "(click Paste friend's Steam ID)";
+        // Paste slots: host Steam has 3 friend IDs; join Steam has the host ID;
+        // join UDP has one IP:port slot. Host UDP listens, so no peer paste.
+        const bool udpJoin = !g_panel.hostFlag && !g_panel.steamFlag;
+        const int nSlots = g_panel.hostFlag ? (g_panel.steamFlag ? 3 : 0) : 1;
+        std::string pasteKey[3], pasteCap[3];
+        int si;
+        for (si = 0; si < nSlots; ++si) {
+            char k[16];
+            _snprintf(k, sizeof(k) - 1, "paste%d", si + 1);
+            k[sizeof(k) - 1] = '\0';
+            pasteKey[si] = k;
+            std::string label;
+            if (udpJoin) {
+                label = "Host UDP: ";
+                if (!g_udpIp.empty()) {
+                    char ep[80];
+                    int p = g_udpPort > 0 ? g_udpPort : (st->udpPort > 0 ? st->udpPort : 27800);
+                    _snprintf(ep, sizeof(ep) - 1, "%s:%d    (click to re-paste)",
+                              g_udpIp.c_str(), p);
+                    ep[sizeof(ep) - 1] = '\0';
+                    label += ep;
+                } else if (g_udpPasteFailed) {
+                    label += "(not an IP:port - copy host address and retry)";
+                } else {
+                    label += "(click to paste IP:port)";
+                }
+            } else {
+                unsigned long long shown = g_pastedPeers[si];
+                if (shown == 0 && si == 0) shown = (unsigned long long)st->peerSteamId;
+                if (g_panel.hostFlag) {
+                    char nbuf[16];
+                    _snprintf(nbuf, sizeof(nbuf) - 1, "Friend %d: ", si + 1);
+                    nbuf[sizeof(nbuf) - 1] = '\0';
+                    label = nbuf;
+                } else {
+                    label = "Host ID: ";
+                }
+                if (shown != 0) {
+                    label += coop::maskSteamId64(shown);
+                    label += "    (click to re-paste)";
+                } else if (g_pasteFailedSlot == si) {
+                    label += "(not a Steam ID - copy theirs and retry)";
+                } else {
+                    label += "(click to paste Steam ID)";
+                }
+            }
+            pasteCap[si] = label;
         }
-        std::string pasteKey = "pasteid";
-        std::string pasteCap = "Paste friend's Steam ID";
 
         std::string selfKey  = "Your Steam ID";
         std::string selfVal  = st->selfSteamId
@@ -537,8 +682,11 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         ps.transKey = &transKey; ps.transCap = &transCap;
         ps.connKey = &connKey; ps.connCap = &connCap;
         ps.dbgKey = &dbgKey; ps.dbgVal = &dbgVal;
-        ps.peerKey = &peerKey; ps.peerVal = &peerVal;
-        ps.pasteKey = &pasteKey; ps.pasteCap = &pasteCap;
+        ps.nSlots = nSlots;
+        for (si = 0; si < 3; ++si) {
+            ps.pasteKey[si] = (si < nSlots) ? &pasteKey[si] : &empty;
+            ps.pasteCap[si] = (si < nSlots) ? &pasteCap[si] : &empty;
+        }
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
         ps.empty = &empty;
@@ -551,15 +699,17 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_transBtn)   g_transBtn->callback   = MyGUI::newDelegate(&onTransBtn);
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
-        if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
+        if (g_pasteBtns[0]) g_pasteBtns[0]->callback = MyGUI::newDelegate(&onPasteSlot0);
+        if (g_pasteBtns[1]) g_pasteBtns[1]->callback = MyGUI::newDelegate(&onPasteSlot1);
+        if (g_pasteBtns[2]) g_pasteBtns[2]->callback = MyGUI::newDelegate(&onPasteSlot2);
         dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
-        dbgColourSeh(g_peerLine, false);
         dbgColourSeh(g_selfLine, false);
 
         g_panel.built = true;
         g_panel.needsRebuild = false;
         g_panel.lastStatus = detail;
         g_panel.lastTransfer = transfer;
+        g_panel.lastUpdate = update;
     }
 
     // Connect / disconnect on the Online/Offline toggle edge (edge, not level, so
@@ -575,7 +725,10 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                       g_panel.steamFlag ? "steam" : "udp");
             b[sizeof(b) - 1] = '\0';
             coop::logLine(b);
-            if (onConnect) onConnect(g_panel.hostFlag, g_panel.steamFlag, g_pastedPeer);
+            unsigned long long first = 0;
+            for (int pi = 0; pi < 3; ++pi)
+                if (g_pastedPeers[pi] != 0) { first = g_pastedPeers[pi]; break; }
+            if (onConnect) onConnect(g_panel.hostFlag, g_panel.steamFlag, first);
         } else if (!g_panel.connectedFlag && st->running) {
             coop::logLine("[coop-ui] DISCONNECT requested");
             if (onDisconnect) onDisconnect();

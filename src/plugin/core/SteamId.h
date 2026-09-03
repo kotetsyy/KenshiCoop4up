@@ -40,6 +40,31 @@ inline bool parseSteamId64(const std::string& text, unsigned long long& out) {
     return true;
 }
 
+// Extract every 17-digit SteamID64 in `text` (comma/space/newline separated).
+// Unlike parseSteamId64 this does NOT concatenate all digits, so two ids on
+// the clipboard stay two ids. Writes up to maxOut unique values; returns count.
+inline int parseSteamId64List(const std::string& text, unsigned long long* out, int maxOut) {
+    if (!out || maxOut <= 0) return 0;
+    int n = 0;
+    std::string digits;
+    for (size_t i = 0; i <= text.size(); ++i) {
+        char ch = (i < text.size()) ? text[i] : 0;
+        if (ch >= '0' && ch <= '9') digits += ch;
+        else {
+            if (digits.size() == 17 && digits.compare(0, 5, "76561") == 0 && n < maxOut) {
+                unsigned long long v = 0;
+                for (size_t k = 0; k < digits.size(); ++k)
+                    v = v * 10ull + (unsigned long long)(digits[k] - '0');
+                bool dup = false;
+                for (int j = 0; j < n; ++j) if (out[j] == v) dup = true;
+                if (!dup) out[n++] = v;
+            }
+            digits.clear();
+        }
+    }
+    return n;
+}
+
 // Render an id for on-screen display with all but the last 4 digits hidden
 // ("76561198012345678" -> "****5678"), so a player streaming or screen-sharing
 // the F2 panel does not expose their (or their friend's) account. The digits are

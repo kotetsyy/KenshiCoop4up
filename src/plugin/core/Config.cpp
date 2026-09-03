@@ -2,6 +2,7 @@
 
 #include "Config.h"
 #include "OwnRanks.h"
+#include "SteamId.h"
 #include <cstdlib>
 #include <cstdio>
 #include <map>
@@ -98,6 +99,81 @@ std::string fileOr(const std::map<std::string, std::string>& f, const char* key,
     return std::string(def);
 }
 
+std::string jsonQuote(const std::string& s) {
+    std::string o = "\"";
+    for (size_t i = 0; i < s.size(); ++i) {
+        char ch = s[i];
+        if (ch == '"' || ch == '\\') o += '\\';
+        o += ch;
+    }
+    o += '"';
+    return o;
+}
+
+void skipWs(const std::string& s, size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+}
+
+bool replaceJsonValue(std::string& text, const std::string& key, const std::string& rendered) {
+    std::string needle = "\"" + key + "\"";
+    size_t k = 0;
+    while (true) {
+        size_t at = text.find(needle, k);
+        if (at == std::string::npos) return false;
+        size_t i = at + needle.size();
+        skipWs(text, i);
+        if (i >= text.size() || text[i] != ':') { k = at + 1; continue; }
+        ++i;
+        skipWs(text, i);
+        size_t vs = i;
+        if (i < text.size() && text[i] == '"') {
+            ++i;
+            while (i < text.size() && text[i] != '"') {
+                if (text[i] == '\\' && i + 1 < text.size()) i += 2;
+                else ++i;
+            }
+            if (i < text.size()) ++i;
+        } else {
+            while (i < text.size() && text[i] != ',' && text[i] != '}' &&
+                   text[i] != '\n' && text[i] != '\r') ++i;
+            while (i > vs && (text[i - 1] == ' ' || text[i - 1] == '\t')) --i;
+        }
+        text.replace(vs, i - vs, rendered);
+        return true;
+    }
+}
+
+void upsertJsonValue(std::string& text, const std::string& key, const std::string& rendered) {
+    if (replaceJsonValue(text, key, rendered)) return;
+    size_t brace = text.rfind('}');
+    if (brace == std::string::npos) {
+        text = "{\n  \"" + key + "\": " + rendered + "\n}\n";
+        return;
+    }
+    size_t i = brace;
+    while (i > 0 && (text[i - 1] == ' ' || text[i - 1] == '\t' ||
+                     text[i - 1] == '\r' || text[i - 1] == '\n')) --i;
+    bool needComma = (i > 0 && text[i - 1] != '{' && text[i - 1] != ',');
+    std::string ins;
+    if (needComma) ins += ",";
+    ins += "\n  \"" + key + "\": " + rendered + "\n";
+    text.insert(brace, ins);
+}
+
+std::string readConfigText() {
+    std::ifstream f(configFilePath().c_str(), std::ios::binary);
+    if (!f) return std::string();
+    return std::string((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+}
+
+bool writeConfigText(const std::string& text) {
+    std::ofstream o(configFilePath().c_str(), std::ios::binary | std::ios::trunc);
+    if (!o) return false;
+    o.write(text.data(), (std::streamsize)text.size());
+    return o.good();
+}
+
 } // namespace
 
 void loadConfig(Config& c) {
@@ -108,6 +184,9 @@ void loadConfig(Config& c) {
     std::string mode = envOr("KENSHICOOP_MODE", fileOr(f, "role", "host").c_str());
     c.isHost      = (mode != "join");
     c.ip          = envOr("KENSHICOOP_IP", fileOr(f, "ip", "127.0.0.1").c_str());
+    while (!c.ip.empty() && (c.ip[c.ip.size()-1] == ',' || c.ip[c.ip.size()-1] == ' ' ||
+                             c.ip[c.ip.size()-1] == '\t' || c.ip[c.ip.size()-1] == '\r'))
+        c.ip.erase(c.ip.size() - 1);
     c.port        = std::atoi(envOr("KENSHICOOP_PORT", fileOr(f, "port", "27800").c_str()).c_str());
     c.save        = envOr("KENSHICOOP_SAVE", "");
     c.testSeconds = std::atoi(envOr("KENSHICOOP_TEST_SECONDS", "0").c_str());
@@ -189,11 +268,12 @@ void loadConfig(Config& c) {
     // forever and cross-player first aid is lost. "0" is the A/B escape hatch.
     c.medSync = envOr("KENSHICOOP_MED_SYNC", "1") != "0";
 
-    // Consensus game-speed sync: DEFAULT ON - requests min-arbitrated by the
-    // host, combat caps fast-forward at 1x. "0" is the A/B escape hatch. The
-    // speed_probe spike (which drives the quiet/loud writers directly) and
-    // time_probe force it OFF via their manifest DiagEnv (KENSHICOOP_SPEED_SYNC=0).
+    // Game-speed sync: DEFAULT ON - last-write-wins on the host, pause is an
+    // independent flag, combat does not cap the multiplier. "0" is the A/B
+    // escape hatch. speed_probe / time_probe force it OFF via DiagEnv.
     c.speedSync = envOr("KENSHICOOP_SPEED_SYNC", "1") != "0";
+    // Deprecated: still parsed (default ON so old manifests are unchanged) but
+    // Replicator::syncSpeed never applies a combat 1x clamp.
     c.speedCombatCap = envOr("KENSHICOOP_SPEED_COMBAT_CAP", "1") != "0";
     c.trackMove = envOr("KENSHICOOP_TRACK_MOVE", "0") == "1";
 
@@ -251,8 +331,20 @@ void loadConfig(Config& c) {
     // port forwarding / CGNAT-immune). steamPeer is the OTHER player's steamid64
     // (two-code exchange); steamPing arms the channel-1 reachability spike.
     c.transport = envOr("KENSHICOOP_TRANSPORT", fileOr(f, "transport", "udp").c_str());
-    c.steamPeer = (unsigned long long)_strtoui64(
-        envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str()).c_str(), 0, 10);
+    {
+        std::string raw = envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str());
+        c.steamPeer = 0;
+        c.steamPeers.clear();
+        unsigned long long ids[4];
+        int n = parseSteamId64List(raw, ids, 4);
+        if (n == 0) {
+            // Numeric-only config (test harness / non-community ids).
+            c.steamPeer = (unsigned long long)_strtoui64(raw.c_str(), 0, 10);
+        } else {
+            c.steamPeer = ids[0];
+            for (int i = 1; i < n; ++i) c.steamPeers.push_back(ids[i]);
+        }
+    }
     c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
 
     // In-game panel session control: opt-in legacy auto-start. Default OFF so a
@@ -497,12 +589,78 @@ void reloadPeerFromFile(Config& c) {
     std::map<std::string, std::string> f = readConfigFile();
     std::map<std::string, std::string>::const_iterator it;
     it = f.find("steamPeer");
-    if (it != f.end() && !it->second.empty())
-        c.steamPeer = (unsigned long long)_strtoui64(it->second.c_str(), 0, 10);
+    if (it != f.end() && !it->second.empty()) {
+        unsigned long long ids[4];
+        int n = parseSteamId64List(it->second, ids, 4);
+        c.steamPeers.clear();
+        if (n == 0) {
+            c.steamPeer = (unsigned long long)_strtoui64(it->second.c_str(), 0, 10);
+        } else {
+            c.steamPeer = ids[0];
+            for (int i = 1; i < n; ++i) c.steamPeers.push_back(ids[i]);
+        }
+    }
     it = f.find("ip");
-    if (it != f.end() && !it->second.empty()) c.ip = it->second;
+    if (it != f.end() && !it->second.empty()) {
+        c.ip = it->second;
+        while (!c.ip.empty() && (c.ip[c.ip.size()-1] == ',' || c.ip[c.ip.size()-1] == ' ' ||
+                                 c.ip[c.ip.size()-1] == '\t' || c.ip[c.ip.size()-1] == '\r'))
+            c.ip.erase(c.ip.size() - 1);
+    }
     it = f.find("port");
     if (it != f.end() && !it->second.empty()) c.port = std::atoi(it->second.c_str());
+}
+
+void saveConnectMemory(const Config& c) {
+    std::string text = readConfigText();
+    if (text.empty()) text = "{\n}\n";
+    upsertJsonValue(text, "role", jsonQuote(c.isHost ? "host" : "join"));
+    std::string trans = c.transport.empty() ? std::string("udp") : c.transport;
+    upsertJsonValue(text, "transport", jsonQuote(trans));
+    if (c.steamPeer != 0) {
+        char idbuf[32];
+        _snprintf(idbuf, sizeof(idbuf) - 1, "%llu", (unsigned long long)c.steamPeer);
+        idbuf[sizeof(idbuf) - 1] = '\0';
+        std::string ids = idbuf;
+        for (size_t i = 0; i < c.steamPeers.size(); ++i) {
+            if (c.steamPeers[i] == 0) continue;
+            _snprintf(idbuf, sizeof(idbuf) - 1, "%llu",
+                      (unsigned long long)c.steamPeers[i]);
+            idbuf[sizeof(idbuf) - 1] = '\0';
+            ids += ",";
+            ids += idbuf;
+        }
+        upsertJsonValue(text, "steamPeer", jsonQuote(ids));
+    }
+    if (!c.ip.empty()) upsertJsonValue(text, "ip", jsonQuote(c.ip));
+    if (c.port > 0 && c.port <= 65535) {
+        char pbuf[16];
+        _snprintf(pbuf, sizeof(pbuf) - 1, "%d", c.port);
+        pbuf[sizeof(pbuf) - 1] = '\0';
+        upsertJsonValue(text, "port", std::string(pbuf));
+    }
+    writeConfigText(text);
+}
+
+void readUpdateSettings(bool* enabled, std::string* owner, std::string* repo,
+                        std::string* branch, std::string* manifestPath,
+                        bool* autoApply) {
+    std::map<std::string, std::string> f = readConfigFile();
+    std::map<std::string, std::string>::const_iterator it;
+    it = f.find("updateEnabled");
+    if (enabled && it != f.end() && !it->second.empty())
+        *enabled = (it->second == "true" || it->second == "1");
+    it = f.find("updateAutoApply");
+    if (autoApply && it != f.end() && !it->second.empty())
+        *autoApply = (it->second == "true" || it->second == "1");
+    it = f.find("updateOwner");
+    if (owner && it != f.end() && !it->second.empty()) *owner = it->second;
+    it = f.find("updateRepo");
+    if (repo && it != f.end() && !it->second.empty()) *repo = it->second;
+    it = f.find("updateBranch");
+    if (branch && it != f.end() && !it->second.empty()) *branch = it->second;
+    it = f.find("updateManifest");
+    if (manifestPath && it != f.end() && !it->second.empty()) *manifestPath = it->second;
 }
 
 } // namespace coop

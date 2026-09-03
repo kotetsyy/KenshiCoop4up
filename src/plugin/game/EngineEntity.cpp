@@ -418,11 +418,35 @@ bool applyRaw(Character* c, const EntityState& e) {
     }
 }
 
+bool teleportVisual(Character* c, float x, float y, float z, float heading) {
+    if (!c) return false;
+    __try {
+        Ogre::Vector3 to(x, y, z);
+        Ogre::Quaternion rot(Ogre::Radian(heading), Ogre::Vector3::UNIT_Y);
+        c->teleportVisuallyOnly(to, rot);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool readPos(Character* c, float* x, float* y, float* z) {
     if (!c) return false;
     __try {
         Ogre::Vector3 p = c->getPosition();
         if (x) *x = p.x; if (y) *y = p.y; if (z) *z = p.z;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool readPose(Character* c, float* x, float* y, float* z, float* heading) {
+    if (!c) return false;
+    __try {
+        Ogre::Vector3 p = c->getPosition();
+        if (x) *x = p.x; if (y) *y = p.y; if (z) *z = p.z;
+        if (heading) *heading = c->getOrientation().getYaw().valueRadians();
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;

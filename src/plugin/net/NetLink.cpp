@@ -83,7 +83,7 @@ NetLink::NetLink()
       outOwner_(0), outStampMs_(0), haveOut_(false),
       thread_(0), running_(0), stopFlag_(0), myId_(0),
       sendEpoch_(0),
-      steamPeer_(0),
+      steamMode_(false), steamPeer_(0),
       simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
     InitializeCriticalSection(&outCs_);
 }
@@ -288,6 +288,39 @@ void NetLink::setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned in
 
 void NetLink::setSteamTransport(unsigned long long peerSteamId) {
     steamPeer_ = peerSteamId;
+    steamMode_ = true;
+}
+
+bool NetLink::shouldRelayType(u8 type) {
+    // Host-only / handshake / per-peer RTT: never rebroadcast.
+    switch (type) {
+        case PKT_HELLO:
+        case PKT_WELCOME:
+        case PKT_TIME_PING:
+        case PKT_TIME_PONG:
+        case PKT_SAVE_REQ:
+        case PKT_SAVE_ACK:
+        case PKT_LOAD_REQ:
+        case PKT_LOAD_NACK:
+        case PKT_MONEY_DELTA:
+        case PKT_SPAWN_REQ:
+        case PKT_COMBAT_HIT:
+        case PKT_SPEED_REQ:
+            return false;
+        default:
+            return true;
+    }
+}
+
+void NetLink::relayToOthers(ENetPeer* from, enet_uint8 channel, ENetPacket* pkt) {
+    if (!isHost_ || !enetHost_ || !pkt || !pkt->data) return;
+    for (size_t i = 0; i < enetHost_->peerCount; ++i) {
+        ENetPeer* p = &enetHost_->peers[i];
+        if (p == from) continue;
+        if (p->state != ENET_PEER_STATE_CONNECTED) continue;
+        ENetPacket* copy = enet_packet_create(pkt->data, pkt->dataLength, pkt->flags);
+        if (copy) enet_peer_send(p, channel, copy);
+    }
 }
 
 // Deliver one received entity to the game thread, applying the WAN sim if enabled.
@@ -363,7 +396,7 @@ void NetLink::threadLoop() {
     // BEFORE the host is created (the fake socket is handed out at create time).
     // The tunnel is addressless; ENet still needs an ENetAddress for its peer
     // routing, so both sides use the fabricated "1.0.0.1:port".
-    const bool steam = (steamPeer_ != 0);
+    const bool steam = steamMode_;
     if (steam) {
         if (steamp2p::installEnetHooks(port_)) {
             netLog("transport=steam (ENet tunnelled over Steam P2P)");
@@ -376,7 +409,8 @@ void NetLink::threadLoop() {
         ENetAddress addr;
         addr.host = ENET_HOST_ANY;
         addr.port = (enet_uint16)port_;
-        enetHost_ = enet_host_create(&addr, 8 /*peers*/, CH_COUNT /*channels*/, 0, 0);
+        enetHost_ = enet_host_create(&addr, (size_t)MAX_PLAYERS /*peers*/,
+                                     CH_COUNT /*channels*/, 0, 0);
         if (!enetHost_) { netErr("host create failed"); InterlockedExchange(&running_, 0); return; }
         netLog("hosting");
     } else {
@@ -444,11 +478,9 @@ void NetLink::threadLoop() {
         while (enet_host_service(enetHost_, &ev, TICK_MS) > 0) {
             switch (ev.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
-                    // A fresh connection restarts the peer's epoch sequence (a
-                    // reconnecting peer may resume at a lower epoch than the one
-                    // we last saw); forget prior per-owner epochs so the new
-                    // session's first batch is never mistaken for stale (v44).
-                    epochSeen_.clear();
+                    // Do NOT wipe epochSeen_ for every other peer: a third join
+                    // connecting used to reset join-1's epoch gate and admit
+                    // stale batches. Per-owner erase happens on HELLO assign.
                     if (isHost_) {
                         // Wait for the client's HELLO before assigning an id, so
                         // a version mismatch is rejected before we admit it.
@@ -478,29 +510,25 @@ void NetLink::threadLoop() {
                                 enet_peer_disconnect(ev.peer, 0);
                             } else {
                                 u32 id = nextId++;
-                                // TWO-PLAYER ASSUMPTION (step-6 guard): the sync model
-                                // is host + ONE join. Join-authored events/inventory/
-                                // conservation intents reach only the host and are NOT
-                                // relayed to other joins, and OWNER_ID_ALL sweeps assume
-                                // a single peer. A third player connects at the wire
-                                // level but will silently desync - fail loudly instead.
-                                if (id >= 2) {
-                                    netErr("3+ players unsupported: join-authored state is "
-                                           "not relayed peer-to-peer; expect desync");
+                                if (id > MAX_JOINS) {
+                                    netErr("server full (max 4 players: host + 3 joins); rejecting");
+                                    enet_peer_disconnect(ev.peer, 0);
+                                } else {
+                                    epochSeen_.erase(id);
+                                    ev.peer->data = (void*)(size_t)id;
+                                    WelcomePacket w;
+                                    w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
+                                    ENetPacket* out =
+                                        enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
+                                    enet_peer_send(ev.peer, CH_RELIABLE, out);
+                                    char b[96];
+                                    _snprintf(b, sizeof(b) - 1,
+                                              "peer connected id=%u (proto v%u)",
+                                              (unsigned)id, (unsigned)PROTOCOL_VERSION);
+                                    b[sizeof(b) - 1] = '\0';
+                                    netLog(b);
+                                    if (inbound_) inbound_->pushConnect(id);
                                 }
-                                ev.peer->data = (void*)(size_t)id;
-                                WelcomePacket w;
-                                w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
-                                ENetPacket* out =
-                                    enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
-                                enet_peer_send(ev.peer, CH_RELIABLE, out);
-                                char b[96];
-                                _snprintf(b, sizeof(b) - 1,
-                                          "peer connected id=%u (proto v%u)",
-                                          (unsigned)id, (unsigned)PROTOCOL_VERSION);
-                                b[sizeof(b) - 1] = '\0';
-                                netLog(b);
-                                if (inbound_) inbound_->pushConnect(id);
                             }
                         }
                     } else if (!isHost_ && type == PKT_WELCOME) {
@@ -701,7 +729,7 @@ void NetLink::threadLoop() {
                             inbound_->pushCombatHit(chp.ownerId, chp);
                         }
                     } else if (type == PKT_SPEED_REQ || type == PKT_SPEED_SET) {
-                        // Reliable game-speed request/set (consensus speed sync).
+                        // Reliable game-speed request/set (last-write-wins).
                         // Delivered immediately like the other reliable packets.
                         SpeedPacket sp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sp)
@@ -970,13 +998,15 @@ void NetLink::threadLoop() {
                             }
                         }
                     }
+                    if (isHost_ && shouldRelayType(type))
+                        relayToOthers(ev.peer, ev.channelID, ev.packet);
                     enet_packet_destroy(ev.packet);
                     break;
                 }
                 case ENET_EVENT_TYPE_DISCONNECT: {
-                    epochSeen_.clear(); // peer gone; its epoch sequence ends (v44)
                     if (isHost_) {
                         u32 id = (u32)(size_t)ev.peer->data;
+                        epochSeen_.erase(id);
                         ev.peer->data = 0;
                         if (inbound_) inbound_->pushLeave(id);
                         char b[64];
@@ -984,6 +1014,7 @@ void NetLink::threadLoop() {
                         b[sizeof(b) - 1] = '\0';
                         netLog(b);
                     } else {
+                        epochSeen_.clear();
                         serverPeer_ = 0;
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
                         netLog("disconnected from host");
@@ -992,6 +1023,16 @@ void NetLink::threadLoop() {
                 }
                 default:
                     break;
+            }
+        }
+
+        if (steam && enetHost_) {
+            if (enetHost_->mtu > 1200) enetHost_->mtu = 1200;
+            for (size_t pi = 0; pi < enetHost_->peerCount; ++pi) {
+                if (enetHost_->peers[pi].state != ENET_PEER_STATE_CONNECTED)
+                    continue;
+                if (enetHost_->peers[pi].mtu > 1200)
+                    enetHost_->peers[pi].mtu = 1200;
             }
         }
 

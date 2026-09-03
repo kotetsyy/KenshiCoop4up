@@ -8,6 +8,7 @@
 
 #include <string>
 #include <set>
+#include <vector>
 
 namespace coop {
 
@@ -293,23 +294,16 @@ struct Config {
     // stay on the events-only model. "0" is the A/B escape hatch.
     bool          medSync;
 
-    // Consensus game-speed sync (KENSHICOOP_SPEED_SYNC != "0"; DEFAULT ON):
-    // each client's UI speed (pause/1x/2x/3x) is a REQUEST; the host arbitrates
-    // effective = min(requests), capped at 1x while either player squad is in
-    // combat, and broadcasts the result both engines apply. Divergent speeds
-    // diverge every rate-based local simulation (medical, hunger, cosmetic
-    // fights). Pause travels as speed 0. "0" is the A/B escape hatch.
+    // Game-speed sync (KENSHICOOP_SPEED_SYNC != "0"; DEFAULT ON): each client's
+    // UI speed click (pause / 1x / 2x / 5x) is a REQUEST; the host last-write-
+    // wins the effective multiplier and an independent pause flag, then
+    // broadcasts PKT_SPEED_SET. Combat does not clamp the multiplier. "0" is
+    // the A/B escape hatch.
     bool          speedSync;
 
-    // The combat leg of that arbitration, separately defeatable
-    // (KENSHICOOP_SPEED_COMBAT_CAP != "0"; DEFAULT ON = capped, i.e. the shipped
-    // behaviour). Pinning the sim to 1x during a fight is right for players -
-    // nobody wants a battle resolved at 5x - but it is wrong for a scenario whose
-    // subject is DISTANCE. run_apart crosses ~121 k u of bandit country, and every
-    // encounter along the way stretched a 3-minute crossing toward 15 while the
-    // squad walked away from the fight anyway. Only run_apart clears this; a
-    // scenario that measures combat must leave it set, because the cap is what
-    // lets a fight resolve at a watchable rate.
+    // DEPRECATED no-op. Parsed so existing env/manifests do not error; the
+    // combat detector still runs for SPEED_IN_COMBAT diagnostics, but it never
+    // reduces game speed. Prefer leaving the env unset.
     bool          speedCombatCap;
 
     // KENSHICOOP_TRACK_MOVE=1 (DEFAULT OFF): log-only 1 Hz position track, one
@@ -537,17 +531,10 @@ struct Config {
     bool          fixtureSync;
 
     // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
-    // (protocol 34) - the HOST censuses container-bearing buildings (storage
-    // chests + the machine classes) in the interest spheres ~1 Hz and
-    // registers each with the container-inventory channel, replacing the
-    // single-container v1 registration; contents stream as the existing
-    // change-gated PKT_INV_SNAPSHOT (hash + settle window + safety resend),
-    // keyed by hand with the protocol-27 translation for session-placed
-    // buildings. The join reconciles through applyContainerContents. Without
-    // it every chest and machine inventory forks per-client the moment items
-    // land in it. Layered on invSync (no container channel, no store sync).
-    // Forced OFF for store_probe (it measures the unsynced baseline). "0" is
-    // the A/B escape hatch.
+    // (protocol 34) plus down/dead world-NPC inventories. The HOST censuses
+    // ~1 Hz around every player-squad member (radius 400 u, nearest 96
+    // buildings + 32 corpses) and authors PKT_INV_SNAPSHOT. Join reconciles
+    // via applyContainerContents. Layered on invSync. "0" is the A/B hatch.
     bool          storeSync;
 
     // KENSHICOOP_SQUAD_SYNC (default ON): squad management sync (protocol 35)
@@ -581,10 +568,11 @@ struct Config {
     // steamPeer below; falls back to UDP (loudly) when Steam is unavailable.
     std::string   transport;
 
-    // The co-op partner's steamid64 (KENSHICOOP_STEAM_PEER). Two-code
-    // exchange: EACH side is configured with the OTHER's SteamID (sending to
-    // a SteamID implicitly accepts its session - no Steam callback plumbing).
+    // The co-op partner's steamid64 (KENSHICOOP_STEAM_PEER). Host may list
+    // several (comma-separated) for 3-4 player Steam; join lists the host.
+    // Extra ids beyond steamPeer live in steamPeers.
     unsigned long long steamPeer;
+    std::vector<unsigned long long> steamPeers;
 
     // Steam reachability spike (KENSHICOOP_STEAM_PING=<steamid64>): ping/echo
     // that peer on P2P channel 1 every 2 s and log RTT + punch-vs-relay,
@@ -611,6 +599,26 @@ void loadConfig(Config& out);
 // coop_config.json into 'c'. Called on the panel's Connect so a friend-code edit
 // applies without restarting the game. No-op for keys absent from the file.
 void reloadPeerFromFile(Config& c);
+
+// Write the last join/host connection (role, transport, steamPeer list, UDP
+// ip/port) into coop_config.json next to the DLL so a relaunch pre-fills F2
+// instead of requiring another clipboard paste. Merges into the existing file
+// (other keys kept). No-op if the path cannot be written.
+void saveConnectMemory(const Config& c);
+
+// Read the self-update keys out of coop_config.json. Kept OUT of struct Config
+// on purpose: the updater runs before/independently of a session, is the only
+// consumer, and Config is already the env-driven test-harness surface - folding
+// a network-fetch switch into it would put it behind the same env precedence
+// rules for no reason. Flat keys, matching the file's flat parser:
+//   "updateEnabled": true,  "updateOwner": "you", "updateRepo": "KenshiCoop",
+//   "updateBranch": "main", "updateManifest": "dist/UPDATE.txt",
+//   "updateAutoApply": true
+// Any out-param may be null. Absent keys leave the target untouched, so the
+// caller's defaults survive.
+void readUpdateSettings(bool* enabled, std::string* owner, std::string* repo,
+                        std::string* branch, std::string* manifestPath,
+                        bool* autoApply);
 
 // One-line summary of the RESOLVED (effective) config - every sync channel's
 // on/off state plus the key tuning knobs - for the startup log. Makes "which

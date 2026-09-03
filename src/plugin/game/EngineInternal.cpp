@@ -513,6 +513,7 @@ bool  g_speedGuardWrite   = false; // reentrancy guard: quiet writes are not int
 bool  g_speedIntentFresh  = false; // set by the hooks, cleared by consumeSpeedIntent
 float g_speedIntentMult   = 1.0f;  // requested multiplier (pause preserves it)
 bool  g_speedIntentPaused = false; // requested pause state
+int   g_speedIntentKind   = SPEED_INTENT_LEVEL;
 bool  g_speedIntentSeeded = false; // first consume seeds from live engine state
 
 // Last QUIET write (the arbitrated effective we applied). The poll-based
@@ -576,8 +577,10 @@ void snapshotVoteButtons() {
 void __fastcall setGameSpeed_hook(GameWorld* self, float speed, bool click) {
     if (speedDbgOn()) speedDbgLog("setGameSpeed", speed, click ? 1 : 0);
     if (!g_speedGuardWrite && speed > 0.0f) {
-        g_speedIntentMult  = speed;
-        g_speedIntentFresh = true;
+        g_speedIntentMult   = speed;
+        g_speedIntentPaused = false;
+        g_speedIntentKind   = SPEED_INTENT_LEVEL;
+        g_speedIntentFresh  = true;
     }
     g_setGameSpeedOrig(self, speed, click);
     // snapshotVoteButtons ignores the blank dehighlight setGameSpeed leaves
@@ -589,7 +592,13 @@ void __fastcall userPause_hook(GameWorld* self, bool p) {
     if (speedDbgOn()) speedDbgLog("userPause", 0.0f, p ? 1 : 0);
     if (!g_speedGuardWrite) {
         g_speedIntentPaused = p;
-        g_speedIntentFresh  = true;
+        // A speed-tier click often calls userPause(false) after setGameSpeed.
+        // Do not demote LEVEL to UNPAUSE or LWW keeps the old 5x forever.
+        if (p)
+            g_speedIntentKind = SPEED_INTENT_PAUSE;
+        else if (!g_speedIntentFresh || g_speedIntentKind != SPEED_INTENT_LEVEL)
+            g_speedIntentKind = SPEED_INTENT_UNPAUSE;
+        g_speedIntentFresh = true;
     }
     g_userPauseOrig(self, p);
     if (!g_speedGuardWrite) snapshotVoteButtons();
@@ -599,7 +608,11 @@ void __fastcall togglePause_hook(GameWorld* self, bool p) {
     if (speedDbgOn()) speedDbgLog("togglePause", 0.0f, p ? 1 : 0);
     if (!g_speedGuardWrite) {
         g_speedIntentPaused = p;
-        g_speedIntentFresh  = true;
+        if (p)
+            g_speedIntentKind = SPEED_INTENT_PAUSE;
+        else if (!g_speedIntentFresh || g_speedIntentKind != SPEED_INTENT_LEVEL)
+            g_speedIntentKind = SPEED_INTENT_UNPAUSE;
+        g_speedIntentFresh = true;
     }
     g_togglePauseOrig(self, p);
     if (!g_speedGuardWrite) snapshotVoteButtons();
@@ -1253,20 +1266,51 @@ bool                              g_combatReport = false;
 HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
                                            Damages& damage, Character* who,
                                            CombatTechniqueData* attack, int comboID) {
-    if (!g_damageGuarded.empty() &&
-        g_damageGuarded.find(self) != g_damageGuarded.end()) {
+    bool guarded = !g_damageGuarded.empty() &&
+        g_damageGuarded.find(self) != g_damageGuarded.end();
+    bool whoOurs = who && !g_reportAttackers.empty() &&
+        g_reportAttackers.find(who) != g_reportAttackers.end();
+    bool selfOurs = self && !g_reportAttackers.empty() &&
+        g_reportAttackers.find(self) != g_reportAttackers.end();
+    float tot = damage.total();
+    // Split dealt vs received: join's squad is g_reportAttackers.
+    //   guard=1 whoOurs=1  -> join DEALT (victim is a driven/guarded copy)
+    //   guard=0 selfOurs=1 -> join RECEIVED (orig will run on our body)
+    //   guard=1 selfOurs=1 -> should not happen (we do not guard our own)
+    if (guarded || whoOurs || selfOurs) {
+        char sn[48], an[48];
+        charName(self, sn, sizeof(sn));
+        charName(who, an, sizeof(an));
+        char b[280];
+        _snprintf(b, sizeof(b) - 1,
+                  "[dmg] HIT guard=%d dealt=%d recv=%d total=%.2f "
+                  "cut=%.1f blunt=%.1f pierce=%.1f stun=%.1f "
+                  "self='%s' who='%s'",
+                  guarded ? 1 : 0, (guarded && whoOurs) ? 1 : 0,
+                  (!guarded && selfOurs) ? 1 : 0, tot,
+                  damage.cut, damage.blunt, damage.pierce, damage.extraStun,
+                  sn, an);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+    if (guarded) {
         ++g_dmgGuardedHits;
         // Report path (join): the local swing never lands here, but if a player-
         // squad attacker dealt it, accumulate so the host wounds the real NPC.
         // flesh ~ solid impact (cut+blunt+pierce+stun); blood ~ bleeding sources
         // (cut+pierce, plus the bleed multiplier). Absolute deltas, host-applied.
-        if (g_combatReport && !g_reportAttackers.empty() && who &&
-            g_reportAttackers.find(who) != g_reportAttackers.end()) {
+        if (g_combatReport) {
             ReportedDmg& rd = g_reportedDmg[self];
             rd.flesh += damage.cut + damage.blunt + damage.pierce + damage.extraStun;
             rd.blood += (damage.cut + damage.pierce) * 0.5f + damage.bleedMult;
         }
-        return HIT_MISSED; // cosmetic fight: the local swing never lands
+        // HIT_FLESH so the join sees a landed swing (no floating MISS) while
+        // skipping the engine hit path — blood/KO still come from the host.
+        float amt = tot;
+        if (amt < 0.05f)
+            amt = damage.cut + damage.blunt + damage.pierce + damage.extraStun;
+        spawnDamageFloater(self, amt);
+        return HIT_FLESH;
     }
     ++g_dmgPassedHits;
     return g_hitByMeleeOrig(self, dir, damage, who, attack, comboID);
@@ -1327,6 +1371,15 @@ typedef lektor<InventorySection*>* (__fastcall* GetAllSectionsFn)(Inventory* sel
 // from Item via a single-inheritance chain (InventoryItemBase->Item->Gear->Weapon), so
 // a Weapon* is numerically an Item* and can be used wherever an Item* is expected.
 typedef Item* (__fastcall* GetWeaponFn)(Inventory* self);
+// Inventory::getInventoryGUI (NON-virtual): the OPEN loot/inventory window for this
+// inventory, or null when no panel has it. This is the only reliable way to ask
+// "is a GUI holding pointers into this container right now" - and it has to be
+// asked, because removeItemAutoDestroy frees an Item the open window still lists
+// in its InventoryIcon set. The engine never revalidates those icons, so the next
+// GUI repaint dereferences the freed stack on the RENDER thread, where no __except
+// of ours is on the stack (host run 20:21:48: three first-chance READs of -1 inside
+// our capture, swallowed, then a fatal READ of -1 at kenshi_x64.exe+0x74898f).
+typedef InventoryGUI* (__fastcall* GetInvGuiFn)(Inventory* self);
 // Protocol 21 runtime-spawn proxies: FactionManager::getFactionByStringID gives
 // the join a LIVE Faction* from the wire's faction stringID; Faction::getData
 // gives the host that stringID off a runtime spawn's live faction (both
@@ -1351,6 +1404,7 @@ GetDataOfTypeFn  g_getDataOfTypeFn = 0;
 CreateItemFn     g_createItemFn   = 0;
 EquipItemFn      g_equipItemFn    = 0;
 GetAllSectionsFn g_getSectionsFn  = 0;
+GetInvGuiFn      g_getInvGuiFn    = 0; // open-window probe (loot-GUI UAF guard)
 GetWeaponFn      g_getPrimaryWeaponFn   = 0;
 GetWeaponFn      g_getSecondaryWeaponFn = 0;
 FacBySidFn       g_facBySidFn     = 0; // protocol 21 proxy spawn (join)
@@ -1740,6 +1794,8 @@ void resolve() {
     // Worn gear lives in equip sections, not _allItems: enumerate ALL sections and
     // keep the equipped ones (covers every slot, incl. weapons + worn backpack).
     g_getSectionsFn = (GetAllSectionsFn)KenshiLib::GetRealAddress(&Inventory::getAllSections);
+    // Open-window probe: gates the destructive half of the inventory reconcile.
+    g_getInvGuiFn = (GetInvGuiFn)KenshiLib::GetRealAddress(&Inventory::getInventoryGUI);
     // Worn weapons are NOT in any section: read the dedicated weapon accessors directly.
     g_getPrimaryWeaponFn   = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getPrimaryWeapon);
     g_getSecondaryWeaponFn = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getSecondaryWeapon);
@@ -1839,6 +1895,7 @@ void resolve() {
             { (void**)&g_ownAddObjFn,       "Ownerships::addOwnedObject",    CAP_DEED,          true },
             { (void**)&g_ownRemObjFn,       "Ownerships::removeOwnedObject", CAP_DEED,          true },
             { (void**)&g_ownIsOwnedFn,      "Ownerships::isOwned",           CAP_DEED,          true },
+            { (void**)&g_getInvGuiFn,       "Inventory::getInventoryGUI",    CAP_INV_GUI,       true },
             // Audit-only: diagnostic depth, never a gate on the write path.
             { (void**)&g_ownCanUseBldFn,    "Ownerships::canIUseThisBuilding",CAP_DEED,         false },
             { (void**)&g_bldIsThePlayerFn,  "Building::isThePlayer",         CAP_DEED,          false },

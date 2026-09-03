@@ -197,11 +197,10 @@ public:
     // startHost/startClient. All-zero = disabled (immediate delivery). See Config.
     void setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct);
 
-    // Steam P2P transport: tunnel the ENet protocol over Steam P2P to 'peerSteamId'
-    // (steamid64) instead of UDP. The wire protocol, channels, reliability and
-    // reconnect logic are unchanged - only the datagram pipe differs (ENet socket
-    // hooks installed on the net thread; MTU clamped to Steam's 1200-byte
-    // unreliable ceiling). Must be called before startHost/startClient. 0 = UDP.
+    // Steam P2P transport: tunnel the ENet protocol over Steam P2P instead of
+    // UDP. Host may pass 0 (listen + accept inbound peers); join passes the
+    // host's steamid64. Must be called before startHost/startClient.
+    // enabled=false (default) = UDP.
     void setSteamTransport(unsigned long long peerSteamId);
 
     // MAIN thread: advance this peer's session epoch (protocol 44). Called on
@@ -237,6 +236,12 @@ private:
     // at every connection edge so a reconnecting peer restarting at epoch 0 is
     // never locked out.
     bool acceptEpoch(u32 ownerId, u32 epoch);
+
+    // NET-thread: clone `pkt` to every connected ENet peer except `from`.
+    // Join-authored game state has to reach other joins; ENet is star-shaped
+    // so the host is the only relay.
+    void relayToOthers(ENetPeer* from, enet_uint8 channel, ENetPacket* pkt);
+    static bool shouldRelayType(u8 type);
 
     bool        isHost_;
     std::string ip_;
@@ -350,7 +355,9 @@ private:
     std::map<u32, u32>   epochSeen_; // newest accepted epoch per ownerId
 
     // Steam P2P transport (set before launch; read-only on the net thread
-    // thereafter). 0 = stock UDP transport.
+    // thereafter). steamMode_ can be true with steamPeer_ == 0 on the host
+    // (accept inbound tunnels). false = stock UDP.
+    bool               steamMode_;
     unsigned long long steamPeer_;
 
     // WAN sim config (set before launch; read-only on the net thread thereafter).

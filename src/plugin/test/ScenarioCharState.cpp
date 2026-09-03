@@ -1631,23 +1631,23 @@ private:
     unsigned int  l1Hand_[5];
 };
 
-// speed_sync (consensus game-speed validation): both clients run the default-on
-// speed-sync module; the scenario SIMULATES user speed clicks by writing the
-// engine's speed directly (writeGameSpeed != the replicator's lastApplied ->
-// detected as a user request, exactly like a real click). Save 'sync' (the bar
-// with armed NPCs for the combat phase). Timeline (peer-ready armed), each step
-// exercising one consensus rule:
-//   T+10 s HOST clicks 3x -> DENIED (join still requests 1x; min holds 1x -
-//          the "both must raise" rule; the host engine snaps back).
-//   T+22 s JOIN clicks 3x -> requests now 3/3 -> both settle at 3x.
-//   T+34 s JOIN clicks 1x -> min rule: EITHER can lower -> both drop to 1x.
-//   T+44 s JOIN clicks 3x -> both back at 3x.
-//   T+52 s HOST orders a bar NPC onto its OWN leader -> own-squad combat ->
-//          the consensus cap demotes the effective speed to 1x mid-3x.
+// speed_sync (last-write-wins game-speed validation): both clients run the
+// default-on speed-sync module; the scenario SIMULATES user speed clicks by
+// writing the engine's speed directly (writeGameSpeed is captured as user
+// intent, exactly like a real click). Save 'sync' (the bar with armed NPCs
+// for the combat phase). Timeline (peer-ready armed):
+//   T+10 s HOST clicks 3x -> LWW, both at 3x (join does not need to agree).
+//   T+22 s JOIN clicks 3x -> already 3x, no SET change.
+//   T+30 s HOST clicks 1x -> LWW, both at 1x.
+//   T+38 s JOIN clicks 1x (same-value) -> REQ lands; effective stays 1x.
+//   T+46 s HOST clicks 3x -> LWW, both at 3x (join's 1x vote is not a holdback).
+//   T+54 s JOIN clicks 3x -> already 3x.
+//   T+62 s HOST orders a bar NPC onto its OWN leader -> combat bit trips;
+//          speed stays at 3x (no 1x combat cap).
 // Both sides log "SCENARIO SPEED t=<ms> mult=<f> paused=<n>" at ~2 Hz; the
 // Test-SpeedSync oracle time-aligns the two series (CLOCKSYNC-corrected) and
-// gates the transition count, the denied lone raise, each transition's follow
-// latency, the match fraction, and the combat window sitting at 1x.
+// gates the transition count, that a lone raise applies, follow latency,
+// match fraction, and the combat window staying at 3x.
 class SpeedSyncScenario : public TimedScenario {
 public:
     SpeedSyncScenario()
@@ -1693,8 +1693,7 @@ public:
             logClick("join", 1.0f, ok, " tag=samevalue");
             joinClicked1_ = true;
         }
-        // Host re-raises to 3x: must be DENIED (join's vote is now 1x) - the
-        // assertion that the same-value click actually landed as a vote.
+        // Host re-raises to 3x: LWW applies even though the join last voted 1x.
         if (ctx.isHost && !hostClicked3b_ && ctx.elapsedMs >= HOST_3XB_AT_MS) {
             bool ok = engine::writeGameSpeed(ctx.gw, 3.0f, false);
             logClick("host", 3.0f, ok, " tag=reraise");
@@ -1706,10 +1705,9 @@ public:
             joinClicked3b_ = true;
         }
 
-        // Combat phase: a bar NPC onto the host's OWN leader, so the host's
-        // own-squad combat flag trips and the consensus cap demotes to 1x.
-        // Re-ordered every 2.5 s (safe no-op while fighting); a KO'd striker
-        // is replaced (the player_combat restrike lesson).
+        // Combat phase: a bar NPC onto the host's OWN leader so the own-squad
+        // combat flag trips. Speed must stay at the last LWW (3x) - combat
+        // does not cap. Re-ordered every 2.5 s; a KO'd striker is replaced.
         if (ctx.isHost && haveOwn_ && ctx.elapsedMs >= COMBAT_AT_MS &&
             (ctx.elapsedMs - lastOrderMs_ >= 2500 || lastOrderMs_ == 0)) {
             lastOrderMs_ = ctx.elapsedMs;
@@ -1746,7 +1744,7 @@ public:
             // The SPEED series the oracle compares across the two clients.
             // buttons= is the MyGUI speed-button highlight (the VOTE indicator);
             // Phase 5 gates that it tracks the vote and returns to it after the
-            // combat cap clears (mult can be capped to 1x while buttons show 3x).
+            // a quiet apply (mult can be 3x while a local vote button shows 1x).
             float mult = 0.0f; bool paused = false;
             if (engine::readGameSpeed(ctx.gw, &mult, &paused)) {
                 char btn[16]; btn[0] = '\0';

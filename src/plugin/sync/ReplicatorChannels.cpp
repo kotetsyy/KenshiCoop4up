@@ -416,14 +416,21 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
         const CombatHitPacket& p = it->pkt;
         Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
         k.i = p.sIndex; k.s = p.sSerial;
-        if (ownHands_.find(k) != ownHands_.end()) {
-            char b[160]; _snprintf(b, sizeof(b) - 1,
-                "[combat] HIT RECV id=%u hand=%u,%u SKIP (own body)",
-                p.hitId, k.i, k.s);
+        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        Character* victim = engine::resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+        bool ours = ownHands_.find(k) != ownHands_.end();
+        bool peerPc = victim && engine::isLocalPlayerChar(gw, victim);
+        if (ours || peerPc) {
+            // Hits on a player-squad body: owner medical is authoritative.
+            // Show the number locally (join never ran orig - the swing landed
+            // on the host's driven copy). Never applyReportedDamage here.
+            if (ours && victim) engine::spawnDamageFloater(victim, p.flesh);
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "[combat] HIT RECV id=%u hand=%u,%u floater=%d skip-hp (squad)",
+                p.hitId, k.i, k.s, (ours && victim) ? 1 : 0);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
         }
-        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
         bool applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
         // A wounded world NPC is definitionally combat-scoped: mark it so the NPC
         // vitals stream (publishMedical, Phase B) mirrors the authoritative drop
@@ -574,7 +581,7 @@ void Replicator::publishMoneyPool(const SyncContext& ctx) {
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_MONEY;
         pkt.ownerId = ownerId;
-        pkt.ackSeq  = poolAcked_;
+        pkt.ackSeq  = 0;
         pkt.money   = poolTotal_;
         net.queueMoney(pkt);
         if (changed) { // resends stay silent; the change is the signal
@@ -626,7 +633,8 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
         for (std::deque<InboundMoneyDelta>::iterator it = deltas.begin();
              it != deltas.end(); ++it) {
             const MoneyDeltaPacket& p = it->pkt;
-            if (p.seq <= poolAcked_) continue; // already folded (defensive)
+            u32& acked = poolAckedByOwner_[it->ownerId];
+            if (p.seq <= acked) continue; // already folded (defensive, per join)
             if (poolTotal_ < 0) {              // no seed yet - adopt the wallet first
                 int cur = -1;
                 if (!engine::readPlayerWallet(gw, &cur) || cur < 0) return;
@@ -642,6 +650,7 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
                 want = 0;
             }
             poolTotal_ = want;
+            acked = p.seq;
             poolAcked_ = p.seq;
             moved = true;
             char b[144];
@@ -668,25 +677,21 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
         memset(&out, 0, sizeof(out));
         out.type    = (u8)PKT_MONEY;
         out.ownerId = ctx.localId;
-        out.ackSeq  = poolAcked_;
+        out.ackSeq  = 0; // broadcast: per-join ackSeq would mis-ack other joins
         out.money   = poolTotal_;
         net.queueMoney(out);
         return;
     }
 
-    // Join: adopt the newest authoritative total, then re-apply whatever the
-    // host has not acked yet so a purchase made moments ago is not reverted for
-    // a round trip and then re-applied.
+    // Join: adopt the newest authoritative total. Pending re-apply used a
+    // single ackSeq shared by one peer; with 3-4 players that seq space is
+    // per-sender, so we take the host total as-is.
     if (totals.empty()) return;
     const MoneyPacket& p = totals.back().pkt;
     if (p.money < 0) return;
-    while (!poolPending_.empty() && poolPending_.front().seq <= p.ackSeq)
-        poolPending_.pop_front();
+    poolPending_.clear();
     poolAcked_ = p.ackSeq;
     int want = p.money;
-    for (std::deque<PoolDelta>::iterator it = poolPending_.begin();
-         it != poolPending_.end(); ++it)
-        want += it->delta;
     if (want < 0) want = 0;
     int cur = -1;
     if (!engine::readPlayerWallet(gw, &cur)) return;
@@ -2057,6 +2062,55 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
         Key nk; nk.t = edges[i].after[0]; nk.c = edges[i].after[1];
         nk.cs = edges[i].after[2]; nk.i = edges[i].after[3]; nk.s = edges[i].after[4];
         bool exited = (nk.t | nk.c | nk.cs | nk.i | nk.s) == 0;
+        if (publishAsWire_.find(nk) != publishAsWire_.end()) {
+            moveEcho_[serial] = nowSq;
+            continue;
+        }
+        // A peer-owned body (another player's squad). Dismissing or dragging
+        // it locally must NOT publish as our move — that dumps them into
+        // player 1's tab and/or player 2's tab. Put them back in the peer tab.
+        if (pinPeer_.count(ok) && !pinOwned_.count(ok) && !ownHands_.count(ok)) {
+            Character* pc = engine::resolveCharByHand(ok.i, ok.s, ok.t, ok.c, ok.cs);
+            if (!pc && !exited)
+                pc = engine::resolveCharByHand(nk.i, nk.s, nk.t, nk.c, nk.cs);
+            if (pc) {
+                unsigned int th[5];
+                bool haveT = false;
+                Character* pcs[80];
+                unsigned int nch = engine::listPlayerChars(gw, pcs, 80);
+                for (unsigned int j = 0; j < nch; ++j) {
+                    if (!pcs[j] || pcs[j] == pc) continue;
+                    unsigned int mh[5];
+                    if (!engine::readObjectHand(
+                            reinterpret_cast<RootObject*>(pcs[j]), mh))
+                        continue;
+                    Key mk; mk.t = mh[0]; mk.c = mh[1]; mk.cs = mh[2];
+                    mk.i = mh[3]; mk.s = mh[4];
+                    if (pinPeer_.count(mk)) {
+                        memcpy(th, mh, sizeof(th));
+                        haveT = true;
+                        break;
+                    }
+                }
+                if (haveT) engine::joinPlayerSquadAt(gw, pc, th);
+                else       engine::detachFromTownAI(pc);
+                unsigned int lh[5];
+                if (engine::readObjectHand(reinterpret_cast<RootObject*>(pc), lh)) {
+                    Key lk; lk.t = lh[0]; lk.c = lh[1]; lk.cs = lh[2];
+                    lk.i = lh[3]; lk.s = lh[4];
+                    pinPeer_.insert(lk);
+                    moveEcho_[lk.s] = nowSq;
+                }
+                moveEcho_[serial] = nowSq;
+            }
+            char sb[128];
+            _snprintf(sb, sizeof(sb) - 1,
+                      "[squad] EVT skip peer-owned old=%u,%u exit=%d (not ours to take)",
+                      ok.i, ok.s, exited ? 1 : 0);
+            sb[sizeof(sb) - 1] = '\0';
+            coop::logLine(sb);
+            continue;
+        }
         // The old hand is dead either way - drop any pin it carried (a moved
         // recruit / a re-moved member must not leave a stale claim behind).
         pinOwned_.erase(ok);
@@ -2089,6 +2143,37 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
                   ev.aType, ev.aContainer, ev.aContainerSerial, ev.aIndex, ev.aSerial,
                   exited ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::announceSquadClaim(NetLink& net, u32 ownerId,
+                                    const unsigned int wire[][5],
+                                    const unsigned int local[][5], unsigned n) {
+    for (unsigned int i = 0; i < n; ++i) {
+        Key lk; lk.t = local[i][0]; lk.c = local[i][1]; lk.cs = local[i][2];
+        lk.i = local[i][3]; lk.s = local[i][4];
+        Key wk; wk.t = wire[i][0]; wk.c = wire[i][1]; wk.cs = wire[i][2];
+        wk.i = wire[i][3]; wk.s = wire[i][4];
+        pinOwned_.insert(lk);
+        pinOwned_.insert(wk);
+        publishAsWire_[lk] = wk;
+        EventPacket ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type    = (u8)PKT_EVENT;
+        ev.event   = EVT_SQUAD_MOVE;
+        ev.ownerId = ownerId;
+        ev.eventId = nextEventId_++;
+        ev.sType = wk.t; ev.sContainer = wk.c; ev.sContainerSerial = wk.cs;
+        ev.sIndex = wk.i; ev.sSerial = wk.s;
+        ev.aType = wk.t; ev.aContainer = wk.c; ev.aContainerSerial = wk.cs;
+        ev.aIndex = wk.i; ev.aSerial = wk.s;
+        net.queueEvent(ev);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[squad] CLAIM-PIN wire=%u,%u local=%u,%u",
+                  wk.i, wk.s, lk.i, lk.s);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
     }
 }
 
@@ -2205,24 +2290,60 @@ void Replicator::applyStealthFeedback(GameWorld* gw, Inbound& in) {
     }
 }
 
+void Replicator::commitSpeedSet(GameWorld* gw, NetLink& net, u32 ownerId,
+                                float mult, bool paused, u32 reqOwner,
+                                unsigned long now) {
+    const float EPS = 0.01f;
+    if (mult < EPS) mult = 1.0f;
+    bool changed = (speedEffMult_ < 0.0f) ||
+                   (paused != speedEffPaused_) ||
+                   (fabs(mult - speedEffMult_) > EPS);
+    speedEffMult_      = mult;
+    speedEffPaused_    = paused;
+    speedLastReqOwner_ = reqOwner;
+    speedLastSet_      = paused ? 0.0f : mult;
+    // slewedEffective carries the clock brake on the host exactly as it
+    // carries the slew on the join (protocol 25). What goes out on the wire
+    // is the UNSLEWED multiplier: broadcasting the brake would slow the join
+    // by the same factor and close nothing.
+    if (engine::writeGameSpeedQuiet(gw, slewedEffective(mult), paused))
+        speedLastApplied_ = speedLastSet_;
+    SpeedPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type    = (u8)PKT_SPEED_SET;
+    pkt.ownerId = ownerId;
+    pkt.seq     = speedSeqOut_++;
+    pkt.speed   = mult; // multiplier even while paused (flag carries pause)
+    pkt.flags   = (paused ? SPEED_PAUSED : 0) |
+                  ((speedMyCombat_ || speedPeerCombat_) ? SPEED_IN_COMBAT : 0);
+    net.queueSpeed(pkt);
+    speedLastSendMs_ = now;
+    if (changed) {
+        char b[144];
+        _snprintf(b, sizeof(b) - 1,
+            "[speed] SET mult=%.2f paused=%d combat=%d owner=%u (my=%.2f peer=%.2f)",
+            mult, paused ? 1 : 0,
+            (speedMyCombat_ || speedPeerCombat_) ? 1 : 0,
+            (unsigned)reqOwner, speedMyReq_, speedPeerReq_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                            bool isHost) {
     const unsigned long RESEND_MS        = 3000; // safety resend (late join / lost state)
     const unsigned long COMBAT_SAMPLE_MS = 1000; // own-squad combat poll cadence
-    const unsigned long COMBAT_HOLD_MS   = 4000; // cap hysteresis: hold past brief gaps
+    const unsigned long COMBAT_HOLD_MS   = 4000; // hint hysteresis: hold past brief gaps
+    const unsigned long DEBOUNCE_MS      = 80;   // coalesce near-simultaneous clicks
     const float         EPS              = 0.01f;
     unsigned long now = nowMs();
 
-    // Own-squad combat flag, ~1 Hz (readCombat per owned member; the cap only
-    // needs second-level reactivity). An edge forces a REQ send below so the
-    // host's cap reacts faster than the safety resend.
+    // Own-squad combat flag, ~1 Hz. Kept for SPEED_IN_COMBAT diagnostics and
+    // KENSHICOOP_DEBUG_SPEED; it does NOT clamp game speed.
     //
-    // Hysteresis (Phase 5 spike 2026-07-17): readCombat drops to false in the
-    // gap between an enemy being KO'd and the next attacker engaging, so a raw
-    // per-sample flag makes the consensus cap FLAP (SET bounced 1x<->3x mid
-    // fight, only 0.667 of the combat window sat at 1x). Hold the cap for
-    // COMBAT_HOLD_MS past the last TRUE read so a momentary lull never releases
-    // the speed - the indicator/effective stay steady while fighting continues.
+    // Hysteresis: readCombat drops in the gap between KO and the next attacker,
+    // so a raw per-sample flag flaps the hint. Hold COMBAT_HOLD_MS past the
+    // last TRUE read so the indicator stays steady while fighting continues.
     bool combatEdge = false;
     if (speedCombatSampleMs_ == 0 || (now - speedCombatSampleMs_) >= COMBAT_SAMPLE_MS) {
         speedCombatSampleMs_ = now;
@@ -2238,47 +2359,59 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         combatEdge     = (held != speedMyCombat_);
         speedMyCombat_ = held;
     }
-    // Phase 5 spike: expose the combat-cap state so the speed-setter
-    // diagnostics (KENSHICOOP_DEBUG_SPEED) can distinguish an engine-forced
-    // combat cap from a user click by context.
     engine::setSpeedCombatHint(speedMyCombat_ || speedPeerCombat_);
 
-    // Local vote capture: the engine-setter hooks (setGameSpeed / userPause /
-    // togglePause) record every REAL user action - UI clicks, keyboard pause,
-    // RE_Kenshi controls, and the scenario's simulated writeGameSpeed clicks -
-    // INCLUDING clicks equal to the current effective, which the old state-diff
-    // detector could never see (the stuck-vote bug). Our own quiet applies are
-    // reentrancy-guarded and never register. Pause requests as speed 0; the
-    // requested multiplier survives a pause (the engine's own model), so
-    // unpausing restores the player's request, not the arbitrated effective.
+    // Local click capture. Quiet applies are reentrancy-guarded and never
+    // register. Pause is a separate last-write-wins flag from the multiplier.
     bool userActed = false;
+    int  lastKind  = engine::SPEED_INTENT_LEVEL;
     {
-        float im = 0.0f; bool ip = false;
-        while (engine::consumeSpeedIntent(gw, &im, &ip)) {
-            speedMyReq_ = ip ? 0.0f : im;
+        float im = 0.0f; bool ip = false; int kind = engine::SPEED_INTENT_LEVEL;
+        while (engine::consumeSpeedIntent(gw, &im, &ip, &kind)) {
             userActed = true;
+            lastKind  = kind;
+            if (kind == engine::SPEED_INTENT_PAUSE || ip) {
+                speedMyPaused_ = true;
+            } else if (kind == engine::SPEED_INTENT_UNPAUSE) {
+                speedMyPaused_ = false;
+                // Space-unpause keeps the consensus multiplier. A speed-tier
+                // click mislabeled as unpause still carries the new im.
+                if (im > EPS && (speedMyReq_ < 0.0f || fabs(im - speedMyReq_) > EPS)) {
+                    speedMyReq_ = im;
+                    lastKind = engine::SPEED_INTENT_LEVEL;
+                }
+            } else {
+                if (im > EPS) speedMyReq_ = im;
+                speedMyPaused_ = false;
+            }
         }
     }
     if (speedMyReq_ < 0.0f) {
-        // First tick (or hooks unavailable): seed the request from the live
-        // engine state and announce it so the peer's arbitration seeds.
+        // First tick: seed local state from the live engine. This is NOT a
+        // user click - join must not LWW-overwrite the host save speed.
         float mult = 0.0f; bool paused = false;
         if (!engine::readGameSpeed(gw, &mult, &paused)) return;
-        speedMyReq_ = paused ? 0.0f : mult;
-        userActed = true;
+        speedMyReq_    = (mult > EPS) ? mult : 1.0f;
+        speedMyPaused_ = paused;
+        if (isHost && speedEffMult_ < 0.0f) {
+            commitSpeedSet(gw, net, ownerId, speedMyReq_, speedMyPaused_,
+                           ownerId, now);
+        }
     }
     if (userActed) {
         char b[112]; _snprintf(b, sizeof(b) - 1,
-            "[speed] REQ mult=%.2f paused=%d combat=%d",
-            speedMyReq_, (speedMyReq_ <= EPS) ? 1 : 0, speedMyCombat_ ? 1 : 0);
+            "[speed] REQ mult=%.2f paused=%d combat=%d kind=%d",
+            speedMyReq_, speedMyPaused_ ? 1 : 0, speedMyCombat_ ? 1 : 0, lastKind);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // Drain peer speed packets: the host keeps the join's latest REQUEST; the
-    // join applies the host's arbitrated SET. The reliable channel is ordered,
-    // but the seq guard keeps a (theoretical) stale packet from rolling back.
+    // Drain peer speed packets. seq guard drops a stale retransmit.
     std::deque<InboundSpeed> got;
     in.drainSpeed(got);
+    bool gotPeerCmd = false;
+    float peerMult = 0.0f;
+    bool  peerPaused = false;
+    u32   peerOwner = 0;
     for (std::deque<InboundSpeed>::iterator it = got.begin(); it != got.end(); ++it) {
         const SpeedPacket& p = it->pkt;
         if (p.seq != 0 && speedSeqSeen_ != 0 && (long)(p.seq - speedSeqSeen_) <= 0)
@@ -2286,31 +2419,46 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         speedSeqSeen_ = p.seq;
         bool pkPaused = (p.flags & SPEED_PAUSED) != 0 || p.speed <= EPS;
         if (p.type == (u8)PKT_SPEED_REQ && isHost) {
-            float req = pkPaused ? 0.0f : p.speed;
+            float req = (p.speed > EPS) ? p.speed : 0.0f;
             bool  cmb = (p.flags & SPEED_IN_COMBAT) != 0;
-            if (speedPeerReq_ < 0.0f || fabs(req - speedPeerReq_) > EPS ||
+            if (speedPeerReq_ < 0.0f ||
+                (req > EPS && fabs(req - speedPeerReq_) > EPS) ||
+                pkPaused != speedEffPaused_ ||
                 cmb != speedPeerCombat_) {
                 char b[112]; _snprintf(b, sizeof(b) - 1,
                     "[speed] REQ RECV owner=%u mult=%.2f paused=%d combat=%d",
-                    (unsigned)it->ownerId, req, pkPaused ? 1 : 0, cmb ? 1 : 0);
+                    (unsigned)it->ownerId, req > EPS ? req : speedEffMult_,
+                    pkPaused ? 1 : 0, cmb ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
-            speedPeerReq_    = req;
+            if (req > EPS) speedPeerReq_ = req;
             speedPeerCombat_ = cmb;
+            // Combat-only / safety echo of the current effective is not a click.
+            bool pauseChg = pkPaused != speedEffPaused_;
+            bool unpause  = !pkPaused && speedEffPaused_;
+            bool multChg  = !pkPaused && req > EPS &&
+                            (speedEffMult_ < 0.0f || fabs(req - speedEffMult_) > EPS);
+            if (pauseChg || unpause || multChg) {
+                gotPeerCmd = true;
+                peerPaused = pkPaused;
+                peerMult   = (req > EPS) ? req : speedEffMult_;
+                peerOwner  = it->ownerId;
+            }
         } else if (p.type == (u8)PKT_SPEED_SET && !isHost) {
-            // QUIET apply: drives the sim to the arbitrated effective without
-            // touching the UI buttons - they keep showing this player's VOTE.
-            // The clock slew (protocol 25) folds in here: the join's sim runs
-            // at effective * timeSlew_ until its game clock matches the host's.
-            float eff = pkPaused ? 0.0f : p.speed;
-            if (engine::writeGameSpeedQuiet(gw, slewedEffective(eff), pkPaused)) {
-                speedLastApplied_ = eff;
-                bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
-                speedLastSet_ = eff;
-                if (changed) { // safety resends stay silent; changes are the signal
+            // QUIET apply: sim follows host effective; UI buttons keep the vote.
+            if (p.speed > EPS) speedEffMult_ = p.speed;
+            speedEffPaused_ = pkPaused;
+            float applyMult = (speedEffMult_ > EPS) ? speedEffMult_ : 1.0f;
+            if (engine::writeGameSpeedQuiet(gw, slewedEffective(applyMult), pkPaused)) {
+                speedLastApplied_ = pkPaused ? 0.0f : applyMult;
+                bool changed = (speedLastSet_ < 0.0f) ||
+                               (pkPaused != (speedLastSet_ <= EPS)) ||
+                               (!pkPaused && fabs(applyMult - speedLastSet_) > EPS);
+                speedLastSet_ = pkPaused ? 0.0f : applyMult;
+                if (changed) {
                     char b[112]; _snprintf(b, sizeof(b) - 1,
                         "[speed] SET mult=%.2f paused=%d combat=%d",
-                        eff, pkPaused ? 1 : 0,
+                        applyMult, pkPaused ? 1 : 0,
                         (p.flags & SPEED_IN_COMBAT) ? 1 : 0);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 }
@@ -2319,91 +2467,116 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     }
 
     if (isHost) {
-        // Arbitrate: effective = min(my request, peer request), capped at 1x
-        // while either player squad fights. The cap never force-unpauses -
-        // pause (0) is already below 1, so min semantics preserve it.
-        float eff = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
-        if (speedPeerReq_ >= 0.0f && speedPeerReq_ < eff) eff = speedPeerReq_;
-        bool combat = speedMyCombat_ || speedPeerCombat_;
-        if (combat && speedCombatCap_ && eff > 1.0f) eff = 1.0f;
-        bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
-        // userActed with an UNCHANGED effective = a denied raise (consensus
-        // holdback): re-apply immediately so the host engine doesn't run fast
-        // until the enforcement below - a click is a request, not an override.
-        if (changed || userActed || speedLastSendMs_ == 0 ||
-            (now - speedLastSendMs_) >= RESEND_MS) {
-            bool effPaused = (eff <= EPS);
-            // slewedEffective carries the clock brake on the host exactly as it
-            // carries the slew on the join (protocol 25). What goes out on the
-            // wire below is the UNSLEWED eff: the brake is the host's own sim
-            // running slow to let the join close a gap, and broadcasting it
-            // would slow the join by the same factor and close nothing.
-            if (engine::writeGameSpeedQuiet(gw, slewedEffective(eff), effPaused))
-                speedLastApplied_ = eff;
-            SpeedPacket pkt;
-            memset(&pkt, 0, sizeof(pkt));
-            pkt.type    = (u8)PKT_SPEED_SET;
-            pkt.ownerId = ownerId;
-            pkt.seq     = speedSeqOut_++;
-            pkt.speed   = eff;
-            pkt.flags   = (effPaused ? SPEED_PAUSED : 0) |
-                          (combat ? SPEED_IN_COMBAT : 0);
-            net.queueSpeed(pkt);
-            speedLastSet_    = eff;
-            speedLastSendMs_ = now;
-            if (changed) {
-                char b[128]; _snprintf(b, sizeof(b) - 1,
-                    "[speed] SET mult=%.2f paused=%d combat=%d (my=%.2f peer=%.2f)",
-                    eff, effPaused ? 1 : 0, combat ? 1 : 0,
-                    speedMyReq_, speedPeerReq_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // Last processed this tick wins: local click first, then peer REQ.
+        bool haveCmd = false;
+        float cmdMult = speedEffMult_;
+        bool  cmdPaused = speedEffPaused_;
+        u32   cmdOwner = speedLastReqOwner_;
+        if (userActed) {
+            haveCmd   = true;
+            cmdPaused = speedMyPaused_;
+            if (speedMyPaused_ || lastKind == engine::SPEED_INTENT_UNPAUSE)
+                cmdMult = (speedEffMult_ > EPS) ? speedEffMult_ : speedMyReq_;
+            else
+                cmdMult = (speedMyReq_ > EPS) ? speedMyReq_ : 1.0f;
+            cmdOwner = ownerId;
+        }
+        if (gotPeerCmd) {
+            haveCmd   = true;
+            cmdPaused = peerPaused;
+            if (peerPaused)
+                cmdMult = (speedEffMult_ > EPS) ? speedEffMult_ : peerMult;
+            else
+                cmdMult = (peerMult > EPS) ? peerMult : speedEffMult_;
+            cmdOwner = peerOwner;
+        }
+        if (haveCmd) {
+            bool same = (speedEffMult_ >= 0.0f) &&
+                        (cmdPaused == speedEffPaused_) &&
+                        (cmdMult > EPS) && (fabs(cmdMult - speedEffMult_) <= EPS);
+            if (!same) {
+                if (speedDebounceUntilMs_ == 0 || now >= speedDebounceUntilMs_) {
+                    commitSpeedSet(gw, net, ownerId, cmdMult, cmdPaused,
+                                   cmdOwner, now);
+                    speedDebounceUntilMs_ = now + DEBOUNCE_MS;
+                    speedPendHave_ = false;
+                } else {
+                    speedPendHave_    = true;
+                    speedPendMult_    = cmdMult;
+                    speedPendPaused_  = cmdPaused;
+                    speedPendOwner_   = cmdOwner;
+                }
             }
         }
+        if (speedPendHave_ && now >= speedDebounceUntilMs_) {
+            bool samePend = (speedEffMult_ >= 0.0f) &&
+                            (speedPendPaused_ == speedEffPaused_) &&
+                            (fabs(speedPendMult_ - speedEffMult_) <= EPS);
+            speedPendHave_ = false;
+            if (!samePend) {
+                commitSpeedSet(gw, net, ownerId, speedPendMult_, speedPendPaused_,
+                               speedPendOwner_, now);
+                speedDebounceUntilMs_ = now + DEBOUNCE_MS;
+            } else {
+                speedDebounceUntilMs_ = 0;
+            }
+        }
+        // Safety resend of the current effective (late join / lost SET).
+        if (speedEffMult_ >= 0.0f &&
+            (speedLastSendMs_ == 0 || (now - speedLastSendMs_) >= RESEND_MS)) {
+            commitSpeedSet(gw, net, ownerId, speedEffMult_, speedEffPaused_,
+                           speedLastReqOwner_ ? speedLastReqOwner_ : ownerId, now);
+        }
     } else {
-        // Join: send our request on change / combat edge / safety resend.
-        if (userActed || combatEdge || speedLastSendMs_ == 0 ||
-            (now - speedLastSendMs_) >= RESEND_MS) {
+        // Join: real clicks send the command. Combat-edge / safety resend echo
+        // the last SET so they cannot LWW-clobber a host 5x with a local 1x vote.
+        bool sendNow = userActed || combatEdge ||
+                       (speedEffMult_ >= 0.0f && speedLastSendMs_ == 0) ||
+                       (speedEffMult_ >= 0.0f && (now - speedLastSendMs_) >= RESEND_MS);
+        if (sendNow && (userActed || speedEffMult_ >= 0.0f)) {
+            float sendMult;
+            bool  sendPaused;
+            if (userActed) {
+                sendPaused = speedMyPaused_;
+                if (sendPaused || lastKind == engine::SPEED_INTENT_UNPAUSE)
+                    sendMult = (speedEffMult_ > EPS) ? speedEffMult_ : speedMyReq_;
+                else
+                    sendMult = (speedMyReq_ > EPS) ? speedMyReq_ : 1.0f;
+            } else {
+                sendMult   = (speedEffMult_ > EPS) ? speedEffMult_ : 1.0f;
+                sendPaused = speedEffPaused_;
+            }
             SpeedPacket pkt;
             memset(&pkt, 0, sizeof(pkt));
             pkt.type    = (u8)PKT_SPEED_REQ;
             pkt.ownerId = ownerId;
             pkt.seq     = speedSeqOut_++;
-            pkt.speed   = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
-            pkt.flags   = ((speedMyReq_ >= 0.0f && speedMyReq_ <= EPS) ? SPEED_PAUSED : 0) |
+            pkt.speed   = sendMult;
+            pkt.flags   = (sendPaused ? SPEED_PAUSED : 0) |
                           (speedMyCombat_ ? SPEED_IN_COMBAT : 0);
             net.queueSpeed(pkt);
             speedLastSendMs_ = now;
         }
     }
 
-    // Continuous enforcement (replaces the old snap-back): a REAL user click
-    // passes through the hooked setters, so the engine briefly leaves the
-    // effective (e.g. a denied raise runs fast for one tick, a local unpause
-    // resumes while the peer still holds pause). Re-assert the effective
-    // quietly whenever the engine diverges - the click stays captured as a
-    // VOTE above, the sim never keeps a non-arbitrated speed, and the buttons
-    // keep showing the vote.
-    if (speedLastSet_ >= 0.0f) {
+    // Continuous enforcement: a real click briefly leaves the effective; re-
+    // assert quietly. Buttons keep showing the local vote.
+    if (speedEffMult_ >= 0.0f) {
         float mult = 0.0f; bool paused = false;
         if (engine::readGameSpeed(gw, &mult, &paused)) {
-            float cur = paused ? 0.0f : mult;
-            // The enforcement target carries the clock slew (protocol 25):
-            // comparing against the UNSLEWED effective would revert the slew
-            // write every tick and the join's clock could never catch up.
-            float want = slewedEffective(speedLastSet_);
+            float cur  = paused ? 0.0f : mult;
+            float want = speedEffPaused_ ? 0.0f : slewedEffective(speedEffMult_);
             if (fabs(cur - want) > EPS) {
-                if (engine::writeGameSpeedQuiet(gw, want, speedLastSet_ <= EPS))
+                if (engine::writeGameSpeedQuiet(gw, slewedEffective(speedEffMult_),
+                                                speedEffPaused_))
                     speedLastApplied_ = speedLastSet_;
             }
         }
     }
 
-    // Phase 5 continuous indicator reconcile: the buttons show the VOTE, but
-    // engine-forced changes (dialog auto-pause re-highlight, the combat cap, a
-    // denied write's dehighlight) drag the MyGUI highlight off it. Unless the
-    // player acted THIS tick (in which case the new click owns the highlight),
-    // snap the buttons back to the captured vote so the indicator self-heals
-    // within a frame and always reflects the player's request.
+    // Phase 5 continuous indicator reconcile: buttons show the VOTE; engine-
+    // forced changes drag the highlight off it. Skip when the player acted
+    // this tick so a genuine same-frame click is not fought.
     if (!userActed) engine::reconcileVoteButtons();
 }
 

@@ -1129,8 +1129,13 @@ bool knockDown(Character* c, bool on) {
             // well past the re-arm interval. Fall back to ragdoll if unresolved.
             if (g_knockoutFn || g_knockoutForceFn) {
                 MedicalSystem* med = &c->medical;
-                if (g_knockoutFn)      g_knockoutFn(med, 1.0f);
-                if (g_knockoutForceFn) g_knockoutForceFn(med, 8.0f);
+                if (g_knockoutFn) g_knockoutFn(med, 1.0f);
+                // knockout() already sets knockoutTimer from toughness. Forcing
+                // 8.0 every collapse made the Unconscious UI jump 7-8 s (and
+                // holdDown used to re-stamp 8.0 every tick). Only top a nearly
+                // expired timer so the wake AI cannot stand the copy up.
+                if (g_knockoutForceFn && med->knockoutTimer < 1.5f)
+                    g_knockoutForceFn(med, 2.0f);
                 return true;
             }
             if (g_ragdollModeFn) { g_ragdollModeFn(c, true, RagdollPart::WHOLE); return true; }
@@ -1155,8 +1160,13 @@ bool knockDown(Character* c, bool on) {
 bool holdDown(Character* c) {
     if (!c) return false;
     __try {
-        if (g_knockoutForceFn) { g_knockoutForceFn(&c->medical, 8.0f); return true; }
-        return false;
+        if (!g_knockoutForceFn) return false;
+        // Do not stamp 8.0 every frame: the medical GUI counts knockoutTimer
+        // down, so a per-tick 8s force looked like the Unconscious time
+        // jumping 7-8 seconds. Keep a 1.5s floor so the copy cannot wake.
+        if (c->medical.knockoutTimer < 1.5f)
+            g_knockoutForceFn(&c->medical, 2.0f);
+        return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -1243,6 +1253,139 @@ bool setupSquadScene(GameWorld* gw) {
         coop::logLine("SETUP(squad): member dump faulted");
     }
     return ra || rb;
+}
+
+bool claimJoinSquadTab(GameWorld* gw, unsigned int playerId, unsigned int nPlayers,
+                       unsigned int wireHands[][5], unsigned int localHands[][5],
+                       unsigned int* outN) {
+    if (outN) *outN = 0;
+    if (!gw || !gw->player || playerId == 0u) {
+        coop::logLine("[squad] CLAIM skipped (no player / host id)");
+        return false;
+    }
+    if (nPlayers < 2u) nPlayers = 2u;
+    if (nPlayers > coop::MAX_PLAYERS) nPlayers = coop::MAX_PLAYERS;
+    if (playerId >= nPlayers) nPlayers = playerId + 1u;
+
+    PlayerInterface* pl = gw->player;
+    Character* picks[16];
+    unsigned int nPick = 0;
+    unsigned int n = 0;
+    unsigned int nTab = 0;
+    unsigned int tabs[16][2];
+    unsigned int lh1 = 0, lh2 = 0;
+    bool haveLeader = false;
+    __try {
+        n = pl->playerCharacters.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            Character* c = pl->playerCharacters[i];
+            if (!c) continue;
+            unsigned int h[5];
+            if (!readObjectHand(static_cast<RootObject*>(c), h)) continue;
+            if (i == 0) { lh1 = h[1]; lh2 = h[2]; haveLeader = true; }
+            bool seen = false;
+            for (unsigned int t = 0; t < nTab; ++t)
+                if (tabs[t][0] == h[1] && tabs[t][1] == h[2]) { seen = true; break; }
+            if (!seen && nTab < 16) {
+                tabs[nTab][0] = h[1]; tabs[nTab][1] = h[2];
+                ++nTab;
+            }
+            // Round-robin share: host keeps i%nPlayers==0 (includes leader).
+            // Never steal a body already sitting in another tab.
+            if (i > 0 && (i % nPlayers) == playerId && nPick < 16) {
+                if (!haveLeader || (h[1] == lh1 && h[2] == lh2))
+                    picks[nPick++] = c;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[squad] CLAIM census faulted");
+        return false;
+    }
+
+    char hdr[176];
+    _snprintf(hdr, sizeof(hdr) - 1,
+              "[squad] CLAIM playerId=%u nPlayers=%u pcs=%u tabs=%u take=%u leaderTab=%u,%u",
+              playerId, nPlayers, n, nTab, nPick, lh1, lh2);
+    hdr[sizeof(hdr) - 1] = '\0';
+    coop::logLine(hdr);
+
+    if (nTab >= playerId + 1u && nPick == 0) {
+        coop::logLine("[squad] CLAIM skipped (enough tabs already)");
+        return false;
+    }
+
+    // Never spawn wanderers. Dismissing people used to trip this path and
+    // mint a brand-new Nameless tab full of random recruits.
+    if (nPick == 0) {
+        coop::logLine("[squad] CLAIM skipped (no extra bodies in leader tab)");
+        return false;
+    }
+
+    unsigned int wires[16][5];
+    memset(wires, 0, sizeof(wires));
+    for (unsigned int p = 0; p < nPick; ++p) {
+        if (!readObjectHand(static_cast<RootObject*>(picks[p]), wires[p]))
+            memset(wires[p], 0, sizeof(wires[p]));
+    }
+
+    // Seed the roster baseline BEFORE the detach so pollSquadRoster later this
+    // tick sees MOVEs (protocol 35) rather than brand-new pointers.
+    pollSquadRoster(gw);
+    bool sep = detachFromTownAI(picks[0]);
+    coop::logLine(sep ? "[squad] CLAIM separated first body into own platoon (join tab)"
+                      : "[squad] CLAIM separateIntoMyOwnSquad FAILED");
+    if (!sep) return false;
+
+    unsigned int moved = 1;
+    unsigned int tHand[5];
+    if (readObjectHand(static_cast<RootObject*>(picks[0]), tHand)) {
+        for (unsigned int p = 1; p < nPick; ++p) {
+            unsigned int mHand[5], before[5], after[5];
+            if (!readObjectHand(static_cast<RootObject*>(picks[p]), mHand)) continue;
+            int r = probeMoveSquadMember(gw, mHand, tHand, 1, before, after);
+            if (r == 1) ++moved;
+            char mb[128];
+            _snprintf(mb, sizeof(mb) - 1, "[squad] CLAIM follow r=%d member=%u", r, p);
+            mb[sizeof(mb) - 1] = '\0';
+            coop::logLine(mb);
+        }
+    }
+
+    char sum[96];
+    _snprintf(sum, sizeof(sum) - 1, "[squad] CLAIM moved=%u into join tab", moved);
+    sum[sizeof(sum) - 1] = '\0';
+    coop::logLine(sum);
+
+    if (wireHands && localHands && outN) {
+        unsigned int wn = 0;
+        for (unsigned int p = 0; p < nPick && wn < 16; ++p) {
+            unsigned int lh[5];
+            if (!readObjectHand(static_cast<RootObject*>(picks[p]), lh)) continue;
+            memcpy(wireHands[wn], wires[p], 5 * sizeof(unsigned int));
+            memcpy(localHands[wn], lh, 5 * sizeof(unsigned int));
+            ++wn;
+        }
+        *outN = wn;
+    }
+
+    __try {
+        unsigned int nn = pl->playerCharacters.size();
+        for (unsigned int i = 0; i < nn; ++i) {
+            Character* c = pl->playerCharacters[i];
+            if (!c) continue;
+            unsigned int h[5];
+            if (!readObjectHand(static_cast<RootObject*>(c), h)) continue;
+            char b2[160];
+            _snprintf(b2, sizeof(b2) - 1,
+                      "[squad] CLAIM member[%u] idx=%u,%u container(tab)=%u,%u",
+                      i, h[3], h[4], h[1], h[2]);
+            b2[sizeof(b2) - 1] = '\0';
+            coop::logLine(b2);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[squad] CLAIM member dump faulted");
+    }
+    return true;
 }
 
 // 'splitfar' setup scene (far-apart desync fixture bake): move every player-squad
@@ -1481,6 +1624,23 @@ bool restoreMovement(Character* c) {
 // position as exactly one tenth of CharMovement::pos on the same body, and the
 // owner's physics velocity as one tenth of its world crawl speed.
 static const float PHYS_UNIT_SCALE = 0.1f;
+
+bool applyHavokPos(Character* c, float x, float y, float z) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv || !mv->havokCharacter) return false;
+        HavokCharacter* hk = mv->havokCharacter;
+        float* q = reinterpret_cast<float*>(&hk->position);
+        q[0] = x * PHYS_UNIT_SCALE;
+        q[1] = y * PHYS_UNIT_SCALE;
+        q[2] = z * PHYS_UNIT_SCALE;
+        hk->positionChanged = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
 bool applyPhysMotion(Character* c, float dirX, float dirY, float dirZ, float speed) {
     if (!c) return false;

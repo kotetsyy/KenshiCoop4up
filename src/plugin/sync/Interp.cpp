@@ -29,6 +29,12 @@ EntityInterp::EntityInterp()
       avgIntervalMs_(50.0f), jitterMs_(0.0f), lagMs_(0.0f), haveLast_(false),
       lastMode_(SM_NONE), lastDelay_(0) {}
 
+void EntityInterp::clear() {
+    count_ = 0; head_ = 0; lastArrival_ = 0;
+    avgIntervalMs_ = 50.0f; jitterMs_ = 0.0f; lagMs_ = 0.0f;
+    haveLast_ = false; lastMode_ = SM_NONE; lastDelay_ = 0;
+}
+
 const EntityInterp::Snap& EntityInterp::at(int i) const {
     // ring_ holds the last count_ snapshots; head_ points past the newest.
     int idx = head_ - count_ + i;

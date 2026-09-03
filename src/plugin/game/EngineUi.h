@@ -19,32 +19,54 @@ namespace engine {
 // MyGUI comboboxes/editboxes have no usable RVAs and don't receive keyboard focus
 // during gameplay) and Connect/Disconnect. The friend's Steam ID is entered by
 // clipboard: "Copy my Steam ID" puts the player's own id on the clipboard to
-// share, and "Paste friend's Steam ID" reads the friend's id back in (per-session,
-// never written to disk). The UDP endpoint (ip/port) still comes from
-// coop_config.json. The GUI layer stays session-agnostic: live status is passed IN
-// via *st and the user's actions are handed BACK through the callbacks (the plugin
-// root owns the session/config wiring). Main-thread only; SEH-guarded.
+// share, and "Paste friend's Steam ID" reads the friend's id back in. A paste
+// (and a successful Connect) is remembered in coop_config.json so the next
+// launch pre-fills the same Steam ID / UDP endpoint. The GUI layer stays
+// session-agnostic: live status is passed IN via *st and the user's actions
+// are handed BACK through the callbacks (the plugin root owns the
+// session/config wiring). Main-thread only; SEH-guarded.
 struct CoopPanelState {
     unsigned long long selfSteamId; // steamp2p::selfId (0 = Steam not up)
     unsigned long long peerSteamId; // config steamPeer fallback (0 = unset; pasted id wins)
+    unsigned long long peerSteamId2;// extra host friends from config (slot 1)
+    unsigned long long peerSteamId3;// extra host friends from config (slot 2)
     bool               running;     // net thread up
     bool               peerPresent; // peer connected
     bool               isHost;      // current armed role (seeds the Host toggle)
     int                transportSel;// current armed transport (0 steam, 1 udp)
+    const char*        udpIp;       // last remembered UDP host (join); may be empty
+    int                udpPort;     // last remembered UDP port (0 = default)
     const char*        detail;      // one-line status string for the panel/overlay
     // Join-side save-transfer status (null when not streaming): byte-level
     // progress the one-line detail above has no room for, shown on the F2 panel
     // while a join receives the host's world (e.g. "Streaming host world... 42%
     // (3.1/7.4 MB)"). Set by coopPanelDrive, rendered in dbgVal.
     const char*        transferDetail;
+    // Self-update status, and only when it is ACTIONABLE (an update installed and
+    // waiting on a restart, or a check that failed) - null the rest of the time.
+    // Takes the debug line ahead of everything else: a player whose DLL is stale
+    // cannot connect at all, so "restart to finish updating" outranks any
+    // connection detail that line would otherwise carry.
+    const char*        updateDetail;
 };
 // The panel's role/transport selections at the moment Connect is hit. peerId is the
 // Steam ID pasted in-panel this session (0 if none), and overrides the config
 // steamPeer in coopUiConnect; the UDP endpoint is re-read from the config there.
 typedef void (*CoopConnectFn)(bool isHost, bool useSteam, unsigned long long peerId);
 typedef void (*CoopDisconnectFn)();
+// Fired after a paste (Steam ID or UDP endpoint) so the plugin can write
+// coop_config.json. isHost/useSteam are the panel's armed toggles at paste time.
+typedef void (*CoopRememberFn)(bool isHost, bool useSteam);
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect);
+                   CoopDisconnectFn onDisconnect, CoopRememberFn onRemember);
+
+// Steam IDs pasted in the F2 panel this session (host may paste several).
+int                coopPanelPastedCount();
+unsigned long long coopPanelPastedId(int i);
+// UDP endpoint pasted (or seeded from config) this session. Empty ip / 0 port
+// means the join has not set one in-panel; Connect then uses coop_config.json.
+const char*        coopPanelUdpIp();
+int                coopPanelUdpPort();
 
 // Persistent co-op connection-status banner: a single screen-space label fixed 10
 // px in from the top-left corner (a createFloatingLabel MyGUI::Window on the

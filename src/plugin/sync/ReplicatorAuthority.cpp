@@ -349,6 +349,20 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             reconcileProxy(chars[i], states[i], proxyKeyOf);
             continue;
         }
+        // Never hide a player-squad body. A join claim re-containers it into a
+        // local tab whose hand is not in keep/census; suppressNpc then
+        // setVisible(false)'s the 3rd player on everyone else's screen.
+        if (engine::isLocalPlayerChar(gw, chars[i])) {
+            Key pk = keyOf(states[i]);
+            std::map<Key, Character*>::iterator ps = suppressed_.find(pk);
+            if (ps != suppressed_.end()) {
+                engine::restoreNpc(gw, chars[i]);
+                suppressed_.erase(ps);
+            }
+            authCount_[pk].unstreamed = 0;
+            ++authSkip;
+            continue;
+        }
         Key k = keyOf(states[i]);
         // Presence authority: not every body here answers to us.
         if (authorHoldsBody(gw, localId, k, chars[i], states[i].x, states[i].z)) {
@@ -478,6 +492,17 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             if (nearSet.find(wChars[i]) != nearSet.end()) continue;
             if (proxyChars.find(wChars[i]) != proxyChars.end()) {
                 reconcileProxy(wChars[i], wStates[i], proxyKeyOf);
+                continue;
+            }
+            if (engine::isLocalPlayerChar(gw, wChars[i])) {
+                Key pk = keyOf(wStates[i]);
+                std::map<Key, Character*>::iterator ps = suppressed_.find(pk);
+                if (ps != suppressed_.end()) {
+                    engine::restoreNpc(gw, wChars[i]);
+                    suppressed_.erase(ps);
+                }
+                authCount_[pk].unstreamed = 0;
+                ++authSkip;
                 continue;
             }
             // Phase 2 mid-band tier: a DRIVEN body used to skip this pass
@@ -631,6 +656,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             // (pointer identity survives the re-containering); never re-hide a
             // body applyTargets drove this tick.
             if (drivenChars_.find(it->second) != drivenChars_.end()) { ++it; continue; }
+            if (engine::isLocalPlayerChar(gw, it->second)) {
+                engine::restoreNpc(gw, it->second);
+                suppressed_.erase(it++);
+                continue;
+            }
             engine::suppressNpc(gw, it->second);
             ++it;
         }

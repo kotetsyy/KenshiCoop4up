@@ -66,7 +66,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;winhttp.lib;crypt32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Harness|x64'">
@@ -89,7 +89,7 @@
            RVA in a text map. The PDB is useless without a tool that reads it. -->
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(OutDir)KenshiCoop.map</MapFileName>
-      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;winhttp.lib;crypt32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -109,7 +109,7 @@
       <ProgramDatabaseFile>$(OutDir)KenshiCoop.pdb</ProgramDatabaseFile>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(OutDir)KenshiCoop.map</MapFileName>
-      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;winhttp.lib;crypt32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -125,6 +125,7 @@
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="net\SteamInvite.cpp" />
+    <ClCompile Include="net\Updater.cpp" />
     <ClCompile Include="game\EngineInternal.cpp" />
     <ClCompile Include="game\EngineEntity.cpp" />
     <ClCompile Include="game\EngineUi.cpp" />
