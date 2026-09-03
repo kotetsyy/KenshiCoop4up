@@ -4,6 +4,7 @@
 #include "Updater.h"
 #include "../CoopLog.h"
 #include "../core/Config.h"
+#include "../core/SemVer.h" // version ordering (unit-tested in prototest)
 
 #include <windows.h>
 #include <winhttp.h>
@@ -331,6 +332,23 @@ DWORD WINAPI threadEntry(LPVOID) {
     if (ver.empty() || sha.size() != 64 || url.empty()) {
         setStatus("manifest incomplete (need version, sha256, url)");
         return 0;
+    }
+    // Refuse to go BACKWARDS unless the manifest says to. A deliberate rollback
+    // stays possible (allowDowngrade=1); an accidental one - a manifest built
+    // from a stale checkout - no longer drags every player back with it. When
+    // either side will not parse we cannot order them, so the old behaviour
+    // stands: different means install. That keeps a mangled version string
+    // recoverable by publishing a good one, instead of wedging every client.
+    {
+        coop::Ver mine = coop::parseVer(g_buildVersion);
+        coop::Ver theirs = coop::parseVer(ver);
+        bool allowDown = (m["allowDowngrade"] == "1" || m["allowDowngrade"] == "true");
+        if (mine.ok && theirs.ok && !allowDown && coop::cmpVer(theirs, mine) < 0) {
+            setStatus("published %s is OLDER than this build %s - ignoring "
+                      "(set allowDowngrade=1 in the manifest to force it)",
+                      ver.c_str(), g_buildVersion.c_str());
+            return 0;
+        }
     }
     if (ver == g_buildVersion) {
         // Same release id, but the GitHub asset may have been replaced in place

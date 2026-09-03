@@ -34,9 +34,18 @@ const u16 PROTOCOL_VERSION = 58;
 // exists. Two builds can share a protocol (a bug fix that changes no packet) and
 // still differ here; a protocol bump should always come with a bump here, since
 // it is the thing that makes everyone else's copy stale.
+// MAJOR.MINOR.PATCH. The updater ORDERS these (a missing component reads as 0)
+// and installs only what is newer, so the sequence must never go backwards:
+// 0.1.0 -> 0.1.1 -> ... -> 0.2.0 for a bigger change.
 // Bump this in the same commit as the git tag, and put the same string in
 // dist/UPDATE.txt when publishing.
-const char* const COOP_BUILD_VERSION = "0.57";
+//
+// The 0.5x line before this used a flat, unordered id and clients compared it
+// by equality alone. Renumbering to 0.1.0 was done in the SAME release that
+// introduced ordering, which is the only moment it was free: those clients
+// install whatever the manifest names regardless of order, so they follow the
+// renumber, and every build after this one is ordered and monotonic.
+const char* const COOP_BUILD_VERSION = "0.1.0";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;

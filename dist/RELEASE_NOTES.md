@@ -1,354 +1,127 @@
-# v0.57 — in-place release edits reach the updater
+# v0.1.0 — panel cleanup, and version numbering restarts here
 
 Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
-author wrote the mod. Protocol **58**.
+author wrote the mod. Protocol **58** — unchanged, so this connects to v0.5x.
 
-Tiny fixes (window size, labels) now **replace the files on the same GitHub
-release** instead of minting v0.58, v0.59, … The updater still checks
-`version=`, and if that matches it also compares SHA-256 of the DLL on disk
-to the manifest. A replaced asset with a new hash is downloaded even though
-the version string did not change.
+> **The version number went "down" on purpose.** This is the same line of work
+> that ended at v0.57, renumbered to `MAJOR.MINOR.PATCH` starting at 0.1.0.
+> Nothing was rolled back. Read the next section before assuming a mistake.
 
-First install still needs `KenshiCoop.dll` + `RE_Kenshi.json` + `KenshiCoop.mod`
-from the release. Later updates are DLL-only.
+## Version numbering restarts at 0.1.0
 
----
+Until now the updater compared build ids for **equality only** — it could not
+tell an upgrade from a downgrade, and installed either. A manifest naming an
+older build would have pushed every player back onto it, which is fine as a
+deliberate rollback and very bad as an accident.
 
-# v0.57 — мелкие правки без новой версии (Русский)
+This release orders versions properly: `MAJOR.MINOR.PATCH`, missing components
+read as 0, and a build installs **only when it is newer**. A deliberate rollback
+is still possible with `allowDowngrade=1` in the manifest.
 
-Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**. Протокол **58**.
+The renumber had to ship in this exact release. By the new rules `0.57` parses
+as 0.57.0 and outranks `0.1.0`, so a client already ordering versions would
+refuse to move — but clients on v0.5x still compare by equality, so they take
+this build regardless. That window closes now: 0.1.0 → 0.1.1 → 0.2.0 from here,
+always forward.
 
-Мелкие фиксы (размер окна, подписи) теперь **подменяют файлы в том же релизе**,
-а не плодят v0.58, v0.59. Апдейтер смотрит `version=` и, если она совпала, ещё
-SHA-256 DLL на диске. Подменённый файл с новым хешем скачивается, даже если
-номер версии не менялся.
+## Panel changes
 
-Первая установка: DLL + `RE_Kenshi.json` + `KenshiCoop.mod`. Дальше — только DLL.
+- **The host no longer has Steam ID paste rows.** They were never needed: the
+  host accepts whoever dials in, so it does not have to know an id in advance.
+  Three "Friend N" rows made a two-player setup look like a four-step chore.
+- **The join no longer shows its own Steam ID.** Nobody needs it. Two masked
+  ids side by side — yours and the host's — only invited pasting the wrong one.
+  What each side actually needs is what it now shows: the host publishes its id,
+  the join pastes one.
+- **Your own id is labelled.** It used to render as a bare `****1843` with
+  nothing saying what it was.
+- **The window is trimmed** from 72% of screen height to 40%. It was sized for
+  its worst case and every layout left two thirds empty rust.
 
----
-
-# v0.56 — clearer F2 nick + UDP address field
-
-Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
-author wrote the mod.
-
-Protocol **58** — unchanged. Everyone still needs the same DLL.
-
-## What changed
-
-- **Your nick** is a labelled row above the type-in box, so it is obvious what
-  the field is. The box no longer sits on top of the connection-status line.
-- **UDP:** a matching type-in **Host IP:port** / **UDP IP:port** field. Steam
-  ID copy/paste rows hide when Transport is UDP.
-- **Release assets** now include `RE_Kenshi.json` and `KenshiCoop.mod` next to
-  the DLL. First-time install needs all three; later updates still only replace
-  the DLL.
-
-## Install
-
-From this release, put these in `<Kenshi>\mods\KenshiCoop\`:
-
-- `KenshiCoop.dll`
-- `RE_Kenshi.json` (RE_Kenshi will not load the plugin without it)
-- `KenshiCoop.mod` (so it appears in the Mods menu)
-
-If you already have that folder from an earlier build, only the DLL is required.
-Requires Kenshi 1.0.65 and [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
-
----
-
-# v0.56 — понятный ник в F2 и поле UDP (Русский)
-
-Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, автор мода —
-он.
-
-Протокол **58**, не менялся. DLL всё равно нужна одна и та же.
-
-## Что изменилось
-
-- **Your nick** — отдельная подпись над полем, чтобы было ясно, что это ник.
-  Бокс больше не наезжает на строку статуса.
-- **UDP:** такое же поле **Host IP:port** / **UDP IP:port**. Строки Steam ID
-  в режиме UDP скрыты.
-- **В релизе теперь три файла:** DLL, `RE_Kenshi.json` и `KenshiCoop.mod`.
-  Первая установка — все три; обновление — только DLL.
-
-## Установка
-
-Из этого релиза положите в `<Kenshi>\mods\KenshiCoop\`:
-
-- `KenshiCoop.dll`
-- `RE_Kenshi.json` (без него RE_Kenshi не загрузит плагин)
-- `KenshiCoop.mod` (чтобы мод был в меню Mods)
-
-Если папка уже есть со старой сборки, достаточно новой DLL. Нужны Kenshi 1.0.65
-и [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
-
----
-
-# v0.55 — type a nick in F2
-
-Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
-author wrote the mod.
-
-Protocol **58** — unchanged, so v0.54 and v0.55 still connect to each other.
-Everyone still needs the same DLL.
-
-## What changed
-
-**The F2 Nick row is a real text field.** Click **Nick** and type. v0.54 only
-accepted a clipboard paste because the panel has no normal edit boxes; this
-build uses Kenshi's own `setLineTextEditable` row (the same type as typed
-numbers on sliders). Connection-status updates no longer rebuild the whole
-panel, so the caret is not wiped while you type.
-
-Set the nick **before** going ONLINE so HELLO / WELCOME carries it. It is
-still written onto the squad unit you own, and remembered in
-`coop_config.json`.
+A fit-to-content resize was tried first and reverted: `getContentHeight()` does
+not return the units `resize()` consumes, so the panel clipped its own toggle
+buttons off the bottom edge after a role switch. The reasoning is recorded in
+the code so the next attempt does not repeat it.
 
 ## Still not tested
 
-- **Typing in the Nick field has not been through a live session.** If keys
-  still go to the camera after you click the row, say so — that is the MyGUI
-  focus risk.
-- **The nick on the claimed unit** is still unconfirmed in 2p.
-- **The loot use-after-free fix from v0.52** is still unconfirmed in 2p.
-- **Three and four players** are implemented but unvalidated.
-
-## Install
-
-If you are already on v0.54 with updates enabled, the in-game updater will
-fetch this. Otherwise put `KenshiCoop.dll` at
-`<Kenshi>\mods\KenshiCoop\KenshiCoop.dll`, with the game closed. Requires
-Kenshi 1.0.65 and [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
-
----
-
-# v0.55 — набор ника в F2 (Русский)
-
-Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, автор мода —
-он.
-
-Протокол **58**, не менялся: v0.54 и v0.55 по-прежнему соединяются. DLL всё
-равно нужна одна и та же.
-
-## Что изменилось
-
-**Строка Nick в F2 — настоящее поле ввода.** Кликни **Nick** и печатай. В
-v0.54 ник только вставлялся из буфера: у панели нет обычных edit box. Эта
-сборка берёт штатную строку Kenshi `setLineTextEditable` (как цифры на
-слайдерах). Статус соединения больше не пересобирает всю панель, чтобы
-курсор не сбрасывался во время набора.
-
-Задай ник **до** ONLINE, чтобы он ушёл в HELLO / WELCOME. Он по-прежнему
-ставится на юнит в твоём отряде и запоминается в `coop_config.json`.
-
-## Что по-прежнему не проверено
-
-- **Набор в поле Nick не проходил живую сессию.** Если после клика клавиши
-  всё равно идут в камеру — напишите, это риск фокуса MyGUI.
-- **Ник на юните в отряде** всё ещё без живой проверки на двоих.
-- **Фикс вылета на луте из v0.52** всё ещё без живой проверки на двоих.
-- **Трое и четверо игроков** реализованы, но не проверены.
-
-## Установка
-
-Если вы уже на v0.54 с обновлениями, апдейтер подтянет сам. Иначе положите
-`KenshiCoop.dll` в `<Kenshi>\mods\KenshiCoop\KenshiCoop.dll` при закрытой игре.
-Нужны Kenshi 1.0.65 и [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
-
----
-
-# v0.54 — F2 nick on the squad unit you play
-
-Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
-author wrote the mod.
-
-Protocol **58** — unchanged, so v0.53 and v0.54 still connect to each other.
-Everyone still needs the same DLL: this is a feature drop, not a wire break.
-
-## What changed
-
-**Paste a display nick in the F2 Co-op Session panel.** The panel still has no
-text field, so it works like Steam ID: copy a name, click **Nick**, and the
-row shows what it captured. It is remembered in `coop_config.json`.
-
-When you join (or host), that nick is sent in the existing HELLO / WELCOME
-name field and written onto the squad unit you own, so the nametag tells you
-who to play. Paste it **before** going ONLINE so the handshake carries it.
-
-```
-Nick: Alice    (click to re-paste)
-```
-
-## Still not tested
-
-- **The nick itself has not been through a live two-player session.** Check:
-  both players paste a nick, go online, and the claimed unit's nametag matches.
-  The log should show `[coop-ui] paste nick` then `[nick] applied id=…`.
-- **The loot use-after-free fix from v0.52** is still unconfirmed in 2p.
-- **Three and four players** are implemented but unvalidated.
-
-## Install
-
-If you are already on v0.53 with updates enabled, the in-game updater will
-fetch this. Otherwise put `KenshiCoop.dll` at
-`<Kenshi>\mods\KenshiCoop\KenshiCoop.dll`, with the game closed. Requires
-Kenshi 1.0.65 and [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
-
----
-
-# v0.54 — ник из F2 на юните в отряде (Русский)
-
-Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, автор мода —
-он.
-
-Протокол **58**, не менялся: v0.53 и v0.54 по-прежнему соединяются. DLL всё
-равно нужна одна и та же — это фича, не смена провода.
-
-## Что изменилось
-
-**В панели F2 можно задать ник.** Поля ввода нет, поэтому как со Steam ID:
-скопируйте имя, нажмите **Nick**, панель покажет, что вставила. Запоминается
-в `coop_config.json`.
-
-При входе на сервер ник уходит в уже существующее поле имени в HELLO / WELCOME
-и ставится на юнит в вашем отряде — по табличке видно, за кого играть. Вставьте
-ник **до** ONLINE, чтобы он попал в рукопожатие.
-
-```
-Nick: Alice    (click to re-paste)
-```
-
-## Что по-прежнему не проверено
-
-- **Сам ник не прошёл живую сессию на двоих.** Проверка: оба вставили ник,
-  зашли, табличка на своём юните совпадает. В логе: `[coop-ui] paste nick`,
-  потом `[nick] applied id=…`.
-- **Фикс вылета на луте из v0.52** всё ещё без живой проверки на двоих.
-- **Трое и четверо игроков** реализованы, но не проверены.
-
-## Установка
-
-Если вы уже на v0.53 с обновлениями, апдейтер подтянет сам. Иначе положите
-`KenshiCoop.dll` в `<Kenshi>\mods\KenshiCoop\KenshiCoop.dll` при закрытой игре.
-Нужны Kenshi 1.0.65 и [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
-
----
-
-# v0.53 — build version visible in the co-op panel
-
-Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
-author wrote the mod. Small release on top of v0.52.
-
-Protocol **58** — unchanged, so v0.52 and v0.53 still connect to each other.
-
-## What changed
-
-**The F2 panel title now shows which build you are running:**
-
-```
-Co-op Session   v0.53 - proto 58    -    F2 to close
-```
-
-Protocol sits next to the release id because it is the value that actually
-gates a connection: `v0.53` tells two players their builds differ, `proto 58`
-tells them whether that is why the handshake refused. It lives in the title
-rather than taking one of the panel's few visible rows, since it never changes
-during a session.
-
-## Also: the updater's check path is now proven in a real session
-
-v0.52 shipped the self-updater untested against a live release. A real host run
-has since logged:
-
-```
-[update] checking kotetsyy/KenshiCoop4up ...
-[update] up to date (0.52, proto 58)
-```
-
-303 ms end to end. So the HTTPS fetch, manifest parse and version comparison are
-confirmed working in-game.
-
-**This release is the first test of the remaining half** — download, SHA-256
-verification, and the on-disk swap. If it worked for you, you are reading a
-panel that says `v0.53` and you did not copy any file by hand.
-
-Remember the shape of it: the update installs on one launch and takes effect on
-the **next** one. The session that downloads it keeps running the old code, and
-the panel says a restart is needed rather than pretending otherwise.
-
-## Still not tested
-
-- **The loot use-after-free fix from v0.52 has not been through a live
-  two-player session.** The check: host keeps a corpse window open, the joining
+- **The loot use-after-free fix from v0.52** has not been through a live
+  two-player session. The check: host keeps a corpse window open, the joining
   player takes everything and reopens it — no crash, no loot reappearing — then
   the host closes the window and the corpse is empty for both. The host log
-  should show `[inv] GUI-DEFER` while the window is open and a single
+  should show `[inv] GUI-DEFER` while the window is open, then one
   `[inv] GUI-RESUME` after it closes.
+- **The nick on the claimed squad unit** is unconfirmed in a real 2-player game.
 - **Three and four players** are implemented but unvalidated.
 
 ## Install
 
-Only needed if you are not on v0.52 already — otherwise the updater handles it.
-Put `KenshiCoop.dll` at `<Kenshi>\mods\KenshiCoop\KenshiCoop.dll`, with the game
-closed. Requires Kenshi 1.0.65 and
-[RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+Already on v0.5x with updates enabled? The in-game updater fetches this.
+Otherwise put all three files in `<Kenshi>\mods\KenshiCoop\`, with the game
+closed: `KenshiCoop.dll`, `RE_Kenshi.json` (RE_Kenshi will not load the plugin
+without it) and `KenshiCoop.mod` (so it appears in the Mods menu). Requires
+Kenshi 1.0.65 and [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
 
 ---
 
-# v0.53 — версия сборки видна в кооп-панели (Русский)
+# v0.1.0 — чистка панели, и нумерация версий начинается заново (Русский)
 
 Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, автор мода —
-он. Небольшой релиз поверх v0.52.
+он. Протокол **58**, не менялся: соединяется с v0.5x.
 
-Протокол **58**, не менялся: v0.52 и v0.53 по-прежнему соединяются друг с другом.
+> **Номер версии понизился намеренно.** Это та же линия работы, что закончилась
+> на v0.57, переномерованная в `MAJOR.MINOR.PATCH` начиная с 0.1.0. Ничего не
+> откатывали. Прежде чем счесть это ошибкой — прочитайте следующий раздел.
 
-## Что изменилось
+## Нумерация начинается с 0.1.0
 
-**В заголовке панели F2 теперь видно, какая сборка запущена:**
+До сих пор апдейтер сравнивал версии **только на равенство** — он не отличал
+обновление от отката и ставил и то, и другое. Манифест со старой версией вернул
+бы всех игроков на неё: как намеренный откат это удобно, как случайность — очень
+плохо.
 
-```
-Co-op Session   v0.53 - proto 58    -    F2 to close
-```
+Теперь версии упорядочены: `MAJOR.MINOR.PATCH`, недостающие части читаются как 0,
+и сборка ставится **только если она новее**. Намеренный откат по-прежнему
+возможен — ключом `allowDowngrade=1` в манифесте.
 
-Протокол стоит рядом с версией не для красоты: именно он гейтит соединение.
-`v0.53` скажет двум игрокам, что сборки разные, а `proto 58` — является ли это
-причиной отказа при рукопожатии. Размещено в заголовке, а не отдельной строкой,
-потому что за сессию значение не меняется, а видимых строк в панели мало.
+Переномерация обязана была выйти именно в этом релизе. По новым правилам `0.57`
+разбирается как 0.57.0 и старше `0.1.0`, так что клиент, уже сравнивающий по
+порядку, отказался бы переходить. Но клиенты на v0.5x пока сравнивают по
+равенству и возьмут эту сборку без вопросов. Это окно сейчас закрывается: дальше
+0.1.0 → 0.1.1 → 0.2.0, всегда вперёд.
 
-## Заодно: проверка обновлений подтверждена в реальной сессии
+## Изменения в панели
 
-v0.52 уезжал с апдейтером, ни разу не работавшим с настоящим релизом. С тех пор
-реальный запуск хоста записал в лог:
+- **У хоста больше нет строк вставки Steam ID.** Они были не нужны: хост
+  принимает любого, кто к нему постучится, и знать ID заранее ему не требуется.
+  Три строки «Friend N» превращали настройку на двоих в четыре шага.
+- **У join больше не показывается свой Steam ID.** Он никому не нужен. Два
+  замаскированных номера рядом — свой и хоста — только провоцировали вставить
+  не тот. Теперь каждая сторона видит ровно то, что ей нужно: хост свой ID
+  отдаёт, join чужой вставляет.
+- **Свой ID подписан.** Раньше висело голое `****1843` без пояснений.
+- **Окно ужато** с 72% высоты экрана до 40%. Оно было рассчитано на худший
+  случай, и в любой раскладке две трети оставались пустой ржавчиной.
 
-```
-[update] checking kotetsyy/KenshiCoop4up ...
-[update] up to date (0.52, proto 58)
-```
-
-303 мс на весь цикл. То есть HTTPS-запрос, разбор манифеста и сравнение версий
-в игре работают.
-
-**Этот релиз — первая проверка второй половины:** скачивания, сверки SHA-256 и
-подмены файла на диске. Если сработало, вы читаете панель с надписью `v0.53`, и
-никаких файлов руками не копировали.
-
-Помните про порядок: обновление устанавливается за один запуск, а вступает в
-силу со **следующего**. Сессия, которая его скачала, продолжает работать на
-старом коде, и панель честно просит перезапустить, а не делает вид, что уже всё.
+Сначала пробовали подгонку под содержимое — откатили: `getContentHeight()`
+возвращает не те единицы, которые принимает `resize()`, и после смены роли
+панель срезала себе кнопки переключателей. Причина записана в коде, чтобы
+следующая попытка не повторила её.
 
 ## Что по-прежнему не проверено
 
-- **Фикс вылета на луте из v0.52 не прошёл живую сессию на двоих.** Проверка:
+- **Фикс вылета на луте из v0.52** не проходил живую сессию на двоих. Проверка:
   хост держит окно трупа открытым, подключившийся забирает всё и открывает
   заново — вылета нет и лут не возрождается, — затем хост закрывает окно, и труп
   пуст у обоих. В логе хоста при открытом окне должны идти `[inv] GUI-DEFER`, а
   после закрытия — одна `[inv] GUI-RESUME`.
-- **Три и четыре игрока** реализованы, но не валидированы.
+- **Ник на юните в отряде** не подтверждён в реальной игре вдвоём.
+- **Трое и четверо игроков** реализованы, но не проверены.
 
 ## Установка
 
-Нужна только если у вас не v0.52 — иначе справится автообновление. Положите
-`KenshiCoop.dll` в `<Kenshi>\mods\KenshiCoop\KenshiCoop.dll` при закрытой игре.
-Нужны Kenshi 1.0.65 и [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+Уже на v0.5x с включёнными обновлениями? Апдейтер подтянет сам. Иначе положите
+при закрытой игре все три файла в `<Kenshi>\mods\KenshiCoop\`: `KenshiCoop.dll`,
+`RE_Kenshi.json` (без него RE_Kenshi не загрузит плагин) и `KenshiCoop.mod`
+(чтобы мод был в меню Mods). Нужны Kenshi 1.0.65 и
+[RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).

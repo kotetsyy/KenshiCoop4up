@@ -30,6 +30,7 @@
 #include "../plugin/core/SteamId.h"
 #include "../plugin/core/UdpEndpoint.h"
 #include "../plugin/core/PlayerNick.h"
+#include "../plugin/core/SemVer.h"
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
@@ -1257,6 +1258,34 @@ static void testUdpEndpointParse() {
 }
 
 static void testPlayerNickParse() {
+    std::printf("== build-version ordering (SemVer.h) ==\n");
+    {
+        // The updater installs only what is NEWER, so a wrong answer here is not
+        // a local bug: "<" backwards pushes every client onto an old DLL, and a
+        // parse failure that silently reads as 0.0.0 makes any published build
+        // look newer than everything. Both directions get pinned.
+        using coop::parseVer; using coop::cmpVer; using coop::Ver;
+        CHECK("0.1.0 parses", parseVer("0.1.0").ok);
+        CHECK("missing component reads as 0 (0.1 == 0.1.0)",
+              cmpVer(parseVer("0.1"), parseVer("0.1.0")) == 0);
+        CHECK("patch orders", cmpVer(parseVer("0.1.2"), parseVer("0.1.10")) < 0);
+        CHECK("minor outranks patch",
+              cmpVer(parseVer("0.2.0"), parseVer("0.1.99")) > 0);
+        CHECK("major outranks minor",
+              cmpVer(parseVer("1.0.0"), parseVer("0.99.99")) > 0);
+        // The renumber this scheme replaced: the old flat ids parse as
+        // MAJOR.MINOR, so 0.57 really is "newer" than 0.1.0 by these rules. That
+        // is why the switch had to ride in the same release that added ordering -
+        // clients still comparing by equality followed it regardless.
+        CHECK("legacy 0.57 outranks 0.1.0 (why the renumber could not wait)",
+              cmpVer(parseVer("0.57"), parseVer("0.1.0")) > 0);
+        CHECK("empty is not orderable", !parseVer("").ok);
+        CHECK("letters are not orderable", !parseVer("0.1.0-beta").ok);
+        CHECK("four components are not orderable", !parseVer("1.2.3.4").ok);
+        CHECK("bare dots are not orderable", !parseVer("..").ok);
+        CHECK("whitespace is not orderable", !parseVer("0.1 ").ok);
+    }
+
     std::printf("== player nick parse (PlayerNick.h) ==\n");
     std::string nick;
 

@@ -26,9 +26,13 @@
 // MANIFEST FORMAT (dist/UPDATE.txt on the release branch), one key=value per
 // line, '#' comments, unknown keys ignored so the format can grow:
 //
-//   version=0.52          # release id; compared against the built-in build tag
-//                         # A same-version SHA change (in-place GitHub asset
-//                         # replace for a tiny fix) is also treated as an update.
+//   version=0.1.0         # release id, MAJOR.MINOR.PATCH; a missing component
+//                         # reads as 0. Installed only when it is NEWER than the
+//                         # built-in build tag. A same-version SHA change (an
+//                         # in-place GitHub asset replace for a tiny fix) also
+//                         # counts as an update. An OLDER version is ignored
+//                         # unless the manifest also carries allowDowngrade=1.
+//   allowDowngrade=1      # optional; force a deliberate rollback
 //   proto=59              # PROTOCOL_VERSION that build speaks (display only)
 //   sha256=<64 hex>       # of the DLL at `url`
 //   url=https://github.com/<owner>/<repo>/releases/download/v0.52/KenshiCoop.dll

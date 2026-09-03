@@ -532,7 +532,8 @@ struct PanelStrings {
     const std::string *udpLblKey, *udpLbl, *udpKey, *udpText;
     const MyGUI::Align *editAlign;
     float editWidth;
-    int showSteam; // 1 = Steam ID rows, 0 = hide (UDP)
+    int showSteam;  // 1 = Steam ID rows, 0 = hide (UDP)
+    int showSelfId; // 1 = own Steam ID + Copy button (HOST only)
     int showUdp;   // 1 = Host IP:port edit, 0 = hide (Steam)
     const std::string *empty;
 };
@@ -566,11 +567,27 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         if (s->showSteam) {
             for (i = 0; i < s->nSlots && i < 3; ++i)
                 g_pasteBtns[i] = p->setLineButton(*s->pasteKey[i], *s->pasteCap[i], 0);
-            p->addSpace(0, 0.25f);
-            g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
-            g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
+            // Own ID + its copy button are HOST-only. Nobody needs the join's id:
+            // the host runs setAllowAny and takes whoever dials in, so a join
+            // handing its id around achieves nothing. On the join the row was
+            // just one more number next to the one that does matter (the host's),
+            // which is exactly the confusion to avoid when both are masked.
+            if (s->showSelfId) {
+                p->addSpace(0, 0.25f);
+                g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
+                g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
+            }
         }
         p->_NV_update();
+        // NO fit-to-content resize here. It was tried and reverted: resizing the
+        // window per rebuild clipped the panel - a mode switch left the three
+        // toggle buttons drawn off the bottom edge, and only closing/reopening
+        // F2 (which destroys and recreates the panel) restored it.
+        // getContentHeight() does not return window pixels the way resize()
+        // consumes them, so the two cannot be chained. The panel is a fixed
+        // fraction of the screen instead, sized for its tallest layout; a little
+        // empty rust beats content that is silently cut off, and this widget has
+        // scrolling=false so nothing clipped can be reached.
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -716,7 +733,12 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     // and armed but attaches to nothing, so F2 logs open/close yet nothing draws.
     if (!g_panel.panel) {
         std::string layer = "Info";
-        g_panel.panel = g->createDatapanel(0.20f, 0.14f, 0.36f, 0.72f, false, layer, true);
+        // Height: sized for the TALLEST layout (join + Steam is the row count to
+        // beat - three toggles, nick label + field, status, host-ID row, own-ID
+        // row, copy button, plus the spacers between groups). 0.72 was two thirds
+        // empty; this is trimmed but still has headroom, because the panel does
+        // not scroll and anything that does not fit is simply lost.
+        g_panel.panel = g->createDatapanel(0.20f, 0.14f, 0.36f, 0.40f, false, layer, true);
         g_panel.built = false;
         if (!g_panel.panel) {
             coop::logErrLine("[coop-ui] createDatapanel FAILED");
@@ -753,9 +775,14 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         std::string connKey  = "conn";
         std::string connCap  = std::string("Connection: ") + (g_panel.connectedFlag ? "ONLINE" : "OFFLINE") + "    (switch)";
 
-        // Steam paste slots: host has 3 friend IDs, join has the host ID.
-        // UDP uses the type-in Host IP:port row instead; Steam copy/id rows hide.
-        const int nSlots = g_panel.steamFlag ? (g_panel.hostFlag ? 3 : 1) : 0;
+        // Steam paste slots: the JOIN needs the host's ID; the HOST needs nothing.
+        // Plugin.cpp arms steamp2p::setAllowAny(isHost), so an inbound tunnel is
+        // accepted and given a slot on its first packet - the host never had to
+        // know an ID in advance. The three "Friend N" rows only ever looked
+        // mandatory, and made a 2-player setup read like it needed four steps.
+        // coop_config.json "steamPeer" still pre-registers peers for anyone who
+        // wants it; this is the panel dropping a prompt, not the tunnel losing one.
+        const int nSlots = (g_panel.steamFlag && !g_panel.hostFlag) ? 1 : 0;
         std::string pasteKey[3], pasteCap[3];
         int si;
         for (si = 0; si < nSlots; ++si) {
@@ -785,10 +812,16 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             pasteCap[si] = label;
         }
 
-        std::string selfKey  = "Your Steam ID";
+        // The key column of a DataPanelLine does not render in this skin - the
+        // status line and this row both came out as a bare value with nothing
+        // saying what it was ("****1843" floating under the friend rows). Put
+        // the label in the VALUE so the row explains itself.
+        std::string selfKey  = "selfid";
         std::string selfVal  = st->selfSteamId
-                                   ? coop::maskSteamId64((unsigned long long)st->selfSteamId)
-                                   : std::string("(Steam not running)");
+                                   ? std::string("Your Steam ID:  ") +
+                                     coop::maskSteamId64((unsigned long long)st->selfSteamId) +
+                                     std::string("   (send it to your friends)")
+                                   : std::string("Your Steam ID:  (Steam not running)");
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
         std::string nickLblKey = "name";
@@ -823,6 +856,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         ps.udpKey = &udpKey; ps.udpText = &udpText;
         ps.editAlign = &editAlign; ps.editWidth = 420.0f;
         ps.showSteam = g_panel.steamFlag ? 1 : 0;
+        ps.showSelfId = (g_panel.steamFlag && g_panel.hostFlag) ? 1 : 0;
         ps.showUdp = g_panel.steamFlag ? 0 : 1;
         ps.empty = &empty;
         panelBuildSeh(g_panel.panel, &ps);
