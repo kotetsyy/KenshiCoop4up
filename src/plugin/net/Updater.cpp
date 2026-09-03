@@ -161,10 +161,14 @@ bool httpGet(const std::string& url, std::string* out, size_t maxBytes,
     if (con) {
         HINTERNET req = WinHttpOpenRequest(
             con, L"GET", std::wstring(path, uc.dwUrlPathLength).c_str(),
-            0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+            0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE | WINHTTP_FLAG_REFRESH);
         if (req) {
             DWORD noRedirect = WINHTTP_DISABLE_REDIRECTS;
             WinHttpSetOption(req, WINHTTP_OPTION_DISABLE_FEATURE, &noRedirect, sizeof(noRedirect));
+            WinHttpAddRequestHeaders(req,
+                L"Cache-Control: no-cache\r\nPragma: no-cache",
+                (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
             if (WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
                 WinHttpReceiveResponse(req, 0)) {

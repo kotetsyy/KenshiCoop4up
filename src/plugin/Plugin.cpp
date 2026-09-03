@@ -847,7 +847,8 @@ void coopPanelDrive() {
     else {
         const char* us = coop::updater::status();
         if (us && (strstr(us, "failed") || strstr(us, "REJECTED") ||
-                   strstr(us, "available") || strstr(us, "incomplete")))
+                   strstr(us, "available") || strstr(us, "incomplete") ||
+                   strstr(us, "downloading") || strstr(us, "updated")))
             ps.updateDetail = us;
     }
 

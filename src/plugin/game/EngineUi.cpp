@@ -416,41 +416,21 @@ void onPasteSlot0(DataPanelLine*) { pasteIntoSlot(0); }
 void onPasteSlot1(DataPanelLine*) { pasteIntoSlot(1); }
 void onPasteSlot2(DataPanelLine*) { pasteIntoSlot(2); }
 
-// Copy EditBox caption via the game vtable (getCaption is virtual). asUTF8 runs
-// in this callee so the SEH frame has only POD locals (C2712).
-void editCaptionCopy(MyGUI::EditBox* box, char* out, unsigned cap) {
-    if (!out || cap == 0) return;
-    out[0] = '\0';
-    if (!box) return;
-    const MyGUI::UString& u = box->getCaption();
-    const std::string& utf8 = u.asUTF8();
-    size_t n = utf8.size();
-    if (n >= cap) n = cap - 1;
-    memcpy(out, utf8.c_str(), n);
-    out[n] = '\0';
-}
-
-void harvestEditSeh(MyGUI::EditBox* box, char* out, unsigned cap) {
-    if (!out || cap == 0) return;
-    out[0] = '\0';
-    if (!box) return;
-    __try {
-        editCaptionCopy(box, out, cap);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        out[0] = '\0';
-    }
-}
-
+// Read the typed text from the engine's DataPanelLine strings only. Calling
+// MyGUI::EditBox::getCaption / UString::asUTF8 from this DLL walks the GAME's
+// UString with OUR MyGUI copy and AV'd (join log 2026-09-04, READ of
+// 0x000056C500000000 while F2 was open). textChanged writes s2.
 void harvestLineRaw(DataPanelLine_TextEditable* line, char* raw, unsigned cap) {
     raw[0] = '\0';
     if (!line || cap == 0) return;
-    harvestEditSeh(line->editBox, raw, cap);
-    if (raw[0] == '\0' && !line->s2.empty()) {
-        size_t n = line->s2.size();
-        if (n >= cap) n = cap - 1;
-        memcpy(raw, line->s2.c_str(), n);
-        raw[n] = '\0';
-    }
+    const std::string* src = 0;
+    if (!line->s2.empty()) src = &line->s2;
+    else if (!line->keyValue.empty()) src = &line->keyValue;
+    if (!src) return;
+    size_t n = src->size();
+    if (n >= cap) n = cap - 1;
+    memcpy(raw, src->c_str(), n);
+    raw[n] = '\0';
 }
 
 void harvestNick() {
@@ -531,11 +511,6 @@ void fillDbgLine(const CoopPanelState* st, bool hostFlag, bool steamFlag,
     if (!update.empty()) { dbgVal = update; dbgKey = "Update"; }
 }
 
-void debugCaptionCopy(MyGUI::TextBox* w, const char* s) {
-    if (!w || !s) return;
-    w->setCaption(MyGUI::UString(s));
-}
-
 void debugLineSet(DataPanelLine* line, const std::string& key, const std::string& val) {
     if (!line) return;
     line->s1 = key;
@@ -543,14 +518,6 @@ void debugLineSet(DataPanelLine* line, const std::string& key, const std::string
     __try {
         line->refresh();
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    if (line->w1) {
-        __try { debugCaptionCopy(line->w1, key.c_str()); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-    if (line->w2) {
-        __try { debugCaptionCopy(line->w2, val.c_str()); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
 }
 
 // POD-only pointer bundle so the row-build SEH frame constructs no std::string.
