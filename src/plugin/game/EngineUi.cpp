@@ -588,7 +588,12 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
 
     // (Re)populate the rows when anything visible changed.
     if (g_panel.panel && (g_panel.needsRebuild || !g_panel.built)) {
-        std::string title    = "Co-op Session    -    F2 to close";
+        std::string title = "Co-op Session";
+        if (st->versionText && st->versionText[0]) {
+            title += "   ";
+            title += st->versionText;
+        }
+        title += "    -    F2 to close";
         std::string roleKey  = "role";
         std::string roleCap  = std::string("Role: ") + (g_panel.hostFlag ? "HOST" : "JOIN") + "    (switch)";
         std::string transKey = "trans";

@@ -824,6 +824,19 @@ void coopPanelDrive() {
     }
     ps.transferDetail = transfer.empty() ? (const char*)0 : transfer.c_str();
 
+    // Build identity in the panel title. Built once: neither value can change
+    // while the process lives, and the panel only rebuilds when a string differs.
+    // Protocol rides along with the release id because IT is what actually gates
+    // a connection - "v0.52" tells two players they differ, "proto 58" tells them
+    // that is why the handshake refused.
+    static char verBuf[48];
+    if (verBuf[0] == '\0') {
+        _snprintf(verBuf, sizeof(verBuf) - 1, "v%s - proto %u",
+                  coop::COOP_BUILD_VERSION, (unsigned)coop::PROTOCOL_VERSION);
+        verBuf[sizeof(verBuf) - 1] = '\0';
+    }
+    ps.versionText = verBuf;
+
     // Self-update line. Only surfaced when there is something to DO about it -
     // an installed update waiting on a restart, or a failure. "Up to date" and
     // "checking..." would just push the connection status off the one debug line

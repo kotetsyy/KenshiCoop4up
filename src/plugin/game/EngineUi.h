@@ -48,6 +48,12 @@ struct CoopPanelState {
     // cannot connect at all, so "restart to finish updating" outranks any
     // connection detail that line would otherwise carry.
     const char*        updateDetail;
+    // Build identity for the panel title, e.g. "v0.52 - proto 58". Null = omit.
+    // Deliberately in the TITLE and not a row of its own: it answers "are we on
+    // the same build?" - the first question when a connection refuses - without
+    // spending one of the panel's few visible lines on something that never
+    // changes during a session.
+    const char*        versionText;
 };
 // The panel's role/transport selections at the moment Connect is hit. peerId is the
 // Steam ID pasted in-panel this session (0 if none), and overrides the config
