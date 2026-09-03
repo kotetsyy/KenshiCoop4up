@@ -22,6 +22,8 @@
 #include <kenshi/gui/DataPanelLine.h>
 #include <kenshi/OptionsHolder.h> // options->damageFloaters
 #include <mygui/MyGUI_Delegate.h> // MyGUI::newDelegate + CDelegate* (free-fn callbacks)
+#include <mygui/MyGUI_Align.h>
+#include <mygui/MyGUI_EditBox.h>
 #include <windows.h>
 
 #include "../core/SteamId.h" // parseSteamId64 (paste button) + maskSteamId64 (id rows)
@@ -196,13 +198,11 @@ void spawnDamageFloater(Character* c, float amount) {
 }
 
 // ---- In-game co-op session panel (config-driven, spike-50 DatapanelGUI stack) -
-// A native DatapanelGUI window toggled with F2. The player picks role + transport
-// (toggle BUTTONS - the only DatapanelGUI control with a callable RVA callback;
-// MyGUI comboboxes/editboxes have no reachable getters and never receive keyboard
-// focus during gameplay) and connects/leaves via a bound checkbox. The friend code
-// (peer SteamID) + UDP endpoint come from coop_config.json as the last-remembered
-// values (a paste or Connect writes them back); a "Copy my Steam ID" button puts
-// the player's own id on the clipboard to share.
+// A native DatapanelGUI window toggled with F2. Role/transport/connection are
+// toggle BUTTONS (callable RVA callback). Steam IDs stay clipboard-paste. The
+// display nick is setLineTextEditable (the same row type Kenshi uses for typed
+// numbers on sliders). Status-line changes update the debug row in place so a
+// rebuild does not wipe the caret while the player is typing.
 // The GUI layer is session-agnostic: live status arrives via *st; the user's
 // actions leave via the onConnect/onDisconnect callbacks (the plugin root owns the
 // net/session/config wiring).
@@ -300,7 +300,7 @@ DataPanelLine_Button*   g_roleBtn      = 0;
 DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
-DataPanelLine_Button*   g_nickBtn      = 0;
+DataPanelLine_TextEditable* g_nickLine = 0;
 DataPanelLine_Button*   g_pasteBtns[3] = {0, 0, 0}; // one paste slot per friend
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
@@ -312,8 +312,9 @@ int                     g_pasteFailedSlot = -1; // which slot last failed, or -1
 std::string             g_udpIp;         // join UDP host (pasted or seeded)
 int                     g_udpPort = 0;   // 0 = not set this session
 bool                    g_udpPasteFailed = false;
-std::string             g_playerNick;    // display nick (pasted or seeded)
-bool                    g_nickPasteFailed = false;
+std::string             g_playerNick;    // display nick (typed / seeded)
+DWORD                   g_nickDirtyTick = 0; // 0 = clean; else last edit tick
+bool                    g_nickHoldHarvest = false; // skip one tick after rebuild
 bool                    g_memorySeeded = false; // config fallback applied once
 CoopConnectFn           g_onConnectCb  = 0;
 CoopRememberFn          g_onRememberCb = 0;
@@ -414,23 +415,105 @@ void onPasteSlot0(DataPanelLine*) {
 }
 void onPasteSlot1(DataPanelLine*) { pasteIntoSlot(1); }
 void onPasteSlot2(DataPanelLine*) { pasteIntoSlot(2); }
-void onPasteNick(DataPanelLine*) {
-    std::string clip;
+
+// Copy EditBox caption via the game vtable (getCaption is virtual). asUTF8 runs
+// in this callee so the SEH frame in harvestNick has only POD locals (C2712).
+void nickCaptionCopy(MyGUI::EditBox* box, char* out, unsigned cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!box) return;
+    const MyGUI::UString& u = box->getCaption();
+    const std::string& utf8 = u.asUTF8();
+    size_t n = utf8.size();
+    if (n >= cap) n = cap - 1;
+    memcpy(out, utf8.c_str(), n);
+    out[n] = '\0';
+}
+
+void harvestNickSeh(MyGUI::EditBox* box, char* out, unsigned cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!box) return;
+    __try {
+        nickCaptionCopy(box, out, cap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = '\0';
+    }
+}
+
+void harvestNick() {
+    if (!g_nickLine) return;
+    if (g_nickHoldHarvest) { g_nickHoldHarvest = false; return; }
+    char raw[128];
+    raw[0] = '\0';
+    harvestNickSeh(g_nickLine->editBox, raw, sizeof(raw));
+    if (raw[0] == '\0' && !g_nickLine->s2.empty()) {
+        size_t n = g_nickLine->s2.size();
+        if (n >= sizeof(raw)) n = sizeof(raw) - 1;
+        memcpy(raw, g_nickLine->s2.c_str(), n);
+        raw[n] = '\0';
+    }
     std::string nick;
-    bool ok = clipboardGetText(clip) && coop::parsePlayerNick(clip, nick);
-    if (ok && !nick.empty()) {
-        g_playerNick = nick;
-        g_nickPasteFailed = false;
+    if (!coop::parsePlayerNick(raw, nick)) nick.clear();
+    if (nick == g_playerNick) return;
+    g_playerNick = nick;
+    g_nickDirtyTick = GetTickCount();
+}
+
+void flushNickRemember() {
+    harvestNick();
+    if (g_nickDirtyTick != 0) {
+        g_nickDirtyTick = 0;
         char b[96];
-        _snprintf(b, sizeof(b) - 1, "[coop-ui] paste nick '%s'", g_playerNick.c_str());
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] nick '%s'",
+                  g_playerNick.empty() ? "-" : g_playerNick.c_str());
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
         fireRemember();
-    } else {
-        g_nickPasteFailed = true;
-        coop::logLine("[coop-ui] paste failed (clipboard not a nick)");
     }
-    g_panel.needsRebuild = true;
+}
+
+void fillDbgLine(const CoopPanelState* st, bool hostFlag, bool steamFlag,
+                 const std::string& transfer, const std::string& update,
+                 std::string& dbgKey, std::string& dbgVal) {
+    std::string transStr = (st->transportSel == 0) ? "Steam" : "UDP";
+    dbgKey = "Connection status";
+    if (st->running) {
+        if (st->peerPresent)
+            dbgVal = (st->isHost ? std::string("Hosting") : std::string("Joining")) +
+                     " over " + transStr + " - player(s) connected";
+        else if (st->isHost)
+            dbgVal = std::string("Hosting over ") + transStr + " - waiting for players (max 4)...";
+        else
+            dbgVal = std::string("Joining over ") + transStr + " - connecting to host...";
+    } else {
+        dbgVal = std::string("Offline - will ") + (hostFlag ? "host" : "join") +
+                 " over " + (steamFlag ? "Steam" : "UDP") + " on Connect";
+    }
+    if (!transfer.empty()) { dbgVal = transfer; dbgKey = "World transfer"; }
+    if (!update.empty()) { dbgVal = update; dbgKey = "Update"; }
+}
+
+void debugCaptionCopy(MyGUI::TextBox* w, const char* s) {
+    if (!w || !s) return;
+    w->setCaption(MyGUI::UString(s));
+}
+
+void debugLineSet(DataPanelLine* line, const std::string& key, const std::string& val) {
+    if (!line) return;
+    line->s1 = key;
+    line->s2 = val;
+    __try {
+        line->refresh();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (line->w1) {
+        __try { debugCaptionCopy(line->w1, key.c_str()); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (line->w2) {
+        __try { debugCaptionCopy(line->w2, val.c_str()); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
 }
 
 // POD-only pointer bundle so the row-build SEH frame constructs no std::string.
@@ -441,7 +524,9 @@ struct PanelStrings {
     const std::string *pasteKey[3], *pasteCap[3];
     int nSlots;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
-    const std::string *nickKey, *nickCap;
+    const std::string *nickKey, *nickText;
+    const MyGUI::Align *nickAlign;
+    float nickWidth;
     const std::string *empty;
 };
 
@@ -452,7 +537,8 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         g_roleBtn  = p->setLineButton(*s->roleKey,  *s->roleCap,  0);
         g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
         g_connBtn  = p->setLineButton(*s->connKey,  *s->connCap,  0);
-        g_nickBtn  = p->setLineButton(*s->nickKey,  *s->nickCap,  0);
+        g_nickLine = p->setLineTextEditable(*s->nickKey, *s->nickText, 0, true,
+                                            false, *s->nickAlign, s->nickWidth);
         p->addSpace(0, 0.35f);
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
         p->addSpace(0, 0.25f);
@@ -563,8 +649,9 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         } else {
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
+            flushNickRemember();
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
-            g_nickBtn = 0;
+            g_nickLine = 0;
             g_pasteBtns[0] = g_pasteBtns[1] = g_pasteBtns[2] = 0;
             g_debugLine = 0; g_selfLine = 0;
             g_panel.open = false;
@@ -574,6 +661,12 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     g_panel.f2Down = f2;
 
     if (!g_panel.open) return;
+
+    harvestNick();
+    if (g_nickDirtyTick != 0 && (GetTickCount() - g_nickDirtyTick) >= 800ul) {
+        g_nickDirtyTick = 0;
+        fireRemember();
+    }
 
     // Keep the Online/Offline toggle honest when the session state changes
     // underneath us (a peer-driven connect, a failed connect that stopped, etc):
@@ -587,17 +680,12 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     }
 
     std::string detail = st->detail ? std::string(st->detail) : std::string();
-    if (detail != g_panel.lastStatus) g_panel.needsRebuild = true;
-
-    // Join save-transfer line (throttled to whole-percent by the caller): rebuild
-    // when it changes so the "Streaming host world... NN%" line advances live.
     std::string transfer = st->transferDetail ? std::string(st->transferDetail)
                                                : std::string();
-    if (transfer != g_panel.lastTransfer) g_panel.needsRebuild = true;
-
-    // Self-update line (null unless actionable - see CoopPanelState::updateDetail).
     std::string update = st->updateDetail ? std::string(st->updateDetail) : std::string();
-    if (update != g_panel.lastUpdate) g_panel.needsRebuild = true;
+    const bool statusChanged = (detail != g_panel.lastStatus) ||
+                               (transfer != g_panel.lastTransfer) ||
+                               (update != g_panel.lastUpdate);
 
     // Create the window once (outside SEH - see the header note on C2712).
     // Layer MUST be "Info": spike 48 proved createFloatingLabel renders non-null
@@ -614,8 +702,20 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         }
     }
 
-    // (Re)populate the rows when anything visible changed.
+    std::string dbgKey, dbgVal;
+    fillDbgLine(st, g_panel.hostFlag, g_panel.steamFlag, transfer, update, dbgKey, dbgVal);
+    if (g_panel.panel && g_panel.built && statusChanged && !g_panel.needsRebuild) {
+        debugLineSet(g_debugLine, dbgKey, dbgVal);
+        dbgColourSeh(g_debugLine, !transfer.empty() && update.empty());
+        g_panel.lastStatus = detail;
+        g_panel.lastTransfer = transfer;
+        g_panel.lastUpdate = update;
+    }
+
+    // (Re)populate the rows when role/transport/connection/paste slots change.
+    // Status text alone must NOT rebuild: that destroys the nick EditBox.
     if (g_panel.panel && (g_panel.needsRebuild || !g_panel.built)) {
+        harvestNick();
         std::string title = "Co-op Session";
         if (st->versionText && st->versionText[0]) {
             title += "   ";
@@ -628,30 +728,6 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         std::string transCap = std::string("Transport: ") + (g_panel.steamFlag ? "STEAM" : "UDP") + "    (switch)";
         std::string connKey  = "conn";
         std::string connCap  = std::string("Connection: ") + (g_panel.connectedFlag ? "ONLINE" : "OFFLINE") + "    (switch)";
-
-        // White debug line: describes the live connection state + type. Reflects
-        // the ACTUAL running session when online; the armed toggles when offline.
-        std::string transStr = (st->transportSel == 0) ? "Steam" : "UDP";
-        std::string dbgKey   = "Connection status";
-        std::string dbgVal;
-        if (st->running) {
-            if (st->peerPresent)
-                dbgVal = (st->isHost ? std::string("Hosting") : std::string("Joining")) +
-                         " over " + transStr + " - player(s) connected";
-            else if (st->isHost)
-                dbgVal = std::string("Hosting over ") + transStr + " - waiting for players (max 4)...";
-            else
-                dbgVal = std::string("Joining over ") + transStr + " - connecting to host...";
-        } else {
-            dbgVal = std::string("Offline - will ") + (g_panel.hostFlag ? "host" : "join") +
-                     " over " + (g_panel.steamFlag ? "Steam" : "UDP") + " on Connect";
-        }
-        // A join streaming the host's world at the menu has no leader for the
-        // screen overlay, so surface the live progress here instead (amber).
-        if (!transfer.empty()) { dbgVal = transfer; dbgKey = "World transfer"; }
-        // A stale DLL cannot connect at all (PROTOCOL_VERSION is a hard gate), so
-        // an actionable update outranks both of the lines above.
-        if (!update.empty()) { dbgVal = update; dbgKey = "Update"; }
 
         // Paste slots: host Steam has 3 friend IDs; join Steam has the host ID;
         // join UDP has one IP:port slot. Host UDP listens, so no peer paste.
@@ -708,16 +784,9 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                                    : std::string("(Steam not running)");
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
-        std::string nickKey  = "nick";
-        std::string nickCap  = "Nick: ";
-        if (!g_playerNick.empty()) {
-            nickCap += g_playerNick;
-            nickCap += "    (click to re-paste)";
-        } else if (g_nickPasteFailed) {
-            nickCap += "(copy a name and click to paste)";
-        } else {
-            nickCap += "(click to paste your name)";
-        }
+        std::string nickKey  = "Nick";
+        std::string nickText = g_playerNick;
+        MyGUI::Align nickAlign(MyGUI::Align::Left);
         std::string empty    = "";
 
         PanelStrings ps;
@@ -732,18 +801,19 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         }
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
-        ps.nickKey = &nickKey; ps.nickCap = &nickCap;
+        ps.nickKey = &nickKey; ps.nickText = &nickText;
+        ps.nickAlign = &nickAlign; ps.nickWidth = 280.0f;
         ps.empty = &empty;
         panelBuildSeh(g_panel.panel, &ps);
+        g_nickHoldHarvest = true;
 
-        // Delegate assignment + white-colouring live OUTSIDE the SEH frame (pointer
+        // Delegate assignment + white-colouring live OUTSIDE the SEH frame (pointer)
         // targets are valid post-build; assignment can't fault) so no delegate
         // temporary lands in it.
         if (g_roleBtn)    g_roleBtn->callback    = MyGUI::newDelegate(&onRoleBtn);
         if (g_transBtn)   g_transBtn->callback   = MyGUI::newDelegate(&onTransBtn);
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
-        if (g_nickBtn)    g_nickBtn->callback    = MyGUI::newDelegate(&onPasteNick);
         if (g_pasteBtns[0]) g_pasteBtns[0]->callback = MyGUI::newDelegate(&onPasteSlot0);
         if (g_pasteBtns[1]) g_pasteBtns[1]->callback = MyGUI::newDelegate(&onPasteSlot1);
         if (g_pasteBtns[2]) g_pasteBtns[2]->callback = MyGUI::newDelegate(&onPasteSlot2);
@@ -764,6 +834,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     if (g_panel.connectedFlag != g_panel.lastChkVal) {
         g_panel.lastChkVal = g_panel.connectedFlag;
         if (g_panel.connectedFlag && !st->running) {
+            flushNickRemember();
             char b[80];
             _snprintf(b, sizeof(b) - 1, "[coop-ui] CONNECT role=%s transport=%s",
                       g_panel.hostFlag ? "HOST" : "JOIN",

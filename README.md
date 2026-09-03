@@ -64,10 +64,9 @@ The Co-op panel works at the **main menu** as well as in-game, so a joining
 player does not need to load anything first.
 
 1. Press **F2**.
-2. **Paste a nick.** Copy a name, then click **Nick**. There is no text field —
-   same clipboard paste as a Steam ID. That name is written onto the squad unit
-   you play after you connect, so the nametag tells you who is yours. Paste it
-   before going ONLINE.
+2. **Type a nick.** Click the **Nick** row and type your name. That name is
+   written onto the squad unit you play after you connect, so the nametag tells
+   you who is yours. Set it before going ONLINE.
 3. **Swap Steam IDs.** Each player clicks **Copy my Steam ID** and sends it to
    the others. Copy the one you receive, then click **Paste friend's Steam ID**.
    The panel shows what it captured. Nick and Steam ID are remembered in
@@ -236,9 +235,9 @@ project.
 ничего предварительно загружать.
 
 1. Нажмите **F2**.
-2. **Вставьте ник.** Скопируйте имя и нажмите **Nick**. Поля ввода нет — как со
-   Steam ID, из буфера. После входа это имя ставится на юнит в вашем отряде,
-   чтобы по табличке было видно, за кого играть. Вставьте ник до ONLINE.
+2. **Введите ник.** Нажмите строку **Nick** и наберите имя. После входа это имя
+   ставится на юнит в вашем отряде, чтобы по табличке было видно, за кого
+   играть. Задайте ник до ONLINE.
 3. **Обменяйтесь Steam ID.** Каждый жмёт **Copy my Steam ID** и отправляет
    остальным. Полученный ID скопируйте и нажмите **Paste friend's Steam ID** —
    панель покажет, что распознала. Ник и Steam ID запоминаются в

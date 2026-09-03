@@ -1,10 +1,9 @@
 // PlayerNick.h - paste-parse a co-op display name (pure, no Win32).
 //
-// The F2 panel has no text fields, so a player pastes a nick from the clipboard
-// the same way they paste a Steam ID. Clipboard text is noisy (whitespace, a
-// trailing newline, a wrapped line). This keeps the first line, strips ASCII
-// controls, and caps at PLAYER_NICK_MAX so the result fits HelloPacket.nameLen
-// (0..63) without inventing a packet.
+// Sanitize a display nick from the F2 edit row (or clipboard / config). Text is
+// noisy (whitespace, a trailing newline). This keeps the first line, strips
+// ASCII controls, and caps at PLAYER_NICK_MAX so the result fits
+// HelloPacket.nameLen (0..63).
 
 #ifndef COOP_PLAYER_NICK_H
 #define COOP_PLAYER_NICK_H

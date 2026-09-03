@@ -1,3 +1,76 @@
+# v0.55 — type a nick in F2
+
+Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
+author wrote the mod.
+
+Protocol **58** — unchanged, so v0.54 and v0.55 still connect to each other.
+Everyone still needs the same DLL.
+
+## What changed
+
+**The F2 Nick row is a real text field.** Click **Nick** and type. v0.54 only
+accepted a clipboard paste because the panel has no normal edit boxes; this
+build uses Kenshi's own `setLineTextEditable` row (the same type as typed
+numbers on sliders). Connection-status updates no longer rebuild the whole
+panel, so the caret is not wiped while you type.
+
+Set the nick **before** going ONLINE so HELLO / WELCOME carries it. It is
+still written onto the squad unit you own, and remembered in
+`coop_config.json`.
+
+## Still not tested
+
+- **Typing in the Nick field has not been through a live session.** If keys
+  still go to the camera after you click the row, say so — that is the MyGUI
+  focus risk.
+- **The nick on the claimed unit** is still unconfirmed in 2p.
+- **The loot use-after-free fix from v0.52** is still unconfirmed in 2p.
+- **Three and four players** are implemented but unvalidated.
+
+## Install
+
+If you are already on v0.54 with updates enabled, the in-game updater will
+fetch this. Otherwise put `KenshiCoop.dll` at
+`<Kenshi>\mods\KenshiCoop\KenshiCoop.dll`, with the game closed. Requires
+Kenshi 1.0.65 and [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+
+---
+
+# v0.55 — набор ника в F2 (Русский)
+
+Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, автор мода —
+он.
+
+Протокол **58**, не менялся: v0.54 и v0.55 по-прежнему соединяются. DLL всё
+равно нужна одна и та же.
+
+## Что изменилось
+
+**Строка Nick в F2 — настоящее поле ввода.** Кликни **Nick** и печатай. В
+v0.54 ник только вставлялся из буфера: у панели нет обычных edit box. Эта
+сборка берёт штатную строку Kenshi `setLineTextEditable` (как цифры на
+слайдерах). Статус соединения больше не пересобирает всю панель, чтобы
+курсор не сбрасывался во время набора.
+
+Задай ник **до** ONLINE, чтобы он ушёл в HELLO / WELCOME. Он по-прежнему
+ставится на юнит в твоём отряде и запоминается в `coop_config.json`.
+
+## Что по-прежнему не проверено
+
+- **Набор в поле Nick не проходил живую сессию.** Если после клика клавиши
+  всё равно идут в камеру — напишите, это риск фокуса MyGUI.
+- **Ник на юните в отряде** всё ещё без живой проверки на двоих.
+- **Фикс вылета на луте из v0.52** всё ещё без живой проверки на двоих.
+- **Трое и четверо игроков** реализованы, но не проверены.
+
+## Установка
+
+Если вы уже на v0.54 с обновлениями, апдейтер подтянет сам. Иначе положите
+`KenshiCoop.dll` в `<Kenshi>\mods\KenshiCoop\KenshiCoop.dll` при закрытой игре.
+Нужны Kenshi 1.0.65 и [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+
+---
+
 # v0.54 — F2 nick on the squad unit you play
 
 Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose

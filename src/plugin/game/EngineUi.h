@@ -15,13 +15,10 @@ namespace engine {
 
 // ---- In-game co-op session panel ---------------------------------------------
 // A native DatapanelGUI opened with F2 that lets the player pick role + transport
-// (buttons/checkboxes - the only reliably interactive DatapanelGUI controls;
-// MyGUI comboboxes/editboxes have no usable RVAs and don't receive keyboard focus
-// during gameplay) and Connect/Disconnect. The friend's Steam ID is entered by
-// clipboard: "Copy my Steam ID" puts the player's own id on the clipboard to
-// share, and "Paste friend's Steam ID" reads the friend's id back in. A nick
-// is pasted the same way (no text field) and stamped onto this player's squad
-// unit after join. A paste (and a successful Connect) is remembered in
+// (toggle buttons) and Connect/Disconnect. Steam IDs are still clipboard-paste
+// (17 digits, no field). The display nick is a real DatapanelGUI text-edit row
+// (setLineTextEditable): click it and type. That name is stamped onto this
+// player's squad unit after join. A paste / edit / Connect is remembered in
 // coop_config.json so the next launch pre-fills the same Steam ID / UDP
 // endpoint / nick. The GUI layer stays
 // session-agnostic: live status is passed IN via *st and the user's actions
@@ -57,7 +54,7 @@ struct CoopPanelState {
     // changes during a session.
     const char*        versionText;
     // Last-remembered display nick (coop_config.json playerName). Empty/null =
-    // none yet; the panel pastes one from the clipboard like a Steam ID.
+    // none yet; the panel's Nick row is a type-in field seeded from this.
     const char*        playerName;
 };
 // The panel's role/transport selections at the moment Connect is hit. peerId is the

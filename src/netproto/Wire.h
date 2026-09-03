@@ -36,7 +36,7 @@ const u16 PROTOCOL_VERSION = 58;
 // it is the thing that makes everyone else's copy stale.
 // Bump this in the same commit as the git tag, and put the same string in
 // dist/UPDATE.txt when publishing.
-const char* const COOP_BUILD_VERSION = "0.54";
+const char* const COOP_BUILD_VERSION = "0.55";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;
