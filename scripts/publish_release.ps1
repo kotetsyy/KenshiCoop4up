@@ -19,6 +19,8 @@ param(
     [string]$Owner,
     [string]$Repo,
     [string]$Dll    = "src\plugin\x64\Release\KenshiCoop.dll",
+    [string]$Mod    = "dist\mods\KenshiCoop\KenshiCoop.mod",
+    [string]$Json   = "dist\mods\KenshiCoop\RE_Kenshi.json",
     [string]$Out    = "dist\UPDATE.txt",
     [string]$Notes  = "",
     [switch]$WhatIf
@@ -40,6 +42,8 @@ if ($wire -notmatch 'PROTOCOL_VERSION\s*=\s*(\d+)') {
 $proto = $Matches[1]
 
 if (-not (Test-Path $Dll)) { throw "No DLL at $Dll - run scripts\build_plugin.cmd Release first" }
+if (-not (Test-Path $Mod)) { throw "No KenshiCoop.mod at $Mod" }
+if (-not (Test-Path $Json)) { throw "No RE_Kenshi.json at $Json" }
 $dllItem = Get-Item $Dll
 
 # A DLL older than the header means the version string in it is not $version.
@@ -81,6 +85,9 @@ Write-Host "  version   $version   (proto $proto)"
 Write-Host "  dll       $($dllItem.Length) bytes, built $($dllItem.LastWriteTime)"
 Write-Host "  sha256    $sha"
 Write-Host "  url       $url"
+Write-Host "  extra     $Mod"
+Write-Host "            $Json"
+Write-Host "            (first-time install; the updater still downloads only the DLL)"
 Write-Host ""
 
 if ($WhatIf) { Write-Host "-WhatIf: not writing $Out"; Write-Host $manifest; exit 0 }
@@ -94,7 +101,7 @@ $manifestLf = ($manifest -replace "`r`n", "`n")
 Write-Host "wrote $Out"
 Write-Host ""
 Write-Host "Next, in order (the manifest must not go live before the asset it names):"
-Write-Host "  1. gh release create $tag `"$Dll`" --title `"$tag`" --notes `"$Notes`""
+Write-Host "  1. gh release create $tag `"$Dll`" `"$Mod`" `"$Json`" --title `"$tag`" --notes `"$Notes`""
 Write-Host "  2. git add $Out && git commit -m `"release $tag`" && git push"
 Write-Host ""
 Write-Host "Order matters: clients read the manifest first and download the url it"

@@ -301,6 +301,9 @@ DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
 DataPanelLine_TextEditable* g_nickLine = 0;
+DataPanelLine_TextEditable* g_udpLine  = 0;
+DataPanelLine*          g_nickHint     = 0;
+DataPanelLine*          g_udpHint      = 0;
 DataPanelLine_Button*   g_pasteBtns[3] = {0, 0, 0}; // one paste slot per friend
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
@@ -314,7 +317,7 @@ int                     g_udpPort = 0;   // 0 = not set this session
 bool                    g_udpPasteFailed = false;
 std::string             g_playerNick;    // display nick (typed / seeded)
 DWORD                   g_nickDirtyTick = 0; // 0 = clean; else last edit tick
-bool                    g_nickHoldHarvest = false; // skip one tick after rebuild
+bool                    g_editHoldHarvest = false; // skip one tick after rebuild
 bool                    g_memorySeeded = false; // config fallback applied once
 CoopConnectFn           g_onConnectCb  = 0;
 CoopRememberFn          g_onRememberCb = 0;
@@ -409,16 +412,13 @@ void pasteUdpEndpoint() {
     }
     g_panel.needsRebuild = true;
 }
-void onPasteSlot0(DataPanelLine*) {
-    if (!g_panel.hostFlag && !g_panel.steamFlag) pasteUdpEndpoint();
-    else pasteIntoSlot(0);
-}
+void onPasteSlot0(DataPanelLine*) { pasteIntoSlot(0); }
 void onPasteSlot1(DataPanelLine*) { pasteIntoSlot(1); }
 void onPasteSlot2(DataPanelLine*) { pasteIntoSlot(2); }
 
 // Copy EditBox caption via the game vtable (getCaption is virtual). asUTF8 runs
-// in this callee so the SEH frame in harvestNick has only POD locals (C2712).
-void nickCaptionCopy(MyGUI::EditBox* box, char* out, unsigned cap) {
+// in this callee so the SEH frame has only POD locals (C2712).
+void editCaptionCopy(MyGUI::EditBox* box, char* out, unsigned cap) {
     if (!out || cap == 0) return;
     out[0] = '\0';
     if (!box) return;
@@ -430,29 +430,33 @@ void nickCaptionCopy(MyGUI::EditBox* box, char* out, unsigned cap) {
     out[n] = '\0';
 }
 
-void harvestNickSeh(MyGUI::EditBox* box, char* out, unsigned cap) {
+void harvestEditSeh(MyGUI::EditBox* box, char* out, unsigned cap) {
     if (!out || cap == 0) return;
     out[0] = '\0';
     if (!box) return;
     __try {
-        nickCaptionCopy(box, out, cap);
+        editCaptionCopy(box, out, cap);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         out[0] = '\0';
     }
 }
 
-void harvestNick() {
-    if (!g_nickLine) return;
-    if (g_nickHoldHarvest) { g_nickHoldHarvest = false; return; }
-    char raw[128];
+void harvestLineRaw(DataPanelLine_TextEditable* line, char* raw, unsigned cap) {
     raw[0] = '\0';
-    harvestNickSeh(g_nickLine->editBox, raw, sizeof(raw));
-    if (raw[0] == '\0' && !g_nickLine->s2.empty()) {
-        size_t n = g_nickLine->s2.size();
-        if (n >= sizeof(raw)) n = sizeof(raw) - 1;
-        memcpy(raw, g_nickLine->s2.c_str(), n);
+    if (!line || cap == 0) return;
+    harvestEditSeh(line->editBox, raw, cap);
+    if (raw[0] == '\0' && !line->s2.empty()) {
+        size_t n = line->s2.size();
+        if (n >= cap) n = cap - 1;
+        memcpy(raw, line->s2.c_str(), n);
         raw[n] = '\0';
     }
+}
+
+void harvestNick() {
+    if (!g_nickLine) return;
+    char raw[128];
+    harvestLineRaw(g_nickLine, raw, sizeof(raw));
     std::string nick;
     if (!coop::parsePlayerNick(raw, nick)) nick.clear();
     if (nick == g_playerNick) return;
@@ -460,13 +464,46 @@ void harvestNick() {
     g_nickDirtyTick = GetTickCount();
 }
 
-void flushNickRemember() {
+void harvestUdp() {
+    if (!g_udpLine) return;
+    char raw[128];
+    harvestLineRaw(g_udpLine, raw, sizeof(raw));
+    if (raw[0] == '\0') return;
+    std::string ip;
+    int port = g_udpPort > 0 ? g_udpPort : 27800;
+    if (!coop::parseUdpEndpoint(raw, ip, port) || ip.empty()) return;
+    if (ip == g_udpIp && port == g_udpPort) return;
+    g_udpIp = ip;
+    g_udpPort = port;
+    g_udpPasteFailed = false;
+    g_nickDirtyTick = GetTickCount();
+}
+
+void harvestEdits() {
     harvestNick();
+    harvestUdp();
+}
+
+void formatUdpText(std::string& out) {
+    int p = g_udpPort > 0 ? g_udpPort : 27800;
+    char b[96];
+    if (!g_udpIp.empty())
+        _snprintf(b, sizeof(b) - 1, "%s:%d", g_udpIp.c_str(), p);
+    else
+        _snprintf(b, sizeof(b) - 1, "127.0.0.1:%d", p);
+    b[sizeof(b) - 1] = '\0';
+    out = b;
+}
+
+void flushNickRemember() {
+    harvestEdits();
     if (g_nickDirtyTick != 0) {
         g_nickDirtyTick = 0;
-        char b[96];
-        _snprintf(b, sizeof(b) - 1, "[coop-ui] nick '%s'",
-                  g_playerNick.empty() ? "-" : g_playerNick.c_str());
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] nick '%s' udp=%s:%d",
+                  g_playerNick.empty() ? "-" : g_playerNick.c_str(),
+                  g_udpIp.empty() ? "-" : g_udpIp.c_str(),
+                  g_udpPort > 0 ? g_udpPort : 27800);
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
         fireRemember();
@@ -524,9 +561,12 @@ struct PanelStrings {
     const std::string *pasteKey[3], *pasteCap[3];
     int nSlots;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
-    const std::string *nickKey, *nickText;
-    const MyGUI::Align *nickAlign;
-    float nickWidth;
+    const std::string *nickLblKey, *nickLbl, *nickKey, *nickText;
+    const std::string *udpLblKey, *udpLbl, *udpKey, *udpText;
+    const MyGUI::Align *editAlign;
+    float editWidth;
+    int showSteam; // 1 = Steam ID rows, 0 = hide (UDP)
+    int showUdp;   // 1 = Host IP:port edit, 0 = hide (Steam)
     const std::string *empty;
 };
 
@@ -537,18 +577,32 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         g_roleBtn  = p->setLineButton(*s->roleKey,  *s->roleCap,  0);
         g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
         g_connBtn  = p->setLineButton(*s->connKey,  *s->connCap,  0);
-        g_nickLine = p->setLineTextEditable(*s->nickKey, *s->nickText, 0, true,
-                                            false, *s->nickAlign, s->nickWidth);
-        p->addSpace(0, 0.35f);
+        p->addSpace(0, 0.25f);
+        g_nickHint = p->setLine(*s->nickLblKey, *s->nickLbl, *s->empty, 0, false, true);
+        g_nickLine = p->setLineTextEditable(*s->nickKey, *s->nickText, 0, false,
+                                            false, *s->editAlign, s->editWidth);
+        p->addSpace(0, 0.45f);
+        g_udpHint = 0;
+        g_udpLine = 0;
+        if (s->showUdp) {
+            g_udpHint = p->setLine(*s->udpLblKey, *s->udpLbl, *s->empty, 0, false, true);
+            g_udpLine = p->setLineTextEditable(*s->udpKey, *s->udpText, 0, false,
+                                               false, *s->editAlign, s->editWidth);
+            p->addSpace(0, 0.45f);
+        }
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
         p->addSpace(0, 0.25f);
         int i;
         for (i = 0; i < 3; ++i) g_pasteBtns[i] = 0;
-        for (i = 0; i < s->nSlots && i < 3; ++i)
-            g_pasteBtns[i] = p->setLineButton(*s->pasteKey[i], *s->pasteCap[i], 0);
-        p->addSpace(0, 0.25f);
-        g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
-        g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
+        g_selfLine = 0;
+        g_copyIdBtn = 0;
+        if (s->showSteam) {
+            for (i = 0; i < s->nSlots && i < 3; ++i)
+                g_pasteBtns[i] = p->setLineButton(*s->pasteKey[i], *s->pasteCap[i], 0);
+            p->addSpace(0, 0.25f);
+            g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
+            g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
+        }
         p->_NV_update();
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -647,11 +701,12 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             g_panel.needsRebuild = true;
             coop::logLine("[coop-ui] panel opened");
         } else {
+            g_editHoldHarvest = false;
+            flushNickRemember();
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
-            flushNickRemember();
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
-            g_nickLine = 0;
+            g_nickLine = 0; g_udpLine = 0; g_nickHint = 0; g_udpHint = 0;
             g_pasteBtns[0] = g_pasteBtns[1] = g_pasteBtns[2] = 0;
             g_debugLine = 0; g_selfLine = 0;
             g_panel.open = false;
@@ -662,7 +717,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
 
     if (!g_panel.open) return;
 
-    harvestNick();
+    if (g_editHoldHarvest) g_editHoldHarvest = false;
+    else harvestEdits();
     if (g_nickDirtyTick != 0 && (GetTickCount() - g_nickDirtyTick) >= 800ul) {
         g_nickDirtyTick = 0;
         fireRemember();
@@ -693,7 +749,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     // and armed but attaches to nothing, so F2 logs open/close yet nothing draws.
     if (!g_panel.panel) {
         std::string layer = "Info";
-        g_panel.panel = g->createDatapanel(0.20f, 0.16f, 0.34f, 0.66f, false, layer, true);
+        g_panel.panel = g->createDatapanel(0.20f, 0.14f, 0.36f, 0.72f, false, layer, true);
         g_panel.built = false;
         if (!g_panel.panel) {
             coop::logErrLine("[coop-ui] createDatapanel FAILED");
@@ -715,7 +771,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     // (Re)populate the rows when role/transport/connection/paste slots change.
     // Status text alone must NOT rebuild: that destroys the nick EditBox.
     if (g_panel.panel && (g_panel.needsRebuild || !g_panel.built)) {
-        harvestNick();
+        g_editHoldHarvest = false;
+        harvestEdits();
         std::string title = "Co-op Session";
         if (st->versionText && st->versionText[0]) {
             title += "   ";
@@ -729,10 +786,9 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         std::string connKey  = "conn";
         std::string connCap  = std::string("Connection: ") + (g_panel.connectedFlag ? "ONLINE" : "OFFLINE") + "    (switch)";
 
-        // Paste slots: host Steam has 3 friend IDs; join Steam has the host ID;
-        // join UDP has one IP:port slot. Host UDP listens, so no peer paste.
-        const bool udpJoin = !g_panel.hostFlag && !g_panel.steamFlag;
-        const int nSlots = g_panel.hostFlag ? (g_panel.steamFlag ? 3 : 0) : 1;
+        // Steam paste slots: host has 3 friend IDs, join has the host ID.
+        // UDP uses the type-in Host IP:port row instead; Steam copy/id rows hide.
+        const int nSlots = g_panel.steamFlag ? (g_panel.hostFlag ? 3 : 1) : 0;
         std::string pasteKey[3], pasteCap[3];
         int si;
         for (si = 0; si < nSlots; ++si) {
@@ -741,39 +797,23 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             k[sizeof(k) - 1] = '\0';
             pasteKey[si] = k;
             std::string label;
-            if (udpJoin) {
-                label = "Host UDP: ";
-                if (!g_udpIp.empty()) {
-                    char ep[80];
-                    int p = g_udpPort > 0 ? g_udpPort : (st->udpPort > 0 ? st->udpPort : 27800);
-                    _snprintf(ep, sizeof(ep) - 1, "%s:%d    (click to re-paste)",
-                              g_udpIp.c_str(), p);
-                    ep[sizeof(ep) - 1] = '\0';
-                    label += ep;
-                } else if (g_udpPasteFailed) {
-                    label += "(not an IP:port - copy host address and retry)";
-                } else {
-                    label += "(click to paste IP:port)";
-                }
+            unsigned long long shown = g_pastedPeers[si];
+            if (shown == 0 && si == 0) shown = (unsigned long long)st->peerSteamId;
+            if (g_panel.hostFlag) {
+                char nbuf[16];
+                _snprintf(nbuf, sizeof(nbuf) - 1, "Friend %d: ", si + 1);
+                nbuf[sizeof(nbuf) - 1] = '\0';
+                label = nbuf;
             } else {
-                unsigned long long shown = g_pastedPeers[si];
-                if (shown == 0 && si == 0) shown = (unsigned long long)st->peerSteamId;
-                if (g_panel.hostFlag) {
-                    char nbuf[16];
-                    _snprintf(nbuf, sizeof(nbuf) - 1, "Friend %d: ", si + 1);
-                    nbuf[sizeof(nbuf) - 1] = '\0';
-                    label = nbuf;
-                } else {
-                    label = "Host ID: ";
-                }
-                if (shown != 0) {
-                    label += coop::maskSteamId64(shown);
-                    label += "    (click to re-paste)";
-                } else if (g_pasteFailedSlot == si) {
-                    label += "(not a Steam ID - copy theirs and retry)";
-                } else {
-                    label += "(click to paste Steam ID)";
-                }
+                label = "Host ID: ";
+            }
+            if (shown != 0) {
+                label += coop::maskSteamId64(shown);
+                label += "    (click to re-paste)";
+            } else if (g_pasteFailedSlot == si) {
+                label += "(not a Steam ID - copy theirs and retry)";
+            } else {
+                label += "(click to paste Steam ID)";
             }
             pasteCap[si] = label;
         }
@@ -784,9 +824,18 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                                    : std::string("(Steam not running)");
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
-        std::string nickKey  = "Nick";
-        std::string nickText = g_playerNick;
-        MyGUI::Align nickAlign(MyGUI::Align::Left);
+        std::string nickLblKey = "name";
+        std::string nickLbl    = "Your nick  (type your name below)";
+        std::string nickKey    = "nickedit";
+        std::string nickText   = g_playerNick;
+        std::string udpLblKey  = "udp";
+        std::string udpLbl     = g_panel.hostFlag
+            ? "UDP IP:port  (your address, type or paste)"
+            : "Host IP:port  (type or paste the host address)";
+        std::string udpKey     = "udpedit";
+        std::string udpText;
+        formatUdpText(udpText);
+        MyGUI::Align editAlign(MyGUI::Align::Left);
         std::string empty    = "";
 
         PanelStrings ps;
@@ -801,11 +850,16 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         }
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
+        ps.nickLblKey = &nickLblKey; ps.nickLbl = &nickLbl;
         ps.nickKey = &nickKey; ps.nickText = &nickText;
-        ps.nickAlign = &nickAlign; ps.nickWidth = 280.0f;
+        ps.udpLblKey = &udpLblKey; ps.udpLbl = &udpLbl;
+        ps.udpKey = &udpKey; ps.udpText = &udpText;
+        ps.editAlign = &editAlign; ps.editWidth = 420.0f;
+        ps.showSteam = g_panel.steamFlag ? 1 : 0;
+        ps.showUdp = g_panel.steamFlag ? 0 : 1;
         ps.empty = &empty;
         panelBuildSeh(g_panel.panel, &ps);
-        g_nickHoldHarvest = true;
+        g_editHoldHarvest = true;
 
         // Delegate assignment + white-colouring live OUTSIDE the SEH frame (pointer)
         // targets are valid post-build; assignment can't fault) so no delegate
@@ -817,6 +871,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_pasteBtns[0]) g_pasteBtns[0]->callback = MyGUI::newDelegate(&onPasteSlot0);
         if (g_pasteBtns[1]) g_pasteBtns[1]->callback = MyGUI::newDelegate(&onPasteSlot1);
         if (g_pasteBtns[2]) g_pasteBtns[2]->callback = MyGUI::newDelegate(&onPasteSlot2);
+        dbgColourSeh(g_nickHint, false);
+        dbgColourSeh(g_udpHint, false);
         dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
         dbgColourSeh(g_selfLine, false);
 
@@ -834,6 +890,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     if (g_panel.connectedFlag != g_panel.lastChkVal) {
         g_panel.lastChkVal = g_panel.connectedFlag;
         if (g_panel.connectedFlag && !st->running) {
+            g_editHoldHarvest = false;
             flushNickRemember();
             char b[80];
             _snprintf(b, sizeof(b) - 1, "[coop-ui] CONNECT role=%s transport=%s",

@@ -1,3 +1,62 @@
+# v0.56 — clearer F2 nick + UDP address field
+
+Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
+author wrote the mod.
+
+Protocol **58** — unchanged. Everyone still needs the same DLL.
+
+## What changed
+
+- **Your nick** is a labelled row above the type-in box, so it is obvious what
+  the field is. The box no longer sits on top of the connection-status line.
+- **UDP:** a matching type-in **Host IP:port** / **UDP IP:port** field. Steam
+  ID copy/paste rows hide when Transport is UDP.
+- **Release assets** now include `RE_Kenshi.json` and `KenshiCoop.mod` next to
+  the DLL. First-time install needs all three; later updates still only replace
+  the DLL.
+
+## Install
+
+From this release, put these in `<Kenshi>\mods\KenshiCoop\`:
+
+- `KenshiCoop.dll`
+- `RE_Kenshi.json` (RE_Kenshi will not load the plugin without it)
+- `KenshiCoop.mod` (so it appears in the Mods menu)
+
+If you already have that folder from an earlier build, only the DLL is required.
+Requires Kenshi 1.0.65 and [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+
+---
+
+# v0.56 — понятный ник в F2 и поле UDP (Русский)
+
+Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, автор мода —
+он.
+
+Протокол **58**, не менялся. DLL всё равно нужна одна и та же.
+
+## Что изменилось
+
+- **Your nick** — отдельная подпись над полем, чтобы было ясно, что это ник.
+  Бокс больше не наезжает на строку статуса.
+- **UDP:** такое же поле **Host IP:port** / **UDP IP:port**. Строки Steam ID
+  в режиме UDP скрыты.
+- **В релизе теперь три файла:** DLL, `RE_Kenshi.json` и `KenshiCoop.mod`.
+  Первая установка — все три; обновление — только DLL.
+
+## Установка
+
+Из этого релиза положите в `<Kenshi>\mods\KenshiCoop\`:
+
+- `KenshiCoop.dll`
+- `RE_Kenshi.json` (без него RE_Kenshi не загрузит плагин)
+- `KenshiCoop.mod` (чтобы мод был в меню Mods)
+
+Если папка уже есть со старой сборки, достаточно новой DLL. Нужны Kenshi 1.0.65
+и [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+
+---
+
 # v0.55 — type a nick in F2
 
 Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose

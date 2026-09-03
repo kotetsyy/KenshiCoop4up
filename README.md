@@ -51,10 +51,19 @@ and — for the Steam transport — Steam running and online on every machine. T
 is the whole network setup: no port forwarding, no router configuration, no IP
 addresses.
 
-Download `KenshiCoop.dll` from the
-[latest release](https://github.com/kotetsyy/KenshiCoop4up/releases/latest) and
-place it so you end up with `<Kenshi>\mods\KenshiCoop\KenshiCoop.dll`. Launch
-Kenshi and enable **KenshiCoop** in the Mods menu.
+**First install:** from the
+[latest release](https://github.com/kotetsyy/KenshiCoop4up/releases/latest)
+download all three files into `<Kenshi>\mods\KenshiCoop\`:
+
+- `KenshiCoop.dll` — the plugin
+- `RE_Kenshi.json` — tells RE_Kenshi to load that DLL (without it the mod never starts)
+- `KenshiCoop.mod` — so Kenshi lists it in the Mods menu
+
+Launch Kenshi and enable **KenshiCoop** in the Mods menu.
+
+**Later updates:** if that folder already exists, only the DLL needs replacing
+(the in-game updater does exactly that). `.mod` and `RE_Kenshi.json` almost
+never change.
 
 **Everyone must run the same build.** Mismatched versions do not connect.
 
@@ -64,9 +73,9 @@ The Co-op panel works at the **main menu** as well as in-game, so a joining
 player does not need to load anything first.
 
 1. Press **F2**.
-2. **Type a nick.** Click the **Nick** row and type your name. That name is
-   written onto the squad unit you play after you connect, so the nametag tells
-   you who is yours. Set it before going ONLINE.
+2. **Type a nick.** The row says **Your nick** — click the box under it and
+   type your name. That name is written onto the squad unit you play after you
+   connect. Set it before going ONLINE.
 3. **Swap Steam IDs.** Each player clicks **Copy my Steam ID** and sends it to
    the others. Copy the one you receive, then click **Paste friend's Steam ID**.
    The panel shows what it captured. Nick and Steam ID are remembered in
@@ -77,8 +86,8 @@ player does not need to load anything first.
 6. **Join:** straight from the main menu, set **Role: JOIN** and go **ONLINE**.
    The host streams its world to you and you load into it.
 
-**LAN / direct UDP:** set **Transport: UDP**, click the **Host UDP** row and
-paste `ip:port` (e.g. `192.168.1.10:27800`).
+**LAN / direct UDP:** set **Transport: UDP**. Steam ID rows hide. Type or paste
+`ip:port` in **Host IP:port** (e.g. `192.168.1.10:27800`).
 
 Each player controls their own squad: one squad tab per player, host runs squad
 1, the first join squad 2, and so on. If your save has only one squad, split
@@ -222,10 +231,19 @@ project.
 для Steam-транспорта — запущенный Steam в сети на каждой машине. Это вся
 сетевая настройка: без проброса портов, без настройки роутера, без IP-адресов.
 
-Скачайте `KenshiCoop.dll` из
-[последнего релиза](https://github.com/kotetsyy/KenshiCoop4up/releases/latest) и
-положите так, чтобы получилось `<Kenshi>\mods\KenshiCoop\KenshiCoop.dll`.
+**Первая установка:** из
+[последнего релиза](https://github.com/kotetsyy/KenshiCoop4up/releases/latest)
+скачайте все три файла в `<Kenshi>\mods\KenshiCoop\`:
+
+- `KenshiCoop.dll` — сам плагин
+- `RE_Kenshi.json` — говорит RE_Kenshi загрузить эту DLL (без него мод не стартует)
+- `KenshiCoop.mod` — чтобы Kenshi показал мод в меню Mods
+
 Запустите Kenshi и включите **KenshiCoop** в меню модов.
+
+**Потом, при обновлении:** если папка уже есть, достаточно заменить DLL
+(внутриигровой апдейтер так и делает). `.mod` и `RE_Kenshi.json` почти не
+меняются.
 
 **У всех должна быть одна и та же сборка.** Разные версии не соединяются.
 
@@ -235,9 +253,8 @@ project.
 ничего предварительно загружать.
 
 1. Нажмите **F2**.
-2. **Введите ник.** Нажмите строку **Nick** и наберите имя. После входа это имя
-   ставится на юнит в вашем отряде, чтобы по табличке было видно, за кого
-   играть. Задайте ник до ONLINE.
+2. **Введите ник.** Строка **Your nick** — кликните поле под ней и наберите
+   имя. После входа оно ставится на юнит в вашем отряде. Задайте ник до ONLINE.
 3. **Обменяйтесь Steam ID.** Каждый жмёт **Copy my Steam ID** и отправляет
    остальным. Полученный ID скопируйте и нажмите **Paste friend's Steam ID** —
    панель покажет, что распознала. Ник и Steam ID запоминаются в
@@ -248,8 +265,9 @@ project.
 6. **Подключение:** прямо из главного меню — **Role: JOIN** и **ONLINE**. Хост
    передаст свой мир, и вы загрузитесь в него.
 
-**LAN / прямой UDP:** поставьте **Transport: UDP**, нажмите строку **Host UDP**
-и вставьте `ip:port` (например `192.168.1.10:27800`).
+**LAN / прямой UDP:** поставьте **Transport: UDP**. Строки Steam ID скрываются.
+В поле **Host IP:port** наберите или вставьте `ip:port` (например
+`192.168.1.10:27800`).
 
 Каждый игрок управляет своим отрядом: по вкладке отряда на игрока, у хоста отряд
 1, у первого подключившегося — 2, и так далее. Если в сейве только один отряд,

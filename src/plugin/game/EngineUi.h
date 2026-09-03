@@ -15,12 +15,11 @@ namespace engine {
 
 // ---- In-game co-op session panel ---------------------------------------------
 // A native DatapanelGUI opened with F2 that lets the player pick role + transport
-// (toggle buttons) and Connect/Disconnect. Steam IDs are still clipboard-paste
-// (17 digits, no field). The display nick is a real DatapanelGUI text-edit row
-// (setLineTextEditable): click it and type. That name is stamped onto this
-// player's squad unit after join. A paste / edit / Connect is remembered in
-// coop_config.json so the next launch pre-fills the same Steam ID / UDP
-// endpoint / nick. The GUI layer stays
+// (toggle buttons) and Connect/Disconnect. Steam IDs are clipboard-paste
+// (17 digits). The display nick and the UDP host IP:port are type-in
+// DatapanelGUI rows (setLineTextEditable). Steam ID copy/paste rows are hidden
+// on UDP. A paste / edit / Connect is remembered in coop_config.json. The GUI
+// layer stays
 // session-agnostic: live status is passed IN via *st and the user's actions
 // are handed BACK through the callbacks (the plugin root owns the
 // session/config wiring). Main-thread only; SEH-guarded.
