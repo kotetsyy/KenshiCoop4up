@@ -2157,6 +2157,7 @@ void Replicator::announceSquadClaim(NetLink& net, u32 ownerId,
         pinOwned_.insert(lk);
         pinOwned_.insert(wk);
         publishAsWire_[lk] = wk;
+        if (i == 0) noteNickHand(ownerId, local[i]);
         EventPacket ev;
         memset(&ev, 0, sizeof(ev));
         ev.type    = (u8)PKT_EVENT;
@@ -2174,6 +2175,59 @@ void Replicator::announceSquadClaim(NetLink& net, u32 ownerId,
                   wk.i, wk.s, lk.i, lk.s);
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
+    }
+}
+
+void Replicator::setPeerNick(u32 ownerId, const char* name) {
+    if (ownerId >= MAX_PLAYERS) return;
+    memset(peerNick_[ownerId], 0, sizeof(peerNick_[ownerId]));
+    if (!name || !name[0]) return;
+    unsigned n = 0;
+    while (name[n] && n < HELLO_NAME_MAX) {
+        peerNick_[ownerId][n] = name[n];
+        ++n;
+    }
+}
+
+void Replicator::noteNickHand(u32 ownerId, const unsigned int hand[5]) {
+    if (ownerId >= MAX_PLAYERS || !hand) return;
+    if (nickHandSet_[ownerId]) return;
+    nickHand_[ownerId].t = hand[0];
+    nickHand_[ownerId].c = hand[1];
+    nickHand_[ownerId].cs = hand[2];
+    nickHand_[ownerId].i = hand[3];
+    nickHand_[ownerId].s = hand[4];
+    nickHandSet_[ownerId] = 1;
+}
+
+void Replicator::applySquadNicks(GameWorld* gw, u32 localId) {
+    (void)gw;
+    for (u32 id = 0; id < MAX_PLAYERS; ++id) {
+        if (peerNick_[id][0] == '\0') continue;
+        Character* c = 0;
+        if (nickHandSet_[id]) {
+            const Key& k = nickHand_[id];
+            c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        }
+        if (!c && id == localId) {
+            if (!ownHands_.empty()) {
+                const Key& k = *ownHands_.begin();
+                c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            } else if (!pinOwned_.empty()) {
+                const Key& k = *pinOwned_.begin();
+                c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            }
+        }
+        if (!c) continue;
+        char cur[64];
+        engine::charName(c, cur, sizeof(cur));
+        if (cur[0] && strcmp(cur, peerNick_[id]) == 0) continue;
+        engine::charSetName(c, peerNick_[id]);
+        char lb[96];
+        _snprintf(lb, sizeof(lb) - 1, "[nick] applied id=%u '%s'",
+                  (unsigned)id, peerNick_[id]);
+        lb[sizeof(lb) - 1] = '\0';
+        coop::logLine(lb);
     }
 }
 

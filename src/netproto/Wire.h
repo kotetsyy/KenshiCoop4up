@@ -36,7 +36,7 @@ const u16 PROTOCOL_VERSION = 58;
 // it is the thing that makes everyone else's copy stale.
 // Bump this in the same commit as the git tag, and put the same string in
 // dist/UPDATE.txt when publishing.
-const char* const COOP_BUILD_VERSION = "0.53";
+const char* const COOP_BUILD_VERSION = "0.54";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;
@@ -146,10 +146,12 @@ const u32 OWNER_ID_ALL = 0xFFFFFFFFu;
 
 #pragma pack(push, 1)
 
+const unsigned HELLO_NAME_MAX = 63;
+
 struct HelloPacket {
     u8  type;    // = PKT_HELLO
     u16 version; // = PROTOCOL_VERSION
-    u8  nameLen; // bytes of name following this struct (0..63)
+    u8  nameLen; // bytes of name following this struct (0..HELLO_NAME_MAX)
     // char name[nameLen] follows
 };
 
@@ -1631,6 +1633,41 @@ inline bool readPacket(const void* data, unsigned int len, T* out) {
     if (data == 0 || out == 0 || len < sizeof(T)) return false;
     memcpy(out, data, sizeof(T));
     return true;
+}
+
+// Copy the optional trailing HELLO name into out (always NUL-terminated).
+// Returns bytes copied. 0 if the packet has no name / is truncated / junk.
+inline unsigned copyHelloName(const void* data, unsigned int len,
+                              char* out, unsigned int cap) {
+    if (out == 0 || cap == 0) return 0;
+    out[0] = '\0';
+    HelloPacket h;
+    if (!readPacket(data, len, &h)) return 0;
+    unsigned n = h.nameLen;
+    if (n > HELLO_NAME_MAX) n = HELLO_NAME_MAX;
+    if (len < sizeof(HelloPacket) + n) return 0;
+    if (n >= cap) n = cap - 1;
+    if (n > 0) memcpy(out, (const char*)data + sizeof(HelloPacket), n);
+    out[n] = '\0';
+    return n;
+}
+
+// WELCOME may append [u8 nameLen][name] after the fixed struct so the join
+// learns the host's nick without a new packet type. sizeof(WelcomePacket) is
+// unchanged; older readers ignore the tail.
+inline unsigned copyWelcomeName(const void* data, unsigned int len,
+                                char* out, unsigned int cap) {
+    if (out == 0 || cap == 0) return 0;
+    out[0] = '\0';
+    if (data == 0 || len <= sizeof(WelcomePacket)) return 0;
+    const unsigned char* p = (const unsigned char*)data + sizeof(WelcomePacket);
+    unsigned n = p[0];
+    if (n > HELLO_NAME_MAX) n = HELLO_NAME_MAX;
+    if (len < sizeof(WelcomePacket) + 1u + n) return 0;
+    if (n >= cap) n = cap - 1;
+    if (n > 0) memcpy(out, p + 1, n);
+    out[n] = '\0';
+    return n;
 }
 
 } // namespace coop

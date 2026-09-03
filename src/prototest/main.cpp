@@ -29,6 +29,7 @@
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
 #include "../plugin/core/UdpEndpoint.h"
+#include "../plugin/core/PlayerNick.h"
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
@@ -528,6 +529,36 @@ static void testFraming() {
     CHECK("HELLO parses from raw bytes", readPacket(hello, 4, &h));
     CHECK_EQ("HELLO version field offset", h.version, PROTOCOL_VERSION);
     CHECK("HELLO version mismatch detectable", ((u16)(PROTOCOL_VERSION + 1)) != h.version);
+    {
+        char nm[16];
+        CHECK_EQ("HELLO nameLen=0 copies nothing", copyHelloName(hello, 4, nm, 16), 0u);
+        CHECK("HELLO empty name is NUL", nm[0] == '\0');
+        unsigned char named[4 + 5];
+        named[0] = (unsigned char)PKT_HELLO;
+        named[1] = (unsigned char)(PROTOCOL_VERSION & 0xFF);
+        named[2] = (unsigned char)((PROTOCOL_VERSION >> 8) & 0xFF);
+        named[3] = 5;
+        named[4] = 'A'; named[5] = 'l'; named[6] = 'i'; named[7] = 'c'; named[8] = 'e';
+        CHECK_EQ("HELLO trailing name copied", copyHelloName(named, 9, nm, 16), 5u);
+        CHECK("HELLO name bytes", std::string(nm) == "Alice");
+        CHECK_EQ("HELLO truncated packet yields no name",
+                 copyHelloName(named, 6, nm, 16), 0u);
+        unsigned char wel[sizeof(WelcomePacket) + 1 + 4];
+        memset(wel, 0, sizeof(wel));
+        wel[0] = (unsigned char)PKT_WELCOME;
+        wel[1] = (unsigned char)(PROTOCOL_VERSION & 0xFF);
+        wel[2] = (unsigned char)((PROTOCOL_VERSION >> 8) & 0xFF);
+        wel[sizeof(WelcomePacket)] = 4;
+        wel[sizeof(WelcomePacket) + 1] = 'H';
+        wel[sizeof(WelcomePacket) + 2] = 'o';
+        wel[sizeof(WelcomePacket) + 3] = 's';
+        wel[sizeof(WelcomePacket) + 4] = 't';
+        CHECK_EQ("WELCOME trailing name copied",
+                 copyWelcomeName(wel, (unsigned)sizeof(wel), nm, 16), 4u);
+        CHECK("WELCOME name bytes", std::string(nm) == "Host");
+        CHECK_EQ("WELCOME without tail has no name",
+                 copyWelcomeName(wel, (unsigned)sizeof(WelcomePacket), nm, 16), 0u);
+    }
 
     // Entity batch framing: [EntityBatchHeader][EntityState*count], the exact
     // bounds check NetLink applies ("len >= need") must hold for a full batch
@@ -1225,6 +1256,34 @@ static void testUdpEndpointParse() {
           ip == "keep");
 }
 
+static void testPlayerNickParse() {
+    std::printf("== player nick parse (PlayerNick.h) ==\n");
+    std::string nick;
+
+    nick.clear();
+    CHECK("plain nick accepted",
+          coop::parsePlayerNick("Kotetsy", nick) && nick == "Kotetsy");
+    nick.clear();
+    CHECK("surrounding whitespace/newline stripped",
+          coop::parsePlayerNick("  Alice \r\n", nick) && nick == "Alice");
+    nick.clear();
+    CHECK("first line only",
+          coop::parsePlayerNick("Bob\nsecond line", nick) && nick == "Bob");
+    nick.clear();
+    CHECK("controls stripped",
+          coop::parsePlayerNick("A\tB C", nick) && nick == "AB C");
+
+    nick = "keep";
+    CHECK("empty rejected", !coop::parsePlayerNick("", nick) && nick == "keep");
+    CHECK("whitespace-only rejected",
+          !coop::parsePlayerNick("   \r\n", nick) && nick == "keep");
+
+    std::string longNick(80, 'x');
+    nick.clear();
+    CHECK("overlong truncated to 63",
+          coop::parsePlayerNick(longNick, nick) && nick.size() == coop::PLAYER_NICK_MAX);
+}
+
 // ---- 8. Pose-fixture acceptance (WorkPose.h) ------------------------------------
 // Guards the mining-sync fix (2026-07-14): a player mining an ore node operates a
 // mine building. A single 6 m seat gate rejected the CORRECT mine as "far"
@@ -1837,6 +1896,7 @@ int main() {
     testOwnRanks();
     testSteamIdParse();
     testUdpEndpointParse();
+    testPlayerNickParse();
     testWorkPoseMatch();
     testTaskClear();
     testDeathRekey();

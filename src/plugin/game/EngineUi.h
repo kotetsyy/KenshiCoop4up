@@ -19,9 +19,11 @@ namespace engine {
 // MyGUI comboboxes/editboxes have no usable RVAs and don't receive keyboard focus
 // during gameplay) and Connect/Disconnect. The friend's Steam ID is entered by
 // clipboard: "Copy my Steam ID" puts the player's own id on the clipboard to
-// share, and "Paste friend's Steam ID" reads the friend's id back in. A paste
-// (and a successful Connect) is remembered in coop_config.json so the next
-// launch pre-fills the same Steam ID / UDP endpoint. The GUI layer stays
+// share, and "Paste friend's Steam ID" reads the friend's id back in. A nick
+// is pasted the same way (no text field) and stamped onto this player's squad
+// unit after join. A paste (and a successful Connect) is remembered in
+// coop_config.json so the next launch pre-fills the same Steam ID / UDP
+// endpoint / nick. The GUI layer stays
 // session-agnostic: live status is passed IN via *st and the user's actions
 // are handed BACK through the callbacks (the plugin root owns the
 // session/config wiring). Main-thread only; SEH-guarded.
@@ -54,6 +56,9 @@ struct CoopPanelState {
     // spending one of the panel's few visible lines on something that never
     // changes during a session.
     const char*        versionText;
+    // Last-remembered display nick (coop_config.json playerName). Empty/null =
+    // none yet; the panel pastes one from the clipboard like a Steam ID.
+    const char*        playerName;
 };
 // The panel's role/transport selections at the moment Connect is hit. peerId is the
 // Steam ID pasted in-panel this session (0 if none), and overrides the config
@@ -73,6 +78,8 @@ unsigned long long coopPanelPastedId(int i);
 // means the join has not set one in-panel; Connect then uses coop_config.json.
 const char*        coopPanelUdpIp();
 int                coopPanelUdpPort();
+// Display nick pasted (or seeded from config) this session. Empty = unset.
+const char*        coopPanelPlayerName();
 
 // Persistent co-op connection-status banner: a single screen-space label fixed 10
 // px in from the top-left corner (a createFloatingLabel MyGUI::Window on the

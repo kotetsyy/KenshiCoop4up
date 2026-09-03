@@ -203,6 +203,13 @@ public:
     // enabled=false (default) = UDP.
     void setSteamTransport(unsigned long long peerSteamId);
 
+    // MAIN thread: display nick sent in HELLO (join) / WELCOME tail (host).
+    // Empty = omit the name bytes (legacy HELLO nameLen=0).
+    void setLocalName(const char* name);
+    // MAIN thread: copy a peer's nick received at handshake. Returns false if
+    // that player sent no name (out[0] = 0).
+    bool copyPeerName(u32 id, char* out, unsigned cap) const;
+
     // MAIN thread: advance this peer's session epoch (protocol 44). Called on
     // every session-reset edge (coordinated world reload, connect/disconnect
     // teardown). Subsequent entity batches carry the new epoch, so the peer
@@ -359,6 +366,14 @@ private:
     // (accept inbound tunnels). false = stock UDP.
     bool               steamMode_;
     unsigned long long steamPeer_;
+
+    // Handshake nicks. localName_ is written on the MAIN thread (setLocalName)
+    // and read on the NET thread when packing HELLO/WELCOME; peerName_ is
+    // written on the NET thread (HELLO/WELCOME recv, disconnect) and read on
+    // the MAIN thread (copyPeerName). nameCs_ covers both.
+    mutable CRITICAL_SECTION nameCs_;
+    char               localName_[64];
+    char               peerName_[MAX_PLAYERS][64];
 
     // WAN sim config (set before launch; read-only on the net thread thereafter).
     unsigned int  simDelayMs_;

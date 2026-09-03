@@ -64,14 +64,18 @@ The Co-op panel works at the **main menu** as well as in-game, so a joining
 player does not need to load anything first.
 
 1. Press **F2**.
-2. **Swap Steam IDs.** Each player clicks **Copy my Steam ID** and sends it to
+2. **Paste a nick.** Copy a name, then click **Nick**. There is no text field —
+   same clipboard paste as a Steam ID. That name is written onto the squad unit
+   you play after you connect, so the nametag tells you who is yours. Paste it
+   before going ONLINE.
+3. **Swap Steam IDs.** Each player clicks **Copy my Steam ID** and sends it to
    the others. Copy the one you receive, then click **Paste friend's Steam ID**.
-   The panel shows what it captured. It is remembered in `coop_config.json`, so
-   a relaunch pre-fills the panel.
-3. Leave **Transport** on **STEAM**.
-4. **Host:** load a save or start a new game — the mod ships two-squad co-op
+   The panel shows what it captured. Nick and Steam ID are remembered in
+   `coop_config.json`, so a relaunch pre-fills the panel.
+4. Leave **Transport** on **STEAM**.
+5. **Host:** load a save or start a new game — the mod ships two-squad co-op
    starts — then set **Role: HOST** and toggle **Connection** to **ONLINE**.
-5. **Join:** straight from the main menu, set **Role: JOIN** and go **ONLINE**.
+6. **Join:** straight from the main menu, set **Role: JOIN** and go **ONLINE**.
    The host streams its world to you and you load into it.
 
 **LAN / direct UDP:** set **Transport: UDP**, click the **Host UDP** row and
@@ -232,14 +236,17 @@ project.
 ничего предварительно загружать.
 
 1. Нажмите **F2**.
-2. **Обменяйтесь Steam ID.** Каждый жмёт **Copy my Steam ID** и отправляет
+2. **Вставьте ник.** Скопируйте имя и нажмите **Nick**. Поля ввода нет — как со
+   Steam ID, из буфера. После входа это имя ставится на юнит в вашем отряде,
+   чтобы по табличке было видно, за кого играть. Вставьте ник до ONLINE.
+3. **Обменяйтесь Steam ID.** Каждый жмёт **Copy my Steam ID** и отправляет
    остальным. Полученный ID скопируйте и нажмите **Paste friend's Steam ID** —
-   панель покажет, что распознала. Значение запоминается в `coop_config.json`,
-   поэтому при следующем запуске поле уже заполнено.
-3. **Transport** оставьте на **STEAM**.
-4. **Хост:** загрузите сейв или начните новую игру (в моде есть старты на два
+   панель покажет, что распознала. Ник и Steam ID запоминаются в
+   `coop_config.json`, поэтому при следующем запуске поля уже заполнены.
+4. **Transport** оставьте на **STEAM**.
+5. **Хост:** загрузите сейв или начните новую игру (в моде есть старты на два
    отряда), затем **Role: HOST** и **Connection** → **ONLINE**.
-5. **Подключение:** прямо из главного меню — **Role: JOIN** и **ONLINE**. Хост
+6. **Подключение:** прямо из главного меню — **Role: JOIN** и **ONLINE**. Хост
    передаст свой мир, и вы загрузитесь в него.
 
 **LAN / прямой UDP:** поставьте **Transport: UDP**, нажмите строку **Host UDP**

@@ -1,3 +1,80 @@
+# v0.54 — F2 nick on the squad unit you play
+
+Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose
+author wrote the mod.
+
+Protocol **58** — unchanged, so v0.53 and v0.54 still connect to each other.
+Everyone still needs the same DLL: this is a feature drop, not a wire break.
+
+## What changed
+
+**Paste a display nick in the F2 Co-op Session panel.** The panel still has no
+text field, so it works like Steam ID: copy a name, click **Nick**, and the
+row shows what it captured. It is remembered in `coop_config.json`.
+
+When you join (or host), that nick is sent in the existing HELLO / WELCOME
+name field and written onto the squad unit you own, so the nametag tells you
+who to play. Paste it **before** going ONLINE so the handshake carries it.
+
+```
+Nick: Alice    (click to re-paste)
+```
+
+## Still not tested
+
+- **The nick itself has not been through a live two-player session.** Check:
+  both players paste a nick, go online, and the claimed unit's nametag matches.
+  The log should show `[coop-ui] paste nick` then `[nick] applied id=…`.
+- **The loot use-after-free fix from v0.52** is still unconfirmed in 2p.
+- **Three and four players** are implemented but unvalidated.
+
+## Install
+
+If you are already on v0.53 with updates enabled, the in-game updater will
+fetch this. Otherwise put `KenshiCoop.dll` at
+`<Kenshi>\mods\KenshiCoop\KenshiCoop.dll`, with the game closed. Requires
+Kenshi 1.0.65 and [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+
+---
+
+# v0.54 — ник из F2 на юните в отряде (Русский)
+
+Форк **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, автор мода —
+он.
+
+Протокол **58**, не менялся: v0.53 и v0.54 по-прежнему соединяются. DLL всё
+равно нужна одна и та же — это фича, не смена провода.
+
+## Что изменилось
+
+**В панели F2 можно задать ник.** Поля ввода нет, поэтому как со Steam ID:
+скопируйте имя, нажмите **Nick**, панель покажет, что вставила. Запоминается
+в `coop_config.json`.
+
+При входе на сервер ник уходит в уже существующее поле имени в HELLO / WELCOME
+и ставится на юнит в вашем отряде — по табличке видно, за кого играть. Вставьте
+ник **до** ONLINE, чтобы он попал в рукопожатие.
+
+```
+Nick: Alice    (click to re-paste)
+```
+
+## Что по-прежнему не проверено
+
+- **Сам ник не прошёл живую сессию на двоих.** Проверка: оба вставили ник,
+  зашли, табличка на своём юните совпадает. В логе: `[coop-ui] paste nick`,
+  потом `[nick] applied id=…`.
+- **Фикс вылета на луте из v0.52** всё ещё без живой проверки на двоих.
+- **Трое и четверо игроков** реализованы, но не проверены.
+
+## Установка
+
+Если вы уже на v0.53 с обновлениями, апдейтер подтянет сам. Иначе положите
+`KenshiCoop.dll` в `<Kenshi>\mods\KenshiCoop\KenshiCoop.dll` при закрытой игре.
+Нужны Kenshi 1.0.65 и [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+
+---
+
 # v0.53 — build version visible in the co-op panel
 
 Fork of **[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop)**, whose

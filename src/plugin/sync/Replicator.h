@@ -400,6 +400,12 @@ public:
                             const unsigned int wire[][5],
                             const unsigned int local[][5], unsigned n);
 
+    // Display nick for a network player (HELLO/WELCOME). Applied onto the
+    // first claimed / owned squad body so F2 nicks show on nametags.
+    void setPeerNick(u32 ownerId, const char* name);
+    void noteNickHand(u32 ownerId, const unsigned int hand[5]);
+    void applySquadNicks(GameWorld* gw, u32 localId);
+
     // Squad management sync master enable (KENSHICOOP_SQUAD_SYNC). Also gates
     // the container-rank LATCH: with it on, tab ranks are assigned once at
     // first census and newly-seen containers APPEND (a mid-session tab can
@@ -2201,6 +2207,9 @@ private:
     // (mid-session) tab inherits its authoring side's ownership.
     std::set<Key> pinOwned_;
     std::set<Key> pinPeer_;
+    char          peerNick_[MAX_PLAYERS][64];
+    Key           nickHand_[MAX_PLAYERS];
+    unsigned char nickHandSet_[MAX_PLAYERS];
     // Local captured hand -> save-stable wire hand (join claim rewrite).
     std::map<Key, Key> publishAsWire_;
     // Wire container (the author's platoon) -> THIS client's local container.

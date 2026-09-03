@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "OwnRanks.h"
 #include "SteamId.h"
+#include "PlayerNick.h"
 #include <cstdlib>
 #include <cstdio>
 #include <map>
@@ -346,6 +347,11 @@ void loadConfig(Config& c) {
         }
     }
     c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
+    {
+        std::string raw = envOr("KENSHICOOP_PLAYER_NAME", fileOr(f, "playerName", "").c_str());
+        std::string nick;
+        c.playerName = parsePlayerNick(raw, nick) ? nick : std::string();
+    }
 
     // In-game panel session control: opt-in legacy auto-start. Default OFF so a
     // panel-driven (env-free) install defers the session to the Connect button;
@@ -609,6 +615,11 @@ void reloadPeerFromFile(Config& c) {
     }
     it = f.find("port");
     if (it != f.end() && !it->second.empty()) c.port = std::atoi(it->second.c_str());
+    it = f.find("playerName");
+    if (it != f.end() && !it->second.empty()) {
+        std::string nick;
+        if (parsePlayerNick(it->second, nick)) c.playerName = nick;
+    }
 }
 
 void saveConnectMemory(const Config& c) {
@@ -639,6 +650,7 @@ void saveConnectMemory(const Config& c) {
         pbuf[sizeof(pbuf) - 1] = '\0';
         upsertJsonValue(text, "port", std::string(pbuf));
     }
+    upsertJsonValue(text, "playerName", jsonQuote(c.playerName));
     writeConfigText(text);
 }
 

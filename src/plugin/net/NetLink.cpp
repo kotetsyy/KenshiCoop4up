@@ -3,6 +3,7 @@
 #include "NetLink.h"
 #include "SteamP2P.h"
 #include "../CoopLog.h"
+#include "../core/PlayerNick.h"
 
 #include <cstring>
 #include <cstdio>
@@ -86,11 +87,46 @@ NetLink::NetLink()
       steamMode_(false), steamPeer_(0),
       simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
     InitializeCriticalSection(&outCs_);
+    InitializeCriticalSection(&nameCs_);
+    memset(localName_, 0, sizeof(localName_));
+    memset(peerName_, 0, sizeof(peerName_));
 }
 
 NetLink::~NetLink() {
     stop();
+    DeleteCriticalSection(&nameCs_);
     DeleteCriticalSection(&outCs_);
+}
+
+void NetLink::setLocalName(const char* name) {
+    EnterCriticalSection(&nameCs_);
+    memset(localName_, 0, sizeof(localName_));
+    if (name && name[0]) {
+        unsigned n = 0;
+        while (name[n] && n < HELLO_NAME_MAX) {
+            localName_[n] = name[n];
+            ++n;
+        }
+    }
+    LeaveCriticalSection(&nameCs_);
+}
+
+bool NetLink::copyPeerName(u32 id, char* out, unsigned cap) const {
+    if (!out || cap == 0) return false;
+    out[0] = '\0';
+    if (id >= MAX_PLAYERS) return false;
+    EnterCriticalSection(&nameCs_);
+    bool have = peerName_[id][0] != '\0';
+    if (have) {
+        unsigned n = 0;
+        while (peerName_[id][n] && n + 1 < cap && n < HELLO_NAME_MAX) {
+            out[n] = peerName_[id][n];
+            ++n;
+        }
+        out[n] = '\0';
+    }
+    LeaveCriticalSection(&nameCs_);
+    return have;
 }
 
 bool NetLink::startHost(int port, Inbound* inbound) {
@@ -486,10 +522,19 @@ void NetLink::threadLoop() {
                         // a version mismatch is rejected before we admit it.
                         netLog("peer connecting (awaiting HELLO)");
                     } else {
-                        // Introduce ourselves with our protocol version.
+                        // Introduce ourselves with our protocol version + optional nick.
+                        char buf[sizeof(HelloPacket) + HELLO_NAME_MAX];
                         HelloPacket h;
-                        h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION; h.nameLen = 0;
-                        ENetPacket* out = enet_packet_create(&h, sizeof(h), ENET_PACKET_FLAG_RELIABLE);
+                        h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION;
+                        EnterCriticalSection(&nameCs_);
+                        unsigned n = 0;
+                        while (localName_[n] && n < HELLO_NAME_MAX) ++n;
+                        h.nameLen = (u8)n;
+                        memcpy(buf, &h, sizeof(h));
+                        if (n) memcpy(buf + sizeof(h), localName_, n);
+                        LeaveCriticalSection(&nameCs_);
+                        ENetPacket* out = enet_packet_create(buf, sizeof(h) + n,
+                                                             ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send(ev.peer, CH_RELIABLE, out);
                         netLog("connected to host; sent HELLO");
                     }
@@ -516,10 +561,41 @@ void NetLink::threadLoop() {
                                 } else {
                                     epochSeen_.erase(id);
                                     ev.peer->data = (void*)(size_t)id;
+                                    {
+                                        char nm[64];
+                                        copyHelloName(ev.packet->data,
+                                                      (unsigned)ev.packet->dataLength,
+                                                      nm, sizeof(nm));
+                                        std::string parsed;
+                                        if (id < MAX_PLAYERS && parsePlayerNick(nm, parsed)) {
+                                            EnterCriticalSection(&nameCs_);
+                                            memset(peerName_[id], 0, sizeof(peerName_[id]));
+                                            memcpy(peerName_[id], parsed.c_str(), parsed.size());
+                                            LeaveCriticalSection(&nameCs_);
+                                            char lb[96];
+                                            _snprintf(lb, sizeof(lb) - 1,
+                                                      "peer nick id=%u '%s'",
+                                                      (unsigned)id, parsed.c_str());
+                                            lb[sizeof(lb) - 1] = '\0';
+                                            netLog(lb);
+                                        }
+                                    }
                                     WelcomePacket w;
                                     w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
+                                    char wbuf[sizeof(WelcomePacket) + 1 + HELLO_NAME_MAX];
+                                    unsigned wlen = sizeof(w);
+                                    memcpy(wbuf, &w, sizeof(w));
+                                    EnterCriticalSection(&nameCs_);
+                                    unsigned hn = 0;
+                                    while (localName_[hn] && hn < HELLO_NAME_MAX) ++hn;
+                                    if (hn > 0) {
+                                        wbuf[sizeof(w)] = (char)(u8)hn;
+                                        memcpy(wbuf + sizeof(w) + 1, localName_, hn);
+                                        wlen = sizeof(w) + 1 + hn;
+                                    }
+                                    LeaveCriticalSection(&nameCs_);
                                     ENetPacket* out =
-                                        enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
+                                        enet_packet_create(wbuf, wlen, ENET_PACKET_FLAG_RELIABLE);
                                     enet_peer_send(ev.peer, CH_RELIABLE, out);
                                     char b[96];
                                     _snprintf(b, sizeof(b) - 1,
@@ -543,6 +619,20 @@ void NetLink::threadLoop() {
                                 netErr(b);
                             } else {
                                 InterlockedExchange(&myId_, (LONG)w.playerId);
+                                {
+                                    char nm[64];
+                                    if (copyWelcomeName(ev.packet->data,
+                                                        (unsigned)ev.packet->dataLength,
+                                                        nm, sizeof(nm))) {
+                                        std::string parsed;
+                                        if (parsePlayerNick(nm, parsed)) {
+                                            EnterCriticalSection(&nameCs_);
+                                            memset(peerName_[0], 0, sizeof(peerName_[0]));
+                                            memcpy(peerName_[0], parsed.c_str(), parsed.size());
+                                            LeaveCriticalSection(&nameCs_);
+                                        }
+                                    }
+                                }
                                 char b[96];
                                 _snprintf(b, sizeof(b) - 1,
                                           "peer connected id=%u (proto v%u) - received WELCOME",
@@ -1008,6 +1098,11 @@ void NetLink::threadLoop() {
                         u32 id = (u32)(size_t)ev.peer->data;
                         epochSeen_.erase(id);
                         ev.peer->data = 0;
+                        if (id < MAX_PLAYERS) {
+                            EnterCriticalSection(&nameCs_);
+                            memset(peerName_[id], 0, sizeof(peerName_[id]));
+                            LeaveCriticalSection(&nameCs_);
+                        }
                         if (inbound_) inbound_->pushLeave(id);
                         char b[64];
                         _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
@@ -1016,6 +1111,9 @@ void NetLink::threadLoop() {
                     } else {
                         epochSeen_.clear();
                         serverPeer_ = 0;
+                        EnterCriticalSection(&nameCs_);
+                        memset(peerName_, 0, sizeof(peerName_));
+                        LeaveCriticalSection(&nameCs_);
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
                         netLog("disconnected from host");
                     }

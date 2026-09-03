@@ -1012,6 +1012,11 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (nk.t == k.t && nk.c == k.c && nk.cs == k.cs &&
                     nk.i == k.i && nk.s == k.s) {
                     pinPeer_.insert(k);
+                    {
+                        unsigned int h[5];
+                        h[0] = k.t; h[1] = k.c; h[2] = k.cs; h[3] = k.i; h[4] = k.s;
+                        noteNickHand(ev.ownerId, h);
+                    }
                     char cb[128];
                     _snprintf(cb, sizeof(cb) - 1,
                               "[squad] CLAIM-PIN recv hand=%u,%u (peer-owned, no rekey)",

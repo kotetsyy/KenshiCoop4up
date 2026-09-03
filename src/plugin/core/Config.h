@@ -574,6 +574,13 @@ struct Config {
     unsigned long long steamPeer;
     std::vector<unsigned long long> steamPeers;
 
+    // F2-panel display nick (KENSHICOOP_PLAYER_NAME / coop_config.json
+    // "playerName"). Pasted from the clipboard - the panel has no text field.
+    // Sent in HELLO (join) / WELCOME tail (host) and written onto this player's
+    // claimed squad unit so both sides can tell who is who. Empty = leave the
+    // character's original name.
+    std::string playerName;
+
     // Steam reachability spike (KENSHICOOP_STEAM_PING=<steamid64>): ping/echo
     // that peer on P2P channel 1 every 2 s and log RTT + punch-vs-relay,
     // independent of the transport in use. 0 = off.
@@ -601,9 +608,9 @@ void loadConfig(Config& out);
 void reloadPeerFromFile(Config& c);
 
 // Write the last join/host connection (role, transport, steamPeer list, UDP
-// ip/port) into coop_config.json next to the DLL so a relaunch pre-fills F2
-// instead of requiring another clipboard paste. Merges into the existing file
-// (other keys kept). No-op if the path cannot be written.
+// ip/port, playerName) into coop_config.json next to the DLL so a relaunch
+// pre-fills F2 instead of requiring another clipboard paste. Merges into the
+// existing file (other keys kept). No-op if the path cannot be written.
 void saveConnectMemory(const Config& c);
 
 // Read the self-update keys out of coop_config.json. Kept OUT of struct Config

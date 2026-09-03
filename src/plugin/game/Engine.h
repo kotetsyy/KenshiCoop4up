@@ -308,6 +308,10 @@ unsigned int countNpcsNear(GameWorld* gw, float x, float y, float z,
 // logs need a human-readable identity to classify pop-out reports.
 void charName(Character* c, char* out, unsigned int cap);
 
+// SEH-guarded: write a character's display name (nametag + roster). No-op on
+// null/empty/fault. Used to stamp a co-op nick onto the unit a player owns.
+void charSetName(Character* c, const char* name);
+
 // Debug marker HUD labels (KENSHICOOP_DEBUG_MARKERS, spike-47 substrate): mint
 // a colored text label pinned to a character; the engine's own projection
 // tracks the body every frame. colorId: 0 = green (host-driven), 1 = red

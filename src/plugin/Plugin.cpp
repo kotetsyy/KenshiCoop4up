@@ -774,6 +774,7 @@ void coopPanelDrive() {
     ps.peerSteamId3 = (g_cfg.steamPeers.size() > 1) ? g_cfg.steamPeers[1] : 0ull;
     ps.udpIp        = g_cfg.ip.c_str();
     ps.udpPort      = g_cfg.port;
+    ps.playerName   = g_cfg.playerName.c_str();
     ps.running      = g_net.isRunning();
     ps.peerPresent  = g_peerPresent;
     ps.isHost       = g_cfg.isHost;
@@ -1074,6 +1075,19 @@ void tickEnsureJoinSquadTab(GameWorld* gw) {
         g_joinTabClaimed = true;
         coopLog("[squad] join auto-claim stopped (will not spawn replacements)");
     }
+}
+
+void tickApplyPlayerNicks(GameWorld* gw) {
+    if (!gw || !g_gameStarted) return;
+    if (!coop::engine::gameplayLive(gw)) return;
+    if (!g_cfg.playerName.empty())
+        g_repl.setPeerNick(g_net.localId(), g_cfg.playerName.c_str());
+    for (coop::u32 id = 0; id < coop::MAX_PLAYERS; ++id) {
+        char nm[64];
+        if (g_net.copyPeerName(id, nm, sizeof(nm)))
+            g_repl.setPeerNick(id, nm);
+    }
+    g_repl.applySquadNicks(gw, g_net.localId());
 }
 
 // Deferred auto-bake: write the fixture save once the armed settle window
@@ -1732,6 +1746,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // friend is connected (world streamed) but cannot issue orders. After the
     // world settles, claim one body into a new tab; protocol 35 carries it.
     tickEnsureJoinSquadTab(gw);
+    tickApplyPlayerNicks(gw);
 
     // Deferred auto-bake: write the fixture save once the armed settle window
     // elapses (one-shot); the self-exit timer then ends the bake run.
@@ -1877,6 +1892,8 @@ void startNetworking() {
     // Debug WAN simulation: when configured, hold/drop inbound entity batches so the
     // loopback harness exercises the real-latency path (interp + local enforcement)
     // instead of the ~0 ms same-frame delivery we'd otherwise validate against.
+    g_net.setLocalName(g_cfg.playerName.c_str());
+
     if (g_cfg.netSimDelayMs || g_cfg.netSimJitterMs || g_cfg.netSimLossPct) {
         g_net.setNetSim(g_cfg.netSimDelayMs, g_cfg.netSimJitterMs, g_cfg.netSimLossPct);
         char b[128];
@@ -1944,12 +1961,15 @@ void persistPanelMemory(bool isHost, bool useSteam) {
     if (ip && ip[0]) g_cfg.ip = ip;
     int port = coop::engine::coopPanelUdpPort();
     if (port > 0) g_cfg.port = port;
+    const char* nick = coop::engine::coopPanelPlayerName();
+    if (nick) g_cfg.playerName = nick;
     coop::saveConnectMemory(g_cfg);
     char b[176];
     _snprintf(b, sizeof(b) - 1,
-              "[coop-ui] remembered role=%s transport=%s peer=%llu ip=%s port=%d",
+              "[coop-ui] remembered role=%s transport=%s peer=%llu ip=%s port=%d nick=%s",
               isHost ? "HOST" : "JOIN", g_cfg.transport.c_str(),
-              (unsigned long long)g_cfg.steamPeer, g_cfg.ip.c_str(), g_cfg.port);
+              (unsigned long long)g_cfg.steamPeer, g_cfg.ip.c_str(), g_cfg.port,
+              g_cfg.playerName.empty() ? "-" : g_cfg.playerName.c_str());
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
 }

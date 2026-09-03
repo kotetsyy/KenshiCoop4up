@@ -26,6 +26,7 @@
 
 #include "../core/SteamId.h" // parseSteamId64 (paste button) + maskSteamId64 (id rows)
 #include "../core/UdpEndpoint.h" // parseUdpEndpoint (join UDP paste)
+#include "../core/PlayerNick.h" // parsePlayerNick (F2 nick paste)
 
 namespace coop {
 namespace engine {
@@ -299,6 +300,7 @@ DataPanelLine_Button*   g_roleBtn      = 0;
 DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
+DataPanelLine_Button*   g_nickBtn      = 0;
 DataPanelLine_Button*   g_pasteBtns[3] = {0, 0, 0}; // one paste slot per friend
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
@@ -310,6 +312,8 @@ int                     g_pasteFailedSlot = -1; // which slot last failed, or -1
 std::string             g_udpIp;         // join UDP host (pasted or seeded)
 int                     g_udpPort = 0;   // 0 = not set this session
 bool                    g_udpPasteFailed = false;
+std::string             g_playerNick;    // display nick (pasted or seeded)
+bool                    g_nickPasteFailed = false;
 bool                    g_memorySeeded = false; // config fallback applied once
 CoopConnectFn           g_onConnectCb  = 0;
 CoopRememberFn          g_onRememberCb = 0;
@@ -410,6 +414,24 @@ void onPasteSlot0(DataPanelLine*) {
 }
 void onPasteSlot1(DataPanelLine*) { pasteIntoSlot(1); }
 void onPasteSlot2(DataPanelLine*) { pasteIntoSlot(2); }
+void onPasteNick(DataPanelLine*) {
+    std::string clip;
+    std::string nick;
+    bool ok = clipboardGetText(clip) && coop::parsePlayerNick(clip, nick);
+    if (ok && !nick.empty()) {
+        g_playerNick = nick;
+        g_nickPasteFailed = false;
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] paste nick '%s'", g_playerNick.c_str());
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+        fireRemember();
+    } else {
+        g_nickPasteFailed = true;
+        coop::logLine("[coop-ui] paste failed (clipboard not a nick)");
+    }
+    g_panel.needsRebuild = true;
+}
 
 // POD-only pointer bundle so the row-build SEH frame constructs no std::string.
 struct PanelStrings {
@@ -419,6 +441,7 @@ struct PanelStrings {
     const std::string *pasteKey[3], *pasteCap[3];
     int nSlots;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
+    const std::string *nickKey, *nickCap;
     const std::string *empty;
 };
 
@@ -429,6 +452,7 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         g_roleBtn  = p->setLineButton(*s->roleKey,  *s->roleCap,  0);
         g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
         g_connBtn  = p->setLineButton(*s->connKey,  *s->connCap,  0);
+        g_nickBtn  = p->setLineButton(*s->nickKey,  *s->nickCap,  0);
         p->addSpace(0, 0.35f);
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
         p->addSpace(0, 0.25f);
@@ -490,6 +514,7 @@ unsigned long long coopPanelPastedId(int i) {
 }
 const char* coopPanelUdpIp() { return g_udpIp.c_str(); }
 int coopPanelUdpPort() { return g_udpPort; }
+const char* coopPanelPlayerName() { return g_playerNick.c_str(); }
 
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                    CoopDisconnectFn onDisconnect, CoopRememberFn onRemember) {
@@ -502,6 +527,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_pastedPeers[2] == 0) g_pastedPeers[2] = st->peerSteamId3;
         if (g_udpIp.empty() && st->udpIp && st->udpIp[0]) g_udpIp = st->udpIp;
         if (g_udpPort <= 0 && st->udpPort > 0) g_udpPort = st->udpPort;
+        if (g_playerNick.empty() && st->playerName && st->playerName[0])
+            g_playerNick = st->playerName;
         g_memorySeeded = true;
     }
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
@@ -537,6 +564,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
+            g_nickBtn = 0;
             g_pasteBtns[0] = g_pasteBtns[1] = g_pasteBtns[2] = 0;
             g_debugLine = 0; g_selfLine = 0;
             g_panel.open = false;
@@ -577,7 +605,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     // and armed but attaches to nothing, so F2 logs open/close yet nothing draws.
     if (!g_panel.panel) {
         std::string layer = "Info";
-        g_panel.panel = g->createDatapanel(0.20f, 0.16f, 0.34f, 0.62f, false, layer, true);
+        g_panel.panel = g->createDatapanel(0.20f, 0.16f, 0.34f, 0.66f, false, layer, true);
         g_panel.built = false;
         if (!g_panel.panel) {
             coop::logErrLine("[coop-ui] createDatapanel FAILED");
@@ -680,6 +708,16 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                                    : std::string("(Steam not running)");
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
+        std::string nickKey  = "nick";
+        std::string nickCap  = "Nick: ";
+        if (!g_playerNick.empty()) {
+            nickCap += g_playerNick;
+            nickCap += "    (click to re-paste)";
+        } else if (g_nickPasteFailed) {
+            nickCap += "(copy a name and click to paste)";
+        } else {
+            nickCap += "(click to paste your name)";
+        }
         std::string empty    = "";
 
         PanelStrings ps;
@@ -694,6 +732,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         }
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
+        ps.nickKey = &nickKey; ps.nickCap = &nickCap;
         ps.empty = &empty;
         panelBuildSeh(g_panel.panel, &ps);
 
@@ -704,6 +743,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_transBtn)   g_transBtn->callback   = MyGUI::newDelegate(&onTransBtn);
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
+        if (g_nickBtn)    g_nickBtn->callback    = MyGUI::newDelegate(&onPasteNick);
         if (g_pasteBtns[0]) g_pasteBtns[0]->callback = MyGUI::newDelegate(&onPasteSlot0);
         if (g_pasteBtns[1]) g_pasteBtns[1]->callback = MyGUI::newDelegate(&onPasteSlot1);
         if (g_pasteBtns[2]) g_pasteBtns[2]->callback = MyGUI::newDelegate(&onPasteSlot2);

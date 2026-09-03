@@ -100,6 +100,8 @@ Replicator::Replicator()
       platoonT0_(0),
       lifeSweepMs_(0) {
     peerCam_[0] = peerCam_[1] = peerCam_[2] = 0.0f;
+    memset(peerNick_, 0, sizeof(peerNick_));
+    memset(nickHandSet_, 0, sizeof(nickHandSet_));
 }
 
 // ---- Phase 3: unified entity lifecycle ---------------------------------------

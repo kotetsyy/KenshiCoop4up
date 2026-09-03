@@ -13,6 +13,7 @@
 // the API consumed by the PowerShell oracles (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include <cstring>
 
 // The co-op session panel + status overlay (the DatapanelGUI/Win32/clipboard
 // surface) moved to EngineUi.cpp in Phase 5e, taking its <kenshi/gui/...>,
@@ -1068,6 +1069,22 @@ void charName(Character* c, char* out, unsigned int cap) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         out[0] = '\0';
     }
+}
+
+namespace {
+void charSetNameCopy(Character* c, const char* name) {
+    c->setName(std::string(name));
+}
+} // namespace
+
+void charSetName(Character* c, const char* name) {
+    if (!c || !name || !name[0]) return;
+    char cur[64];
+    charName(c, cur, sizeof(cur));
+    if (cur[0] && strcmp(cur, name) == 0) return;
+    __try {
+        charSetNameCopy(c, name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 // The debug marker HUD labels (markerColour/markerCreateSeh/markerUpdateSeh/
