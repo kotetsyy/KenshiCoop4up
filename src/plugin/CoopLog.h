@@ -22,6 +22,26 @@ namespace coop {
 // short mode tag (e.g. "HOST"/"JOIN"). Safe to call once at plugin load.
 void logInit(const char* path, const char* modeTag);
 
+// Move logging to a different file mid-run, because the role this session
+// actually plays is not known when logInit runs.
+//
+// The log name is derived from coop_config.json "role", which defaults to
+// "host" and is only a REMEMBERED INTENT - the live role is whatever the player
+// arms in the F2 panel, possibly minutes later. A fresh install that joins
+// therefore wrote its whole session into KenshiCoop_host.log, and the join log
+// people were asked for did not exist: not missing, never created under that
+// name. Calling this at Connect, once the role is real, gives the session the
+// file it will be looked for in.
+//
+// No-op when `path` is already the open file. Otherwise the old file gets a
+// closing line naming the new one (so a half-read log points at its
+// continuation) and the new file is opened truncating, like logInit. The mode
+// tag on every subsequent line changes with it. Thread-safe.
+// Returns true only when the file actually CHANGED, so the caller can re-emit
+// a startup banner into the new file without duplicating it into the old one
+// on every Connect (those lines are parsed by the log oracles).
+bool logRetarget(const char* path, const char* modeTag);
+
 // The wall clock every timestamp in this plugin derives from: milliseconds
 // since local midnight PLUS the injected fake skew (see logSetFakeSkewMs).
 // Both the log-line "[HH:MM:SS.mmm]" stamps AND the wire time-sync packets

@@ -213,6 +213,9 @@ void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 // startNetworking() (which coopUiConnect reuses); forward-declared here so
 // mainLoop_hook can hand their addresses to coopPanelTick.
 void startNetworking();
+// Defined further down; coopUiConnect re-emits it after switching the log file
+// to the role actually being played, so the new file is self-contained.
+void logStartupBanner();
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
 void coopUiDisconnect();
 void persistPanelMemory(bool isHost, bool useSteam);
@@ -1992,6 +1995,22 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
 
     g_cfg.isHost    = isHost;
     g_cfg.transport = useSteam ? "steam" : "udp";
+
+    // Point the log at the role this session ACTUALLY plays. The file name was
+    // chosen at load time from coop_config.json "role", which defaults to "host"
+    // and is only a remembered intent - so a fresh install that joins wrote its
+    // whole session into KenshiCoop_host.log, and the join log players kept being
+    // asked for had never been created under that name. Re-emit the banner after
+    // the switch: build stamp, effective config and CAPS are the first things
+    // wanted from a log, and without this they would be stranded in the file
+    // nobody sends. No-op when the name already matches; skipped entirely when
+    // KENSHICOOP_LOG is set, because the harness names its own files.
+    if (getenv("KENSHICOOP_LOG") == 0) {
+        const char* want = isHost ? "KenshiCoop_host.log" : "KenshiCoop_join.log";
+        if (coop::logRetarget(want, isHost ? "HOST" : "JOIN"))
+            logStartupBanner(); // only on a real switch - not once per Connect
+    }
+
     // Re-read the UDP endpoint (ip/port) from coop_config.json so editing it then
     // hitting Connect works without restarting the game. (It also picks up a
     // steamPeer if one is set for advanced/back-compat use.)
@@ -2054,7 +2073,6 @@ void coopUiDisconnect() {
     sessionResetForUi();
 }
 
-} // namespace
 
 // RE_Kenshi resolves the entry by its C++-mangled name (?startPlugin@@YAXXZ), so
 // this must NOT be extern "C".
@@ -2096,6 +2114,7 @@ void logStartupBanner() {
     // for THIS run + the key tuning knobs. Answerable from the log alone.
     coopLog(coop::describeConfig(g_cfg).c_str());
 }
+} // namespace
 
 // Main-thread tick hook. GameWorld exposes both the virtual and the non-virtual
 // _NV_mainLoop_GPUSensitiveStuff (same RVA); GetRealAddress only works on the
