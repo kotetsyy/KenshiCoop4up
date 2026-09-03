@@ -86,7 +86,11 @@ Write-Host ""
 if ($WhatIf) { Write-Host "-WhatIf: not writing $Out"; Write-Host $manifest; exit 0 }
 
 New-Item -ItemType Directory -Force -Path (Split-Path $Out) | Out-Null
-[IO.File]::WriteAllText((Join-Path $root $Out), $manifest -replace "`r`n", "`n")
+# Parenthesised: without them PowerShell binds -replace's operands as extra
+# WriteAllText arguments and the overload resolution fails. LF endings so the
+# manifest reads identically however git normalises it on the way out.
+$manifestLf = ($manifest -replace "`r`n", "`n")
+[IO.File]::WriteAllText((Join-Path $root $Out), $manifestLf)
 Write-Host "wrote $Out"
 Write-Host ""
 Write-Host "Next, in order (the manifest must not go live before the asset it names):"
