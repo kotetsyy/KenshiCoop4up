@@ -14,6 +14,17 @@
 # It does NOT push or create the GitHub release - it prints the two commands to
 # run, so nothing leaves the machine without you typing it.
 #
+# RELEASE NOTES FORMAT (dist/RELEASE_NOTES.md, passed as --notes-file):
+#   * Russian first, plain. English goes in a <details><summary> block at the
+#     bottom so it is one click away without pushing the Russian down the page.
+#   * Do NOT use in-page anchor links to switch language. GitHub strips heading
+#     ids from RELEASE BODIES (they work in README.md, not here), so "#english"
+#     renders as a link that goes nowhere - verified on the v0.1.0 page.
+#     <details> is the only toggle that actually works in a release body.
+#   * Do not repeat the fork attribution or the protocol number in every
+#     release; that belongs in README.md. Mention the protocol only when it
+#     CHANGES, since that is the release where it decides who can still connect.
+#
 # -Amend: same version/tag, replace the assets on the EXISTING GitHub release
 # (window-size, label copy, tiny fixes). Use a new COOP_BUILD_VERSION / tag
 # only for a real feature or a protocol bump. Order is still: upload the DLL
