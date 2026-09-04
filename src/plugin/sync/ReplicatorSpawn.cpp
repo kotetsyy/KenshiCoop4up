@@ -745,6 +745,11 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     // proxy body's ACTUAL local position, in the SCENARIO series shape (hand
     // order i,s,t,c,cs like MEMBER/RECV lines) so the spawn_sync oracle can
     // time-pair it with the host's MEMBER series per hand.
+    // Harness-only: this is the spawn_sync oracle's input, not something a
+    // player session has any use for. At 2 Hz per live proxy it was 20965 of
+    // the 34434 lines in the 12:28-12:34 join log - 61% of a 3.8 MB file, seven
+    // times the host's - which is how a log stops being something anyone sends.
+#ifdef KENSHICOOP_HARNESS
     if (!proxyByKey_.empty() && (now - spawnPosLogMs_) >= 500) {
         spawnPosLogMs_ = now;
         for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
@@ -758,6 +763,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
+#endif // KENSHICOOP_HARNESS
 }
 
 bool Replicator::pickMintedProxyNear(GameWorld* gw, const unsigned int refHand[5],

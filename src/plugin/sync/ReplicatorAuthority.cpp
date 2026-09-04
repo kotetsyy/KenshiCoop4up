@@ -262,6 +262,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     // away with nobody near it, had it at peace. Measure the gap before
     // deciding what to do about it - one line per proxy per second, against
     // the census position of the STREAM key that minted it.
+#ifdef KENSHICOOP_HARNESS
+    // Harness-only telemetry: one line per proxy per second, consumed by the
+    // Motion/World/Combat oracles. In a real session it is pure noise at that
+    // rate - it was 9053 of the 34434 lines in the 12:28-12:34 join log - and a
+    // player log has to stay small enough to actually be sent and read.
     if (censusFresh && !proxyChars.empty()) {
         unsigned long nowD = nowMs();
         if ((nowD - proxyDriftLogMs_) >= 1000) {
@@ -304,6 +309,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             }
         }
     }
+#endif // KENSHICOOP_HARNESS
 
     // Under presence authority this pass runs on both sides, so the audit label
     // has to follow the role rather than the pass. With cellAuth off it is
