@@ -317,7 +317,16 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         // "awake" while we hold the body down clears it. The downward
         // transition stays entirely with the events, so a late or duplicated
         // medical packet can never knock a body down on its own.
-        if (!(p.flags & MED_UNCONSCIOUS) && !(p.flags & MED_DEAD)) {
+        // CRIPPLED is excluded, and that exclusion is the whole lesson of 0.1.10:
+        // "conscious" is not "on its feet". A character with a ruined leg crawls
+        // while fully awake, so the owner reports conscious, the copy is legitimately
+        // down, and the wake stood it up - session 19:19 fired 92 of these on one
+        // body (host leg at -62, crawling; the join showed him walking) at several
+        // per second, fighting the local engine every packet. The cooldown below is
+        // the second half: a disagreement must never become a tug of war, so even a
+        // genuine wake gets one attempt per body per few seconds.
+        if (!(p.flags & MED_UNCONSCIOUS) && !(p.flags & MED_DEAD) &&
+            !(p.flags & MED_CRIPPLED)) {
             std::map<Key, Driven>::iterator dt = targets_.find(k);
             bool latched = (dt != targets_.end()) &&
                            (dt->second.koLatched || dt->second.downApplied);
@@ -336,12 +345,24 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
                 if (engine::readMedical(c, &lr) && lr.valid)
                     localOut = lr.unconscious && !lr.dead;
             }
-            if ((latched || localOut) && !deathLatched) {
+            static std::map<Key, unsigned long> lastWake;
+            unsigned long wnow = nowMs();
+            bool cooled = true;
+            {
+                std::map<Key, unsigned long>::iterator wt = lastWake.find(k);
+                if (wt != lastWake.end() && wnow - wt->second < 3000) cooled = false;
+            }
+            if ((latched || localOut) && !deathLatched && cooled) {
+                lastWake[k] = wnow;
                 if (dt != targets_.end()) {
                     dt->second.koLatched = false;
                     dt->second.downApplied = false;
                 }
                 engine::knockDown(c, false);
+                // restoreMovement re-creates the physics capsule and the project's
+                // own rule is that it is only for a body that is NOT down. We just
+                // established this one should be up, so it applies - but only here,
+                // never on the crippled path above, which no longer reaches this.
                 engine::restoreMovement(c);
                 char wb[170]; _snprintf(wb, sizeof(wb) - 1,
                     "[med] WAKE hand=%u,%u src=%s (owner reports conscious)",
