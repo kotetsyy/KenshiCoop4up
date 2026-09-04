@@ -326,6 +326,13 @@ typedef Item* (__fastcall* GetWeaponFn)(Inventory* self);
 // Inventory::getInventoryGUI: the OPEN window holding this container, or null.
 // Backs CAP_INV_GUI; see the loot-GUI UAF note in EngineInternal.cpp.
 typedef InventoryGUI* (__fastcall* GetInvGuiFn)(Inventory* self);
+// InventoryGUI::refreshAllSections: rebuild every icon in an open panel from
+// the inventory as it stands NOW. This is what makes a live reconcile safe:
+// the panel hands each icon a raw Item*, and destroying a stack leaves those
+// icons dangling until something rebuilds them - the render-thread fault that
+// the whole defer-while-open compromise was built to avoid. Refreshing in the
+// same call, before returning to the engine, closes the window entirely.
+typedef void (__fastcall* InvGuiRefreshFn)(InventoryGUI* self);
 // DataPanelLine_TextEditable::textChanged: the engine's OWN handler that copies
 // its EditBox's live text into the line's s2 string. We call it before reading
 // s2 because s2 otherwise still holds the value the row was SEEDED with, so a
@@ -575,6 +582,7 @@ extern CreateItemFn     g_createItemFn;
 extern EquipItemFn      g_equipItemFn;
 extern GetAllSectionsFn g_getSectionsFn;
 extern GetInvGuiFn      g_getInvGuiFn;
+extern InvGuiRefreshFn  g_invGuiRefreshFn;
 extern LineTextChangedFn g_lineTextChangedFn;
 extern GetWeaponFn      g_getPrimaryWeaponFn;
 extern GetWeaponFn      g_getSecondaryWeaponFn;

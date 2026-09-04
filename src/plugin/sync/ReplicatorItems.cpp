@@ -139,7 +139,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         // the rest of the session. The map lookup is the cheap gate - only a
         // container already known to be deferred pays for the panel probe.
         if (guiDefer_.count(*it) != 0) {
-            if (engine::containerGuiOpen(gw, cHand)) continue;
+            if (engine::containerGuiNeedsDefer(gw, cHand)) continue;
             guiDefer_.erase(*it);
             guiDeferSaid_.erase(*it);
         }
@@ -275,7 +275,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         // the window closes, the peer's snapshot lands, and the next echo
         // reports contents both sides already agree on.
         if (guiDefer_.count(k) != 0) {
-            if (engine::containerGuiOpen(gw, cHand)) continue;
+            if (engine::containerGuiNeedsDefer(gw, cHand)) continue;
             guiDefer_.erase(k);
             guiDeferSaid_.erase(k);
         }
@@ -347,7 +347,7 @@ void Replicator::applyInventories(GameWorld* gw) {
         // documented outcome ("close the host's GUI -> the corpse is empty on both").
         // Held open indefinitely, the host's own panel keeps showing ghosts; that is
         // the accepted compromise, and the peer stays authoritative for what is left.
-        if (engine::containerGuiOpen(gw, cHand)) {
+        if (engine::containerGuiNeedsDefer(gw, cHand)) {
             it->second.dirty = true; // re-visit next tick
             unsigned long now = nowMs();
             unsigned long& since = guiDefer_[k];

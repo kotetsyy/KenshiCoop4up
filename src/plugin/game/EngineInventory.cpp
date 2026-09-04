@@ -63,6 +63,25 @@ bool inventoryGuiOpen(Inventory* inv) {
     }
 }
 
+// Rebuild an open panel's icons from the inventory as it stands now; returns
+// whether that actually happened. This is what makes destroying a stack under a
+// live window safe: the icons hold raw Item* pointers, and re-making them from
+// the current contents before we hand control back leaves nothing stale for the
+// render thread to walk. False means we could not refresh (lever unresolved, no
+// panel, or a fault) and the caller must not destroy.
+bool inventoryGuiRefresh(Inventory* inv) {
+    if (!inv || !g_getInvGuiFn || !g_invGuiRefreshFn) return false;
+    __try {
+        InventoryGUI* g = g_getInvGuiFn(inv);
+        if (!g) return false;
+        g_invGuiRefreshFn(g);
+        g->needItemsUpdate = true; // also ask for the engine's own next pass
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // SEH-guarded helper: copy an item's manufacturer + material GameData stringIDs into the
 // snapshot entry. WEAPONS need them to be reconstructable on the peer (createItem requires
 // the manufacturer/mesh GameData); armour/items leave them empty (the pointers are null).
@@ -700,6 +719,11 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     // inventoryGuiOpen). Read the window state ONCE, up front: the loop below must
     // not change its mind about it half way through a container.
     const bool guiOpen = inventoryGuiOpen(inv);
+    // Can the panel's icons be rebuilt after we mutate? If yes the reconcile runs
+    // in FULL and loot changes show up live on the other screen; if not it stays
+    // additive-only - which is what shipped from 0.1.2 and is exactly why taking
+    // an item did not appear on the other side until the window was reopened.
+    const bool canRefreshGui = guiOpen && (g_invGuiRefreshFn != 0);
 
     bool changed = false;
     for (unsigned int k = 0; k < ng; ++k) {
@@ -807,10 +831,11 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
         //    snapshot and re-runs it when the window closes) make this a delay; a caller that
         //    cannot degrades to additive-only, the same recoverable divergence a truncated
         //    snapshot already produces. Never destroy under a live window.
-        if (guiOpen && (g[k].curLoose > g[k].desiredLoose || g[k].curEq > g[k].desiredEq)) {
+        if (guiOpen && !canRefreshGui &&
+            (g[k].curLoose > g[k].desiredLoose || g[k].curEq > g[k].desiredEq)) {
             char b[200]; _snprintf(b, sizeof(b) - 1,
-                "[recon]   REMOVE-SKIP-GUI sid='%s' surplusLoose=%d surplusEq=%d (panel open; "
-                "destroying under it is the loot UAF)",
+                "[recon]   REMOVE-SKIP-GUI sid='%s' surplusLoose=%d surplusEq=%d (panel open, "
+                "no refresh lever; destroying under it is the loot UAF)",
                 g[k].sid, g[k].curLoose - g[k].desiredLoose, g[k].curEq - g[k].desiredEq);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
@@ -842,6 +867,13 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
                 b[sizeof(b)-1]='\0'; coop::logLine(b); }
         }
     }
+    // Rebuild the open panel's icons BEFORE returning to the engine. Every Item*
+    // we may have destroyed above is still referenced by an icon until this runs,
+    // and the next repaint would walk it on the render thread - the fault that
+    // made 0.1.2 defer the whole apply while a window was open. Doing it here, in
+    // the same call, means there is no moment where a stale icon is reachable, so
+    // loot can change live on both screens instead of only after a reopen.
+    if (changed && canRefreshGui) inventoryGuiRefresh(inv);
     return changed;
 }
 
@@ -1136,6 +1168,15 @@ bool containerGuiOpen(GameWorld* gw, const unsigned int cHand[5]) {
         if (inventoryGuiOpen(sub)) return true;
     }
     return false;
+}
+
+bool containerGuiNeedsDefer(GameWorld* gw, const unsigned int cHand[5]) {
+    // With the refresh lever present a live reconcile rebuilds the panel's icons
+    // itself, so there is nothing to wait for and loot changes are visible on
+    // both screens at once. Without it we are back to the only safe option:
+    // leave the container alone until the window closes.
+    if (g_invGuiRefreshFn != 0) return false;
+    return containerGuiOpen(gw, cHand);
 }
 
 namespace {

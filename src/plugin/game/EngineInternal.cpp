@@ -1409,6 +1409,7 @@ CreateItemFn     g_createItemFn   = 0;
 EquipItemFn      g_equipItemFn    = 0;
 GetAllSectionsFn g_getSectionsFn  = 0;
 GetInvGuiFn      g_getInvGuiFn    = 0; // open-window probe (loot-GUI UAF guard)
+InvGuiRefreshFn  g_invGuiRefreshFn = 0; // rebuild an open panel's icons
 LineTextChangedFn g_lineTextChangedFn = 0; // F2 edit rows: refresh s2 from the box
 GetWeaponFn      g_getPrimaryWeaponFn   = 0;
 GetWeaponFn      g_getSecondaryWeaponFn = 0;
@@ -1801,6 +1802,9 @@ void resolve() {
     g_getSectionsFn = (GetAllSectionsFn)KenshiLib::GetRealAddress(&Inventory::getAllSections);
     // Open-window probe: gates the destructive half of the inventory reconcile.
     g_getInvGuiFn = (GetInvGuiFn)KenshiLib::GetRealAddress(&Inventory::getInventoryGUI);
+    // Lets a reconcile run LIVE under an open panel instead of being deferred.
+    g_invGuiRefreshFn = (InvGuiRefreshFn)KenshiLib::GetRealAddress(
+        &InventoryGUI::refreshAllSections);
     // F2 type-in rows: without this the harvest reads the SEEDED s2 forever and
     // a typed nick never registers as a change.
     g_lineTextChangedFn = (LineTextChangedFn)KenshiLib::GetRealAddress(

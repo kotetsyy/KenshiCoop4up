@@ -616,6 +616,13 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
 // unavailable - the lever is reported in the [engine] CAPS line.
 bool containerGuiOpen(GameWorld* gw, const unsigned int cHand[5]);
 
+// True when an open panel on this container can be REFRESHED after we mutate it
+// - i.e. a live reconcile is safe and the caller need not defer. False either
+// because no panel is open (nothing to defer for) or because the refresh lever
+// is unavailable, in which case the caller should keep deferring rather than
+// destroy under a window it cannot rebuild.
+bool containerGuiNeedsDefer(GameWorld* gw, const unsigned int cHand[5]);
+
 // SEH-guarded (protocol 48): create `qty` of (sid,type) INSIDE the container the character at
 // cHand carries - a worn backpack's own private inventory, which is a different Inventory from
 // the character's and the only place a "bagged" item actually lives. `which` selects among
