@@ -2196,6 +2196,28 @@ private:
     // Same as handForContainerKey, then the entity-proxy remap applyInventories
     // already uses for runtime NPC corpses (host hand -> join-local mint).
     bool resolveInvLocalHand(const Key& k, unsigned int cHand[5]) const;
+    // The same host-hand -> local-instance remap, for EVENTS.
+    //
+    // An event names a body by the AUTHOR's hand. For a save-native body that
+    // hand resolves on both machines, but a body minted at runtime exists here
+    // as a proxy with a DIFFERENT local hand (session 12:29:09:
+    // "[rekey] wire=2,3137817344 local=1,1228515584"). Every event handler that
+    // resolved the wire hand directly therefore did nothing for exactly the
+    // bodies that need it - carried corpses, knocked-out raiders - and said so
+    // only as "ok=0" plus a settle whose transform writes were all zero.
+    //
+    // Strictly additive: when the direct resolve works this returns the same
+    // Character* it always did, and when the body is unknown it still returns 0.
+    // Only "would have failed" becomes "resolved through the proxy". Goes back
+    // through the engine rather than trusting the cached pointer, because the
+    // engine owns object lifetime and a proxy's block can unload unannounced.
+    Character* resolveEventChar(const Key& k) const;
+    // Key for an event's ACTOR (the a* fields), so the actor gets the same remap
+    // as the subject; a carry has a proxy on BOTH ends often enough to matter.
+    static Key actorKeyOf(const EventPacket& ev) {
+        Key k; k.t = ev.aType; k.c = ev.aContainer; k.cs = ev.aContainerSerial;
+        k.i = ev.aIndex; k.s = ev.aSerial; return k;
+    }
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the

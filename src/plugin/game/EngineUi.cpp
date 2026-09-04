@@ -423,13 +423,16 @@ void onPasteSlot2(DataPanelLine*) { pasteIntoSlot(2); }
 void harvestLineRaw(DataPanelLine_TextEditable* line, char* raw, unsigned cap) {
     raw[0] = '\0';
     if (!line || cap == 0) return;
-    const std::string* src = 0;
-    if (!line->s2.empty()) src = &line->s2;
-    else if (!line->keyValue.empty()) src = &line->keyValue;
-    if (!src) return;
-    size_t n = src->size();
+    // s2 ONLY. keyValue was tried as a fallback and is wrong: it holds the row's
+    // KEY ("nickedit" / "udpedit"), never anything the player typed, so an empty
+    // field harvested the key and used it as the value. Session 12:29:09 shows
+    // the result - "[nick] applied id=1 'nickedit'" - and the same fallback
+    // would have fed "udpedit" to the UDP endpoint parser. An unreadable field
+    // must report NOTHING and let the caller keep what it already had.
+    if (line->s2.empty()) return;
+    size_t n = line->s2.size();
     if (n >= cap) n = cap - 1;
-    memcpy(raw, src->c_str(), n);
+    memcpy(raw, line->s2.c_str(), n);
     raw[n] = '\0';
 }
 
@@ -437,8 +440,13 @@ void harvestNick() {
     if (!g_nickLine) return;
     char raw[128];
     harvestLineRaw(g_nickLine, raw, sizeof(raw));
+    // Empty read = the field told us nothing this tick, which is NOT the same as
+    // the player clearing their nick. Keep what we have (usually the one seeded
+    // from coop_config.json), the way harvestUdp already does. Clearing here
+    // would silently drop a remembered nick every time the row read back blank.
+    if (raw[0] == '\0') return;
     std::string nick;
-    if (!coop::parsePlayerNick(raw, nick)) nick.clear();
+    if (!coop::parsePlayerNick(raw, nick)) return;
     if (nick == g_playerNick) return;
     g_playerNick = nick;
     g_nickDirtyTick = GetTickCount();

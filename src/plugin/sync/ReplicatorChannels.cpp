@@ -232,8 +232,41 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
         k.i = p.sIndex; k.s = p.sSerial;
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
-        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
-        Character* c = engine::resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+        // Same host-hand -> local-instance remap the event channel needs: a
+        // runtime-spawned NPC exists here as a proxy under a different hand, so
+        // the direct resolve returned null and every vitals/limb update for
+        // exactly those bodies was dropped by the `continue` below - silently,
+        // because this path had no log line at all. That combination is why the
+        // 12:28-12:34 session could show 436 "[med] SEND" and no way to tell
+        // whether anything was ever received.
+        Character* c = resolveEventChar(k);
+        // Throttled diagnostics, main-thread only (function-local statics are
+        // safe here and keep a purely diagnostic counter out of the header).
+        {
+            static std::map<Key, unsigned long> lastHit;
+            static std::map<Key, unsigned long> lastMiss;
+            unsigned long mnow = nowMs();
+            if (!c) {
+                unsigned long& t = lastMiss[k];
+                if (t == 0 || mnow - t >= 5000) {
+                    t = mnow;
+                    char mb[160]; _snprintf(mb, sizeof(mb) - 1,
+                        "[med] APPLY-MISS hand=%u,%u (body does not resolve here, "
+                        "vitals dropped)", k.i, k.s);
+                    mb[sizeof(mb) - 1] = '\0'; coop::logLine(mb);
+                }
+            } else {
+                unsigned long& t = lastHit[k];
+                if (t == 0 || mnow - t >= 5000) {
+                    t = mnow;
+                    char mb[190]; _snprintf(mb, sizeof(mb) - 1,
+                        "[med] APPLY hand=%u,%u blood=%.1f bleed=%.2f flags=%u nparts=%u",
+                        k.i, k.s, p.blood, p.bleedRate,
+                        (unsigned)p.flags, (unsigned)p.nParts);
+                    mb[sizeof(mb) - 1] = '\0'; coop::logLine(mb);
+                }
+            }
+        }
         if (!c) continue;
         engine::MedicalRead w;
         memset(&w, 0, sizeof(w));

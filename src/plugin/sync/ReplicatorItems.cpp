@@ -16,6 +16,20 @@
 
 namespace coop {
 
+Character* Replicator::resolveEventChar(const Key& k) const {
+    Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+    if (c) return c;
+    std::map<Key, Character*>::const_iterator pit = proxyByKey_.find(k);
+    if (pit == proxyByKey_.end() || !pit->second) return 0;
+    // Re-ask the engine instead of handing back the cached pointer, and use the
+    // TYPED hand API so the two legacy component orders cannot be swapped here -
+    // getting that wrong is a silent no-op, which is the failure mode this whole
+    // helper exists to remove.
+    ObjectHand h;
+    if (!engine::charHandOf(pit->second, h)) return 0;
+    return engine::resolveChar(h);
+}
+
 bool Replicator::resolveInvLocalHand(const Key& k, unsigned int cHand[5]) const {
     handForContainerKey(k, cHand);
     if (engine::resolveObjectByHand(cHand) != 0) return true;
@@ -109,6 +123,26 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         // Skip until the container actually resolves here (post-load it may not yet),
         // so we never blast a spurious "empty" snapshot that would wipe baked contents.
         if (engine::resolveObjectByHand(cHand) == 0) continue;
+        // Do NOT publish a container whose incoming snapshot we have not applied
+        // yet. While an inventory panel is open here the apply is deferred (see
+        // applyInventories), so this copy is knowingly behind the peer's - and
+        // shipping it as authoritative is what duplicated loot: the peer applied
+        // our stale, still-full corpse and its reconcile CREATED back the items
+        // it had just taken. Session 12:31:30-12:32:05, host deferred for 35 s
+        // while the join's remaining-count oscillated 1 -> 2 -> 1 -> 0 -> 1.
+        // The peer keeps publishing what IT holds, so nothing is lost: the moment
+        // the window closes we apply that and resume from an agreed state.
+        //
+        // Confirmed against the LIVE panel rather than the flag alone: guiDefer_
+        // is only cleared when a further snapshot arrives, so a container that
+        // was deferred once and then went quiet would otherwise stay muted for
+        // the rest of the session. The map lookup is the cheap gate - only a
+        // container already known to be deferred pays for the panel probe.
+        if (guiDefer_.count(*it) != 0) {
+            if (engine::containerGuiOpen(gw, cHand)) continue;
+            guiDefer_.erase(*it);
+            guiDeferSaid_.erase(*it);
+        }
         u32 hash = 0;
         bool trunc = false;
         // includeNested (protocol 48): the ONLY capture that wants a worn container's own

@@ -814,12 +814,11 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // Latch used to wait for applyTargets, which never ran on an
                 // unstreamed NPC - join local AI stood the host's corpse.
                 if (ownHands_.find(k) == ownHands_.end()) {
-                    Character* who = engine::resolveCharByHand(
-                        k.i, k.s, k.t, k.c, k.cs);
-                    if (!who) {
-                        std::map<Key, Character*>::iterator px = proxyByKey_.find(k);
-                        if (px != proxyByKey_.end()) who = px->second;
-                    }
+                    // Was an inline proxy lookup that handed back the CACHED
+                    // pointer; resolveEventChar does the same remap but re-asks
+                    // the engine, so a proxy whose block unloaded reads as gone
+                    // instead of being knocked down through a stale pointer.
+                    Character* who = resolveEventChar(k);
                     if (who) engine::knockDown(who, true);
                 }
                 break;
@@ -827,7 +826,9 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
             case EVT_REVIVE: {
                 d.deathLatched = false; d.koLatched = false;
                 clearThrown(k, "revive");
-                Character* who = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                // Remapped: whatever we knocked down through the proxy has to be
+                // the same body we stand back up, or it stays down forever.
+                Character* who = resolveEventChar(k);
                 if (who) {
                     engine::knockDown(who, false);
                     engine::restoreMovement(who);
@@ -853,7 +854,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (ownHands_.find(k) != ownHands_.end()) break;
                 int limb = (int)ev.arg;
                 if (limb < 0 || limb > 3) break;
-                Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                Character* c = resolveEventChar(k);
                 if (!c) break; // not loaded here; the medical stream self-heals later
                 unsigned char states[4] = { LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN,
                                             LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN };
@@ -877,10 +878,18 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // Works for own-tab, cross-tab, and either direction: each
                 // machine mirrors the relationship between its own instances.
                 if (!carrySync_) break;
-                Character* carrier = engine::resolveCharByHand(
-                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
+                Character* carrier = resolveEventChar(actorKeyOf(ev));
+                // Hand the carried body through the SAME remap. applyPickup
+                // re-resolves from the array, so give it the hand of the local
+                // instance rather than the author's - a runtime-spawned corpse
+                // is a proxy here and the wire hand names nothing.
+                Character* carried = resolveEventChar(k);
                 unsigned int ch[5] = { ev.sType, ev.sContainer, ev.sContainerSerial,
                                        ev.sIndex, ev.sSerial };
+                if (carried) {
+                    ObjectHand lh;
+                    if (engine::charHandOf(carried, lh)) lh.toObjOrder(ch);
+                }
                 bool ok = carrier && engine::applyPickup(0, carrier, ch);
                 clearThrown(k, "pickup");
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
@@ -895,8 +904,11 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // ragdoll / landing). Idempotent applyDrop if not carrying.
                 // arg=2 is the post-flight landing settle (no applyDrop).
                 if (!carrySync_) break;
-                Character* who = engine::resolveCharByHand(
-                    ev.sIndex, ev.sSerial, ev.sType, ev.sContainer, ev.sContainerSerial);
+                // Same remap as the pickup: a dropped corpse is exactly the kind
+                // of runtime body that exists here only as a proxy, and settling
+                // a null `who` is what produced "park=0 raw=0 vis=0 hkset=0" with
+                // the position reading 0,0,0 in the 12:31:09 session.
+                Character* who = resolveEventChar(k);
                 if (ev.arg >= DROP_ARG_LANDING) {
                     char cb[240]; _snprintf(cb, sizeof(cb) - 1,
                         "[carry] RECV LANDING id=%u carried=%u,%u "
@@ -909,8 +921,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                     clearThrown(k, "landing");
                     break;
                 }
-                Character* carrier = engine::resolveCharByHand(
-                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
+                Character* carrier = resolveEventChar(actorKeyOf(ev));
                 bool ragdoll = ev.arg >= DROP_ARG_RAGDOLL;
                 bool ok = carrier && engine::applyDrop(carrier, ragdoll);
                 char cb[240]; _snprintf(cb, sizeof(cb) - 1,
