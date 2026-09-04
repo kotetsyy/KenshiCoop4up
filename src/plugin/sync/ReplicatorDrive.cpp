@@ -158,7 +158,13 @@ void Replicator::tickThrown(GameWorld* gw, NetLink& net, u32 ownerId) {
          it != thrown_.end(); ++it) {
         const Key& k = it->first;
         ThrownState& ts = it->second;
-        Character* who = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        // Remapped like the event handlers (0.1.2): a thrown body is very often
+        // a runtime corpse, which exists here as a proxy under a DIFFERENT local
+        // hand, so the wire hand resolved to nothing and settleDroppedBody was
+        // handed a null. Session 19:04:58 is what that looks like from the
+        // outside - "SETTLE thrown-land xyz=0.0,0.0,0.0 park=0 raw=0 vis=0" and
+        // then a LANDING broadcast carrying those zeros to the peer.
+        Character* who = resolveEventChar(k);
         if (who) {
             engine::CarryRead cr;
             if (engine::readCarry(who, &cr) && cr.valid && cr.beingCarried) {
@@ -1532,6 +1538,22 @@ void Replicator::applyTargets(GameWorld* gw) {
                     unsigned int ch[5] = { out.sType, out.sContainer,
                                            out.sContainerSerial,
                                            out.sIndex, out.sSerial };
+                    // Same remap the pickup event got in 0.1.2. Without it this
+                    // retried a hand that names nothing locally, forever: the
+                    // 19:05-19:06 log is a solid minute of "HEAL PICKUP ... ok=0"
+                    // every 1.5 s, which is also why the corpse could end up
+                    // duplicated - the carry relationship never actually formed
+                    // on this side while the peer believed it had.
+                    {
+                        Key sk; sk.t = out.sType; sk.c = out.sContainer;
+                        sk.cs = out.sContainerSerial; sk.i = out.sIndex;
+                        sk.s = out.sSerial;
+                        Character* sc = resolveEventChar(sk);
+                        if (sc) {
+                            ObjectHand lh;
+                            if (engine::charHandOf(sc, lh)) lh.toObjOrder(ch);
+                        }
+                    }
                     bool ok = engine::applyPickup(gw, c, ch);
                     char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[carry] HEAL PICKUP carrier=%u,%u carried=%u,%u ok=%d",
