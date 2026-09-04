@@ -12,6 +12,10 @@
 
 #include "EngineInternal.h"
 
+// For &DataPanelLine_TextEditable::textChanged - the F2 type-in rows' own
+// handler, resolved so the harvest can make the engine refresh its s2.
+#include <kenshi/gui/DataPanelLine.h>
+
 namespace coop {
 namespace engine {
 
@@ -1405,6 +1409,7 @@ CreateItemFn     g_createItemFn   = 0;
 EquipItemFn      g_equipItemFn    = 0;
 GetAllSectionsFn g_getSectionsFn  = 0;
 GetInvGuiFn      g_getInvGuiFn    = 0; // open-window probe (loot-GUI UAF guard)
+LineTextChangedFn g_lineTextChangedFn = 0; // F2 edit rows: refresh s2 from the box
 GetWeaponFn      g_getPrimaryWeaponFn   = 0;
 GetWeaponFn      g_getSecondaryWeaponFn = 0;
 FacBySidFn       g_facBySidFn     = 0; // protocol 21 proxy spawn (join)
@@ -1796,6 +1801,10 @@ void resolve() {
     g_getSectionsFn = (GetAllSectionsFn)KenshiLib::GetRealAddress(&Inventory::getAllSections);
     // Open-window probe: gates the destructive half of the inventory reconcile.
     g_getInvGuiFn = (GetInvGuiFn)KenshiLib::GetRealAddress(&Inventory::getInventoryGUI);
+    // F2 type-in rows: without this the harvest reads the SEEDED s2 forever and
+    // a typed nick never registers as a change.
+    g_lineTextChangedFn = (LineTextChangedFn)KenshiLib::GetRealAddress(
+        &DataPanelLine_TextEditable::textChanged);
     // Worn weapons are NOT in any section: read the dedicated weapon accessors directly.
     g_getPrimaryWeaponFn   = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getPrimaryWeapon);
     g_getSecondaryWeaponFn = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getSecondaryWeapon);

@@ -350,7 +350,12 @@ void loadConfig(Config& c) {
     {
         std::string raw = envOr("KENSHICOOP_PLAYER_NAME", fileOr(f, "playerName", "").c_str());
         std::string nick;
-        c.playerName = parsePlayerNick(raw, nick) ? nick : std::string();
+        // isPoisonedNick: a pre-0.1.2 build could persist the row key itself
+        // ("nickedit") as the player's name, and it then reloads forever as a
+        // legitimate remembered nick. Drop it on read so the stuck value clears
+        // itself instead of needing a hand-edited config.
+        c.playerName = (parsePlayerNick(raw, nick) && !isPoisonedNick(nick))
+                           ? nick : std::string();
     }
 
     // In-game panel session control: opt-in legacy auto-start. Default OFF so a
@@ -618,7 +623,8 @@ void reloadPeerFromFile(Config& c) {
     it = f.find("playerName");
     if (it != f.end() && !it->second.empty()) {
         std::string nick;
-        if (parsePlayerNick(it->second, nick)) c.playerName = nick;
+        if (parsePlayerNick(it->second, nick) && !isPoisonedNick(nick))
+            c.playerName = nick;
     }
 }
 

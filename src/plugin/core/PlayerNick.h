@@ -12,6 +12,21 @@
 
 namespace coop {
 
+// Nicks a build before v0.1.2 could WRITE TO DISK by mistake. The F2 text row
+// used to fall back to its own row key when the field read back empty, so
+// "nickedit" (and "udpedit") got harvested as if the player had typed them, and
+// then persisted to coop_config.json - after which they load back as a
+// perfectly legitimate remembered nick forever. Session 15:33 shows exactly
+// that on a build that already had the fix: "nick=nickedit" came from the file,
+// not the field. Rejecting them on read is what actually clears it, since the
+// alternative is asking every player to hand-edit JSON.
+//
+// These are internal row keys and nobody would choose them as a name; the cost
+// of the false positive is one player retyping a nick.
+inline bool isPoisonedNick(const std::string& s) {
+    return s == "nickedit" || s == "udpedit";
+}
+
 const unsigned PLAYER_NICK_MAX = 63;
 
 // Parse a display nick from clipboard / config text. On success writes nick

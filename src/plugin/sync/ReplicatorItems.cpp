@@ -263,6 +263,22 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (ownHands_.count(k) || ownedContainers_.count(k)) continue;
         unsigned int cHand[5];
         if (!resolveInvLocalHand(k, cHand)) continue;
+        // The same "do not publish what you know is stale" gate the owned loop
+        // above uses. It was left off here on the reasoning that remaining-loot
+        // IS the join's truth - which is wrong precisely while an apply is
+        // deferred: the panel being open means the peer's newer snapshot has NOT
+        // been folded in, so this capture is the OLD contents, and echoing it
+        // re-creates on the peer exactly what was taken. Session 15:36:
+        // host published items=2, the join deferred that (panel open) and one
+        // second later echoed its stale items=3, and the host applied 3 - the
+        // item came back. Staying quiet costs nothing: the deferral ends when
+        // the window closes, the peer's snapshot lands, and the next echo
+        // reports contents both sides already agree on.
+        if (guiDefer_.count(k) != 0) {
+            if (engine::containerGuiOpen(gw, cHand)) continue;
+            guiDefer_.erase(k);
+            guiDeferSaid_.erase(k);
+        }
         u32 hash = 0;
         bool trunc = false;
         unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX,

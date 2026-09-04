@@ -93,6 +93,12 @@
 #include <utility>
 #include <vector>
 
+// Forward declarations at GLOBAL scope: this header is included before the
+// panel-row headers and only the POINTER types are needed. Declaring them
+// inside coop::engine would create coop::engine::MyGUI and shadow the real one.
+class DataPanelLine_TextEditable;
+namespace MyGUI { class EditBox; }
+
 namespace coop {
 namespace engine {
 
@@ -320,6 +326,15 @@ typedef Item* (__fastcall* GetWeaponFn)(Inventory* self);
 // Inventory::getInventoryGUI: the OPEN window holding this container, or null.
 // Backs CAP_INV_GUI; see the loot-GUI UAF note in EngineInternal.cpp.
 typedef InventoryGUI* (__fastcall* GetInvGuiFn)(Inventory* self);
+// DataPanelLine_TextEditable::textChanged: the engine's OWN handler that copies
+// its EditBox's live text into the line's s2 string. We call it before reading
+// s2 because s2 otherwise still holds the value the row was SEEDED with, so a
+// typed nick was never seen (session 15:33: the field showed 'moogg' while the
+// harvest kept reading 'nickedit'). Going through the engine also avoids
+// touching MyGUI from this DLL at all - reading the EditBox caption with our
+// own MyGUI copy is what AV'd in v0.57.
+typedef void (__fastcall* LineTextChangedFn)(DataPanelLine_TextEditable* self,
+                                             MyGUI::EditBox* box);
 typedef Faction*  (__fastcall* FacBySidFn)(FactionManager* self, const std::string* sid);
 typedef GameData* (__fastcall* FacGetDataFn)(const Faction* self);
 typedef float (__fastcall* RelGetFn)(FactionRelations* self, Faction* p);
@@ -560,6 +575,7 @@ extern CreateItemFn     g_createItemFn;
 extern EquipItemFn      g_equipItemFn;
 extern GetAllSectionsFn g_getSectionsFn;
 extern GetInvGuiFn      g_getInvGuiFn;
+extern LineTextChangedFn g_lineTextChangedFn;
 extern GetWeaponFn      g_getPrimaryWeaponFn;
 extern GetWeaponFn      g_getSecondaryWeaponFn;
 extern FacBySidFn       g_facBySidFn;

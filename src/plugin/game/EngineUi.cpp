@@ -423,6 +423,18 @@ void onPasteSlot2(DataPanelLine*) { pasteIntoSlot(2); }
 void harvestLineRaw(DataPanelLine_TextEditable* line, char* raw, unsigned cap) {
     raw[0] = '\0';
     if (!line || cap == 0) return;
+    // Make the engine refresh its own s2 from the live EditBox first. Without
+    // this, s2 still holds the string the row was SEEDED with, so typing changed
+    // what the player saw and nothing else: session 15:33 had "moogg" visible in
+    // the field while the harvest kept reading back "nickedit", found no change,
+    // and therefore never applied it, never sent it and never wrote it to
+    // coop_config.json. Calling the ENGINE's handler keeps MyGUI entirely on its
+    // own side of the DLL boundary - reading the caption with our copy of MyGUI
+    // is what faulted in v0.57.
+    if (g_lineTextChangedFn && line->editBox) {
+        __try { g_lineTextChangedFn(line, line->editBox); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     // s2 ONLY. keyValue was tried as a fallback and is wrong: it holds the row's
     // KEY ("nickedit" / "udpedit"), never anything the player typed, so an empty
     // field harvested the key and used it as the value. Session 12:29:09 shows
