@@ -485,43 +485,40 @@ void harvestEdits() {
     harvestUdp();
 }
 
-// Explicit "apply my nick" click. Two jobs.
+// Set the nick FROM THE CLIPBOARD, and why it is not read from the field.
 //
-// One: give the harvest a moment the player controls. Typing alone kept losing
-// the text - a status change rebuilds the panel, the row is recreated seeded
-// from the REMEMBERED nick, and anything typed but not yet harvested dies with
-// the old widget (screenshot: "qwegwegwe" typed, field blank after toggling
-// Connection).
+// The type-in row cannot be read from this DLL. The probe settled it:
+//   nick-probe lever=1 box=1 key='nickedit' s1='nickedit' s2='kotetsy'
+// the engine's textChanged resolved and ran, the EditBox exists, and yet s2
+// still held the value the row was SEEDED with - the typed text lives only
+// inside the MyGUI widget. Reading that widget is what AV'd in v0.57: our MyGUI
+// headers do not match the game's build, and KenshiLib carries no RVAs for
+// MyGUI, so there is no resolve-by-address path either.
 //
-// Two: say what it actually found. Two attempts at reading the typed text have
-// failed and the logs could not distinguish "the lever did not resolve" from
-// "the text lives in a different field" from "keystrokes never reach the box" -
-// so this prints all three row strings and the lever state. One run settles it
-// instead of a third guess.
+// So this uses the mechanism that demonstrably works and that the Steam ID rows
+// already use: the clipboard. Copy a name, click, done. The field above stays as
+// a display of the nick currently in effect.
 void onApplyNickBtn(DataPanelLine*) {
-    if (!g_nickLine) return;
-    const char* ks = "";
-    const char* s1 = "";
-    const char* s2 = "";
-    __try {
-        ks = g_nickLine->keyValue.c_str();
-        s1 = g_nickLine->s1.c_str();
-        s2 = g_nickLine->s2.c_str();
-    } __except (EXCEPTION_EXECUTE_HANDLER) { ks = s1 = s2 = "<fault>"; }
-    char pb[300]; _snprintf(pb, sizeof(pb) - 1,
-        "[coop-ui] nick-probe lever=%d box=%d key='%s' s1='%s' s2='%s'",
-        g_lineTextChangedFn ? 1 : 0, g_nickLine->editBox ? 1 : 0, ks, s1, s2);
-    pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
-
-    harvestNick();
-    // Persist + broadcast even when harvestNick saw no change: the player asked
-    // for this explicitly, and a no-op that logs nothing is what made the last
-    // two rounds unreadable.
+    std::string clip;
+    if (!clipboardGetText(clip)) {
+        coop::logLine("[coop-ui] nick: clipboard empty - copy a name first");
+        return;
+    }
+    std::string nick;
+    if (!coop::parsePlayerNick(clip, nick)) {
+        coop::logLine("[coop-ui] nick: clipboard is not a usable name");
+        return;
+    }
+    if (coop::isPoisonedNick(nick)) {
+        coop::logLine("[coop-ui] nick: refusing an internal row key as a name");
+        return;
+    }
+    g_playerNick = nick;
     g_nickDirtyTick = 0;
+    g_panel.needsRebuild = true; // redraw the field with what is now in effect
     fireRemember();
-    char b[160]; _snprintf(b, sizeof(b) - 1, "[coop-ui] nick applied '%s'",
-                           g_playerNick.empty() ? "-" : g_playerNick.c_str());
-    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    char b[160]; _snprintf(b, sizeof(b) - 1, "[coop-ui] nick applied '%s'", g_playerNick.c_str());
+    b[sizeof(b) - 1] = 0; coop::logLine(b);
 }
 
 void formatUdpText(std::string& out) {
@@ -886,11 +883,13 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                                      std::string("   (send it to your friends)")
                                    : std::string("Your Steam ID:  (Steam not running)");
         std::string applyNickKey = "applynick";
-        std::string applyNickCap = "Apply nick";
+        std::string applyNickCap = "Set nick from clipboard";
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
         std::string nickLblKey = "name";
-        std::string nickLbl    = "Your nick  (type your name below)";
+        std::string nickLbl    = std::string("Your nick: ") +
+            (g_playerNick.empty() ? "(none)" : g_playerNick.c_str()) +
+            "   - copy a name, then click below";
         std::string nickKey    = "nickedit";
         std::string nickText   = g_playerNick;
         std::string udpLblKey  = "udp";
