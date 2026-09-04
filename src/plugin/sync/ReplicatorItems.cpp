@@ -114,7 +114,11 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     // window stays. Equip and unequip-to-bag keep the entry count (a MOVE), so they still
     // replicate promptly; only genuine removals (and the in-cursor flicker) wait it out.
     const unsigned long INV_SETTLE_MS        = 350;
-    const unsigned long INV_REMOVE_SETTLE_MS = 1800;
+    // 1800 -> 1000: the comment above measures the cursor hold at "up to ~1 s",
+    // so 1800 was nearly double the hazard it guards. Combined with the panel
+    // test below - which skips this window entirely when no drag is possible -
+    // the worst case a player can feel drops from about two seconds to one.
+    const unsigned long INV_REMOVE_SETTLE_MS = 1000;
     InvItemEntry items[INV_ITEMS_MAX];
     unsigned long now = nowMs();
     for (std::set<Key>::iterator it = owned.begin();
@@ -173,8 +177,17 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         // else (additions, equip<->loose moves) settles fast. Units not entries: at the
         // INV_ITEMS_MAX cap the entry count cannot fall, which silently disabled this
         // guard for exactly the full inventories that need it most.
-        unsigned long settleMs = (sent && units < pub.lastSentUnits) ? INV_REMOVE_SETTLE_MS
-                                                                    : INV_SETTLE_MS;
+        // The long window exists for ONE thing: an item held on the mouse cursor
+        // mid-drag is out of the inventory entirely, and publishing that transient
+        // would have the peer destroy a worn item. Dragging requires an OPEN
+        // PANEL on this container - with no panel there is no cursor, no
+        // transient, and nothing to wait out. So the long settle now applies only
+        // where the hazard can actually occur, and a corpse being looted from the
+        // other machine replicates at the short window instead of ~2 s later,
+        // which is the delay reported after 0.1.13 made loot live at all.
+        bool dragPossible = engine::containerGuiOpen(gw, cHand);
+        unsigned long settleMs = (sent && units < pub.lastSentUnits && dragPossible)
+                                     ? INV_REMOVE_SETTLE_MS : INV_SETTLE_MS;
         bool settled  = (now - pub.pendingSince >= settleMs);
         bool changed  = differs && settled;
         unsigned long resendMs = (n >= INV_RESEND_BIG_N) ? INV_RESEND_BIG_MS : INV_RESEND_MS;

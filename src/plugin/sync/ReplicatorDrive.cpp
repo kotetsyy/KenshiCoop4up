@@ -1523,9 +1523,25 @@ void Replicator::applyTargets(GameWorld* gw) {
                 d.carryNoSeeTick = 0;
                 engine::CarryRead lcr;
                 bool haveCr = engine::readCarry(c, &lcr);
+                // Compare against the LOCAL hand of the carried body, not the
+                // wire one. For a proxied corpse the two differ, so this never
+                // matched and the heal below re-applied a carry that was already
+                // correct - session 19:54 logs a successful HEAL PICKUP every
+                // 1.5 s for the whole time a body was carried.
+                unsigned int wantI = out.sIndex, wantS = out.sSerial;
+                {
+                    Key sk0; sk0.t = out.sType; sk0.c = out.sContainer;
+                    sk0.cs = out.sContainerSerial; sk0.i = out.sIndex;
+                    sk0.s = out.sSerial;
+                    Character* sc0 = resolveEventChar(sk0);
+                    ObjectHand lh0;
+                    if (sc0 && engine::charHandOf(sc0, lh0)) {
+                        wantI = lh0.index; wantS = lh0.serial;
+                    }
+                }
                 bool carryingRight = haveCr && lcr.carrying &&
-                                     lcr.carried[3] == out.sIndex &&
-                                     lcr.carried[4] == out.sSerial;
+                                     lcr.carried[3] == wantI &&
+                                     lcr.carried[4] == wantS;
                 if (haveCr && lcr.carrying) {
                     d.hadCarry = true;
                     for (int ci = 0; ci < 5; ++ci) d.lastCarried[ci] = lcr.carried[ci];
