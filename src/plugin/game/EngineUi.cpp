@@ -449,22 +449,6 @@ void harvestLineRaw(DataPanelLine_TextEditable* line, char* raw, unsigned cap) {
     raw[n] = '\0';
 }
 
-void harvestNick() {
-    if (!g_nickLine) return;
-    char raw[128];
-    harvestLineRaw(g_nickLine, raw, sizeof(raw));
-    // Empty read = the field told us nothing this tick, which is NOT the same as
-    // the player clearing their nick. Keep what we have (usually the one seeded
-    // from coop_config.json), the way harvestUdp already does. Clearing here
-    // would silently drop a remembered nick every time the row read back blank.
-    if (raw[0] == '\0') return;
-    std::string nick;
-    if (!coop::parsePlayerNick(raw, nick)) return;
-    if (nick == g_playerNick) return;
-    g_playerNick = nick;
-    g_nickDirtyTick = GetTickCount();
-}
-
 void harvestUdp() {
     if (!g_udpLine) return;
     char raw[128];
@@ -481,7 +465,17 @@ void harvestUdp() {
 }
 
 void harvestEdits() {
-    harvestNick();
+    // The NICK row is display-only and must never be read back. Its s2 holds the
+    // value the row was SEEDED with, not what the widget shows, so harvesting it
+    // does not just fail - it actively UNDOES the clipboard button one tick
+    // later, which is the revert loop in the 16:24 log:
+    //   16:24:12 remembered ... nick=kotetsy123   (button)
+    //   16:24:13 remembered ... nick=kotetsy      (harvest put the seed back)
+    // A source that can only ever return a stale value has no business being an
+    // input. The button is the sole writer now.
+    //
+    // harvestUdp stays: the same staleness makes it a no-op there (the seed IS
+    // the value in effect), and it is the only way that endpoint gets set today.
     harvestUdp();
 }
 
