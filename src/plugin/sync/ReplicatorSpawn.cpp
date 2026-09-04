@@ -976,7 +976,11 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                         break;
                     }
                 }
-                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                // Remapped: an occupant the world authority put in a bed or a cage is
+                // often a runtime body, a proxy here under a different hand - the wire
+                // hand named nothing and this reported ok=0 on a 5 s retry forever
+                // (session 19:44: 48 of them for one bed).
+                Character* occ = resolveEventChar(k);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
@@ -993,7 +997,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // that never entered locally (lost/late enter) is a no-op success.
                 if (!furnSync_) break;
                 if (ownHands_.find(k) != ownHands_.end()) break;
-                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                Character* occ = resolveEventChar(k); // same remap as ENTER above
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
