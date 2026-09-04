@@ -319,15 +319,33 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         // medical packet can never knock a body down on its own.
         if (!(p.flags & MED_UNCONSCIOUS) && !(p.flags & MED_DEAD)) {
             std::map<Key, Driven>::iterator dt = targets_.find(k);
-            if (dt != targets_.end() && (dt->second.koLatched || dt->second.downApplied) &&
-                !dt->second.deathLatched) {
-                dt->second.koLatched = false;
-                dt->second.downApplied = false;
+            bool latched = (dt != targets_.end()) &&
+                           (dt->second.koLatched || dt->second.downApplied);
+            bool deathLatched = (dt != targets_.end()) && dt->second.deathLatched;
+            // Ask the BODY, not just our own bookkeeping. The first version only
+            // released a latch we had applied ourselves, which misses the case
+            // that actually happens: session 18:52 had the host publish its NPC
+            // conscious 36 times running while the join's copy lay there, having
+            // been knocked down by the join's OWN damage simulation - no event,
+            // no latch, nothing for a latch-only check to release. The owner is
+            // authoritative for its bodies, so a copy that disagrees is simply
+            // wrong regardless of how it got that way.
+            bool localOut = false;
+            if (!latched && !deathLatched) {
+                engine::MedicalRead lr;
+                if (engine::readMedical(c, &lr) && lr.valid)
+                    localOut = lr.unconscious && !lr.dead;
+            }
+            if ((latched || localOut) && !deathLatched) {
+                if (dt != targets_.end()) {
+                    dt->second.koLatched = false;
+                    dt->second.downApplied = false;
+                }
                 engine::knockDown(c, false);
                 engine::restoreMovement(c);
-                char wb[150]; _snprintf(wb, sizeof(wb) - 1,
-                    "[med] WAKE hand=%u,%u (owner reports conscious; no EVT_REVIVE arrived)",
-                    k.i, k.s);
+                char wb[170]; _snprintf(wb, sizeof(wb) - 1,
+                    "[med] WAKE hand=%u,%u src=%s (owner reports conscious)",
+                    k.i, k.s, latched ? "latch" : "local-state");
                 wb[sizeof(wb) - 1] = '\0'; coop::logLine(wb);
             }
         }
