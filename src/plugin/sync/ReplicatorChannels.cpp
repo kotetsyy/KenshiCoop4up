@@ -304,6 +304,33 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         // engage (the posture apply in applyTargets is the other half).
         w.crippled    = (p.flags & MED_CRIPPLED) != 0;
         engine::writeMedical(c, w);
+        // WAKE SELF-HEAL. writeMedical deliberately leaves unconscious/dead to
+        // the event channel, on the doctrine that events own transitions. But
+        // the wake edge is the one that goes missing: session 15:57 carried
+        // three EVT_KNOCKOUT and NOT ONE EVT_REVIVE, so every copy that was
+        // knocked down stayed down while its owner had long since been treated
+        // and stood up - the reported "coma on my side, fine on the host's".
+        //
+        // Limb state already works the other way round (event for the moment,
+        // snapshot to close the gap), and this is the same doctrine applied to
+        // consciousness. Deliberately ONE-DIRECTIONAL: only the owner saying
+        // "awake" while we hold the body down clears it. The downward
+        // transition stays entirely with the events, so a late or duplicated
+        // medical packet can never knock a body down on its own.
+        if (!(p.flags & MED_UNCONSCIOUS) && !(p.flags & MED_DEAD)) {
+            std::map<Key, Driven>::iterator dt = targets_.find(k);
+            if (dt != targets_.end() && (dt->second.koLatched || dt->second.downApplied) &&
+                !dt->second.deathLatched) {
+                dt->second.koLatched = false;
+                dt->second.downApplied = false;
+                engine::knockDown(c, false);
+                engine::restoreMovement(c);
+                char wb[150]; _snprintf(wb, sizeof(wb) - 1,
+                    "[med] WAKE hand=%u,%u (owner reports conscious; no EVT_REVIVE arrived)",
+                    k.i, k.s);
+                wb[sizeof(wb) - 1] = '\0'; coop::logLine(wb);
+            }
+        }
         // Limb-state self-heal (Phase C/D): reconcile stump/crushed/robotic
         // state with the owner's. The reliable EVT_AMPUTATE/EVT_CRUSH events
         // carry the transition moment; this closes any gap (late join, missed

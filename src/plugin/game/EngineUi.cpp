@@ -300,6 +300,7 @@ DataPanelLine_Button*   g_roleBtn      = 0;
 DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
+DataPanelLine_Button*   g_applyNickBtn = 0; // explicit "apply the typed nick"
 DataPanelLine_TextEditable* g_nickLine = 0;
 DataPanelLine_TextEditable* g_udpLine  = 0;
 DataPanelLine*          g_nickHint     = 0;
@@ -484,6 +485,45 @@ void harvestEdits() {
     harvestUdp();
 }
 
+// Explicit "apply my nick" click. Two jobs.
+//
+// One: give the harvest a moment the player controls. Typing alone kept losing
+// the text - a status change rebuilds the panel, the row is recreated seeded
+// from the REMEMBERED nick, and anything typed but not yet harvested dies with
+// the old widget (screenshot: "qwegwegwe" typed, field blank after toggling
+// Connection).
+//
+// Two: say what it actually found. Two attempts at reading the typed text have
+// failed and the logs could not distinguish "the lever did not resolve" from
+// "the text lives in a different field" from "keystrokes never reach the box" -
+// so this prints all three row strings and the lever state. One run settles it
+// instead of a third guess.
+void onApplyNickBtn(DataPanelLine*) {
+    if (!g_nickLine) return;
+    const char* ks = "";
+    const char* s1 = "";
+    const char* s2 = "";
+    __try {
+        ks = g_nickLine->keyValue.c_str();
+        s1 = g_nickLine->s1.c_str();
+        s2 = g_nickLine->s2.c_str();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ks = s1 = s2 = "<fault>"; }
+    char pb[300]; _snprintf(pb, sizeof(pb) - 1,
+        "[coop-ui] nick-probe lever=%d box=%d key='%s' s1='%s' s2='%s'",
+        g_lineTextChangedFn ? 1 : 0, g_nickLine->editBox ? 1 : 0, ks, s1, s2);
+    pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
+
+    harvestNick();
+    // Persist + broadcast even when harvestNick saw no change: the player asked
+    // for this explicitly, and a no-op that logs nothing is what made the last
+    // two rounds unreadable.
+    g_nickDirtyTick = 0;
+    fireRemember();
+    char b[160]; _snprintf(b, sizeof(b) - 1, "[coop-ui] nick applied '%s'",
+                           g_playerNick.empty() ? "-" : g_playerNick.c_str());
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
 void formatUdpText(std::string& out) {
     int p = g_udpPort > 0 ? g_udpPort : 27800;
     char b[96];
@@ -548,6 +588,7 @@ struct PanelStrings {
     const std::string *pasteKey[3], *pasteCap[3];
     int nSlots;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
+    const std::string *applyNickKey, *applyNickCap;
     const std::string *nickLblKey, *nickLbl, *nickKey, *nickText;
     const std::string *udpLblKey, *udpLbl, *udpKey, *udpText;
     const MyGUI::Align *editAlign;
@@ -569,6 +610,7 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         g_nickHint = p->setLine(*s->nickLblKey, *s->nickLbl, *s->empty, 0, false, true);
         g_nickLine = p->setLineTextEditable(*s->nickKey, *s->nickText, 0, false,
                                             false, *s->editAlign, s->editWidth);
+        g_applyNickBtn = p->setLineButton(*s->applyNickKey, *s->applyNickCap, 0);
         p->addSpace(0, 0.45f);
         g_udpHint = 0;
         g_udpLine = 0;
@@ -710,6 +752,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
+            g_applyNickBtn = 0;
             g_nickLine = 0; g_udpLine = 0; g_nickHint = 0; g_udpHint = 0;
             g_pasteBtns[0] = g_pasteBtns[1] = g_pasteBtns[2] = 0;
             g_debugLine = 0; g_selfLine = 0;
@@ -842,6 +885,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                                      coop::maskSteamId64((unsigned long long)st->selfSteamId) +
                                      std::string("   (send it to your friends)")
                                    : std::string("Your Steam ID:  (Steam not running)");
+        std::string applyNickKey = "applynick";
+        std::string applyNickCap = "Apply nick";
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
         std::string nickLblKey = "name";
@@ -870,6 +915,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         }
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
+        ps.applyNickKey = &applyNickKey; ps.applyNickCap = &applyNickCap;
         ps.nickLblKey = &nickLblKey; ps.nickLbl = &nickLbl;
         ps.nickKey = &nickKey; ps.nickText = &nickText;
         ps.udpLblKey = &udpLblKey; ps.udpLbl = &udpLbl;
@@ -889,6 +935,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_transBtn)   g_transBtn->callback   = MyGUI::newDelegate(&onTransBtn);
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
+        if (g_applyNickBtn) g_applyNickBtn->callback = MyGUI::newDelegate(&onApplyNickBtn);
         if (g_pasteBtns[0]) g_pasteBtns[0]->callback = MyGUI::newDelegate(&onPasteSlot0);
         if (g_pasteBtns[1]) g_pasteBtns[1]->callback = MyGUI::newDelegate(&onPasteSlot1);
         if (g_pasteBtns[2]) g_pasteBtns[2]->callback = MyGUI::newDelegate(&onPasteSlot2);
