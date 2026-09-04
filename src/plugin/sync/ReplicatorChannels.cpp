@@ -565,6 +565,23 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
         Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
         k.i = p.sIndex; k.s = p.sSerial;
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
+        // Anchor for this peer's NICK. applySquadNicks can only rename a remote
+        // player's body once it knows WHICH body is theirs (nickHand_), and the
+        // sole thing that recorded that was a squad-claim event which a normal
+        // session never fires - session 18:24 has "[net] peer nick id=1
+        // 'qweqweq'" arriving intact and then no "[nick] applied id=1" at all,
+        // because there was no body to put it on. The host saw the unit's
+        // original name for the whole session.
+        //
+        // The stats channel is the right anchor and needs no new packet: it
+        // carries ownerId and, by construction, ONLY the sender's own squad
+        // members - world NPCs are deliberately excluded from it, so this can
+        // never latch onto an NPC the way the medical stream could.
+        // noteNickHand keeps the first hand it is given, so this settles once.
+        {
+            unsigned int nh[5] = { k.t, k.c, k.cs, k.i, k.s };
+            noteNickHand(p.ownerId, nh);
+        }
         Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
         if (!c) continue;
         engine::StatsRead w;
