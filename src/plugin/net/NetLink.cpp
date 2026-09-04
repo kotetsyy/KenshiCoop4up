@@ -469,7 +469,6 @@ void NetLink::threadLoop() {
         if (serverPeer_) serverPeer_->mtu = 1200;
     }
 
-    u32   nextId = 1;
     DWORD lastConnectAttempt = GetTickCount();
 
     // Wall-clock time-sync state (client only). The join pings every ~2 s; each
@@ -554,7 +553,33 @@ void NetLink::threadLoop() {
                                 netErr(b);
                                 enet_peer_disconnect(ev.peer, 0);
                             } else {
-                                u32 id = nextId++;
+                                // LOWEST FREE id, not a monotonic counter. A join
+                                // that receives the host's world DISCONNECTS to
+                                // load it and comes back - that reconnect is part
+                                // of the normal join flow, not an error - and a
+                                // counter handed it id=2 on the way back in.
+                                // Squad rank is derived from the player id, so it
+                                // then owned tab rank 2, which a two-tab save does
+                                // not have: ownHands_ came up empty, the join
+                                // published no stats/medical/inventory at all, and
+                                // the host saw its whole squad standing still
+                                // (session 18:39, "ownRanks={2} (playerId)" then
+                                // "CLAIM skipped (no extra bodies in leader tab)").
+                                // Reusing the slot the peer just vacated keeps the
+                                // id - and therefore the squad rank - stable across
+                                // the transfer reconnect.
+                                u32 id = 0;
+                                for (u32 cand = 1; cand <= MAX_JOINS; ++cand) {
+                                    bool taken = false;
+                                    for (size_t pi = 0; pi < enetHost_->peerCount; ++pi) {
+                                        ENetPeer* p = &enetHost_->peers[pi];
+                                        if (p == ev.peer) continue;
+                                        if (p->state == ENET_PEER_STATE_DISCONNECTED) continue;
+                                        if ((u32)(size_t)p->data == cand) { taken = true; break; }
+                                    }
+                                    if (!taken) { id = cand; break; }
+                                }
+                                if (id == 0) id = (u32)MAX_JOINS + 1; // forces the reject below
                                 if (id > MAX_JOINS) {
                                     netErr("server full (max 4 players: host + 3 joins); rejecting");
                                     enet_peer_disconnect(ev.peer, 0);
