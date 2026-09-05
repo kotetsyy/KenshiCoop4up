@@ -260,6 +260,8 @@ void Replicator::resetSession() {
     invRecv_.clear();
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
+    censusEverFilled_.clear();
+    censusMuteSaid_.clear();
     lootRemain_.clear();
     lootAdopt_.clear();
     guiDefer_.clear();

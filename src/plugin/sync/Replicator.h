@@ -1445,6 +1445,13 @@ private:
     bool           storeSync_;
     unsigned long  contCensusMs_;
     std::set<Key>  censusContainers_;
+    // Census-adopted containers we have seen hold something at least once, and
+    // the one-line-per-container gate for the mute that depends on it. Kenshi
+    // builds a shop's stock and a machine's output LAZILY, so "empty" on a
+    // container this machine has never populated is a fact about US, not about
+    // the world - see publishInventories.
+    std::set<Key>  censusEverFilled_;
+    std::set<Key>  censusMuteSaid_;
     // Join remaining-loot cap after SEND-LOOT: a host snapshot with MORE units
     // is the open-GUI echo (host window still lists items the join already
     // took). Ignore it so reopen does not restore the corpse. Host lootAdopt_

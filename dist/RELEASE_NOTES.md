@@ -1,59 +1,72 @@
-## Вещь, надетая на труп, больше не дублируется
+## Торговцы больше не остаются с пустым прилавком
 
-Хост надевает вещь на труп — она надевается, и рядом с трупом у клиента лежит
-вторая такая же. Причина в логе, и автор дюпа сам её признаёт одной строкой ниже.
+У торговца нет товара. Причина в логе, и она измерима.
 
-За сохранностью снаряжения следит отдельный канал: он сравнивает содержимое
-своего отряда тик к тику, и **уменьшение** считает выброшенной на землю вещью —
-чтобы сосед перенёс свою копию туда же. Проверок было три: это не обмен между
-отрядами, это не незавершённая передача, и рядом действительно лежит свободная
-вещь на земле.
+Kenshi наполняет прилавок лавки и бункер станка **лениво** — пока рядом никто не
+стоял, содержимого просто нет. Хост объявляет соседу содержимое всех складов и
+станков вокруг себя, и если его движок ещё не наполнил прилавок, уходит снимок
+«пусто». Сосед честно применяет: **уничтожает у себя весь товар**. А дальше
+страховочная пересылка повторяет тот же пустой снимок каждые пять секунд, поэтому
+прилавок остаётся голым — восстановиться ему не дают.
 
-Ни одна из них не срабатывает, когда вещь кладут **в другой инвентарь**. Труп —
-не отряд соседа, значит не обмен. На земле ничего нет, значит проверка «лежит
-рядом» промахивается — а она и должна промахиваться, для честно выброшенного в
-городе оружия движок тоже ничего не находит, ради этого запасной путь и писался.
-Дебаунс истекает, и уходит пакет «выброшено».
-
-Дальше у соседа два канала независимо делают своё: снимок инвентаря надевает вещь
-на труп, а пакет «выброшено» кладёт рядом с трупом вторую копию — а если своей
-копии не нашлось, то и вовсе **создаёт новую** (`APPLY-HEALED ... rebuilt from
-intent provenance`). Отсюда и вещь на трупе, и вещь на земле.
-
-Свой же вердикт хост выносит через десять секунд:
+Масштаб за одну вашу сессию:
 
 ```
-[wd] ground-prune sid='2309-clothes_v1.mod' drop=0/4 (2044 consecutive reads over 10002ms, everLive=0: not a free ground item)
+хост:    83 контейнера из 106 объявили items=0 первым же снимком
+клиент:  440 применений пустого снимка
 ```
 
-`everLive=0` — «за две тысячи чтений ни разу не прочиталось как свободный предмет
-на земле». То есть выброса не было вовсе, и это было известно — просто поздно.
+Пустота — это факт про **машину**, а не про мир. Теперь контейнер, который мы
+объявляем своим только потому, что стоим рядом (лавка, станок, труп), не имеет
+права утверждать пустоту, пока мы **хоть раз не видели в нём содержимое**.
+Собственных карманов отряда это не касается: там пусто — значит игрок вынес, и
+это надо передать.
 
-Теперь перед публикацией выброса проверяется сам предмет: если он **жив и всё ещё
-лежит внутри контейнера**, выброса не было, и пакет не уходит. Вещь реплицируется
-одним каналом — снимком инвентаря. Подавляет только *положительное* чтение: если
-указатель мёртв или нечитаем, поведение прежнее, потому что «движок выгрузил
-объект» — это ровно тот случай, ради которого запасной путь и существует.
+В лог добавлена строка `[inv] CENSUS-MUTE`.
 
-В лог добавлена строка `[wd] decrease-moved`.
+### 0.1.17 проверен, но не полностью
 
-### Бой из 0.1.16 подтверждён
+Новая проверка сработала:
 
-В вашей сессии на стороне клиента **60 приказов из 60 — `r=2`**, цель нашлась
-каждый раз, и в 34 из них `localFight=1` — копия реально дерётся. До правки было
-`r=1` подряд и `localFight=0` весь бой.
+```
+[wd] decrease-moved ... sid='52295-rebirth.mod' (still in a container, never on the ground; no drop authored)
+```
 
-### Что осталось и почему я это не трогал
+Фантомных выбросов было 6 у хоста и 4 у клиента, стало 0 и 1. Но **один всё-таки
+прошёл** — и хост под него сфабриковал вещь (`APPLY-HEALED`). Проверка подавляет
+выброс только по положительному чтению предмета; когда указатель прочитать не
+удалось, работает старый путь. Значит дюп стал редким, а не исчез.
 
-Разная обстановка на хосте и клиенте — **не баг репликации, а разошедшийся мир**.
-Костры кочевых лагерей из `nodes_otto1.mod` стоят у вас и у друга на 14–84 юнита
-друг от друга; порог сопоставления — 5. Эти лагеря движок расставляет сам при
-загрузке, каждая машина своим броском, и сейв тут ни при чём. Канал `[fixture]`
-эту разницу измеряет, а не создаёт: расширение порога сведёт объекты в коде, но
-не сдвинет их на экране. Настоящее решение — транслировать раскладку лагеря
-целиком, и это отдельная большая работа, а не правка числа.
+### NPC у хоста и у клиента: измерил, править не стал
 
-Рагдолл всё ещё может улететь. Не тронуто.
+Расхождение реальное и причина у него не в NPC, а в том, **кто чем владеет**:
+
+```
+хост:    enum=69  notmine=68  proxyrow=36   mine=1   hid=22  supp=22
+клиент:  wide=47              drv=17        mine=29  hid=0   supp=0
+```
+
+У хоста 69 тел, и он считает своими **одно**. 22 своих NPC он прячет, потому что
+их область объявил своей клиент, и вместо них показывает 36 копий, присланных
+клиентом. У клиента при этом своих — 29.
+
+Это работает механизм «владения по клеткам»: клетка достаётся тому, кто в ней
+стоял, и остаётся за ним после ухода. Клиент зашёл в город первым — город его.
+Формально всё отработало как задумано, фактически хост перестал быть хозяином
+мира, и населённость у вас разъехалась.
+
+Гадать, как это перекроить, я не буду — это решение про устройство мода, а не
+правка. Но есть бесплатная проверка: **выключите владение по клеткам на обеих
+машинах** и сыграйте сессию.
+
+```bash
+setx KENSHICOOP_CELL_AUTH 0
+```
+
+Тогда мир целиком остаётся за хостом. Если разница NPC уходит — значит виноват
+именно этот механизм, и дальше решаем: чинить его или оставить выключенным. Если
+не уходит — причина другая, и я её искал не там. Ставить надо **обоим**, и это
+переменная окружения, поэтому Kenshi после неё надо перезапустить.
 
 ### Установка
 
@@ -64,70 +77,80 @@ intent provenance`). Отсюда и вещь на трупе, и вещь на 
 <details>
 <summary>🇬🇧 English</summary>
 
-## Clothing put on a corpse no longer duplicates
+## Traders no longer end up with an empty counter
 
-The host dresses a corpse — the item goes on, and a second copy of it lies on the
-ground beside the body on the client. The log explains it, and the code that
-authors the duplicate admits to it one line later.
+A trader has no goods. The log explains it, and the effect is measurable.
 
-Gear conservation has its own channel: it compares an owned squad's contents tick
-to tick and reads a **decrease** as an item dropped on the ground, so the peer can
-relocate its copy to the same spot. It had three guards: this is not a
-squad-to-squad trade, not an in-flight transfer, and there really is a free item
-lying on the ground nearby.
+Kenshi stocks a shop's shelf and a machine's output bin **lazily** — until someone
+has stood nearby, there simply is no content. The host announces the contents of
+every store and machine around it, and if its engine has not stocked the shelf
+yet, an "empty" snapshot goes out. The peer faithfully applies it and **destroys
+its own stock**. The safety resend then repeats that empty snapshot every five
+seconds, so the counter stays bare — it is never allowed to recover.
 
-None of them fires when the item is put **into another inventory**. A corpse is
-not the peer's squad, so it is not a trade. Nothing is on the ground, so the "is
-it lying nearby" query misses — and it is *supposed* to miss sometimes: for a
-genuinely dropped weapon in a town the engine finds nothing either, which is why
-the fallback path was written. The debounce expires and a "dropped" packet goes
-out.
-
-On the peer, two channels then act independently: the inventory snapshot puts the
-item on the corpse, and the drop packet places a second copy beside it — or, if no
-local copy is found, **manufactures a new one** (`APPLY-HEALED ... rebuilt from
-intent provenance`). Hence one worn and one on the ground.
-
-The host reaches its own verdict ten seconds later:
+Over one of your sessions:
 
 ```
-[wd] ground-prune sid='2309-clothes_v1.mod' drop=0/4 (2044 consecutive reads over 10002ms, everLive=0: not a free ground item)
+host:  83 of 106 authored containers announced items=0 on their first send
+join:  440 empty snapshots applied
 ```
 
-`everLive=0` — "over two thousand reads it never once read as a free ground
-item". There was no drop at all, and that was knowable — just too late.
+Emptiness is a fact about the **machine**, not about the world. A container we
+author only because we happen to stand near it (a shop, a machine, a corpse) may
+no longer assert emptiness until we have seen it hold something **at least once**.
+Squad pockets are unaffected: empty there means the player emptied it, and that
+must cross.
 
-Now, before a drop is published, the object itself is checked: if it is **alive
-and still inside a container**, no drop happened and no packet goes out. The item
-replicates through one channel, the inventory snapshot. Only a *positive* read
-suppresses: a dead or unreadable handle keeps the old behaviour, because "the
-engine streamed the object out" is exactly the case the fallback exists for.
+New log line: `[inv] CENSUS-MUTE`.
 
-New log line: `[wd] decrease-moved`.
+### 0.1.17 verified, but not completely
 
-### The 0.1.16 combat fix is confirmed
+The new check does fire:
 
-In your session, on the client, **60 of 60 orders returned `r=2`** — the target
-resolved every time — and 34 of them show `localFight=1`, the copy actually
-fighting. Before the fix it was `r=1` throughout and `localFight=0` all fight.
+```
+[wd] decrease-moved ... sid='52295-rebirth.mod' (still in a container, never on the ground; no drop authored)
+```
 
-### Still open, and why I left it alone
+Phantom drops went from 6 (host) and 4 (join) to 0 and 1. But **one still got
+through**, and the host fabricated an item for it (`APPLY-HEALED`). The check
+suppresses only on a positive read of the object; when the pointer cannot be read,
+the old path still runs. So the duplicate is now rare, not gone.
 
-The different scenery on host and client is **not a replication bug — the two
-worlds genuinely differ**. Nomad camp fires from `nodes_otto1.mod` stand 14–84
-units apart on the two machines; the matching threshold is 5. The engine lays
-those camps out itself at load time, each machine with its own roll, and the save
-has nothing to do with it. The `[fixture]` channel measures that difference, it
-does not cause it: widening the threshold would pair the objects in code without
-moving them on screen. The real fix is to stream the camp layout itself, which is
-separate, substantial work — not a changed number.
+### NPCs on host vs client: measured, not changed
 
-The ragdoll can still fly off. Untouched.
+The divergence is real, and its cause is not the NPCs but **who owns what**:
+
+```
+host:  enum=69  notmine=68  proxyrow=36   mine=1   hid=22  supp=22
+join:  wide=47              drv=17        mine=29  hid=0   supp=0
+```
+
+The host has 69 bodies and considers **one** of them its own. It hides 22 of its
+own NPCs because the client claimed their region, and shows 36 client-streamed
+copies instead. The client, meanwhile, owns 29.
+
+This is per-cell authority doing its job: a cell goes to whoever stood in it and
+stays with them after they leave. The client entered the town first, so the town
+is theirs. Formally correct; in practice the host stopped being the world's owner
+and your populations drifted apart.
+
+I am not going to guess at a redesign — that is a decision about how the mod
+works, not a fix. But there is a free experiment: **turn per-cell authority off on
+both machines** and play a session.
+
+```bash
+setx KENSHICOOP_CELL_AUTH 0
+```
+
+The whole world then stays with the host. If the NPC difference goes away, this
+mechanism is the cause and we decide whether to fix it or leave it off. If it does
+not, the cause is elsewhere and I was looking in the wrong place. Both machines
+need it, and it is an environment variable, so restart Kenshi afterwards.
 
 ### Install
 
-With updates on, the updater fetches it. Otherwise, with the game closed, drop
-the three files into `<Kenshi>\mods\KenshiCoop\`. Requires Kenshi 1.0.65 and
+With updates on, the updater fetches it. Otherwise, with the game closed, drop the
+three files into `<Kenshi>\mods\KenshiCoop\`. Requires Kenshi 1.0.65 and
 [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
 
 </details>

@@ -154,6 +154,36 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         // Every other reader leaves it off - a nested entry describes a different inventory.
         unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX,
                                                           &hash, &trunc, /*includeNested=*/true);
+        // Kenshi builds a shop's stock and a machine's output LAZILY: a store
+        // shelf, a vendor's crate or a farm this engine has not populated yet
+        // reads as EMPTY, and that emptiness is a fact about THIS machine, not
+        // about the world. Publishing it as authoritative destroys the peer's
+        // copy - and because the safety resend re-asserts it every 5 s, a trader
+        // the peer had already stocked stays permanently bare, which is exactly
+        // the "no goods at the trader" report. Session 01:10-01:24: 83 of the
+        // host's 106 authored containers announced items=0 on their very first
+        // send, and the join applied 440 empty snapshots.
+        //
+        // So a census-ADOPTED container (a world shop, machine or corpse that we
+        // author only because it stands near us) does not get to assert emptiness
+        // until we have seen it hold something at least once. An explicitly owned
+        // container is untouched: a squad pocket really is empty when it reads
+        // empty, and that is a user action, not a generation gap.
+        if (n > 0) {
+            censusEverFilled_.insert(*it);
+        } else if (censusContainers_.count(*it) != 0 &&
+                   ownedContainers_.count(*it) == 0 &&
+                   ownHands_.count(*it) == 0 &&
+                   censusEverFilled_.count(*it) == 0) {
+            if (censusMuteSaid_.insert(*it).second) {
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[inv] CENSUS-MUTE hand=%u,%u,%u,%u,%u "
+                    "(empty and never seen filled here; not asserting it)",
+                    it->t, it->c, it->cs, it->i, it->s);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            continue;
+        }
         // Total UNITS across the capture: the removal-settle signal (see InvPub).
         unsigned int units = 0;
         for (unsigned int ui = 0; ui < n; ++ui)
