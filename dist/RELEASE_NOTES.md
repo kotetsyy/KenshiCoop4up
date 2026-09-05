@@ -1,49 +1,59 @@
-## Бой теперь виден с обеих сторон
+## Вещь, надетая на труп, больше не дублируется
 
-Вы били врага на хосте, а на клиенте тот же боец просто стоял. Причина нашлась
-в логе целиком.
+Хост надевает вещь на труп — она надевается, и рядом с трупом у клиента лежит
+вторая такая же. Причина в логе, и автор дюпа сам её признаёт одной строкой ниже.
 
-Драка реплицируется не анимацией, а **причиной**: сосед получает «этот боец
-атакует вон того» и его собственный движок разыгрывает замах, шаги и удар. В
-приказе едет **рука цели** — идентификатор тела в системе координат отправителя.
+За сохранностью снаряжения следит отдельный канал: он сравнивает содержимое
+своего отряда тик к тику, и **уменьшение** считает выброшенной на землю вещью —
+чтобы сосед перенёс свою копию туда же. Проверок было три: это не обмен между
+отрядами, это не незавершённая передача, и рядом действительно лежит свободная
+вещь на земле.
 
-Беда в том, что тело, которое клиент создал у себя как копию (`[rekey]`), живёт
-под **другой локальной рукой**. В этой сессии враг «Сау» у хоста был
-`1,2475097600`, а у клиента — `1,3468139776`. Приход приказа искал цель по руке
-хоста, не находил ничего и возвращал `r=1` — и так каждые полторы секунды весь
-бой: `localFight=0`, боец стоит.
+Ни одна из них не срабатывает, когда вещь кладут **в другой инвентарь**. Труп —
+не отряд соседа, значит не обмен. На земле ничего нет, значит проверка «лежит
+рядом» промахивается — а она и должна промахиваться, для честно выброшенного в
+городе оружия движок тоже ничего не находит, ради этого запасной путь и писался.
+Дебаунс истекает, и уходит пакет «выброшено».
 
-Сторона отправки этот перевод уже делала (`[combat] CAP xlate`); недоставало
-ровно такого же шага на стороне приёма. Теперь рука цели переводится в локальную
-один раз, до всего остального.
+Дальше у соседа два канала независимо делают своё: снимок инвентаря надевает вещь
+на труп, а пакет «выброшено» кладёт рядом с трупом вторую копию — а если своей
+копии не нашлось, то и вовсе **создаёт новую** (`APPLY-HEALED ... rebuilt from
+intent provenance`). Отсюда и вещь на трупе, и вещь на земле.
 
-Заодно чинится второе, менее заметное: проверка «а не дерётся ли копия не с тем»
-сравнивала показания локального движка с рукой **с провода**. Для копии они
-разные всегда, то есть правильно начатый бой считался ошибочным и сбрасывался
-`clearGoals` на каждом переприказе. Теперь обе величины в одной системе координат.
+Свой же вердикт хост выносит через десять секунд:
 
-В лог добавлена строка `[combat] APPLY xlate` — видно, когда перевод сработал.
+```
+[wd] ground-prune sid='2309-clothes_v1.mod' drop=0/4 (2044 consecutive reads over 10002ms, everLive=0: not a free ground item)
+```
 
-### Что проверено и оказалось в порядке
+`everLive=0` — «за две тысячи чтений ни разу не прочиталось как свободный предмет
+на земле». То есть выброса не было вовсе, и это было известно — просто поздно.
 
-- **Лишних NPC у клиента нет.** Была версия, что «разные объекты» — это
-  разъехавшийся мир. Аудит её не подтверждает: `ghost=0` всю сессию, ни одного
-  неучтённого локального тела. Из 199 промахов усыновления 192 — «такого NPC
-  здесь просто нет», это штатный минт, а не дубль.
-- **Обмен между отрядами работает.** Все четыре передачи: `verdict=accept
-  applied=1/1`.
-- **Перенос тел не пересобирается вхолостую** — правка 0.1.15 держится.
+Теперь перед публикацией выброса проверяется сам предмет: если он **жив и всё ещё
+лежит внутри контейнера**, выброса не было, и пакет не уходит. Вещь реплицируется
+одним каналом — снимком инвентаря. Подавляет только *положительное* чтение: если
+указатель мёртв или нечитаем, поведение прежнее, потому что «движок выгрузил
+объект» — это ровно тот случай, ради которого запасной путь и существует.
 
-### Что осталось
+В лог добавлена строка `[wd] decrease-moved`.
 
-Про «разные объекты» я пока не знаю, что именно расходится. В логе видно, как
-содержимое трупа на хосте прыгает 4 → 3 → 4 предмета, и как два последних снимка
-несут по одному предмету, но с разными хешами — то есть предмет один, а вещь
-разная. Дальше без построчного разбора не двинуться: один заход с переменной
-`KENSHICOOP_INV_DUMP=1` печатает решение по каждому предмету, и тогда будет видно
-причина, а не симптом.
+### Бой из 0.1.16 подтверждён
 
-Рагдолл всё ещё может улететь — это отдельная причина, не тронута.
+В вашей сессии на стороне клиента **60 приказов из 60 — `r=2`**, цель нашлась
+каждый раз, и в 34 из них `localFight=1` — копия реально дерётся. До правки было
+`r=1` подряд и `localFight=0` весь бой.
+
+### Что осталось и почему я это не трогал
+
+Разная обстановка на хосте и клиенте — **не баг репликации, а разошедшийся мир**.
+Костры кочевых лагерей из `nodes_otto1.mod` стоят у вас и у друга на 14–84 юнита
+друг от друга; порог сопоставления — 5. Эти лагеря движок расставляет сам при
+загрузке, каждая машина своим броском, и сейв тут ни при чём. Канал `[fixture]`
+эту разницу измеряет, а не создаёт: расширение порога сведёт объекты в коде, но
+не сдвинет их на экране. Настоящее решение — транслировать раскладку лагеря
+целиком, и это отдельная большая работа, а не правка числа.
+
+Рагдолл всё ещё может улететь. Не тронуто.
 
 ### Установка
 
@@ -54,52 +64,65 @@
 <details>
 <summary>🇬🇧 English</summary>
 
-## Fights now render on both machines
+## Clothing put on a corpse no longer duplicates
 
-You were swinging at an enemy on the host while the same fighter just stood
-there on the client. The log explains it end to end.
+The host dresses a corpse — the item goes on, and a second copy of it lies on the
+ground beside the body on the client. The log explains it, and the code that
+authors the duplicate admits to it one line later.
 
-A fight is replicated as a **cause**, not as animation: the peer is told "this
-fighter is attacking that one" and its own engine plays the draw, the footwork
-and the swing. The order carries the **target's hand** — the body's identifier in
-the *sender's* key space.
+Gear conservation has its own channel: it compares an owned squad's contents tick
+to tick and reads a **decrease** as an item dropped on the ground, so the peer can
+relocate its copy to the same spot. It had three guards: this is not a
+squad-to-squad trade, not an in-flight transfer, and there really is a free item
+lying on the ground nearby.
 
-The catch: a body the client minted as a copy (`[rekey]`) lives under a
-**different local hand**. This session, the enemy "Сау" was `1,2475097600` on the
-host and `1,3468139776` on the client. The arriving order looked the target up by
-the host's hand, found nothing, and returned `r=1` — every 1.5 s, all fight long:
-`localFight=0`, fighter idle.
+None of them fires when the item is put **into another inventory**. A corpse is
+not the peer's squad, so it is not a trade. Nothing is on the ground, so the "is
+it lying nearby" query misses — and it is *supposed* to miss sometimes: for a
+genuinely dropped weapon in a town the engine finds nothing either, which is why
+the fallback path was written. The debounce expires and a "dropped" packet goes
+out.
 
-The send side already did this translation (`[combat] CAP xlate`); the matching
-hop on the receive side was simply missing. The target hand is now translated to
-the local one once, before anything else.
+On the peer, two channels then act independently: the inventory snapshot puts the
+item on the corpse, and the drop packet places a second copy beside it — or, if no
+local copy is found, **manufactures a new one** (`APPLY-HEALED ... rebuilt from
+intent provenance`). Hence one worn and one on the ground.
 
-That also fixes a quieter second bug: the "is the copy fighting the wrong body"
-check compared a local engine read against the **wire** hand. For a copy those
-always differ, so a correctly started fight was judged wrong and `clearGoals`-reset
-on every re-issue. Both values now live in the same key space.
+The host reaches its own verdict ten seconds later:
 
-A `[combat] APPLY xlate` line was added so the translation is visible in the log.
+```
+[wd] ground-prune sid='2309-clothes_v1.mod' drop=0/4 (2044 consecutive reads over 10002ms, everLive=0: not a free ground item)
+```
 
-### Checked and clean
+`everLive=0` — "over two thousand reads it never once read as a free ground
+item". There was no drop at all, and that was knowable — just too late.
 
-- **No extra NPCs on the client.** One theory for "different objects" was a
-  diverged world. The audit does not support it: `ghost=0` for the whole session,
-  not one unaccounted local body. Of 199 adoption misses, 192 are "no such NPC
-  here at all" — a normal mint, not a duplicate.
-- **Squad-to-squad transfers work.** All four: `verdict=accept applied=1/1`.
-- **Body carry no longer re-issues itself** — the 0.1.15 fix holds.
+Now, before a drop is published, the object itself is checked: if it is **alive
+and still inside a container**, no drop happened and no packet goes out. The item
+replicates through one channel, the inventory snapshot. Only a *positive* read
+suppresses: a dead or unreadable handle keeps the old behaviour, because "the
+engine streamed the object out" is exactly the case the fallback exists for.
 
-### Still open
+New log line: `[wd] decrease-moved`.
 
-I do not yet know what "different objects" actually refers to. The log shows a
-corpse's contents bouncing 4 → 3 → 4 items on the host, and the last two
-snapshots each carrying one item but with different hashes — same count,
-different thing. Going further needs the per-item breakdown: one session with
-`KENSHICOOP_INV_DUMP=1` prints the decision for every item, and then this is a
-cause rather than a symptom.
+### The 0.1.16 combat fix is confirmed
 
-The ragdoll can still fly off — a separate cause, untouched.
+In your session, on the client, **60 of 60 orders returned `r=2`** — the target
+resolved every time — and 34 of them show `localFight=1`, the copy actually
+fighting. Before the fix it was `r=1` throughout and `localFight=0` all fight.
+
+### Still open, and why I left it alone
+
+The different scenery on host and client is **not a replication bug — the two
+worlds genuinely differ**. Nomad camp fires from `nodes_otto1.mod` stand 14–84
+units apart on the two machines; the matching threshold is 5. The engine lays
+those camps out itself at load time, each machine with its own roll, and the save
+has nothing to do with it. The `[fixture]` channel measures that difference, it
+does not cause it: widening the threshold would pair the objects in code without
+moving them on screen. The real fix is to stream the camp layout itself, which is
+separate, substantial work — not a changed number.
+
+The ragdoll can still fly off. Untouched.
 
 ### Install
 

@@ -1203,6 +1203,38 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 // feet, so the peer relocating its own copy there reproduces the drop. (A rare
                 // intra-squad trade would be mirrored as a drop here; reconcile then corrects it.)
                 prevC.retries.erase(pe->first); prevC.retryArmMs.erase(pe->first);
+                // ...unless the departed object is still ALIVE and still INSIDE a
+                // container. Then it did not hit the ground at all: it was moved into
+                // another inventory - dressing a corpse, stuffing a chest. Authoring a
+                // drop for that makes the peer relocate (or, failing that, FABRICATE) a
+                // second copy on the ground beside the very container it was just put
+                // into, so the item ends up worn AND lying next to the body. That is the
+                // reported duplicate, and the author's own bookkeeping calls it out one
+                // prune later: "everLive=0: not a free ground item" (session 00:36-00:46,
+                // four clothing drops, none of which ever read as a ground object).
+                //
+                // Only a POSITIVE read suppresses. A dead or unreadable handle keeps the
+                // old behaviour, because "the engine streamed the object out" is exactly
+                // the case this fallback was written for.
+                {
+                    std::deque<void*>& dq = prevC.ptrs[pe->first];
+                    bool inBag = false;
+                    if (!dq.empty() && dq.front()) {
+                        bool picked = false;
+                        if (engine::groundObjectLiveness(
+                                reinterpret_cast<RootObject*>(dq.front()), 0, &picked) == 0 &&
+                            picked)
+                            inBag = true;
+                    }
+                    if (inBag) {
+                        char b[216]; _snprintf(b, sizeof(b) - 1,
+                            "[wd] decrease-moved hand=%u,%u,%u,%u,%u sid='%s' delta=%d "
+                            "(still in a container, never on the ground; no drop authored)",
+                            it->t, it->c, it->cs, it->i, it->s, pe->first.c_str(), delta);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        continue;
+                    }
+                }
                 if (!engine::objectWorldPos(cHand, pos)) {
                     if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[wd] decrease-nopos hand=%u,%u,%u,%u,%u sid='%s' (owner pos unresolved; skip)",
