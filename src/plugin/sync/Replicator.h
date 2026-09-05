@@ -1046,6 +1046,9 @@ private:
     std::map<Key, unsigned long> combatCapMs_;
     // Same throttle for the "[build] POSE-CAP xlate" line, keyed by wire site key.
     std::map<Key, unsigned long> buildPoseCapMs_;
+    // Apply-side twin of the above: throttle for "[combat] APPLY xlate", keyed by
+    // the WIRE hand of the attack target we rewrote to a local hand.
+    std::map<Key, unsigned long> combatTgtXlateMs_;
     u32                   nextEventId_;
     // Stage 6: world NPCs we've hidden+frozen on the join because the host isn't
     // streaming them. Keyed by hand so we restore the exact body when it re-enters

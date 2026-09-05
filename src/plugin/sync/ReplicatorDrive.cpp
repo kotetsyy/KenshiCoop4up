@@ -1215,6 +1215,46 @@ void Replicator::applyTargets(GameWorld* gw) {
         // AI-suspend path below (their AI must run to animate), reached only via this
         // early `continue`.
         if (coop::taskIsCombat(out.task)) {
+            // The streamed SUBJECT is the target's hand in the PEER's key space.
+            // A body this client minted as a proxy lives under a different local
+            // hand (that is what the [rekey] line records), so applyCombat's raw
+            // resolve missed and returned r=1 on every re-issue - the peer's
+            // attacker just stood there while it swung on the other machine
+            // (session 20:08, wire target 1,2475097600 = local 1,3468139776:
+            // r=1 localFight=0 for the whole fight). The publish side already
+            // translates the other way ("[combat] CAP xlate"); this is the
+            // matching apply-side hop. Rewrite once, up front, so the order,
+            // the wrong-target check and the re-target bookkeeping below all
+            // speak the same key space - comparing a local engine read against
+            // a wire hand is a false "wrong target" and clearGoals-thrashes the
+            // copy out of the fight it was already in.
+            {
+                Key tk; tk.t = out.sType; tk.c = out.sContainer;
+                tk.cs = out.sContainerSerial; tk.i = out.sIndex; tk.s = out.sSerial;
+                Character* tc = resolveEventChar(tk);
+                ObjectHand lh;
+                if (tc && engine::charHandOf(tc, lh) &&
+                    (lh.index != out.sIndex || lh.serial != out.sSerial ||
+                     lh.type != out.sType || lh.container != out.sContainer ||
+                     lh.containerSerial != out.sContainerSerial)) {
+                    std::map<Key, unsigned long>::iterator xt =
+                        combatTgtXlateMs_.find(tk);
+                    if (xt == combatTgtXlateMs_.end() || (now - xt->second) >= 2000) {
+                        combatTgtXlateMs_[tk] = now;
+                        char b[200]; _snprintf(b, sizeof(b) - 1,
+                            "[combat] APPLY xlate hand=%u,%u tgt wire=%u,%u,%u,%u,%u"
+                            " -> local=%u,%u,%u,%u,%u",
+                            out.hIndex, out.hSerial,
+                            tk.t, tk.c, tk.cs, tk.i, tk.s,
+                            lh.type, lh.container, lh.containerSerial,
+                            lh.index, lh.serial);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                    out.sType = lh.type; out.sContainer = lh.container;
+                    out.sContainerSerial = lh.containerSerial;
+                    out.sIndex = lh.index; out.sSerial = lh.serial;
+                }
+            }
             bool hostWaiting = coop::taskIsCombatWait(out.task);
             d.combatSeenTick = now; // feeds the disarm debounce below
             // Do NOT separateIntoMyOwnSquad here. Re-containering the body
