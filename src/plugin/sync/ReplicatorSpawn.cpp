@@ -528,6 +528,54 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             it = spawnInfoPend_.erase(it);
             continue;
         }
+        // Sustained-miss dwell for a NEAR mint, the twin of FAR_MINT_ARM_MS above.
+        // The far branch already documents the phenomenon - "the zone-loaded signal
+        // precedes baked-body materialization by a few seconds" - but only the far
+        // path waited it out. A near row minted on FIRST sight, and right after a
+        // load that is far too early: the join's town population streams in over
+        // ~13 s, while the first census pass runs 250 ms after the load finishes.
+        //
+        // Session 01:32:40.851 load done -> 01:32:41.101 first pass: 4 adoptions, 20
+        // misses, every one "no same-template body in reach" - because the townsfolk
+        // did not exist yet. Those 20 mints are permanent, so when the real
+        // townspeople did arrive they were surplus and got hidden (hid=14 supp=14).
+        // The join's town then consists largely of freshly minted template copies,
+        // and a minted body is born EMPTY: no shop stock, no cash. That is the
+        // trader with an empty counter and k.0 while the host's has k.8527, and it
+        // is the same root as the NPC populations differing at all.
+        //
+        // Cost, stated plainly: a genuinely new nearby NPC that this client really
+        // does lack now appears up to MINT_ARM_MS late instead of at once. Adoption
+        // keeps running throughout, so the usual outcome is not a late mint but no
+        // mint - the local twin materializes and gets adopted, which is the correct
+        // body with its inventory, money and history intact.
+        //
+        // Census rows only: an explicit REQ (forceReq) is the peer telling us about
+        // a body it has already decided we need, and a runtime spawn has no baked
+        // twin to wait for.
+        {
+            const unsigned long MINT_ARM_MS = 10000;
+            if (rq.fromCensus && !rq.forceReq &&
+                (rq.firstMissMs == 0 || (now - rq.firstMissMs) < MINT_ARM_MS)) {
+                if (rq.firstMissMs == 0) rq.firstMissMs = now;
+                rq.farMs = now;
+                rq.sends = 0;
+                // One line a second, like the budget defer below: a whole town
+                // held at once would otherwise write a line per body per pass.
+                static unsigned long settleLogMs = 0; // main-thread only
+                if (now - settleLogMs >= 1000) {
+                    settleLogMs = now;
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[spawn] INFO deferred (settling) hand=%u,%u,%u,%u,%u sid='%s' "
+                        "heldMs=%lu arm=%lu (local twin may still be streaming in)",
+                        k.t, k.c, k.cs, k.i, k.s, p.charSid,
+                        (unsigned long)(now - rq.firstMissMs), MINT_ARM_MS);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                it = spawnInfoPend_.erase(it);
+                continue;
+            }
+        }
         // Per-tick mint budget: a raid arriving all at once answers a burst
         // of REQs with a burst of INFOs - creating many bodies in one engine
         // tick is a visible hitch (1 then a clump of 3-4). Overflow stays in

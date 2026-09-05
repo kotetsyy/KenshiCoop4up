@@ -1,72 +1,61 @@
-## Торговцы больше не остаются с пустым прилавком
+## Пустой торговец и разные NPC — это одна причина
 
-У торговца нет товара. Причина в логе, и она измерима.
+Трактирщица у хоста: к.8527 и полный прилавок. У клиента она же: к.0 и пусто.
+Разгадка нашлась целиком, и она же объясняет, почему у вас разное население.
 
-Kenshi наполняет прилавок лавки и бункер станка **лениво** — пока рядом никто не
-стоял, содержимого просто нет. Хост объявляет соседу содержимое всех складов и
-станков вокруг себя, и если его движок ещё не наполнил прилавок, уходит снимок
-«пусто». Сосед честно применяет: **уничтожает у себя весь товар**. А дальше
-страховочная пересылка повторяет тот же пустой снимок каждые пять секунд, поэтому
-прилавок остаётся голым — восстановиться ему не дают.
-
-Масштаб за одну вашу сессию:
+Смотрите на время в логе клиента:
 
 ```
-хост:    83 контейнера из 106 объявили items=0 первым же снимком
-клиент:  440 применений пустого снимка
+01:32:40.851  [load] JOIN load suppression ON      <- загрузка закончилась
+01:32:41.101  [spawn] proxy ADOPT ... (4 штуки)
+01:32:41.101  [spawn] adopt MISS  ... (20 штук, все "no same-template body in reach")
 ```
 
-Пустота — это факт про **машину**, а не про мир. Теперь контейнер, который мы
-объявляем своим только потому, что стоим рядом (лавка, станок, труп), не имеет
-права утверждать пустоту, пока мы **хоть раз не видели в нём содержимое**.
-Собственных карманов отряда это не касается: там пусто — значит игрок вынес, и
-это надо передать.
+**250 миллисекунд.** Первая перепись мира приходит через четверть секунды после
+загрузки — а Kenshi заселяет город постепенно, в этой сессии заселение шло
+секунд тринадцать. То есть в момент переписи горожан на клиенте ещё нет. Мод не
+находит, кого усыновить, и **создаёт двадцать тел заново по шаблону**.
 
-В лог добавлена строка `[inv] CENSUS-MUTE`.
+Дальше всё предрешено. Созданные тела остаются навсегда, а когда настоящие
+горожане наконец появляются, они оказываются лишними — и их прячут (`hid=14
+supp=14`). Город у клиента после этого состоит в основном из свежесозданных
+копий.
 
-### 0.1.17 проверен, но не полностью
+А созданное по шаблону тело рождается **пустым**: ни товара, ни денег. Вот вам и
+к.0 у трактирщицы. Это не потеря товара — его там никогда и не было.
 
-Новая проверка сработала:
+### Правка
 
-```
-[wd] decrease-moved ... sid='52295-rebirth.mod' (still in a container, never on the ground; no drop authored)
-```
+В коде уже была ровно та защита, которой не хватало, — но только для дальних тел.
+Там прямо написано: «зона рапортует о загрузке за несколько секунд до появления
+тел», и дальний минт поэтому ждёт десять секунд непрерывного отсутствия. Ближний
+минт не ждал ничего и создавал тело с первого взгляда.
 
-Фантомных выбросов было 6 у хоста и 4 у клиента, стало 0 и 1. Но **один всё-таки
-прошёл** — и хост под него сфабриковал вещь (`APPLY-HEALED`). Проверка подавляет
-выброс только по положительному чтению предмета; когда указатель прочитать не
-удалось, работает старый путь. Значит дюп стал редким, а не исчез.
+Теперь ждёт так же. Усыновление всё это время продолжает работать, поэтому обычный
+исход — не поздний минт, а **отсутствие минта**: настоящий горожанин появляется и
+усыновляется, со своим товаром, деньгами и историей.
 
-### NPC у хоста и у клиента: измерил, править не стал
+Цена, честно: по-настоящему новый NPC рядом, которого у клиента правда нет,
+теперь появится на десять секунд позже, а не сразу.
 
-Расхождение реальное и причина у него не в NPC, а в том, **кто чем владеет**:
+В лог добавлена строка `[spawn] INFO deferred (settling)`.
 
-```
-хост:    enum=69  notmine=68  proxyrow=36   mine=1   hid=22  supp=22
-клиент:  wide=47              drv=17        mine=29  hid=0   supp=0
-```
+### 0.1.18 подтверждён
 
-У хоста 69 тел, и он считает своими **одно**. 22 своих NPC он прячет, потому что
-их область объявил своей клиент, и вместо них показывает 36 копий, присланных
-клиентом. У клиента при этом своих — 29.
+`[inv] CENSUS-MUTE` сработал девять раз — столько пустых снимков не ушло к
+соседу. Владение в этой сессии было здоровое: `cells=1`, у хоста `mine=22`, у
+клиента `mine=0` — то есть мир целиком у хоста, как и задумано.
 
-Это работает механизм «владения по клеткам»: клетка достаётся тому, кто в ней
-стоял, и остаётся за ним после ухода. Клиент зашёл в город первым — город его.
-Формально всё отработало как задумано, фактически хост перестал быть хозяином
-мира, и населённость у вас разъехалась.
+### Что осталось
 
-Гадать, как это перекроить, я не буду — это решение про устройство мода, а не
-правка. Но есть бесплатная проверка: **выключите владение по клеткам на обеих
-машинах** и сыграйте сессию.
+Отдельно от всего этого мод **не передаёт инвентарь живого торговца вообще**.
+Перепись хоста берёт склады, станки и трупы; живой лавочник не попадает ни в одну
+из этих трёх корзин. Пока обе стороны видят одного и того же настоящего торговца,
+это незаметно — сейв-то общий. Правка выше именно к этому и ведёт. Если после неё
+расхождение у прилавка останется, значит нужен отдельный канал для лавок, и я его
+сделаю.
 
-```bash
-setx KENSHICOOP_CELL_AUTH 0
-```
-
-Тогда мир целиком остаётся за хостом. Если разница NPC уходит — значит виноват
-именно этот механизм, и дальше решаем: чинить его или оставить выключенным. Если
-не уходит — причина другая, и я её искал не там. Ставить надо **обоим**, и это
-переменная окружения, поэтому Kenshi после неё надо перезапустить.
+Рагдолл всё ещё может улететь. Не тронуто.
 
 ### Установка
 
@@ -77,75 +66,65 @@ setx KENSHICOOP_CELL_AUTH 0
 <details>
 <summary>🇬🇧 English</summary>
 
-## Traders no longer end up with an empty counter
+## The empty trader and the different NPCs are one cause
 
-A trader has no goods. The log explains it, and the effect is measurable.
+The barmaid on the host: 8,527 cats and a full counter. The same barmaid on the
+client: 0 cats and nothing. The whole chain is in the log, and it also explains
+why your populations differ.
 
-Kenshi stocks a shop's shelf and a machine's output bin **lazily** — until someone
-has stood nearby, there simply is no content. The host announces the contents of
-every store and machine around it, and if its engine has not stocked the shelf
-yet, an "empty" snapshot goes out. The peer faithfully applies it and **destroys
-its own stock**. The safety resend then repeats that empty snapshot every five
-seconds, so the counter stays bare — it is never allowed to recover.
-
-Over one of your sessions:
+Look at the timing on the client:
 
 ```
-host:  83 of 106 authored containers announced items=0 on their first send
-join:  440 empty snapshots applied
+01:32:40.851  [load] JOIN load suppression ON      <- load finished
+01:32:41.101  [spawn] proxy ADOPT ... (4 of them)
+01:32:41.101  [spawn] adopt MISS  ... (20 of them, all "no same-template body in reach")
 ```
 
-Emptiness is a fact about the **machine**, not about the world. A container we
-author only because we happen to stand near it (a shop, a machine, a corpse) may
-no longer assert emptiness until we have seen it hold something **at least once**.
-Squad pockets are unaffected: empty there means the player emptied it, and that
-must cross.
+**250 milliseconds.** The first world census arrives a quarter of a second after
+the load — and Kenshi populates a town gradually; in this session it took about
+thirteen seconds. So at census time the townsfolk do not exist on the client yet.
+The mod finds nobody to adopt and **creates twenty bodies from templates**.
 
-New log line: `[inv] CENSUS-MUTE`.
+Everything after that follows. Those created bodies are permanent, so when the
+real townspeople finally arrive they are surplus and get hidden (`hid=14
+supp=14`). The client's town then consists largely of freshly minted copies.
 
-### 0.1.17 verified, but not completely
+And a body minted from a template is born **empty**: no stock, no money. That is
+the barmaid's 0 cats. Nothing was lost — it was never there.
 
-The new check does fire:
+### The fix
 
-```
-[wd] decrease-moved ... sid='52295-rebirth.mod' (still in a container, never on the ground; no drop authored)
-```
+The guard that was missing already existed in the code, but only for distant
+bodies. It says so outright: "the zone-loaded signal precedes baked-body
+materialization by a few seconds", and a far mint therefore waits ten seconds of
+continuous absence. A near mint waited for nothing and created a body on first
+sight.
 
-Phantom drops went from 6 (host) and 4 (join) to 0 and 1. But **one still got
-through**, and the host fabricated an item for it (`APPLY-HEALED`). The check
-suppresses only on a positive read of the object; when the pointer cannot be read,
-the old path still runs. So the duplicate is now rare, not gone.
+Now it waits the same. Adoption keeps running throughout, so the usual outcome is
+not a late mint but **no mint**: the real townsperson materializes and is adopted,
+with its stock, money and history intact.
 
-### NPCs on host vs client: measured, not changed
+The cost, plainly: a genuinely new nearby NPC the client really does lack now
+appears ten seconds late instead of at once.
 
-The divergence is real, and its cause is not the NPCs but **who owns what**:
+New log line: `[spawn] INFO deferred (settling)`.
 
-```
-host:  enum=69  notmine=68  proxyrow=36   mine=1   hid=22  supp=22
-join:  wide=47              drv=17        mine=29  hid=0   supp=0
-```
+### 0.1.18 confirmed
 
-The host has 69 bodies and considers **one** of them its own. It hides 22 of its
-own NPCs because the client claimed their region, and shows 36 client-streamed
-copies instead. The client, meanwhile, owns 29.
+`[inv] CENSUS-MUTE` fired nine times — nine empty snapshots that did not go out.
+Authority was healthy this session: `cells=1`, host `mine=22`, join `mine=0` — the
+whole world with the host, as intended.
 
-This is per-cell authority doing its job: a cell goes to whoever stood in it and
-stays with them after they leave. The client entered the town first, so the town
-is theirs. Formally correct; in practice the host stopped being the world's owner
-and your populations drifted apart.
+### Still open
 
-I am not going to guess at a redesign — that is a decision about how the mod
-works, not a fix. But there is a free experiment: **turn per-cell authority off on
-both machines** and play a session.
+Separately from all this, the mod **does not replicate a living trader's inventory
+at all**. The host's census covers stores, machines and corpses; a living
+shopkeeper falls into none of the three. While both sides see the same real
+trader this goes unnoticed — the save is shared. The fix above is what gets you
+there. If a discrepancy at the counter survives it, then a dedicated shop channel
+is needed and I will write one.
 
-```bash
-setx KENSHICOOP_CELL_AUTH 0
-```
-
-The whole world then stays with the host. If the NPC difference goes away, this
-mechanism is the cause and we decide whether to fix it or leave it off. If it does
-not, the cause is elsewhere and I was looking in the wrong place. Both machines
-need it, and it is an environment variable, so restart Kenshi afterwards.
+The ragdoll can still fly off. Untouched.
 
 ### Install
 
