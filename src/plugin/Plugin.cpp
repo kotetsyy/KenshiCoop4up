@@ -1092,6 +1092,54 @@ void tickApplyPlayerNicks(GameWorld* gw) {
             g_repl.setPeerNick(id, nm);
     }
     g_repl.applySquadNicks(gw, g_net.localId());
+
+    // Protocol 56: publish the roster. HELLO tells the host a joiner's name and
+    // WELCOME tells that joiner the host's, which is the entire roster for two
+    // players and not enough for three - join A and join B never exchange
+    // anything, so each could only ever name the host and itself. Measured in the
+    // 01:59 session: the host applied all three names, each join applied exactly
+    // one. Everything else about the third player already crossed (their squad is
+    // driven, their inventory, stats and events all arrive); only the name was
+    // missing.
+    //
+    // Host only: it is the one client that knows every name. Change-gated, with a
+    // slow safety resend so a player who connects later still learns the names
+    // already in play without a handshake of its own.
+    if (!g_cfg.isHost) return;
+    coop::RosterPacket rp;
+    memset(&rp, 0, sizeof(rp));
+    rp.type = (coop::u8)coop::PKT_PLAYER_ROSTER;
+    rp.ownerId = 0;
+    for (coop::u32 id = 0; id < coop::MAX_PLAYERS; ++id) {
+        const char* src = 0;
+        char nm[64];
+        if (id == g_net.localId()) {
+            if (!g_cfg.playerName.empty()) src = g_cfg.playerName.c_str();
+        } else if (g_net.copyPeerName(id, nm, sizeof(nm))) {
+            src = nm;
+        }
+        if (!src) continue;
+        unsigned n = 0;
+        while (src[n] && n < coop::HELLO_NAME_MAX) { rp.name[id][n] = src[n]; ++n; }
+    }
+    static char s_lastRoster[coop::MAX_PLAYERS][coop::HELLO_NAME_MAX + 1] = { { 0 } };
+    static DWORD s_lastRosterMs = 0;
+    DWORD now = GetTickCount();
+    bool changed = memcmp(s_lastRoster, rp.name, sizeof(rp.name)) != 0;
+    if (!changed && s_lastRosterMs != 0 && (now - s_lastRosterMs) < 10000) return;
+    memcpy(s_lastRoster, rp.name, sizeof(rp.name));
+    s_lastRosterMs = now;
+    g_net.queueRoster(rp);
+    if (changed) {
+        for (coop::u32 id = 0; id < coop::MAX_PLAYERS; ++id) {
+            if (!rp.name[id][0]) continue;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "[nick] roster id=%u '%s'",
+                      (unsigned)id, rp.name[id]);
+            b[sizeof(b) - 1] = '\0';
+            coopLog(b);
+        }
+    }
 }
 
 // Deferred auto-bake: write the fixture save once the armed settle window

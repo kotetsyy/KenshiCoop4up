@@ -262,6 +262,8 @@ void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pk
 
 void NetLink::queueFixture(const FixturePacket& pkt) { pushLocked(outCs_, outFixture_, pkt); }
 
+void NetLink::queueRoster(const RosterPacket& pkt) { pushLocked(outCs_, outRoster_, pkt); }
+
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
 void NetLink::queueBuildState(const BuildStatePacket& pkt) { pushLocked(outCs_, outBuildState_, pkt); }
@@ -922,6 +924,41 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dep)
                             && inbound_) {
                             inbound_->pushDeed(dep.ownerId, dep);
+                        }
+                    } else if (!isHost_ && type == PKT_PLAYER_ROSTER) {
+                        // The player roster (protocol 56), host -> everyone. This
+                        // is the ONLY way a join learns a THIRD player's name:
+                        // HELLO reaches the host and WELCOME comes back from it,
+                        // so join A and join B never exchanged anything at all.
+                        //
+                        // Written straight into peerName_, which the game thread
+                        // already polls (tickApplyPlayerNicks -> setPeerNick ->
+                        // applySquadNicks), so nothing downstream changes. Our OWN
+                        // slot is skipped: the local config is the authority for
+                        // that one, and the host's copy can lag a rename.
+                        RosterPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)) {
+                            u32 me = (u32)InterlockedCompareExchange(&myId_, 0, 0);
+                            for (u32 i = 0; i < MAX_PLAYERS; ++i) {
+                                if (i == me) continue;
+                                rp.name[i][HELLO_NAME_MAX] = '\0';
+                                std::string parsed;
+                                // Peer text: re-parse rather than trust the wire.
+                                bool ok = parsePlayerNick(rp.name[i], parsed);
+                                EnterCriticalSection(&nameCs_);
+                                bool changed = strcmp(peerName_[i],
+                                                      ok ? parsed.c_str() : "") != 0;
+                                memset(peerName_[i], 0, sizeof(peerName_[i]));
+                                if (ok) memcpy(peerName_[i], parsed.c_str(), parsed.size());
+                                LeaveCriticalSection(&nameCs_);
+                                if (changed && ok) {
+                                    char lb[96];
+                                    _snprintf(lb, sizeof(lb) - 1, "roster id=%u '%s'",
+                                              (unsigned)i, parsed.c_str());
+                                    lb[sizeof(lb) - 1] = '\0';
+                                    netLog(lb);
+                                }
+                            }
                         }
                     } else if (type == PKT_FIXTURE) {
                         // Reliable runtime-fixture identity row (protocol 55):
@@ -1675,6 +1712,23 @@ void NetLink::threadLoop() {
                 enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send the queued player roster on CH_RELIABLE (protocol 56).
+        // HOST ONLY by construction - the host is the only client that knows
+        // every name - so there is no join branch here, unlike the symmetric
+        // channels around it.
+        {
+            std::vector<RosterPacket> rosPkts;
+            EnterCriticalSection(&outCs_);
+            rosPkts.swap(outRoster_);
+            LeaveCriticalSection(&outCs_);
+            for (size_t i = 0; i < rosPkts.size(); ++i) {
+                if (!isHost_) break;
+                ENetPacket* out = enet_packet_create(&rosPkts[i], sizeof(RosterPacket),
+                                                     ENET_PACKET_FLAG_RELIABLE);
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             }
         }
 

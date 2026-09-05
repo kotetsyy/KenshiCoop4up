@@ -1,61 +1,50 @@
-## Пустой торговец и разные NPC — это одна причина
+## Ники третьего игрока
 
-Трактирщица у хоста: к.8527 и полный прилавок. У клиента она же: к.0 и пусто.
-Разгадка нашлась целиком, и она же объясняет, почему у вас разное население.
+> **Протокол меняется: 58 → 59.** Со старой сборкой соединения не будет.
+> Обновиться должны **все**. При включённых обновлениях это произойдёт само.
 
-Смотрите на время в логе клиента:
+Втроём каждый клиент видел только два ника — хоста и свой. Третий игрок стоял
+безымянным. В логах видно ровно это:
 
 ```
-01:32:40.851  [load] JOIN load suppression ON      <- загрузка закончилась
-01:32:41.101  [spawn] proxy ADOPT ... (4 штуки)
-01:32:41.101  [spawn] adopt MISS  ... (20 штук, все "no same-template body in reach")
+хост:      [nick] applied id=0 'kotetsy'
+           [nick] applied id=1 'qweqweq'
+           [nick] applied id=2 'matiga'
+
+клиент 1:  [nick] applied id=1 'qweqweq'      <- и всё
+клиент 2:  [nick] applied id=2 'matiga'       <- и всё
 ```
 
-**250 миллисекунд.** Первая перепись мира приходит через четверть секунды после
-загрузки — а Kenshi заселяет город постепенно, в этой сессии заселение шло
-секунд тринадцать. То есть в момент переписи горожан на клиенте ещё нет. Мод не
-находит, кого усыновить, и **создаёт двадцать тел заново по шаблону**.
+Причина простая до обидного. Ник едет в двух пакетах: при подключении клиент
+сообщает своё имя хосту, а хост в ответ сообщает своё. **Для двоих это весь
+список.** Для троих — нет: клиент 1 и клиент 2 между собой не обмениваются ничем,
+и о существовании чужого имени ни один из них не узнаёт никогда.
 
-Дальше всё предрешено. Созданные тела остаются навсегда, а когда настоящие
-горожане наконец появляются, они оказываются лишними — и их прячут (`hid=14
-supp=14`). Город у клиента после этого состоит в основном из свежесозданных
-копий.
+Всё остальное про третьего игрока при этом уже доходит — я проверил по логам:
+клиент 1 ведёт отряд игрока 2, применяет его инвентарь (`items=12`), получает его
+характеристики (29 пакетов) и события. Не хватало **только имени**.
 
-А созданное по шаблону тело рождается **пустым**: ни товара, ни денег. Вот вам и
-к.0 у трактирщицы. Это не потеря товара — его там никогда и не было.
+Теперь хост рассылает всем таблицу имён целиком, при изменении и раз в десять
+секунд на подстраховку. Подключившийся позже сразу узнаёт тех, кто уже играет.
+Одна строка на всю таблицу, а не по строке на игрока: список крошечный, а половина
+таблицы — это состояние, которого лучше не бывает.
 
-### Правка
+В лог добавлены строки `[nick] roster` (хост) и `roster id=` (клиент).
 
-В коде уже была ровно та защита, которой не хватало, — но только для дальних тел.
-Там прямо написано: «зона рапортует о загрузке за несколько секунд до появления
-тел», и дальний минт поэтому ждёт десять секунд непрерывного отсутствия. Ближний
-минт не ждал ничего и создавал тело с первого взгляда.
+### Почему пришлось менять протокол
 
-Теперь ждёт так же. Усыновление всё это время продолжает работать, поэтому обычный
-исход — не поздний минт, а **отсутствие минта**: настоящий горожанин появляется и
-усыновляется, со своим товаром, деньгами и историей.
+Подходящего канала не было: ни один пакет не возит сведения об игроках всем
+сразу. Правило в проекте — не заводить новые типы пакетов, пока не доказано, что
+без них никак. Здесь доказано логом: место, куда клиент кладёт чужое имя, у
+третьего игрока пустует всю сессию.
 
-Цена, честно: по-настоящему новый NPC рядом, которого у клиента правда нет,
-теперь появится на десять секунд позже, а не сразу.
-
-В лог добавлена строка `[spawn] INFO deferred (settling)`.
-
-### 0.1.18 подтверждён
-
-`[inv] CENSUS-MUTE` сработал девять раз — столько пустых снимков не ушло к
-соседу. Владение в этой сессии было здоровое: `cells=1`, у хоста `mine=22`, у
-клиента `mine=0` — то есть мир целиком у хоста, как и задумано.
+Заодно `prototest` вырос с 562 до 567 проверок — новый пакет закрыт тестами на
+номер, на отсутствие коллизии и на разбор имени предельной длины.
 
 ### Что осталось
 
-Отдельно от всего этого мод **не передаёт инвентарь живого торговца вообще**.
-Перепись хоста берёт склады, станки и трупы; живой лавочник не попадает ни в одну
-из этих трёх корзин. Пока обе стороны видят одного и того же настоящего торговца,
-это незаметно — сейв-то общий. Правка выше именно к этому и ведёт. Если после неё
-расхождение у прилавка останется, значит нужен отдельный канал для лавок, и я его
-сделаю.
-
-Рагдолл всё ещё может улететь. Не тронуто.
+Живой торговец по-прежнему не реплицируется как таковой, рагдолл всё ещё может
+улететь. Не тронуто.
 
 ### Установка
 
@@ -66,65 +55,54 @@ supp=14`). Город у клиента после этого состоит в 
 <details>
 <summary>🇬🇧 English</summary>
 
-## The empty trader and the different NPCs are one cause
+## The third player's name
 
-The barmaid on the host: 8,527 cats and a full counter. The same barmaid on the
-client: 0 cats and nothing. The whole chain is in the log, and it also explains
-why your populations differ.
+> **Protocol changes: 58 -> 59.** An older build will not connect. **Everyone**
+> must update. With updates on this happens by itself.
 
-Look at the timing on the client:
+With three players, each client saw only two names — the host's and its own. The
+third player stood there unnamed. The logs show exactly that:
 
 ```
-01:32:40.851  [load] JOIN load suppression ON      <- load finished
-01:32:41.101  [spawn] proxy ADOPT ... (4 of them)
-01:32:41.101  [spawn] adopt MISS  ... (20 of them, all "no same-template body in reach")
+host:      [nick] applied id=0 'kotetsy'
+           [nick] applied id=1 'qweqweq'
+           [nick] applied id=2 'matiga'
+
+client 1:  [nick] applied id=1 'qweqweq'      <- that's all
+client 2:  [nick] applied id=2 'matiga'       <- that's all
 ```
 
-**250 milliseconds.** The first world census arrives a quarter of a second after
-the load — and Kenshi populates a town gradually; in this session it took about
-thirteen seconds. So at census time the townsfolk do not exist on the client yet.
-The mod finds nobody to adopt and **creates twenty bodies from templates**.
+The cause is almost embarrassingly simple. A name travels in two packets: on
+connect a client tells the host its name, and the host replies with its own.
+**For two players that is the entire roster.** For three it is not: client 1 and
+client 2 exchange nothing with each other, so neither ever learns the other's
+name.
 
-Everything after that follows. Those created bodies are permanent, so when the
-real townspeople finally arrive they are surplus and get hidden (`hid=14
-supp=14`). The client's town then consists largely of freshly minted copies.
+Everything else about the third player already arrives — I checked it in the logs:
+client 1 drives player 2's squad, applies their inventory (`items=12`), receives
+their stats (29 packets) and their events. Only the name was missing.
 
-And a body minted from a template is born **empty**: no stock, no money. That is
-the barmaid's 0 cats. Nothing was lost — it was never there.
+The host now broadcasts the whole name table, on change and every ten seconds as a
+backstop, so a player who connects later immediately learns who is already
+playing. One row for the entire table rather than a row per player: the list is
+tiny, and half a table is the worst state to be in.
 
-### The fix
+New log lines: `[nick] roster` (host) and `roster id=` (client).
 
-The guard that was missing already existed in the code, but only for distant
-bodies. It says so outright: "the zone-loaded signal precedes baked-body
-materialization by a few seconds", and a far mint therefore waits ten seconds of
-continuous absence. A near mint waited for nothing and created a body on first
-sight.
+### Why the protocol had to change
 
-Now it waits the same. Adoption keeps running throughout, so the usual outcome is
-not a late mint but **no mint**: the real townsperson materializes and is adopted,
-with its stock, money and history intact.
+There was no suitable channel: no existing packet carries per-player information
+to everyone. The project rule is not to add packet types until it is proven
+necessary. The log proves it here — the slot where a client stores another
+player's name sits empty for the whole session on the third player.
 
-The cost, plainly: a genuinely new nearby NPC the client really does lack now
-appears ten seconds late instead of at once.
-
-New log line: `[spawn] INFO deferred (settling)`.
-
-### 0.1.18 confirmed
-
-`[inv] CENSUS-MUTE` fired nine times — nine empty snapshots that did not go out.
-Authority was healthy this session: `cells=1`, host `mine=22`, join `mine=0` — the
-whole world with the host, as intended.
+`prototest` also grew from 562 to 567 checks: the new packet is covered for its
+tag, for tag collisions, and for parsing a maximum-length name.
 
 ### Still open
 
-Separately from all this, the mod **does not replicate a living trader's inventory
-at all**. The host's census covers stores, machines and corpses; a living
-shopkeeper falls into none of the three. While both sides see the same real
-trader this goes unnoticed — the save is shared. The fix above is what gets you
-there. If a discrepancy at the counter survives it, then a dedicated shop channel
-is needed and I will write one.
-
-The ragdoll can still fly off. Untouched.
+A living trader is still not replicated as such, and the ragdoll can still fly
+off. Untouched.
 
 ### Install
 

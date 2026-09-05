@@ -142,6 +142,11 @@ public:
     // Symmetric and static (a fixture's position/template never change), so this
     // is first-sight plus a slow safety resend and idles at zero traffic.
     void queueFixture(const FixturePacket& pkt);
+    // MAIN thread, HOST ONLY: queue the reliable player-roster row (protocol
+    // 56) - every player's display name by id. HELLO/WELCOME only ever tell
+    // the host and ONE joiner about each other, so with three players nobody
+    // but the host knew the third name. Change-gated by the caller.
+    void queueRoster(const RosterPacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -318,6 +323,7 @@ private:
     std::vector<DeedPacket>      outDeed_;
     // Reliable runtime-fixture identity rows (protocol 55). Guarded by outCs_.
     std::vector<FixturePacket>   outFixture_;
+    std::vector<RosterPacket>    outRoster_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;

@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 58;
+const u16 PROTOCOL_VERSION = 59;
 
 // RELEASE id - a different axis from PROTOCOL_VERSION, and the two are routinely
 // confused. PROTOCOL_VERSION is the WIRE contract: peers with different values
@@ -45,7 +45,7 @@ const u16 PROTOCOL_VERSION = 58;
 // introduced ordering, which is the only moment it was free: those clients
 // install whatever the manifest names regardless of order, so they follow the
 // renumber, and every build after this one is ordered and monotonic.
-const char* const COOP_BUILD_VERSION = "0.1.19";
+const char* const COOP_BUILD_VERSION = "0.1.20";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;
@@ -100,7 +100,8 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_PLAYER_ROSTER    = 49 // RELIABLE display-name table (host -> all, protocol 56); RosterPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1203,6 +1204,30 @@ struct DeedPacket {
 // A receiver that cannot match the row yet (zone not loaded) simply records
 // nothing; the safety resend retries, and every consumer falls back to the raw
 // hand, which is still correct for a genuinely save-baked machine.
+// ---- Protocol 56: the player roster ----------------------------------------
+// Display names by player id, HOST -> everyone.
+//
+// HELLO carries a joiner's nick to the host and WELCOME carries the host's nick
+// back to that joiner, and for two players that is the whole roster. It is not
+// for three: nothing ever told join A about join B, so peerName_ for the third
+// player stayed empty forever and applySquadNicks skipped it. Measured in the
+// 01:59 session - the host applied all three names, while each join applied
+// exactly one, its own. Everything else about the third player already crosses
+// (that join drives their squad, receives their inventory, stats and events);
+// only the name was missing.
+//
+// One fixed-size row for the WHOLE table rather than a row per player: the
+// roster is tiny, it changes only when someone connects, disconnects or renames,
+// and a single packet cannot deliver half a table. Sent on change and on a slow
+// safety resend, so a late joiner learns the existing names without a handshake
+// of its own. Names are NUL-terminated and already sanitized by parsePlayerNick
+// on the way in; a receiver re-parses anyway, because this is peer text.
+struct RosterPacket {
+    u8  type;      // = PKT_PLAYER_ROSTER
+    u32 ownerId;   // always 0 - the host is the only author of the roster
+    char name[MAX_PLAYERS][HELLO_NAME_MAX + 1]; // index = player id; empty = no such player
+};
+
 struct FixturePacket {
     u8  type;      // = PKT_FIXTURE
     u32 ownerId;   // network player id of the sender

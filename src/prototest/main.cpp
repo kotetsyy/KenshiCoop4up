@@ -315,8 +315,31 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v58: spawn KO latch + census KO edges)",
-             (int)PROTOCOL_VERSION, 58);
+    CHECK_EQ("PROTOCOL_VERSION (v59: player roster)",
+             (int)PROTOCOL_VERSION, 59);
+    // Protocol 56 (v59): the roster table. One row carries EVERY name, so a
+    // receiver can never be handed half a table, and the tag must not collide
+    // with the fixture row that preceded it.
+    CHECK_EQ("PKT_PLAYER_ROSTER id", (int)PKT_PLAYER_ROSTER, 49);
+    CHECK("PKT_PLAYER_ROSTER distinct", PKT_PLAYER_ROSTER != PKT_FIXTURE &&
+          PKT_PLAYER_ROSTER != PKT_DEED && PKT_PLAYER_ROSTER != PKT_HELLO);
+    CHECK_EQ("RosterPacket holds every player",
+             (int)(sizeof(((RosterPacket*)0)->name) / (HELLO_NAME_MAX + 1)),
+             (int)MAX_PLAYERS);
+    {
+        // A short name leaves the rest of its row NUL, and an over-long one is
+        // capped by the sender - the receiver still terminates before parsing.
+        RosterPacket rp; memset(&rp, 0, sizeof(rp));
+        rp.type = (u8)PKT_PLAYER_ROSTER;
+        for (unsigned i = 0; i < HELLO_NAME_MAX; ++i) rp.name[2][i] = 'x';
+        rp.name[2][HELLO_NAME_MAX] = '\0';
+        std::string parsed;
+        CHECK("roster parses a max-length name",
+              parsePlayerNick(rp.name[2], parsed) &&
+              parsed.size() == HELLO_NAME_MAX);
+        CHECK("roster empty slot yields no nick",
+              !parsePlayerNick(rp.name[1], parsed));
+    }
     CHECK_EQ("SPAWN_BODY_KO", (int)SPAWN_BODY_KO, 2);
     CHECK("SPAWN_BODY values distinct",
           SPAWN_BODY_ALIVE != SPAWN_BODY_DEAD &&
