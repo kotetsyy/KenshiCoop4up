@@ -31,12 +31,14 @@
 #include "core/CrashDump.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
+#include "core/PlayerNick.h"
+#include "core/UdpEndpoint.h"
+#include "core/UiModule.h"      // optional KenshiCoopUI.dll: F2 panel + banner
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
 #include "net/Updater.h"
 #include "game/Engine.h"
-#include "game/EngineUi.h"       // Phase 5a: F2 co-op panel + status overlay
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
@@ -65,11 +67,11 @@ coop::Inbound&    g_inbound = g_host.inbound;
 coop::Replicator& g_repl    = g_host.repl;
 coop::u32        g_tick = 0;
 
-// Last GameWorld seen by the main-loop hook. The F2-panel UI callbacks
-// (coopUiConnect/coopUiDisconnect) run without a GameWorld argument, but the
-// world is live when the user hits Connect/Disconnect, so we despawn our
-// minted proxies (NPC + world-item, Phase 3) through this cached pointer to
-// avoid leaking duplicate bodies into the save. Only touched on the main thread.
+// Last GameWorld seen by the main-loop hook. The F2-panel commands
+// (connect/disconnect) run without a GameWorld argument, but the world is live
+// when the user hits Connect/Disconnect, so we despawn our minted proxies
+// (NPC + world-item, Phase 3) through this cached pointer to avoid leaking
+// duplicate bodies into the save. Only touched on the main thread.
 GameWorld*       g_lastGw = 0;
 
 // Cross-owner trade veto owner classifier (engine InvOwnerClassFn): forwards a
@@ -136,14 +138,38 @@ struct SessionController {
     // it can sit unconsumed mid-session. Armed on every coordinated load issue;
     // if the swap hasn't started after the grace window, pump execute() once.
     DWORD        loadPumpArmTick;  // != 0: backstop armed at this tick
+    // F2 world-sync status (join). Reported by the panel only - nothing gates
+    // on these. Set where the coordinated-load path acts, cleared per session.
+    bool         worldLoadIssued;  // join: host-world load issued, awaiting live edge
+    bool         worldFromHost;    // join: the host's world went live here
+    bool         worldSyncFailed;  // join: host-world transfer or load failed
 
+#ifdef KENSHICOOP_NET_DIAG
+    // Private protocol 61: pause host simulation from connect through the
+    // join's completed LOAD_GO world swap, not merely through save transfer.
+    bool         connected[coop::MAX_PLAYERS];
+    coop::u32    expectedLoadId[coop::MAX_PLAYERS];
+    coop::u32    pendingReadyLoadId; // join: GO awaiting new-world live edge
+    bool         pendingReadyLoadIssued; // join: LOAD_GO save was actually issued
+    coop::u32    readyLoadId;        // join: acknowledged GO for the live world
+#endif
     SessionController()
       : gameStarted(false), gameStartTick(0), autoLoadDone(false),
         titleFirstTick(0), peerPresent(false), peerCount(0),
         saveReqId(0), bootstrapArmed(false),
         swapStartTick(0), swapHookTicks(0),
         loadSuppressOn(false), loadIdOut(0), loadIdSeen(0), loadReqId(0),
-        loadCommitBase(0), loadPumpArmTick(0) {}
+        loadCommitBase(0), loadPumpArmTick(0),
+        worldLoadIssued(false), worldFromHost(false), worldSyncFailed(false)
+#ifdef KENSHICOOP_NET_DIAG
+        , pendingReadyLoadId(0), pendingReadyLoadIssued(false), readyLoadId(0)
+#endif
+    {
+#ifdef KENSHICOOP_NET_DIAG
+        memset(connected, 0, sizeof(connected));
+        memset(expectedLoadId, 0, sizeof(expectedLoadId));
+#endif
+    }
 };
 SessionController g_session;
 
@@ -167,6 +193,24 @@ std::string& g_loadXferPending = g_session.loadXferPending;
 std::string& g_loadAfterCommit = g_session.loadAfterCommit;
 coop::u32&   g_loadCommitBase  = g_session.loadCommitBase;
 DWORD&       g_loadPumpArmTick  = g_session.loadPumpArmTick;
+#ifdef KENSHICOOP_NET_DIAG
+void expectJoinLoad(coop::u32 loadId) {
+    for (unsigned int id = 1; id < coop::MAX_PLAYERS; ++id)
+        if (g_session.connected[id]) g_session.expectedLoadId[id] = loadId;
+}
+
+bool hostWaitingForJoinLoad() {
+    // No pause without the load handshake, clock ACK channel and speed writer.
+    if (!g_cfg.isHost || !g_cfg.saveSync || !g_cfg.loadSync ||
+        !g_cfg.speedSync || !g_cfg.timeSync || !g_peerPresent) return false;
+    if (g_bootstrapArmed) return true;
+    for (unsigned int id = 1; id < coop::MAX_PLAYERS; ++id)
+        if (g_session.connected[id] && g_session.expectedLoadId[id] != 0 &&
+            g_repl.peerReadyLoadId(id) != g_session.expectedLoadId[id])
+            return true;
+    return false;
+}
+#endif
 
 // Scenario harness state. Harness/Debug builds only - the shipped Release DLL
 // excludes test/Scenario*.cpp and does not define KENSHICOOP_HARNESS (Phase 1).
@@ -209,16 +253,17 @@ const DWORD  LOAD_PUMP_GRACE_MS = 2000;  // deferred-LOADGAME backstop grace win
 void (*g_mainLoop_orig)(GameWorld*, float) = 0;
 void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 
-// In-game co-op panel (F2) connect/disconnect handlers. Defined after
-// startNetworking() (which coopUiConnect reuses); forward-declared here so
-// mainLoop_hook can hand their addresses to coopPanelTick.
+// Session connect/disconnect (F2 panel commands + inbound Steam invites).
+// Defined after startNetworking(), which coopUiConnect reuses; forward-declared
+// here so the panel driver can execute the queued UI command.
 void startNetworking();
 // Defined further down; coopUiConnect re-emits it after switching the log file
 // to the role actually being played, so the new file is self-contained.
 void logStartupBanner();
-void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
+void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId,
+                   const CoopUiSettings* ui);
 void coopUiDisconnect();
-void persistPanelMemory(bool isHost, bool useSteam);
+void rememberUiSettings(const CoopUiSettings& ui);
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
 // and the engine's kenshi.log (handy when attached live).
@@ -259,6 +304,9 @@ void sessionResetForUi() {
     else          g_repl.resetSession();
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: fence off any in-flight prior-session batch
+    g_session.worldLoadIssued = false;
+    g_session.worldFromHost   = false;
+    g_session.worldSyncFailed = false;
 }
 
 // World-reload session reset (protocol 32): the old world is gone - every
@@ -273,6 +321,15 @@ void sessionResetForWorldReload() {
     g_joinTabClaimed = false;
     g_joinTabTries = 0;
     coopLog("[load] inbound world-state queues flushed");
+}
+
+// F2 status only (join): an issued host-world load reached a live world. Called
+// from every edge that means "the new world is live" - the in-game reload edge,
+// the synchronous-swap backstop and the title-screen gameplay-start edge.
+void noteJoinWorldLive() {
+    if (!g_session.worldLoadIssued) return;
+    g_session.worldLoadIssued = false;
+    g_session.worldFromHost   = true;
 }
 
 // Push-save-on-connect (host): bake a fresh save of the live world and arm the
@@ -292,8 +349,10 @@ void armConnectPush() {
     _snprintf(b, sizeof(b) - 1,
               "[boot] baking save '%s' to push to join on connect", name.c_str());
     b[sizeof(b) - 1] = '\0'; coopLog(b);
-    if (!coop::engine::saveGameAs(name))
+    if (!coop::engine::saveGameAs(name)) {
         coopErr("[boot] connect-push save FAILED to issue");
+        g_bootstrapArmed = false; // no LOAD_GO can follow a failed save
+    }
 }
 
 // Drain peer connect/leave events and surface a single game-thread confirmation
@@ -316,6 +375,12 @@ void processNetEvents(GameWorld* gw) {
         if (g_cfg.latejoinSync) g_repl.onPeerConnected(g_net, g_net.localId());
         else coopLog("[latejoin] connect edge seen, resync OFF (gate)");
         ++g_peerCount;
+#ifdef KENSHICOOP_NET_DIAG
+        if (g_cfg.isHost && *it < coop::MAX_PLAYERS) {
+            g_session.connected[*it] = true;
+            g_session.expectedLoadId[*it] = 0;
+        }
+#endif
         g_peerPresent = true;
         // Join learns its squad-tab rank from WELCOME playerId (1, 2 or 3).
         if (!g_cfg.isHost && !g_cfg.ownRanksFromEnv) {
@@ -353,6 +418,17 @@ void processNetEvents(GameWorld* gw) {
         if (*it == coop::OWNER_ID_ALL) g_peerCount = 0;
         else if (g_peerCount > 0) --g_peerCount;
         g_peerPresent = g_peerCount > 0;
+#ifdef KENSHICOOP_NET_DIAG
+        if (g_cfg.isHost) {
+            if (*it == coop::OWNER_ID_ALL) {
+                memset(g_session.connected, 0, sizeof(g_session.connected));
+                memset(g_session.expectedLoadId, 0, sizeof(g_session.expectedLoadId));
+            } else if (*it < coop::MAX_PLAYERS) {
+                g_session.connected[*it] = false;
+                g_session.expectedLoadId[*it] = 0;
+            }
+        }
+#endif
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync && g_peerCount == 0) {
             coop::engine::setSaveSuppress(false);
@@ -376,20 +452,18 @@ void processNetEvents(GameWorld* gw) {
 // unaffected by the extraction.
 void pumpSaveReceive() {
     std::deque<coop::InboundSaveBegin> begins;
-    g_inbound.drainSaveBegins(begins);
+    std::deque<coop::InboundSaveFile> chunks;
+    std::deque<coop::InboundSaveDone> dones;
+    g_inbound.drainSaveTransfer(begins, chunks, dones);
     for (std::deque<coop::InboundSaveBegin>::iterator it = begins.begin();
          it != begins.end(); ++it)
         coop::savexfer::onSaveBegin(it->pkt);
 
-    std::deque<coop::InboundSaveFile> chunks;
-    g_inbound.drainSaveFiles(chunks);
     for (std::deque<coop::InboundSaveFile>::iterator it = chunks.begin();
          it != chunks.end(); ++it)
         coop::savexfer::onSaveFile(it->hdr, it->path.c_str(),
                                    it->data.empty() ? 0 : &it->data[0]);
 
-    std::deque<coop::InboundSaveDone> dones;
-    g_inbound.drainSaveDones(dones);
     for (std::deque<coop::InboundSaveDone>::iterator it = dones.begin();
          it != dones.end(); ++it) {
         coop::u16 files = 0;
@@ -493,6 +567,9 @@ void driveSaveSync() {
                     go.fingerprint = coop::savexfer::folderFingerprint(g_bootstrapName);
                     strncpy(go.name, g_bootstrapName.c_str(), sizeof(go.name) - 1);
                     g_net.queueLoadGo(go);
+#ifdef KENSHICOOP_NET_DIAG
+                    expectJoinLoad(go.loadId);
+#endif
                     g_loadPumpArmTick = GetTickCount();
                     char b2[192];
                     _snprintf(b2, sizeof(b2) - 1,
@@ -570,6 +647,9 @@ void driveLoadSync(GameWorld* gw) {
             go.fingerprint = coop::savexfer::folderFingerprint(name);
             strncpy(go.name, name.c_str(), sizeof(go.name) - 1);
             g_net.queueLoadGo(go);
+#ifdef KENSHICOOP_NET_DIAG
+            expectJoinLoad(go.loadId);
+#endif
             g_loadPumpArmTick = GetTickCount();
             char b[160];
             _snprintf(b, sizeof(b) - 1,
@@ -688,6 +768,15 @@ void driveLoadSync(GameWorld* gw) {
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
             if (!name[0]) continue;
+#ifdef KENSHICOOP_NET_DIAG
+            g_session.pendingReadyLoadId = it->pkt.loadId;
+            g_session.pendingReadyLoadIssued = false;
+            g_session.readyLoadId = 0;
+#endif
+            // A new GO supersedes whatever world state the panel reported.
+            g_session.worldFromHost   = false;
+            g_session.worldLoadIssued = false;
+            g_session.worldSyncFailed = false;
             coop::u32 fp = coop::savexfer::folderFingerprint(name);
             char b[192];
             if (!s_forceStream && fp != 0 && fp == it->pkt.fingerprint) {
@@ -708,8 +797,15 @@ void driveLoadSync(GameWorld* gw) {
                 warnIfNoPortraits(name);
                 g_loadAfterCommit.clear();
                 coop::engine::setLoadBypassOnce();
-                if (!coop::engine::loadSave(name))
+                const bool issued = coop::engine::loadSave(name);
+                if (!issued)
                     coopErr("[load] coordinated load FAILED to issue");
+#ifdef KENSHICOOP_NET_DIAG
+                else
+                    g_session.pendingReadyLoadIssued = true;
+#endif
+                g_session.worldLoadIssued = issued;
+                g_session.worldSyncFailed = !issued;
             } else {
                 _snprintf(b, sizeof(b) - 1,
                           "[load] GO id=%u name='%s' hostFp=%08x localFp=%08x %s -> NACK (transfer)",
@@ -748,85 +844,432 @@ void driveLoadSync(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
                 warnIfNoPortraits(g_loadAfterCommit);
                 coop::engine::setLoadBypassOnce();
-                if (!coop::engine::loadSave(g_loadAfterCommit))
+                const bool issued = coop::engine::loadSave(g_loadAfterCommit);
+                if (!issued)
                     coopErr("[load] post-transfer load FAILED to issue");
+#ifdef KENSHICOOP_NET_DIAG
+                else
+                    g_session.pendingReadyLoadIssued = true;
+#endif
+                g_session.worldLoadIssued = issued;
+                g_session.worldSyncFailed = !issued;
                 g_loadAfterCommit.clear();
             } else {
                 // Some other/failed commit landed; re-base and keep waiting.
+                // OUR transfer failing verification is reported (the latch
+                // still waits: a later matching commit loads as before).
+                if (coop::savexfer::lastCommitResult() == 0 &&
+                    _stricmp(coop::savexfer::lastCommitName().c_str(),
+                             g_loadAfterCommit.c_str()) == 0)
+                    g_session.worldSyncFailed = true;
                 g_loadCommitBase = coop::savexfer::commitSeq();
             }
         }
     }
 }
 
-// Co-op session panel (F2) + status banner. Interactive sessions only - the
-// unattended harness (scenario / self-exit timer) never touches the panel, and
-// keeping the GUI stack out of those runs avoids perturbing the scenario
-// oracles. Both calls are SEH-guarded internally and touch only GUI + input, so
-// they are safe wherever the GUI stack is up - neither needs a world, which is
-// why this takes no GameWorld*. Driven from BOTH the in-game mainLoop_hook and
-// the title-screen titleUpdate_hook so a join can go ONLINE (and copy/paste
-// Steam IDs) straight from the main menu, and so the banner reports status there
-// too.
+// ---------------------------------------------------------------------------
+// F2 panel status model. Everything the panel shows is DERIVED from facts:
+// NetLink's lifecycle snapshot (phase, actual transport, errors, accepted
+// members, measured traffic) and the coordinated save/load state above. The
+// config contributes only what the player SELECTED. Player-facing text is
+// Russian, written as hex-escaped UTF-8: the v100 toolchain has no /utf-8, and
+// MyGUI renders UTF-8 (a raw literal would be re-encoded via the ANSI page).
+// ---------------------------------------------------------------------------
+
+// Russian reason the plugin refused a start before NetLink ran (Steam not
+// available, no host endpoint). Empty = none. Cleared by Connect / Disconnect.
+std::string g_panelStartError;
+
+const char* netPhaseTag(coop::NetPhase p) {
+    switch (p) {
+        case coop::NET_IDLE:         return "IDLE";
+        case coop::NET_STARTING:     return "STARTING";
+        case coop::NET_LISTENING:    return "LISTENING";
+        case coop::NET_CONNECTING:   return "CONNECTING";
+        case coop::NET_HANDSHAKING:  return "HANDSHAKING";
+        case coop::NET_CONNECTED:    return "CONNECTED";
+        case coop::NET_RECONNECTING: return "RECONNECTING";
+        case coop::NET_FAILED:       return "FAILED";
+    }
+    return "?";
+}
+
+const char* worldPhaseTag(int w) {
+    switch (w) {
+        case COOP_WORLD_NONE:      return "NONE";
+        case COOP_WORLD_WAITING:   return "WAITING";
+        case COOP_WORLD_PREPARING: return "PREPARING";
+        case COOP_WORLD_RECEIVING: return "RECEIVING";
+        case COOP_WORLD_LOADING:   return "LOADING";
+        case COOP_WORLD_READY:     return "READY";
+        case COOP_WORLD_FAILED:    return "FAILED";
+    }
+    return "?";
+}
+
+const char* transportTag(int t) {
+    return t == coop::NET_TRANSPORT_STEAM ? "Steam" : t == coop::NET_TRANSPORT_UDP ? "UDP" : "-";
+}
+
+CoopUiNetworkPhase panelNetPhase(const coop::NetStatus& ns) {
+    switch (ns.phase) {
+        case coop::NET_STARTING:     return COOP_STARTING;
+        case coop::NET_LISTENING:    return COOP_HOSTING;
+        case coop::NET_CONNECTING:   return COOP_CONNECTING;
+        case coop::NET_HANDSHAKING:  return COOP_HANDSHAKING;
+        case coop::NET_CONNECTED:    return COOP_CONNECTED;
+        case coop::NET_RECONNECTING: return COOP_RECONNECTING;
+        case coop::NET_FAILED:       return COOP_FAILED;
+        case coop::NET_IDLE:         break;
+    }
+    // Never started: a start the plugin itself refused is a failure too.
+    return g_panelStartError.empty() ? COOP_OFFLINE : COOP_FAILED;
+}
+
+// This client's shared-world readiness (see CoopUiWorldPhase in CoopUiApi.h).
+CoopUiWorldPhase panelWorldPhase(const coop::NetStatus& ns) {
+    if (ns.phase == coop::NET_IDLE || ns.phase == coop::NET_STARTING ||
+        ns.phase == coop::NET_FAILED)
+        return COOP_WORLD_NONE;
+    if (g_cfg.isHost) {
+        if (!g_gameStarted) return COOP_WORLD_WAITING;   // no save loaded yet
+        if (g_swapStartTick != 0) return COOP_WORLD_LOADING;
+        if (g_bootstrapArmed || !g_loadXferPending.empty())
+            return COOP_WORLD_PREPARING;
+        return COOP_WORLD_READY;
+    }
+    if (g_session.worldSyncFailed) return COOP_WORLD_FAILED;
+    // Only a transfer we NACKed for is the host's WORLD; a mid-game
+    // coordinated-save copy streams too but changes nothing about readiness.
+    if (!g_loadAfterCommit.empty())
+        return coop::savexfer::receiving() ? COOP_WORLD_RECEIVING : COOP_WORLD_PREPARING;
+    if (g_session.worldLoadIssued) return COOP_WORLD_LOADING;
+    if (ns.phase != coop::NET_CONNECTED) return COOP_WORLD_NONE;
+    if (g_session.worldFromHost) return COOP_WORLD_READY;
+    // Without coordinated save+load the host never sends its world: readiness
+    // is simply not tracked then.
+    if (g_cfg.saveSync && g_cfg.loadSync) return COOP_WORLD_WAITING;
+    return COOP_WORLD_NONE;
+}
+
+// Accepted members only (NetLink memberMask), local player first-class.
+void fillPanelPlayers(CoopUiSnapshot& ps, const coop::NetStatus& ns) {
+    ps.playerCount = 0;
+    memset(ps.players, 0, sizeof(ps.players));
+    const coop::u32 self = g_net.localId();
+    for (coop::u32 id = 0; id < coop::MAX_PLAYERS && ps.playerCount < 4; ++id) {
+        if (!(ns.memberMask & (1u << id))) continue;
+        CoopUiPlayer& p = ps.players[ps.playerCount++];
+        p.id = id;
+        p.local = (id == self) ? 1 : 0;
+        if (p.local) {
+            strncpy(p.name, g_cfg.playerName.c_str(), sizeof(p.name) - 1);
+            p.worldReadyKnown = ps.worldPhase != COOP_WORLD_NONE;
+            p.worldReady = g_cfg.isHost ? (g_gameStarted && g_swapStartTick == 0)
+                                       : ps.worldPhase == COOP_WORLD_READY;
+        } else {
+            g_net.copyPeerName(id, p.name, sizeof(p.name));
+#ifdef KENSHICOOP_NET_DIAG
+            // Private protocol 61: the join acknowledges its completed load.
+            if (g_cfg.isHost && g_session.expectedLoadId[id] != 0) {
+                p.worldReadyKnown = true;
+                p.worldReady = g_repl.peerReadyLoadId(id) == g_session.expectedLoadId[id];
+            }
+#endif
+        }
+    }
+}
+
+std::string panelDetailText(const CoopUiSnapshot& ps, const coop::NetStatus& ns) {
+    char b[256];
+    b[0] = '\0';
+    switch (ps.phase) {
+        case COOP_OFFLINE:
+            return "\xD0\x9D\xD0\xB5 \xD0\xB2 \xD1\x81\xD0\xB5\xD1\x82\xD0\xB8. \xD0\x92\xD1\x8B\xD0\xB1\xD0\xB5\xD1\x80\xD0\xB8\xD1\x82\xD0\xB5 \xD1\x80\xD0\xBE\xD0\xBB\xD1\x8C \xD0\xB8 \xD1\x81\xD0\xBF\xD0\xBE\xD1\x81\xD0\xBE\xD0\xB1 \xD0\xBF\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD1\x8F.";
+        case COOP_STARTING:
+            return ns.host ? "\xD0\x97\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD0\xBA \xD1\x81\xD0\xB5\xD1\x80\xD0\xB2\xD0\xB5\xD1\x80\xD0\xB0..." : "\xD0\x97\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD0\xBA \xD0\xBF\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD1\x8F...";
+        case COOP_HOSTING:
+            if (!g_gameStarted)
+                _snprintf(b, sizeof(b) - 1,
+                          "\xD0\xA1\xD0\xB5\xD1\x80\xD0\xB2\xD0\xB5\xD1\x80 \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x89\xD0\xB5\xD0\xBD (%s). \xD0\x97\xD0\xB0\xD0\xB3\xD1\x80\xD1\x83\xD0\xB7\xD0\xB8\xD1\x82\xD0\xB5 \xD1\x81\xD0\xBE\xD1\x85\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5, \xD1\x87\xD1\x82\xD0\xBE\xD0\xB1\xD1\x8B \xD0\xB8\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA\xD0\xB8 \xD0\xBC\xD0\xBE\xD0\xB3\xD0\xBB\xD0\xB8 \xD0\xB2\xD0\xBE\xD0\xB9\xD1\x82\xD0\xB8.",
+                          transportTag(ns.active));
+            else if (ps.playerCount > 1)
+                _snprintf(b, sizeof(b) - 1, "\xD0\xA1\xD0\xB5\xD1\x80\xD0\xB2\xD0\xB5\xD1\x80 \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x89\xD0\xB5\xD0\xBD (%s). \xD0\x98\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA\xD0\xBE\xD0\xB2: %d/4",
+                          transportTag(ns.active), ps.playerCount);
+            else
+                _snprintf(b, sizeof(b) - 1, "\xD0\xA1\xD0\xB5\xD1\x80\xD0\xB2\xD0\xB5\xD1\x80 \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x89\xD0\xB5\xD0\xBD (%s). \xD0\x9E\xD0\xB6\xD0\xB8\xD0\xB4\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xB5 \xD0\xB8\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA\xD0\xBE\xD0\xB2...",
+                          transportTag(ns.active));
+            break;
+        case COOP_CONNECTING:
+            if (ns.connectAttempts > 1)
+                _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 \xD0\xBA \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD1\x83 (%s), \xD0\xBF\xD0\xBE\xD0\xBF\xD1\x8B\xD1\x82\xD0\xBA\xD0\xB0 %u...",
+                          transportTag(ns.active), (unsigned)ns.connectAttempts);
+            else
+                _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 \xD0\xBA \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD1\x83 (%s)...",
+                          transportTag(ns.active));
+            break;
+        case COOP_HANDSHAKING:
+            return "\xD0\xA1\xD0\xB2\xD1\x8F\xD0\xB7\xD1\x8C \xD1\x81 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xBE\xD0\xBC \xD1\x83\xD1\x81\xD1\x82\xD0\xB0\xD0\xBD\xD0\xBE\xD0\xB2\xD0\xBB\xD0\xB5\xD0\xBD\xD0\xB0, \xD0\xBF\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB5\xD1\x80\xD0\xBA\xD0\xB0 \xD0\xB2\xD0\xB5\xD1\x80\xD1\x81\xD0\xB8\xD0\xB8 \xD0\xB8 \xD0\xB2\xD1\x85\xD0\xBE\xD0\xB4...";
+        case COOP_CONNECTED:
+            _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB5\xD0\xBD\xD0\xBE \xD0\xBA \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD1\x83 (%s). \xD0\x98\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA\xD0\xBE\xD0\xB2: %d/4",
+                      transportTag(ns.active), ps.playerCount);
+            break;
+        case COOP_RECONNECTING:
+            return "\xD0\xA1\xD0\xB2\xD1\x8F\xD0\xB7\xD1\x8C \xD1\x81 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xBE\xD0\xBC \xD0\xBF\xD0\xBE\xD1\x82\xD0\xB5\xD1\x80\xD1\x8F\xD0\xBD\xD0\xB0, \xD0\xBF\xD0\xB5\xD1\x80\xD0\xB5\xD0\xBF\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5...";
+        case COOP_FAILED:
+            return "\xD0\xA1\xD0\xB5\xD1\x82\xD1\x8C \xD0\xBD\xD0\xB5 \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x89\xD0\xB5\xD0\xBD\xD0\xB0 \xD0\xB8\xD0\xB7-\xD0\xB7\xD0\xB0 \xD0\xBE\xD1\x88\xD0\xB8\xD0\xB1\xD0\xBA\xD0\xB8.";
+    }
+    b[sizeof(b) - 1] = '\0';
+    return b;
+}
+
+std::string panelErrorText(const coop::NetStatus& ns, int wp) {
+    if (!g_panelStartError.empty()) return g_panelStartError;
+    const bool steam = ns.requested == coop::NET_TRANSPORT_STEAM;
+    char b[320];
+    b[0] = '\0';
+    switch (ns.error) {
+        case coop::NET_ERR_NONE:
+            break;
+        case coop::NET_ERR_ENET_INIT:
+            return "\xD0\x9D\xD0\xB5 \xD1\x83\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x8C \xD0\xB8\xD0\xBD\xD0\xB8\xD1\x86\xD0\xB8\xD0\xB0\xD0\xBB\xD0\xB8\xD0\xB7\xD0\xB8\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB0\xD1\x82\xD1\x8C \xD1\x81\xD0\xB5\xD1\x82\xD1\x8C (ENet). \xD0\x9F\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD1\x82\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xB8\xD0\xB3\xD1\x80\xD1\x83.";
+        case coop::NET_ERR_THREAD:
+            return "\xD0\x9D\xD0\xB5 \xD1\x83\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x8C \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD1\x82\xD0\xB8\xD1\x82\xD1\x8C \xD1\x81\xD0\xB5\xD1\x82\xD0\xB5\xD0\xB2\xD0\xBE\xD0\xB9 \xD0\xBF\xD0\xBE\xD1\x82\xD0\xBE\xD0\xBA. \xD0\x9F\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD1\x82\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xB8\xD0\xB3\xD1\x80\xD1\x83.";
+        case coop::NET_ERR_STEAM_TUNNEL:
+            return "\xD0\x9D\xD0\xB5 \xD1\x83\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x8C \xD0\xB2\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB8\xD1\x82\xD1\x8C \xD1\x81\xD0\xBE\xD0\xB5\xD0\xB4\xD0\xB8\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 \xD1\x87\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB7 Steam. \xD0\xA3\xD0\xB1\xD0\xB5\xD0\xB4\xD0\xB8\xD1\x82\xD0\xB5\xD1\x81\xD1\x8C, \xD1\x87\xD1\x82\xD0\xBE Steam \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x89\xD0\xB5\xD0\xBD \xD0\xB8 \xD0\xB2\xD1\x8B \xD0\xB2 \xD1\x81\xD0\xB5\xD1\x82\xD0\xB8, \xD0\xB8\xD0\xBB\xD0\xB8 \xD0\xB2\xD1\x8B\xD0\xB1\xD0\xB5\xD1\x80\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xBF\xD1\x80\xD1\x8F\xD0\xBC\xD0\xBE\xD0\xB9 IP.";
+        case coop::NET_ERR_BIND:
+            _snprintf(b, sizeof(b) - 1,
+                      "\xD0\x9F\xD0\xBE\xD1\x80\xD1\x82 %u \xD0\xB7\xD0\xB0\xD0\xBD\xD1\x8F\xD1\x82 \xD0\xB8\xD0\xBB\xD0\xB8 \xD0\xBD\xD0\xB5\xD0\xB4\xD0\xBE\xD1\x81\xD1\x82\xD1\x83\xD0\xBF\xD0\xB5\xD0\xBD. \xD0\x97\xD0\xB0\xD0\xBA\xD1\x80\xD0\xBE\xD0\xB9\xD1\x82\xD0\xB5 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB3\xD1\x83\xD1\x8E \xD0\xBA\xD0\xBE\xD0\xBF\xD0\xB8\xD1\x8E \xD0\xB8\xD0\xB3\xD1\x80\xD1\x8B \xD0\xB8\xD0\xBB\xD0\xB8 \xD1\x83\xD0\xBA\xD0\xB0\xD0\xB6\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB3\xD0\xBE\xD0\xB9 \xD0\xBF\xD0\xBE\xD1\x80\xD1\x82.",
+                      (unsigned)ns.errorArg);
+            break;
+        case coop::NET_ERR_SOCKET:
+            return "\xD0\x9D\xD0\xB5 \xD1\x83\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x8C \xD0\xBE\xD1\x82\xD0\xBA\xD1\x80\xD1\x8B\xD1\x82\xD1\x8C \xD1\x81\xD0\xB5\xD1\x82\xD0\xB5\xD0\xB2\xD0\xBE\xD0\xB5 \xD1\x81\xD0\xBE\xD0\xB5\xD0\xB4\xD0\xB8\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5. \xD0\x9F\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD1\x82\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xB8\xD0\xB3\xD1\x80\xD1\x83.";
+        case coop::NET_ERR_RESOLVE:
+            _snprintf(b, sizeof(b) - 1, "\xD0\x90\xD0\xB4\xD1\x80\xD0\xB5\xD1\x81 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0 \"%s\" \xD0\xBD\xD0\xB5 \xD0\xBD\xD0\xB0\xD0\xB9\xD0\xB4\xD0\xB5\xD0\xBD. \xD0\x9F\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB5\xD1\x80\xD1\x8C\xD1\x82\xD0\xB5 IP-\xD0\xB0\xD0\xB4\xD1\x80\xD0\xB5\xD1\x81.",
+                      g_cfg.ip.c_str());
+            break;
+        case coop::NET_ERR_CONNECT_ALLOC:
+            return "\xD0\x9D\xD0\xB5 \xD1\x83\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x8C \xD0\xBD\xD0\xB0\xD1\x87\xD0\xB0\xD1\x82\xD1\x8C \xD0\xBF\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5. \xD0\x9F\xD0\xBE\xD0\xB2\xD1\x82\xD0\xBE\xD1\x80...";
+        case coop::NET_ERR_NO_RESPONSE:
+            if (steam)
+                _snprintf(b, sizeof(b) - 1,
+                          "\xD0\xA5\xD0\xBE\xD1\x81\xD1\x82 \xD0\xBD\xD0\xB5 \xD0\xBE\xD1\x82\xD0\xB2\xD0\xB5\xD1\x87\xD0\xB0\xD0\xB5\xD1\x82 \xD1\x87\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB7 Steam (\xD0\xBF\xD0\xBE\xD0\xBF\xD1\x8B\xD1\x82\xD0\xBE\xD0\xBA: %u). \xD0\x9F\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB5\xD1\x80\xD1\x8C\xD1\x82\xD0\xB5 Steam ID \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0 \xD0\xB8 \xD1\x87\xD1\x82\xD0\xBE \xD0\xBE\xD0\xBD \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB \xD1\x81\xD0\xB5\xD1\x80\xD0\xB2\xD0\xB5\xD1\x80. \xD0\x9F\xD0\xBE\xD0\xB2\xD1\x82\xD0\xBE\xD1\x80 \xD0\xBF\xD1\x80\xD0\xBE\xD0\xB4\xD0\xBE\xD0\xBB\xD0\xB6\xD0\xB0\xD0\xB5\xD1\x82\xD1\x81\xD1\x8F.",
+                          (unsigned)ns.errorArg);
+            else
+                _snprintf(b, sizeof(b) - 1,
+                          "\xD0\xA5\xD0\xBE\xD1\x81\xD1\x82 %s:%d \xD0\xBD\xD0\xB5 \xD0\xBE\xD1\x82\xD0\xB2\xD0\xB5\xD1\x87\xD0\xB0\xD0\xB5\xD1\x82 (\xD0\xBF\xD0\xBE\xD0\xBF\xD1\x8B\xD1\x82\xD0\xBE\xD0\xBA: %u). \xD0\x9F\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB5\xD1\x80\xD1\x8C\xD1\x82\xD0\xB5 \xD0\xB0\xD0\xB4\xD1\x80\xD0\xB5\xD1\x81 \xD0\xB8 \xD0\xBF\xD0\xBE\xD1\x80\xD1\x82 \xD0\xB8 \xD1\x87\xD1\x82\xD0\xBE \xD1\x85\xD0\xBE\xD1\x81\xD1\x82 \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD1\x82\xD0\xB8\xD0\xBB \xD1\x81\xD0\xB5\xD1\x80\xD0\xB2\xD0\xB5\xD1\x80. \xD0\x9F\xD0\xBE\xD0\xB2\xD1\x82\xD0\xBE\xD1\x80 \xD0\xBF\xD1\x80\xD0\xBE\xD0\xB4\xD0\xBE\xD0\xBB\xD0\xB6\xD0\xB0\xD0\xB5\xD1\x82\xD1\x81\xD1\x8F.",
+                          g_cfg.ip.c_str(), g_cfg.port, (unsigned)ns.errorArg);
+            break;
+        case coop::NET_ERR_HANDSHAKE_DROPPED:
+            return "\xD0\xA5\xD0\xBE\xD1\x81\xD1\x82 \xD1\x80\xD0\xB0\xD0\xB7\xD0\xBE\xD1\x80\xD0\xB2\xD0\xB0\xD0\xBB \xD1\x81\xD0\xBE\xD0\xB5\xD0\xB4\xD0\xB8\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 \xD0\xBF\xD1\x80\xD0\xB8 \xD0\xB2\xD1\x85\xD0\xBE\xD0\xB4\xD0\xB5: \xD1\x83 \xD0\xB2\xD0\xB0\xD1\x81 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB3\xD0\xB0\xD1\x8F \xD0\xB2\xD0\xB5\xD1\x80\xD1\x81\xD0\xB8\xD1\x8F \xD0\xBC\xD0\xBE\xD0\xB4\xD0\xB0 \xD0\xB8\xD0\xBB\xD0\xB8 \xD0\xB2\xD1\x81\xD0\xB5 3 \xD0\xBC\xD0\xB5\xD1\x81\xD1\x82\xD0\xB0 \xD0\xB7\xD0\xB0\xD0\xBD\xD1\x8F\xD1\x82\xD1\x8B. \xD0\xA1\xD0\xB2\xD0\xB5\xD1\x80\xD1\x8C\xD1\x82\xD0\xB5 \xD0\xB2\xD0\xB5\xD1\x80\xD1\x81\xD0\xB8\xD1\x8E \xD0\xB2 \xD0\xB7\xD0\xB0\xD0\xB3\xD0\xBE\xD0\xBB\xD0\xBE\xD0\xB2\xD0\xBA\xD0\xB5 \xD0\xBE\xD0\xBA\xD0\xBD\xD0\xB0.";
+        case coop::NET_ERR_PROTOCOL:
+            _snprintf(b, sizeof(b) - 1,
+                      "\xD0\x92\xD0\xB5\xD1\x80\xD1\x81\xD0\xB8\xD1\x8F \xD0\xBF\xD1\x80\xD0\xBE\xD1\x82\xD0\xBE\xD0\xBA\xD0\xBE\xD0\xBB\xD0\xB0 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0 (%u) \xD0\xBD\xD0\xB5 \xD1\x81\xD0\xBE\xD0\xB2\xD0\xBF\xD0\xB0\xD0\xB4\xD0\xB0\xD0\xB5\xD1\x82 \xD1\x81 \xD0\xB2\xD0\xB0\xD1\x88\xD0\xB5\xD0\xB9 (%u). \xD0\x9E\xD0\xB1\xD0\xBD\xD0\xBE\xD0\xB2\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xBC\xD0\xBE\xD0\xB4 \xD1\x83 \xD0\xBE\xD0\xB1\xD0\xBE\xD0\xB8\xD1\x85 \xD0\xB8\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA\xD0\xBE\xD0\xB2.",
+                      (unsigned)ns.errorArg, (unsigned)coop::PROTOCOL_VERSION);
+            break;
+        case coop::NET_ERR_PEER_VERSION:
+            _snprintf(b, sizeof(b) - 1,
+                      "\xD0\x9E\xD1\x82\xD0\xBA\xD0\xBB\xD0\xBE\xD0\xBD\xD1\x91\xD0\xBD \xD0\xB8\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA \xD1\x81 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB3\xD0\xBE\xD0\xB9 \xD0\xB2\xD0\xB5\xD1\x80\xD1\x81\xD0\xB8\xD0\xB5\xD0\xB9 \xD0\xBF\xD1\x80\xD0\xBE\xD1\x82\xD0\xBE\xD0\xBA\xD0\xBE\xD0\xBB\xD0\xB0 (%u, \xD1\x83 \xD0\xB2\xD0\xB0\xD1\x81 %u): \xD0\xB5\xD0\xBC\xD1\x83 \xD0\xBD\xD1\x83\xD0\xB6\xD0\xBD\xD0\xBE \xD0\xBE\xD0\xB1\xD0\xBD\xD0\xBE\xD0\xB2\xD0\xB8\xD1\x82\xD1\x8C \xD0\xBC\xD0\xBE\xD0\xB4.",
+                      (unsigned)ns.errorArg, (unsigned)coop::PROTOCOL_VERSION);
+            break;
+        case coop::NET_ERR_SERVER_FULL:
+            return "\xD0\x9E\xD1\x82\xD0\xBA\xD0\xBB\xD0\xBE\xD0\xBD\xD1\x91\xD0\xBD \xD0\xB8\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA: \xD0\xB2\xD1\x81\xD0\xB5 3 \xD0\xBC\xD0\xB5\xD1\x81\xD1\x82\xD0\xB0 \xD0\xB7\xD0\xB0\xD0\xBD\xD1\x8F\xD1\x82\xD1\x8B.";
+    }
+    b[sizeof(b) - 1] = '\0';
+    if (b[0]) return b;
+    if (wp == COOP_WORLD_FAILED)
+        return "\xD0\x9D\xD0\xB5 \xD1\x83\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x8C \xD0\xBF\xD0\xBE\xD0\xBB\xD1\x83\xD1\x87\xD0\xB8\xD1\x82\xD1\x8C \xD0\xB8\xD0\xBB\xD0\xB8 \xD0\xB7\xD0\xB0\xD0\xB3\xD1\x80\xD1\x83\xD0\xB7\xD0\xB8\xD1\x82\xD1\x8C \xD0\xBC\xD0\xB8\xD1\x80 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0. \xD0\x9E\xD1\x82\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB8\xD1\x82\xD0\xB5\xD1\x81\xD1\x8C \xD0\xB8 \xD0\xBF\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB8\xD1\x82\xD0\xB5\xD1\x81\xD1\x8C \xD1\x81\xD0\xBD\xD0\xBE\xD0\xB2\xD0\xB0.";
+    return std::string();
+}
+
+// "Copy report" body: measured facts only; '-' = not measured / not applicable.
+std::string panelDiagnostics(const CoopUiSnapshot& ps, const coop::NetStatus& ns) {
+    coop::NetDebugStats st;
+    g_net.copyDebugStats(&st);
+    std::string r;
+    char b[320];
+#ifdef KENSHICOOP_NET_DIAG
+    const char* diagTag = " (NET DIAG)";
+#else
+    const char* diagTag = "";
+#endif
+    _snprintf(b, sizeof(b) - 1, "KenshiCoop v%s, \xD0\xBF\xD1\x80\xD0\xBE\xD1\x82\xD0\xBE\xD0\xBA\xD0\xBE\xD0\xBB %u%s\n",
+              coop::COOP_BUILD_VERSION, (unsigned)coop::PROTOCOL_VERSION, diagTag);
+    b[sizeof(b) - 1] = '\0'; r += b;
+    _snprintf(b, sizeof(b) - 1, "\xD0\xA0\xD0\xBE\xD0\xBB\xD1\x8C: %s\n", g_cfg.isHost ? "\xD1\x85\xD0\xBE\xD1\x81\xD1\x82" : "\xD0\xBA\xD0\xBB\xD0\xB8\xD0\xB5\xD0\xBD\xD1\x82");
+    b[sizeof(b) - 1] = '\0'; r += b;
+    _snprintf(b, sizeof(b) - 1, "\xD0\xA2\xD1\x80\xD0\xB0\xD0\xBD\xD1\x81\xD0\xBF\xD0\xBE\xD1\x80\xD1\x82: \xD0\xB2\xD1\x8B\xD0\xB1\xD1\x80\xD0\xB0\xD0\xBD %s, \xD1\x84\xD0\xB0\xD0\xBA\xD1\x82\xD0\xB8\xD1\x87\xD0\xB5\xD1\x81\xD0\xBA\xD0\xB8 %s\n",
+              g_cfg.transport == "steam" ? "Steam" : "UDP", transportTag(ns.active));
+    b[sizeof(b) - 1] = '\0'; r += b;
+    if (ns.phase == coop::NET_IDLE)
+        _snprintf(b, sizeof(b) - 1, "\xD0\xA4\xD0\xB0\xD0\xB7\xD0\xB0 \xD1\x81\xD0\xB5\xD1\x82\xD0\xB8: %s\n", netPhaseTag(ns.phase));
+    else
+        _snprintf(b, sizeof(b) - 1, "\xD0\xA4\xD0\xB0\xD0\xB7\xD0\xB0 \xD1\x81\xD0\xB5\xD1\x82\xD0\xB8: %s, %lu \xD1\x81\n", netPhaseTag(ns.phase),
+                  (unsigned long)((GetTickCount() - ns.phaseSinceTick) / 1000));
+    b[sizeof(b) - 1] = '\0'; r += b;
+    _snprintf(b, sizeof(b) - 1, "\xD0\xA4\xD0\xB0\xD0\xB7\xD0\xB0 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0: %s\n", worldPhaseTag(ps.worldPhase));
+    b[sizeof(b) - 1] = '\0'; r += b;
+    if (g_cfg.isHost) {
+        if (g_cfg.transport == "steam") _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xBE\xD1\x80\xD1\x82: - (Steam)\n");
+        else _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xBE\xD1\x80\xD1\x82: %d (UDP)\n", g_cfg.port);
+    } else if (g_cfg.transport == "steam") {
+        if (g_cfg.steamPeer) _snprintf(b, sizeof(b) - 1, "Steam ID \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0: %llu\n", g_cfg.steamPeer);
+        else _snprintf(b, sizeof(b) - 1, "Steam ID \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0: -\n");
+    } else {
+        _snprintf(b, sizeof(b) - 1, "\xD0\x90\xD0\xB4\xD1\x80\xD0\xB5\xD1\x81 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0: %s:%d\n",
+                  g_cfg.ip.empty() ? "-" : g_cfg.ip.c_str(), g_cfg.port);
+    }
+    b[sizeof(b) - 1] = '\0'; r += b;
+    if (ps.selfSteamId) _snprintf(b, sizeof(b) - 1, "\xD0\x9C\xD0\xBE\xD0\xB9 Steam ID: %llu\n", ps.selfSteamId);
+    else _snprintf(b, sizeof(b) - 1, "\xD0\x9C\xD0\xBE\xD0\xB9 Steam ID: -\n");
+    b[sizeof(b) - 1] = '\0'; r += b;
+    _snprintf(b, sizeof(b) - 1, "\xD0\x98\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA\xD0\xB8: %d/4\n", ps.playerCount);
+    b[sizeof(b) - 1] = '\0'; r += b;
+    for (int i = 0; i < ps.playerCount; ++i) {
+        const CoopUiPlayer& p = ps.players[i];
+        const char* ready = !p.worldReadyKnown ? "-" : p.worldReady ? "\xD0\xB4\xD0\xB0" : "\xD0\xBD\xD0\xB5\xD1\x82";
+        _snprintf(b, sizeof(b) - 1, "  id %u%s: '%s', \xD0\xBC\xD0\xB8\xD1\x80 \xD0\xB3\xD0\xBE\xD1\x82\xD0\xBE\xD0\xB2: %s\n",
+                  p.id, p.local ? " (\xD0\xB2\xD1\x8B)" : "", p.name[0] ? p.name : "-", ready);
+        b[sizeof(b) - 1] = '\0'; r += b;
+    }
+    if (ns.host) _snprintf(b, sizeof(b) - 1, "\xD0\x9E\xD0\xB6\xD0\xB8\xD0\xB4\xD0\xB0\xD1\x8E\xD1\x82 \xD0\xB2\xD1\x85\xD0\xBE\xD0\xB4\xD0\xB0: %u\n", (unsigned)ns.pendingHandshakes);
+    else         _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xBE\xD0\xBF\xD1\x8B\xD1\x82\xD0\xBE\xD0\xBA \xD0\xBF\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD1\x8F: %u\n", (unsigned)ns.connectAttempts);
+    b[sizeof(b) - 1] = '\0'; r += b;
+    if (st.sampleTickMs) {
+        char rtt[32] = "-";
+        if (st.connectedPeers) {
+            _snprintf(rtt, sizeof(rtt) - 1, "%lu \xD0\xBC\xD1\x81",
+                      (unsigned long)st.maxRttMs);
+            rtt[sizeof(rtt) - 1] = '\0';
+        }
+        _snprintf(b, sizeof(b) - 1,
+                  "\xD0\x9E\xD1\x82\xD0\xBF\xD1\x80\xD0\xB0\xD0\xB2\xD0\xBA\xD0\xB0: %lu \xD0\x91/\xD1\x81, %lu \xD0\xBF\xD0\xB0\xD0\xBA/\xD1\x81\n\xD0\x9F\xD1\x80\xD0\xB8\xD1\x91\xD0\xBC: %lu \xD0\x91/\xD1\x81, %lu \xD0\xBF\xD0\xB0\xD0\xBA/\xD1\x81\n"
+                  "RTT (\xD0\xBC\xD0\xB0\xD0\xBA\xD1\x81.): %s\n\xD0\x9D\xD0\xB0\xD0\xB4\xD1\x91\xD0\xB6\xD0\xBD\xD1\x8B\xD0\xB5 \xD0\xB4\xD0\xB0\xD0\xBD\xD0\xBD\xD1\x8B\xD0\xB5 \xD0\xB2 \xD0\xBF\xD1\x83\xD1\x82\xD0\xB8: %lu \xD0\x91\n\xD0\xA1\xD0\xBE\xD0\xB5\xD0\xB4\xD0\xB8\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB9 ENet: %lu\n",
+                  (unsigned long)st.sentBytesPerSec, (unsigned long)st.sentPacketsPerSec,
+                  (unsigned long)st.recvBytesPerSec, (unsigned long)st.recvPacketsPerSec,
+                  rtt, (unsigned long)st.reliableBytesInTransit,
+                  (unsigned long)st.connectedPeers);
+    } else {
+        _snprintf(b, sizeof(b) - 1,
+                  "\xD0\x9E\xD1\x82\xD0\xBF\xD1\x80\xD0\xB0\xD0\xB2\xD0\xBA\xD0\xB0: -\n\xD0\x9F\xD1\x80\xD0\xB8\xD1\x91\xD0\xBC: -\nRTT (\xD0\xBC\xD0\xB0\xD0\xBA\xD1\x81.): -\n\xD0\x9D\xD0\xB0\xD0\xB4\xD1\x91\xD0\xB6\xD0\xBD\xD1\x8B\xD0\xB5 \xD0\xB4\xD0\xB0\xD0\xBD\xD0\xBD\xD1\x8B\xD0\xB5 \xD0\xB2 \xD0\xBF\xD1\x83\xD1\x82\xD0\xB8: -\n\xD0\xA1\xD0\xBE\xD0\xB5\xD0\xB4\xD0\xB8\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB9 ENet: -\n");
+    }
+    b[sizeof(b) - 1] = '\0'; r += b;
+    if (ns.error != coop::NET_ERR_NONE)
+        _snprintf(b, sizeof(b) - 1, "\xD0\x9E\xD1\x88\xD0\xB8\xD0\xB1\xD0\xBA\xD0\xB0 \xD1\x81\xD0\xB5\xD1\x82\xD0\xB8: #%d %s\n", (int)ns.error,
+                  ns.errorRaw[0] ? ns.errorRaw : "-");
+    else if (!g_panelStartError.empty())
+        _snprintf(b, sizeof(b) - 1, "\xD0\x9E\xD1\x88\xD0\xB8\xD0\xB1\xD0\xBA\xD0\xB0 \xD1\x81\xD0\xB5\xD1\x82\xD0\xB8: \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD0\xBA \xD0\xBE\xD1\x82\xD0\xBA\xD0\xBB\xD0\xBE\xD0\xBD\xD1\x91\xD0\xBD \xD0\xB4\xD0\xBE \xD1\x81\xD1\x82\xD0\xB0\xD1\x80\xD1\x82\xD0\xB0 \xD1\x81\xD0\xB5\xD1\x82\xD0\xB8\n");
+    else
+        _snprintf(b, sizeof(b) - 1, "\xD0\x9E\xD1\x88\xD0\xB8\xD0\xB1\xD0\xBA\xD0\xB0 \xD1\x81\xD0\xB5\xD1\x82\xD0\xB8: -\n");
+    b[sizeof(b) - 1] = '\0'; r += b;
+    if (ps.totalBytes)
+        _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB0 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0: %I64u/%I64u \xD0\x91\n",
+                  (unsigned __int64)ps.receivedBytes, (unsigned __int64)ps.totalBytes);
+    else
+        _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB0 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0: -\n");
+    b[sizeof(b) - 1] = '\0'; r += b;
+    r += "\xD0\xA2\xD1\x80\xD0\xB0\xD1\x84\xD0\xB8\xD0\xBA: \xD0\xB4\xD0\xB0\xD0\xBD\xD0\xBD\xD1\x8B\xD0\xB5 ENet \xD1\x81 \xD0\xBF\xD0\xBE\xD0\xB2\xD1\x82\xD0\xBE\xD1\x80\xD0\xBD\xD1\x8B\xD0\xBC\xD0\xB8 \xD0\xBE\xD1\x82\xD0\xBF\xD1\x80\xD0\xB0\xD0\xB2\xD0\xBA\xD0\xB0\xD0\xBC\xD0\xB8, \xD0\xB1\xD0\xB5\xD0\xB7 \xD0\xB7\xD0\xB0\xD0\xB3\xD0\xBE\xD0\xBB\xD0\xBE\xD0\xB2\xD0\xBA\xD0\xBE\xD0\xB2 IP/UDP \xD0\xB8 Steam; \xD0\xB7\xD0\xB0\xD0\xBC\xD0\xB5\xD1\x80 \xD1\x80\xD0\xB0\xD0\xB7 \xD0\xB2 1 \xD1\x81.";
+    return r;
+}
+
+// Co-op session panel (F2) + status banner, both drawn by the optional
+// KenshiCoopUI.dll. Interactive sessions only - the unattended harness
+// (scenario / self-exit timer) never touches the panel, and keeping the GUI
+// stack out of those runs avoids perturbing the scenario oracles. The provider
+// is SEH-guarded by UiModule and touches only GUI + input, so it is safe
+// wherever the GUI stack is up - it needs no world, which is why this takes no
+// GameWorld*. Driven from BOTH the in-game mainLoop_hook and the title-screen
+// titleUpdate_hook so a join can go ONLINE (and copy/paste Steam IDs) straight
+// from the main menu, and so the banner reports status there too. The one
+// command the UI queued runs here, after its tick returned, on the main thread.
 void coopPanelDrive() {
     if (!(g_cfg.scenario.empty() && g_cfg.testSeconds == 0)) return;
-    coop::engine::CoopPanelState ps;
+    coop::NetStatus ns;
+    g_net.copyStatus(&ns);
+
+    CoopUiSnapshot ps;
+    memset(&ps, 0, sizeof(ps));
+    ps.structSize   = sizeof(ps);
     ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
     ps.peerSteamId  = g_cfg.steamPeer;
-    ps.peerSteamId2 = (g_cfg.steamPeers.size() > 0) ? g_cfg.steamPeers[0] : 0ull;
-    ps.peerSteamId3 = (g_cfg.steamPeers.size() > 1) ? g_cfg.steamPeers[1] : 0ull;
     ps.udpIp        = g_cfg.ip.c_str();
     ps.udpPort      = g_cfg.port;
     ps.playerName   = g_cfg.playerName.c_str();
-    ps.running      = g_net.isRunning();
-    ps.peerPresent  = g_peerPresent;
-    ps.isHost       = g_cfg.isHost;
+    ps.running      = g_net.isRunning() ? 1 : 0;
+    ps.peerPresent  = g_peerPresent ? 1 : 0;
+    ps.isHost       = g_cfg.isHost ? 1 : 0;
     ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
-    std::string detail;
-    int ostate;
-    if (g_peerPresent) {
-        if (g_cfg.isHost) {
-            char d[64];
-            _snprintf(d, sizeof(d) - 1, "Connected - %d join(s)", g_peerCount);
-            d[sizeof(d) - 1] = '\0';
-            detail = d;
-        } else {
-            detail = "Connected to host";
-        }
-        ostate = 2;
-    } else if (g_net.isRunning()) {
-        detail = g_cfg.isHost ? "Hosting - waiting for players..." : "Connecting...";
-        ostate = 1;
-    } else {
-        detail = "Offline - press F2, then set Connection to ONLINE";
-        ostate = 0;
-    }
-    ps.detail = detail.c_str();
+    ps.busy            = ps.running;
+    ps.activeTransport = (int)ns.active;
+    ps.phase           = panelNetPhase(ns);
+    ps.worldPhase      = panelWorldPhase(ns);
+    fillPanelPlayers(ps, ns);
 
-    // Join save-transfer status for the panel: while a join streams the host's
-    // world at the menu (no leader -> no screen overlay), show live progress on
-    // the F2 panel. The percent is whole-number so the panel only rebuilds ~100x
-    // over a transfer, not every chunk. Null when not streaming.
+    // World-sync progress. Byte counts only while the host's world streams in.
     std::string transfer;
-    if (!g_cfg.isHost && g_net.isRunning() && !g_gameStarted) {
-        if (coop::savexfer::receiving()) {
+    char tb[160];
+    tb[0] = '\0';
+    switch (ps.worldPhase) {
+        case COOP_WORLD_RECEIVING: {
             unsigned __int64 got = coop::savexfer::recvBytes();
             unsigned __int64 tot = coop::savexfer::recvTotalBytes();
+            ps.receivedBytes = got;
+            ps.totalBytes    = tot;
             int pct = (tot > 0) ? (int)((got * 100) / tot) : 0;
             if (pct > 100) pct = 100;
-            char tb[96];
-            _snprintf(tb, sizeof(tb) - 1,
-                      "Streaming host world... %d%% (%.1f/%.1f MB)", pct,
-                      (double)got / (1024.0 * 1024.0),
-                      (double)tot / (1024.0 * 1024.0));
-            tb[sizeof(tb) - 1] = '\0';
-            transfer = tb;
-        } else if (!g_loadAfterCommit.empty()) {
-            // NACK sent (host baking/streaming) or committed + about to load.
-            transfer = "Preparing host world...";
+            _snprintf(tb, sizeof(tb) - 1, "\xD0\x9F\xD0\xBE\xD0\xBB\xD1\x83\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0: %d%% (%.1f/%.1f \xD0\x9C\xD0\x91)", pct,
+                      (double)got / (1024.0 * 1024.0), (double)tot / (1024.0 * 1024.0));
+            break;
         }
+        case COOP_WORLD_PREPARING:
+            if (!g_cfg.isHost)       _snprintf(tb, sizeof(tb) - 1, "\xD0\xA5\xD0\xBE\xD1\x81\xD1\x82 \xD0\xB3\xD0\xBE\xD1\x82\xD0\xBE\xD0\xB2\xD0\xB8\xD1\x82 \xD0\xBC\xD0\xB8\xD1\x80 \xD0\xB4\xD0\xBB\xD1\x8F \xD0\xBF\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB8...");
+            else if (g_bootstrapArmed) _snprintf(tb, sizeof(tb) - 1, "\xD0\xA1\xD0\xBE\xD1\x85\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0 \xD0\xB4\xD0\xBB\xD1\x8F \xD0\xBF\xD0\xBE\xD0\xB4\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87\xD0\xB8\xD0\xB2\xD1\x88\xD0\xB5\xD0\xB3\xD0\xBE\xD1\x81\xD1\x8F \xD0\xB8\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA\xD0\xB0...");
+            else                     _snprintf(tb, sizeof(tb) - 1, "\xD0\x9F\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB0 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0 \xD0\xB8\xD0\xB3\xD1\x80\xD0\xBE\xD0\xBA\xD0\xB0\xD0\xBC...");
+            break;
+        case COOP_WORLD_LOADING:
+            _snprintf(tb, sizeof(tb) - 1, g_cfg.isHost ? "\xD0\x97\xD0\xB0\xD0\xB3\xD1\x80\xD1\x83\xD0\xB7\xD0\xBA\xD0\xB0 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0..." : "\xD0\x97\xD0\xB0\xD0\xB3\xD1\x80\xD1\x83\xD0\xB7\xD0\xBA\xD0\xB0 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0...");
+            break;
+        default:
+            // A mid-game coordinated-save copy (not the world itself).
+            if (!g_cfg.isHost && ps.running && coop::savexfer::receiving()) {
+                unsigned __int64 got = coop::savexfer::recvBytes();
+                unsigned __int64 tot = coop::savexfer::recvTotalBytes();
+                int pct = (tot > 0) ? (int)((got * 100) / tot) : 0;
+                if (pct > 100) pct = 100;
+                _snprintf(tb, sizeof(tb) - 1, "\xD0\x9A\xD0\xBE\xD0\xBF\xD0\xB8\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xB5 \xD1\x81\xD0\xBE\xD1\x85\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD1\x8F \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0: %d%%", pct);
+            }
+            break;
     }
+    tb[sizeof(tb) - 1] = '\0';
+    transfer = tb;
     ps.transferDetail = transfer.empty() ? (const char*)0 : transfer.c_str();
+
+    const std::string detail = panelDetailText(ps, ns);
+    ps.detail = detail.c_str();
+    const std::string error = panelErrorText(ns, ps.worldPhase);
+    ps.errorDetail = error.empty() ? (const char*)0 : error.c_str();
+    // Network rates are sampled once a second; do not rebuild the multi-line
+    // diagnostic report on every gameplay/render tick.
+    static std::string diag;
+    static DWORD diagTick = 0;
+    static coop::NetStatus diagStatus;
+    static int diagWorld = COOP_WORLD_NONE;
+    static int diagHost = 0;
+    static int diagTransport = -1, diagPort = 0;
+    const DWORD now = GetTickCount();
+    if (diag.empty() || (DWORD)(now - diagTick) >= 1000 ||
+        memcmp(&diagStatus, &ns, sizeof(ns)) != 0 || diagWorld != ps.worldPhase ||
+        diagHost != ps.isHost || diagTransport != ps.transportSel || diagPort != ps.udpPort) {
+        diag = panelDiagnostics(ps, ns);
+        diagTick = now;
+        diagStatus = ns;
+        diagWorld = ps.worldPhase;
+        diagHost = ps.isHost;
+        diagTransport = ps.transportSel;
+        diagPort = ps.udpPort;
+    }
+    ps.diagnosticsDetail = diag.c_str();
 
     // Build identity in the panel title. Built once: neither value can change
     // while the process lives, and the panel only rebuilds when a string differs.
@@ -835,8 +1278,13 @@ void coopPanelDrive() {
     // that is why the handshake refused.
     static char verBuf[48];
     if (verBuf[0] == '\0') {
+#ifdef KENSHICOOP_NET_DIAG
+        _snprintf(verBuf, sizeof(verBuf) - 1, "v%s - proto %u - NET DIAG",
+                  coop::COOP_BUILD_VERSION, (unsigned)coop::PROTOCOL_VERSION);
+#else
         _snprintf(verBuf, sizeof(verBuf) - 1, "v%s - proto %u",
                   coop::COOP_BUILD_VERSION, (unsigned)coop::PROTOCOL_VERSION);
+#endif
         verBuf[sizeof(verBuf) - 1] = '\0';
     }
     ps.versionText = verBuf;
@@ -859,9 +1307,23 @@ void coopPanelDrive() {
     // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
     coop::steaminvite::tick();
 
-    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect,
-                                &persistPanelMemory);
-    coop::engine::coopOverlayTick(detail.c_str(), ostate, g_net.isRunning());
+    CoopUiCommand cmd;
+    coop::uimodule::tick(&ps, &cmd);
+    switch (cmd.kind) {
+        case COOP_UI_REMEMBER:
+            rememberUiSettings(cmd.settings);
+            break;
+        case COOP_UI_CONNECT:
+            if (!g_net.isRunning())
+                coopUiConnect(cmd.settings.isHost != 0, cmd.settings.useSteam != 0, 0,
+                              &cmd.settings);
+            else
+                coopErr("[coop-ui] ignored CONNECT while a session is live");
+            break;
+        case COOP_UI_DISCONNECT:
+            coopUiDisconnect();
+            break;
+    }
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
@@ -904,6 +1366,20 @@ void tickWorldSwapEdge(GameWorld* gw) {
                 // inbound queues). Peer presence + suppression levers survive.
                 if (g_cfg.loadSync)
                     sessionResetForWorldReload();
+                noteJoinWorldLive();
+#ifdef KENSHICOOP_NET_DIAG
+                if (!g_cfg.isHost && g_session.pendingReadyLoadId != 0 &&
+                    g_session.pendingReadyLoadIssued) {
+                    g_session.readyLoadId = g_session.pendingReadyLoadId;
+                    g_session.pendingReadyLoadId = 0;
+                    g_session.pendingReadyLoadIssued = false;
+                    char ready[96];
+                    _snprintf(ready, sizeof(ready) - 1,
+                              "[boot] READY->host loadId=%u world-live",
+                              (unsigned)g_session.readyLoadId);
+                    ready[sizeof(ready) - 1] = '\0'; coopLog(ready);
+                }
+#endif
             }
         }
     }
@@ -1093,53 +1569,6 @@ void tickApplyPlayerNicks(GameWorld* gw) {
     }
     g_repl.applySquadNicks(gw, g_net.localId());
 
-    // Protocol 56: publish the roster. HELLO tells the host a joiner's name and
-    // WELCOME tells that joiner the host's, which is the entire roster for two
-    // players and not enough for three - join A and join B never exchange
-    // anything, so each could only ever name the host and itself. Measured in the
-    // 01:59 session: the host applied all three names, each join applied exactly
-    // one. Everything else about the third player already crossed (their squad is
-    // driven, their inventory, stats and events all arrive); only the name was
-    // missing.
-    //
-    // Host only: it is the one client that knows every name. Change-gated, with a
-    // slow safety resend so a player who connects later still learns the names
-    // already in play without a handshake of its own.
-    if (!g_cfg.isHost) return;
-    coop::RosterPacket rp;
-    memset(&rp, 0, sizeof(rp));
-    rp.type = (coop::u8)coop::PKT_PLAYER_ROSTER;
-    rp.ownerId = 0;
-    for (coop::u32 id = 0; id < coop::MAX_PLAYERS; ++id) {
-        const char* src = 0;
-        char nm[64];
-        if (id == g_net.localId()) {
-            if (!g_cfg.playerName.empty()) src = g_cfg.playerName.c_str();
-        } else if (g_net.copyPeerName(id, nm, sizeof(nm))) {
-            src = nm;
-        }
-        if (!src) continue;
-        unsigned n = 0;
-        while (src[n] && n < coop::HELLO_NAME_MAX) { rp.name[id][n] = src[n]; ++n; }
-    }
-    static char s_lastRoster[coop::MAX_PLAYERS][coop::HELLO_NAME_MAX + 1] = { { 0 } };
-    static DWORD s_lastRosterMs = 0;
-    DWORD now = GetTickCount();
-    bool changed = memcmp(s_lastRoster, rp.name, sizeof(rp.name)) != 0;
-    if (!changed && s_lastRosterMs != 0 && (now - s_lastRosterMs) < 10000) return;
-    memcpy(s_lastRoster, rp.name, sizeof(rp.name));
-    s_lastRosterMs = now;
-    g_net.queueRoster(rp);
-    if (changed) {
-        for (coop::u32 id = 0; id < coop::MAX_PLAYERS; ++id) {
-            if (!rp.name[id][0]) continue;
-            char b[96];
-            _snprintf(b, sizeof(b) - 1, "[nick] roster id=%u '%s'",
-                      (unsigned)id, rp.name[id]);
-            b[sizeof(b) - 1] = '\0';
-            coopLog(b);
-        }
-    }
 }
 
 // Deferred auto-bake: write the fixture save once the armed settle window
@@ -1609,6 +2038,7 @@ void tickLoadPumpBackstop(GameWorld* gw) {
                     coop::engine::gameplayLive(gw)) {
                     coopLog("[load] synchronous execute swap - forcing session reset");
                     sessionResetForWorldReload();
+                    noteJoinWorldLive();
                 }
             }
         }
@@ -1679,6 +2109,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         g_gameStarted   = true;
         g_gameStartTick = GetTickCount();
         coopLog("KenshiCoop: gameplay started");
+        noteJoinWorldLive(); // a title-screen join's host-world load completing
         // Coordinated load (protocol 32): the title-screen auto-load fired the
         // load detour BEFORE gameplay - discard its queued edge here, or the
         // first driveLoadSync tick (g_gameStarted now true) would mistake it
@@ -1694,6 +2125,22 @@ void mainLoop_hook(GameWorld* gw, float dt) {
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
             }
         }
+#ifdef KENSHICOOP_NET_DIAG
+        // A join that receives LOAD_GO on the title screen has no previous
+        // gameplay world to transition FROM. Its first live tick is the load
+        // completion edge; waiting only for WORLD-RELOAD strands the host paused.
+        if (!g_cfg.isHost && g_session.pendingReadyLoadId != 0 &&
+            g_session.pendingReadyLoadIssued) {
+            g_session.readyLoadId = g_session.pendingReadyLoadId;
+            g_session.pendingReadyLoadId = 0;
+            g_session.pendingReadyLoadIssued = false;
+            char ready[96];
+            _snprintf(ready, sizeof(ready) - 1,
+                      "[boot] READY->host loadId=%u first-world-live",
+                      (unsigned)g_session.readyLoadId);
+            ready[sizeof(ready) - 1] = '\0'; coopLog(ready);
+        }
+#endif
         // Speed-intent capture (vote/effective decoupling): detour the engine's
         // speed setters so every USER action (button, keyboard pause, simulated
         // click) registers as a vote, while our own quiet applies stay invisible.
@@ -1831,6 +2278,20 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // needs worldLive handed to it: a world load creates every building in the
     // save through that same factory and none of them are player placements.
     coop::engine::setBuildCaptureArmed(worldLive);
+#ifdef KENSHICOOP_NET_DIAG
+    const bool joinHold = hostWaitingForJoinLoad();
+    static bool wasJoinHold = false;
+    if (joinHold != wasJoinHold) {
+        char line[120];
+        _snprintf(line, sizeof(line) - 1,
+                  "[boot] HOST %s while join loads (consensus speed unchanged)",
+                  joinHold ? "PAUSED" : "RESUMED");
+        line[sizeof(line) - 1] = '\0'; coopLog(line);
+        wasJoinHold = joinHold;
+    }
+    g_repl.setBootstrapHold(joinHold);
+    g_repl.setReadyLoadId(g_cfg.isHost ? 0 : g_session.readyLoadId);
+#endif
 
     // Replication publish (pre-engine, worldLive-gated): ingest received targets,
     // then stream every owned channel so applied state is current this tick.
@@ -1903,9 +2364,9 @@ void titleUpdate_hook(TitleScreen* self) {
     // mainLoop_hook (gated on g_gameStarted). Pump the join half FIRST (before
     // the panel) so a GUI fault can never block it. gw is null: processNetEvents
     // only touches it under a gw&& guard, and the JOIN branches of driveSaveSync/
-    // driveLoadSync never deref it. The load path is gated on savesReady():
-    // before then the host's LOAD_GO simply waits in the inbound queue (no NACK
-    // -> no stream yet), and the save-receiver half still commits chunks to disk.
+    // driveLoadSync never deref it. Wait for the SaveManager singleton, NOT for
+    // local saves: a fresh join must process LOAD_GO and NACK a missing copy
+    // before the host can stream it. The receiver still commits chunks to disk.
     if (g_net.isRunning() && !g_cfg.isHost && !g_gameStarted) {
         processNetEvents(0);
         if (g_cfg.saveSync) driveSaveSync();
@@ -1964,78 +2425,108 @@ void startNetworking() {
     }
 
     // Steam P2P transport: connect by SteamID (NAT punch + Valve relay) with the
-    // ENet protocol unchanged. Requires the partner's steamid64; falls back to
-    // UDP loudly when Steam is unavailable so a misconfigured session still
-    // behaves like the stock build instead of silently doing nothing.
+    // ENet protocol unchanged. Requires the partner's steamid64. When Steam was
+    // selected but cannot be used, the start is REFUSED with a reason: silently
+    // falling back to UDP ran a session the player did not choose (and a join
+    // then dialled whatever stale UDP endpoint the config held).
+    g_panelStartError.clear();
+    coop::NetTransport transport = coop::NET_TRANSPORT_UDP;
     if (g_cfg.transport == "steam") {
         if (!g_cfg.isHost && g_cfg.steamPeer == 0) {
-            coopErr("[steam] join over steam needs the host Steam ID (paste it in F2); falling back to UDP");
-        } else if (!coop::steamp2p::init()) {
-            coopErr("[steam] init failed (Steam not running / offline?); falling back to UDP");
-        } else {
-            coop::steamp2p::setAllowAny(g_cfg.isHost);
-            if (g_cfg.steamPeer != 0) coop::steamp2p::setPeer(g_cfg.steamPeer);
-            for (size_t i = 0; i < g_cfg.steamPeers.size(); ++i)
-                coop::steamp2p::addPeer(g_cfg.steamPeers[i]);
-            g_net.setSteamTransport(g_cfg.steamPeer);
-            coopLog("[steam] transport=steam armed (connect by SteamID; no port forwarding)");
+            coopErr("[steam] join over steam needs the host Steam ID (paste it in F2); not starting");
+            g_panelStartError = "\xD0\xA3\xD0\xBA\xD0\xB0\xD0\xB6\xD0\xB8\xD1\x82\xD0\xB5 Steam ID \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0 (\xD0\xB2\xD1\x81\xD1\x82\xD0\xB0\xD0\xB2\xD1\x8C\xD1\x82\xD0\xB5 \xD0\xB5\xD0\xB3\xD0\xBE \xD0\xB2 \xD0\xBE\xD0\xBA\xD0\xBD\xD0\xB5 F2).";
+            return;
         }
+        if (!coop::steamp2p::init()) {
+            coopErr("[steam] init failed (Steam not running / offline?); not starting (no UDP fallback)");
+            g_panelStartError = "Steam \xD0\xBD\xD0\xB5\xD0\xB4\xD0\xBE\xD1\x81\xD1\x82\xD1\x83\xD0\xBF\xD0\xB5\xD0\xBD: \xD0\xB7\xD0\xB0\xD0\xBF\xD1\x83\xD1\x81\xD1\x82\xD0\xB8\xD1\x82\xD0\xB5 Steam \xD0\xB8 \xD0\xB2\xD0\xBE\xD0\xB9\xD0\xB4\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xB2 \xD1\x81\xD0\xB5\xD1\x82\xD1\x8C \xD0\xB8\xD0\xBB\xD0\xB8 \xD0\xB2\xD1\x8B\xD0\xB1\xD0\xB5\xD1\x80\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xBF\xD1\x80\xD1\x8F\xD0\xBC\xD0\xBE\xD0\xB9 IP.";
+            return;
+        }
+        coop::steamp2p::setAllowAny(g_cfg.isHost);
+        if (g_cfg.steamPeer != 0) coop::steamp2p::setPeer(g_cfg.steamPeer);
+        for (size_t i = 0; i < g_cfg.steamPeers.size(); ++i)
+            coop::steamp2p::addPeer(g_cfg.steamPeers[i]);
+        transport = coop::NET_TRANSPORT_STEAM;
+        coopLog("[steam] transport=steam armed (connect by SteamID; no port forwarding)");
+    } else if (!g_cfg.isHost && g_cfg.ip.empty()) {
+        coopErr("[net] join over UDP needs the host address; not starting");
+        g_panelStartError = "\xD0\xA3\xD0\xBA\xD0\xB0\xD0\xB6\xD0\xB8\xD1\x82\xD0\xB5 IP-\xD0\xB0\xD0\xB4\xD1\x80\xD0\xB5\xD1\x81 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0.";
+        return;
     }
 
     bool ok;
     if (g_cfg.isHost) {
         coopLog("KenshiCoop: starting as HOST");
-        ok = g_net.startHost(g_cfg.port, &g_inbound);
+        ok = g_net.startHost(g_cfg.port, &g_inbound, transport);
     } else {
         coopLog("KenshiCoop: starting as CLIENT");
-        ok = g_net.startClient(g_cfg.ip, g_cfg.port, &g_inbound);
+        ok = g_net.startClient(g_cfg.ip, g_cfg.port, &g_inbound, transport);
     }
     if (!ok) coopErr("KenshiCoop: networking failed to start");
 }
 
-// In-game panel handlers. coopUiConnect tears down any live session, re-arms the
-// config from the panel's choices, and restarts via the shared startNetworking()
-// path (NetLink cleanly supports stop() then start again; Steam is re-armed and
-// the Replicator/Inbound session state is reset for a clean handshake).
-void persistPanelMemory(bool isHost, bool useSteam) {
-    g_cfg.isHost    = isHost;
-    g_cfg.transport = useSteam ? "steam" : "udp";
-    unsigned long long first = 0;
-    g_cfg.steamPeers.clear();
-    for (int i = 0; i < 3; ++i) {
-        unsigned long long id = coop::engine::coopPanelPastedId(i);
-        if (id == 0) continue;
-        if (first == 0) first = id;
-        else g_cfg.steamPeers.push_back(id);
+// Session handlers for the F2 panel commands and inbound Steam invites.
+// coopUiConnect tears down any live session, re-arms the config from the chosen
+// role/transport (plus the panel's settings when the panel asked), and restarts
+// via the shared startNetworking() path (NetLink::start* stops + reaps the
+// previous worker and re-chooses the transport every time; the
+// Replicator/Inbound session state is reset for a clean handshake).
+//
+// applyUiSettings: while a session is live or launching (lockSession), its
+// role, transport and endpoint belong to that session, not to the panel's
+// toggles. Rewriting g_cfg.isHost under a running session flipped every
+// role-keyed path (net events, save/load direction) to the other side. Only the
+// nick is always taken - pushed to NetLink for the next HELLO/WELCOME. The UI is
+// a separate module, so the nick and UDP host are re-validated here with the
+// same parsers the panel uses; invalid values leave the config unchanged.
+void applyUiSettings(const CoopUiSettings& s, bool lockSession) {
+    if (!lockSession) {
+        g_cfg.isHost    = s.isHost != 0;
+        g_cfg.transport = s.useSteam ? "steam" : "udp";
+        if (s.hostSteamId != 0) g_cfg.steamPeer = s.hostSteamId;
+        if (s.udpIp[0]) {
+            std::string ip;
+            int port = 0;
+            if (coop::parseUdpEndpoint(s.udpIp, ip, port)) g_cfg.ip = ip;
+            else coopErr("[coop-ui] ignored an invalid UDP host from the panel");
+        }
+        if (s.udpPort >= 1 && s.udpPort <= 65535) g_cfg.port = s.udpPort;
     }
-    if (first != 0) g_cfg.steamPeer = first;
-    const char* ip = coop::engine::coopPanelUdpIp();
-    if (ip && ip[0]) g_cfg.ip = ip;
-    int port = coop::engine::coopPanelUdpPort();
-    if (port > 0) g_cfg.port = port;
-    const char* nick = coop::engine::coopPanelPlayerName();
-    if (nick) g_cfg.playerName = nick;
+    if (s.playerName[0]) {
+        std::string nick;
+        if (coop::parsePlayerNick(s.playerName, nick) && !coop::isPoisonedNick(nick))
+            g_cfg.playerName = nick;
+        else
+            coopErr("[coop-ui] ignored an invalid nick from the panel");
+    }
+}
+
+// Push the nick to NetLink and write the connection memory to coop_config.json.
+void persistConnectMemory(bool sessionKept) {
+    g_net.setLocalName(g_cfg.playerName.c_str());
     coop::saveConnectMemory(g_cfg);
-    char b[176];
+    char b[192];
     _snprintf(b, sizeof(b) - 1,
-              "[coop-ui] remembered role=%s transport=%s peer=%llu ip=%s port=%d nick=%s",
-              isHost ? "HOST" : "JOIN", g_cfg.transport.c_str(),
+              "[coop-ui] remembered role=%s transport=%s peer=%llu ip=%s port=%d nick=%s%s",
+              g_cfg.isHost ? "HOST" : "JOIN", g_cfg.transport.c_str(),
               (unsigned long long)g_cfg.steamPeer, g_cfg.ip.c_str(), g_cfg.port,
-              g_cfg.playerName.empty() ? "-" : g_cfg.playerName.c_str());
+              g_cfg.playerName.empty() ? "-" : g_cfg.playerName.c_str(),
+              sessionKept ? " (session live: role/transport/endpoint kept)" : "");
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
 }
 
-void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
-    // Already hosting on Steam: extra lobby members / extra pasted IDs just
-    // join the tunnel. Do not tear the live session down.
-    if (g_net.isRunning() && isHost && useSteam && peerId != 0) {
-        coop::steamp2p::addPeer(peerId);
-        persistPanelMemory(true, true);
-        coopLog("[coop-ui] add steam peer to live host session");
-        return;
-    }
-    if (g_net.isRunning()) g_net.stop();
+void rememberUiSettings(const CoopUiSettings& ui) {
+    const bool busy = g_net.isRunning();
+    applyUiSettings(ui, busy);
+    persistConnectMemory(busy);
+}
+
+// peerId: a Steam ID resolved by an invite (0 = none). ui: the panel's settings
+// when the panel asked (0 for an invite).
+void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId,
+                   const CoopUiSettings* ui) {
+    g_net.stop(); // also reaps a worker that already exited on a failed start
     coop::steamp2p::shutdown();
     // World is live here (reconnect from within a running game): despawn minted
     // proxies before clearing maps so a re-connect leaves no orphaned duplicates.
@@ -2063,17 +2554,12 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // hitting Connect works without restarting the game. (It also picks up a
     // steamPeer if one is set for advanced/back-compat use.)
     coop::reloadPeerFromFile(g_cfg);
-    // A Steam ID pasted in the F2 panel this session wins over the config: the
-    // normal flow is Copy my Steam ID -> friend Pastes it -> Connect, with no file
-    // editing. peerId is 0 when nothing was pasted, so the config value stands.
+    // Invite-resolved peer, then the panel's settings, win over the config: the
+    // normal flow is Copy my Steam ID -> friend Pastes it -> Connect, with no
+    // file editing. Nothing set leaves the config value standing.
     if (peerId != 0) g_cfg.steamPeer = peerId;
-    {
-        const char* ip = coop::engine::coopPanelUdpIp();
-        if (ip && ip[0]) g_cfg.ip = ip;
-        int port = coop::engine::coopPanelUdpPort();
-        if (port > 0) g_cfg.port = port;
-    }
-    persistPanelMemory(isHost, useSteam);
+    if (ui) applyUiSettings(*ui, false);
+    persistConnectMemory(false);
     // Host streams world NPCs; join drives. Under presence authority both do,
     // each for the cells it claims.
     g_repl.setStreamNpcs(isHost || g_cfg.cellAuth);
@@ -2101,19 +2587,17 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
     startNetworking();
-    if (isHost && useSteam) {
-        for (int i = 0; i < 3; ++i) {
-            unsigned long long id = coop::engine::coopPanelPastedId(i);
-            if (id != 0) coop::steamp2p::addPeer(id);
-        }
-        for (size_t i = 0; i < g_cfg.steamPeers.size(); ++i)
-            coop::steamp2p::addPeer(g_cfg.steamPeers[i]);
-    }
+}
+
+// SteamInvite's ConnectFn: a resolved invite reuses the normal connect path.
+void steamInviteConnect(bool isHost, bool useSteam, unsigned long long peerId) {
+    coopUiConnect(isHost, useSteam, peerId, 0);
 }
 
 void coopUiDisconnect() {
     coopLog("[coop-ui] disconnect");
-    if (g_net.isRunning()) g_net.stop();
+    g_net.stop(); // unconditional: a failed start leaves no live worker but a status
+    g_panelStartError.clear();
     coop::steaminvite::reset(); // leave any Steam lobby
     coop::steamp2p::shutdown();
     // World stays live on a manual disconnect: despawn minted proxies before
@@ -2639,7 +3123,7 @@ __declspec(dllexport) void startPlugin() {
     // panel - the joiner never has to open it or type an ID.
     if (!autoStart || g_cfg.transport == "steam" || g_cfg.steamPing != 0) {
         if (coop::steamp2p::init())
-            coop::steaminvite::init(&coopUiConnect);
+            coop::steaminvite::init(&steamInviteConnect);
     }
 
     if (autoStart) {

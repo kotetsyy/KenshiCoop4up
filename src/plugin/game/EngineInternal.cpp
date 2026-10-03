@@ -12,10 +12,6 @@
 
 #include "EngineInternal.h"
 
-// For &DataPanelLine_TextEditable::textChanged - the F2 type-in rows' own
-// handler, resolved so the harvest can make the engine refresh its s2.
-#include <kenshi/gui/DataPanelLine.h>
-
 namespace coop {
 namespace engine {
 
@@ -61,16 +57,14 @@ void noteFault(FaultOp op) {
 }
 
 // SaveManager entry points, resolved at load. getSingleton is a static member;
-// load(name) and savesExist are __thiscall (passed via __fastcall self in RCX).
+// load(name) is __thiscall (passed via __fastcall self in RCX).
 typedef SaveManager* (__fastcall* SaveMgrGetFn)();
 typedef void         (__fastcall* SaveMgrLoadNameFn)(SaveManager* self, const std::string* name);
-typedef bool         (__fastcall* SaveMgrSavesExistFn)(SaveManager* self);
 typedef void         (__fastcall* SaveMgrSaveNameFn)(SaveManager* self, const std::string* name,
                                                      bool autosave);
 
 SaveMgrGetFn        g_getFn        = 0;
 SaveMgrLoadNameFn   g_loadFn       = 0;
-SaveMgrSavesExistFn g_savesExistFn = 0;
 SaveMgrSaveNameFn   g_saveFn       = 0;
 
 // Protocol 31 (coordinated save): SaveManager::getCurrentGame / getSavePath.
@@ -1410,7 +1404,6 @@ EquipItemFn      g_equipItemFn    = 0;
 GetAllSectionsFn g_getSectionsFn  = 0;
 GetInvGuiFn      g_getInvGuiFn    = 0; // open-window probe (loot-GUI UAF guard)
 InvGuiRefreshFn  g_invGuiRefreshFn = 0; // rebuild an open panel's icons
-LineTextChangedFn g_lineTextChangedFn = 0; // F2 edit rows: refresh s2 from the box
 GetWeaponFn      g_getPrimaryWeaponFn   = 0;
 GetWeaponFn      g_getSecondaryWeaponFn = 0;
 FacBySidFn       g_facBySidFn     = 0; // protocol 21 proxy spawn (join)
@@ -1586,7 +1579,6 @@ void resolve() {
     g_getFn  = (SaveMgrGetFn)KenshiLib::GetRealAddress(&SaveManager::getSingleton);
     g_loadFn = (SaveMgrLoadNameFn)KenshiLib::GetRealAddress(
         static_cast<void (SaveManager::*)(const std::string&)>(&SaveManager::load));
-    g_savesExistFn = (SaveMgrSavesExistFn)KenshiLib::GetRealAddress(&SaveManager::savesExist);
     g_saveFn = (SaveMgrSaveNameFn)KenshiLib::GetRealAddress(&SaveManager::save);
     g_saveMgrExecFn = (SaveMgrExecFn)KenshiLib::GetRealAddress(&SaveManager::execute);
     // Protocol 31: locate the active save on disk (spike 39 RVAs, runtime-
@@ -1805,10 +1797,6 @@ void resolve() {
     // Lets a reconcile run LIVE under an open panel instead of being deferred.
     g_invGuiRefreshFn = (InvGuiRefreshFn)KenshiLib::GetRealAddress(
         &InventoryGUI::refreshAllSections);
-    // F2 type-in rows: without this the harvest reads the SEEDED s2 forever and
-    // a typed nick never registers as a change.
-    g_lineTextChangedFn = (LineTextChangedFn)KenshiLib::GetRealAddress(
-        &DataPanelLine_TextEditable::textChanged);
     // Worn weapons are NOT in any section: read the dedicated weapon accessors directly.
     g_getPrimaryWeaponFn   = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getPrimaryWeapon);
     g_getSecondaryWeaponFn = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getSecondaryWeapon);
@@ -2105,11 +2093,11 @@ bool saveMgrExecute() {
 }
 
 bool savesReady() {
-    if (!g_getFn || !g_savesExistFn) return true; // unresolved: don't block auto-load
+    if (!g_getFn) return false;
     __try {
-        SaveManager* mgr = g_getFn();
-        if (!mgr) return false;
-        return g_savesExistFn(mgr);
+        // A fresh JOIN has no local saves until it receives the host's world.
+        // savesExist() reports content, not whether the manager can load it.
+        return g_getFn() != 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }

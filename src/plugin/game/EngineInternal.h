@@ -31,7 +31,6 @@
 // Phase 5a domain split: the adapter re-includes the narrow public headers carved
 // out of Engine.h so the domain TUs (which define these entry points) still see
 // their declarations.
-#include "EngineUi.h"
 #include "EngineScenario.h"
 #include "EngineProbe.h"
 #include "EngineFaults.h" // Phase 5c: typed, throttled SEH-fault accounting
@@ -43,7 +42,7 @@
 #include <kenshi/GameWorld.h>       // GameWorld::player
 #include <kenshi/PlayerInterface.h> // PlayerInterface::playerCharacters
 #include <kenshi/CameraClass.h>     // CameraClass (camera-anchored interest, spike 35)
-#include <kenshi/SaveManager.h>     // SaveManager::getSingleton/load/savesExist
+#include <kenshi/SaveManager.h>     // SaveManager::getSingleton/load
 #include <kenshi/SaveInfo.h>        // SaveInfo (the in-game load menu's load(SaveInfo&) overload)
 #include <kenshi/Character.h>       // Character (handle/getPosition/getOrientation/movement)
 #include <kenshi/CharMovement.h>    // CharMovement::_setPositionDirectionAndTeleport/setDestination
@@ -93,12 +92,6 @@
 #include <utility>
 #include <vector>
 
-// Forward declarations at GLOBAL scope: this header is included before the
-// panel-row headers and only the POINTER types are needed. Declaring them
-// inside coop::engine would create coop::engine::MyGUI and shadow the real one.
-class DataPanelLine_TextEditable;
-namespace MyGUI { class EditBox; }
-
 namespace coop {
 namespace engine {
 
@@ -108,7 +101,6 @@ namespace engine {
 // SaveManager (save/load, protocols 31-32)
 typedef SaveManager* (__fastcall* SaveMgrGetFn)();
 typedef void         (__fastcall* SaveMgrLoadNameFn)(SaveManager* self, const std::string* name);
-typedef bool         (__fastcall* SaveMgrSavesExistFn)(SaveManager* self);
 typedef void         (__fastcall* SaveMgrSaveNameFn)(SaveManager* self, const std::string* name,
                                                      bool autosave);
 typedef const std::string* (__fastcall* SaveMgrStrFn)(SaveManager* self);
@@ -333,15 +325,6 @@ typedef InventoryGUI* (__fastcall* GetInvGuiFn)(Inventory* self);
 // the whole defer-while-open compromise was built to avoid. Refreshing in the
 // same call, before returning to the engine, closes the window entirely.
 typedef void (__fastcall* InvGuiRefreshFn)(InventoryGUI* self);
-// DataPanelLine_TextEditable::textChanged: the engine's OWN handler that copies
-// its EditBox's live text into the line's s2 string. We call it before reading
-// s2 because s2 otherwise still holds the value the row was SEEDED with, so a
-// typed nick was never seen (session 15:33: the field showed 'moogg' while the
-// harvest kept reading 'nickedit'). Going through the engine also avoids
-// touching MyGUI from this DLL at all - reading the EditBox caption with our
-// own MyGUI copy is what AV'd in v0.57.
-typedef void (__fastcall* LineTextChangedFn)(DataPanelLine_TextEditable* self,
-                                             MyGUI::EditBox* box);
 typedef Faction*  (__fastcall* FacBySidFn)(FactionManager* self, const std::string* sid);
 typedef GameData* (__fastcall* FacGetDataFn)(const Faction* self);
 typedef float (__fastcall* RelGetFn)(FactionRelations* self, Faction* p);
@@ -393,7 +376,6 @@ struct FacLogGate {
 // SaveManager
 extern SaveMgrGetFn        g_getFn;
 extern SaveMgrLoadNameFn   g_loadFn;
-extern SaveMgrSavesExistFn g_savesExistFn;
 extern SaveMgrSaveNameFn   g_saveFn;
 extern SaveMgrStrFn        g_saveMgrCurGameFn;
 extern SaveMgrStrFn        g_saveMgrPathFn;
@@ -583,7 +565,6 @@ extern EquipItemFn      g_equipItemFn;
 extern GetAllSectionsFn g_getSectionsFn;
 extern GetInvGuiFn      g_getInvGuiFn;
 extern InvGuiRefreshFn  g_invGuiRefreshFn;
-extern LineTextChangedFn g_lineTextChangedFn;
 extern GetWeaponFn      g_getPrimaryWeaponFn;
 extern GetWeaponFn      g_getSecondaryWeaponFn;
 extern FacBySidFn       g_facBySidFn;

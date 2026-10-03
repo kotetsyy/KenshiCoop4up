@@ -5,6 +5,10 @@
 #define _CRT_SECURE_NO_WARNINGS 1
 
 #include "CoopLog.h"
+#ifdef KENSHICOOP_NET_DIAG
+#include "../netproto/Wire.h"
+#include <cstring>
+#endif
 
 #include <windows.h>
 #include <cstdio>
@@ -20,6 +24,50 @@ char             g_tag[16] = { 0 };
 // and can name the previous file in the breadcrumb it leaves behind.
 char             g_path[MAX_PATH] = { 0 };
 volatile long    g_fakeSkewMs = 0;
+
+#ifdef KENSHICOOP_NET_DIAG
+enum { MIRROR_FILE_CAP = 16 * 1024 * 1024 };
+HANDLE g_mirrorRead = INVALID_HANDLE_VALUE;
+unsigned __int64 g_mirrorOffset = 0;
+unsigned g_mirrorPeeked = 0;
+FILE* g_remoteFiles[MAX_JOINS + 1] = { 0 };
+unsigned __int64 g_remoteOffsets[MAX_JOINS + 1] = { 0 };
+unsigned g_remoteSizes[MAX_JOINS + 1] = { 0 };
+
+// Call with g_cs held.
+void closeMirror() {
+    if (g_mirrorRead != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_mirrorRead);
+        g_mirrorRead = INVALID_HANDLE_VALUE;
+    }
+    g_mirrorOffset = 0;
+    g_mirrorPeeked = 0;
+}
+
+// Call with g_cs held.
+void closeRemote(unsigned peerId) {
+    if (g_remoteFiles[peerId]) {
+        std::fclose(g_remoteFiles[peerId]);
+        g_remoteFiles[peerId] = 0;
+    }
+    g_remoteOffsets[peerId] = 0;
+    g_remoteSizes[peerId] = 0;
+}
+
+// The peer id is range-checked before this function. Use only the directory
+// from the configured host log, never any untrusted bytes for the filename.
+bool remotePath(unsigned peerId, char* path) {
+    size_t dirLen = 0;
+    for (size_t i = 0; g_path[i]; ++i) {
+        if (g_path[i] == '\\' || g_path[i] == '/') dirLen = i + 1;
+    }
+    if (dirLen >= MAX_PATH) return false;
+    std::memcpy(path, g_path, dirLen);
+    int n = _snprintf(path + dirLen, MAX_PATH - dirLen,
+                      "KenshiCoop_join_%u_mirror.log", peerId);
+    return n > 0 && (size_t)n < MAX_PATH - dirLen;
+}
+#endif
 
 void writeLine(const char* level, const char* msg) {
     if (!g_init) return;
@@ -97,6 +145,10 @@ bool logRetarget(const char* path, const char* modeTag) {
     { size_t i = 0; for (; g_path[i] && i < sizeof(oldPath) - 1; ++i) oldPath[i] = g_path[i];
       oldPath[i] = '\0'; }
     if (!same) {
+#ifdef KENSHICOOP_NET_DIAG
+        closeMirror();
+        for (unsigned id = 1; id <= MAX_JOINS; ++id) closeRemote(id);
+#endif
         size_t i = 0;
         for (; path[i] && i < sizeof(g_path) - 1; ++i) g_path[i] = path[i];
         g_path[i] = '\0';
@@ -136,9 +188,104 @@ bool logRetarget(const char* path, const char* modeTag) {
 void logLine(const char* msg)    { writeLine("INFO",  msg); }
 void logErrLine(const char* msg) { writeLine("ERROR", msg); }
 
+#ifdef KENSHICOOP_NET_DIAG
+void logMirrorCapture(bool enabled) {
+    if (!g_init) return;
+    EnterCriticalSection(&g_cs);
+    closeMirror();
+    if (enabled && g_fp && g_path[0]) {
+        g_mirrorRead = CreateFileA(g_path, GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
+unsigned logMirrorPeek(char* out, unsigned cap, unsigned __int64* offset) {
+    if (!g_init || !out || !cap || !offset) return 0;
+    EnterCriticalSection(&g_cs);
+    DWORD count = 0;
+    if (g_mirrorRead != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER at;
+        at.QuadPart = (LONGLONG)g_mirrorOffset;
+        if (SetFilePointerEx(g_mirrorRead, at, 0, FILE_BEGIN) &&
+            ReadFile(g_mirrorRead, out, cap, &count, 0)) {
+            *offset = g_mirrorOffset;
+            g_mirrorPeeked = count;
+        } else {
+            closeMirror();
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return (unsigned)count;
+}
+
+void logMirrorCommit(unsigned bytes) {
+    if (!g_init) return;
+    EnterCriticalSection(&g_cs);
+    if (g_mirrorRead != INVALID_HANDLE_VALUE && bytes && bytes <= g_mirrorPeeked) {
+        g_mirrorOffset += bytes;
+        g_mirrorPeeked = 0;
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
+bool logRemoteChunk(unsigned peerId, unsigned __int64 offset,
+                    const char* data, unsigned bytes) {
+    if (!g_init || peerId == 0 || peerId > MAX_JOINS ||
+        !data || !bytes || bytes > MIRROR_FILE_CAP) return false;
+    EnterCriticalSection(&g_cs);
+    bool ok = false;
+    FILE*& fp = g_remoteFiles[peerId];
+    if (offset == 0) {
+        // Offset zero denotes a fresh connection; restart its file and stream.
+        closeRemote(peerId);
+        char path[MAX_PATH];
+        if (remotePath(peerId, path)) fp = std::fopen(path, "wb");
+    }
+    if (fp && offset == g_remoteOffsets[peerId] &&
+        offset <= ~((unsigned __int64)0) - bytes) {
+        if (g_remoteSizes[peerId] > MIRROR_FILE_CAP - bytes) {
+            // Rotation discards the old on-disk prefix, not the wire offset.
+            char path[MAX_PATH];
+            if (remotePath(peerId, path)) {
+                std::fclose(fp);
+                fp = std::fopen(path, "wb");
+            } else {
+                std::fclose(fp);
+                fp = 0;
+            }
+            g_remoteSizes[peerId] = 0;
+        }
+        if (fp && std::fwrite(data, 1, bytes, fp) == bytes &&
+            std::fflush(fp) == 0) {
+            g_remoteSizes[peerId] += bytes;
+            g_remoteOffsets[peerId] += bytes;
+            ok = true;
+        } else {
+            // A partial write cannot be retried safely with the same offset.
+            closeRemote(peerId);
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return ok;
+}
+
+void logRemoteClose(unsigned peerId) {
+    if (!g_init || peerId == 0 || peerId > MAX_JOINS) return;
+    EnterCriticalSection(&g_cs);
+    closeRemote(peerId);
+    LeaveCriticalSection(&g_cs);
+}
+#endif
+
 void logClose() {
     if (!g_init) return;
     EnterCriticalSection(&g_cs);
+#ifdef KENSHICOOP_NET_DIAG
+    closeMirror();
+    for (unsigned id = 1; id <= MAX_JOINS; ++id) closeRemote(id);
+#endif
     if (g_fp) {
         std::fflush(g_fp);
         std::fclose(g_fp);

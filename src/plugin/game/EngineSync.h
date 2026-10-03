@@ -2,13 +2,15 @@
 // domain split, 2026-07-19). This is the STABLE name the replication layer
 // depends on; it currently re-exports the Engine.h sync core.
 //
-// Phase 5a carved the cleanly-separable public surfaces (UI panel -> EngineUi.h,
-// deterministic test-scene setup -> EngineScenario.h, raw-RVA diagnostic probes
-// -> EngineProbe.h) OUT of Engine.h, so a consumer that includes EngineSync.h /
-// Engine.h no longer transitively sees the panel, scene-builder, or spike-probe
-// APIs. The remaining sync-vs-scenario reclassification (medical / stats /
-// furniture / carry / inventory / world-item / combat scaffolds that are still
-// interleaved with their sync siblings) rides along in later Phase 5 increments;
+// Phase 5a carved the cleanly-separable public surfaces (deterministic
+// test-scene setup -> EngineScenario.h, raw-RVA diagnostic probes ->
+// EngineProbe.h) OUT of Engine.h, so a consumer that includes EngineSync.h /
+// Engine.h no longer transitively sees the scene-builder or spike-probe APIs.
+// The session panel is not an engine surface at all: it lives in the separate
+// KenshiCoopUI.dll behind src/ui/CoopUiApi.h. The remaining sync-vs-scenario
+// reclassification (medical / stats / furniture / carry / inventory /
+// world-item / combat scaffolds that are still interleaved with their sync
+// siblings) rides along in later Phase 5 increments;
 // as those decls move into EngineScenario.h, Engine.h shrinks to the pure sync
 // surface and this header stays the Replicator's unchanged include point.
 

@@ -25,16 +25,108 @@
 
 namespace coop {
 
+// ENet UDP payload counters include ENet framing and retransmissions (not IP/UDP
+// headers, not Steam tunnel overhead). Sampled ~1 Hz by the net thread in EVERY
+// build (the F2 diagnostics report reads it); only the [net-diag] log lines and
+// the private overlay are KENSHICOOP_NET_DIAG-only.
+struct NetDebugPeer {
+    DWORD slot;                   // ENet host peer slot (valid before handshake)
+    DWORD playerId;               // 0 = host or not yet assigned by HELLO
+    DWORD rttMs;
+    DWORD reliableBytesInTransit;
+};
+
+struct NetDebugStats {
+    DWORD sampleTickMs;           // zero until the first complete sample
+    DWORD sentBytesPerSec;
+    DWORD recvBytesPerSec;
+    DWORD sentPacketsPerSec;
+    DWORD recvPacketsPerSec;
+    DWORD connectedPeers;
+    DWORD maxRttMs;
+    DWORD reliableBytesInTransit;
+    DWORD peerStatsCount;
+    NetDebugPeer peers[MAX_PLAYERS]; // fixed-size, no per-sample allocations
+};
+
+// ---- Lifecycle facts (MAIN thread reads a coherent copy via copyStatus) ------
+// Written only by NetLink itself (start/stop on the MAIN thread, the worker on
+// the NET thread) under one lock, so a reader never sees e.g. "UDP" from a start
+// whose Steam tunnel is still open.
+enum NetPhase {
+    NET_IDLE,         // never started, or stop() completed
+    NET_STARTING,     // start accepted (thread launched); transport not open yet
+    NET_LISTENING,    // host: listen socket / Steam tunnel open, accepting joins
+    NET_CONNECTING,   // join: connect attempt(s) in flight, no link established yet
+    NET_HANDSHAKING,  // join: ENet link up, HELLO sent, awaiting WELCOME
+    NET_CONNECTED,    // join: WELCOME accepted (player id assigned)
+    NET_RECONNECTING, // join: an established session dropped; auto-retrying
+    NET_FAILED        // worker gave up (see error); the thread has exited
+};
+// Numeric values match CoopUiSnapshot::activeTransport (0 Steam, 1 UDP).
+enum NetTransport {
+    NET_TRANSPORT_NONE  = -1,
+    NET_TRANSPORT_STEAM = 0,
+    NET_TRANSPORT_UDP   = 1
+};
+enum NetError {
+    NET_ERR_NONE = 0,
+    NET_ERR_ENET_INIT,          // enet_initialize failed (fatal)
+    NET_ERR_THREAD,             // CreateThread failed (fatal)
+    NET_ERR_STEAM_TUNNEL,       // Steam ENet socket hooks did not install (fatal)
+    NET_ERR_BIND,               // host: listen socket did not open; arg = port (fatal)
+    NET_ERR_SOCKET,             // join: local ENet host did not open (fatal)
+    NET_ERR_RESOLVE,            // join: host address did not resolve (fatal on the
+                                //   first attempt; retried after a lost session)
+    NET_ERR_CONNECT_ALLOC,      // join: enet_host_connect returned no peer (retried)
+    NET_ERR_NO_RESPONSE,        // join: attempt timed out before any ENet link;
+                                //   arg = attempts so far (retried)
+    NET_ERR_HANDSHAKE_DROPPED,  // join: host closed the link after CONNECT but
+                                //   before WELCOME (host rejects exactly for a
+                                //   protocol mismatch or a full session) (retried)
+    NET_ERR_PROTOCOL,           // join: WELCOME carried another protocol; arg = host's
+    NET_ERR_PEER_VERSION,       // host: rejected a join's HELLO; arg = its protocol
+    NET_ERR_SERVER_FULL         // host: rejected a join, all MAX_JOINS ids in use
+};
+struct NetStatus {
+    NetPhase     phase;
+    bool         host;              // role of the current / last start
+    NetTransport requested;         // transport asked for at the current / last start
+    NetTransport active;            // transport ACTUALLY open (NONE when nothing is)
+    NetError     error;             // last error of this start; NONE = none
+    u32          errorArg;          // see NetError
+    char         errorRaw[128];     // technical English detail ("" = none)
+    DWORD        phaseSinceTick;    // GetTickCount when phase last changed
+    u32          connectAttempts;   // join: enet_host_connect calls this start
+    u32          pendingHandshakes; // host: ENet-linked peers not yet given an id
+    // Accepted players by id bit (bit 0 = host). Host: itself + every join
+    // whose HELLO was accepted and has not left. Join: host + itself once
+    // WELCOME arrived, then the host's accepted-member roster (even nameless
+    // joins, and even before a world is loaded). Never the raw ENet peer count.
+    u32          memberMask;
+};
+
 class NetLink {
 public:
     NetLink();
     ~NetLink();
 
-    // Start as host on 'port' / as client to 'ip:port'. Inbound events go to
-    // 'inbound'. Returns false if ENet init or the thread launch failed.
-    bool startHost(int port, Inbound* inbound);
-    bool startClient(const std::string& ip, int port, Inbound* inbound);
+    // Start as host on 'port' / as client to 'ip:port' over 'transport'
+    // (NET_TRANSPORT_STEAM tunnels ENet over Steam P2P - steamp2p must already
+    // be initialised and its peers set; NET_TRANSPORT_UDP is plain UDP). Any
+    // previous worker (live or already failed) is stopped and reaped first.
+    // Returns false if ENet init or the thread launch failed (status FAILED);
+    // true means the launch was ACCEPTED - the transport opens asynchronously
+    // (NET_STARTING -> NET_LISTENING / NET_CONNECTING, or NET_FAILED).
+    bool startHost(int port, Inbound* inbound, NetTransport transport);
+    bool startClient(const std::string& ip, int port, Inbound* inbound,
+                     NetTransport transport);
+    // Stop the worker, reap its handle, and reset the status to NET_IDLE.
+    // Safe (and cheap) when nothing runs.
     void stop();
+
+    // MAIN thread: coherent copy of the lifecycle facts above.
+    void copyStatus(NetStatus* out) const;
 
     // MAIN thread: publish this peer's owned entities (copied under lock). The
     // net thread re-broadcasts the latest snapshot each tick. Pass count 0 to
@@ -142,11 +234,6 @@ public:
     // Symmetric and static (a fixture's position/template never change), so this
     // is first-sight plus a slow safety resend and idles at zero traffic.
     void queueFixture(const FixturePacket& pkt);
-    // MAIN thread, HOST ONLY: queue the reliable player-roster row (protocol
-    // 56) - every player's display name by id. HELLO/WELCOME only ever tell
-    // the host and ONE joiner about each other, so with three players nobody
-    // but the host knew the third name. Change-gated by the caller.
-    void queueRoster(const RosterPacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -202,12 +289,6 @@ public:
     // startHost/startClient. All-zero = disabled (immediate delivery). See Config.
     void setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct);
 
-    // Steam P2P transport: tunnel the ENet protocol over Steam P2P instead of
-    // UDP. Host may pass 0 (listen + accept inbound peers); join passes the
-    // host's steamid64. Must be called before startHost/startClient.
-    // enabled=false (default) = UDP.
-    void setSteamTransport(unsigned long long peerSteamId);
-
     // MAIN thread: display nick sent in HELLO (join) / WELCOME tail (host).
     // Empty = omit the name bytes (legacy HELLO nameLen=0).
     void setLocalName(const char* name);
@@ -224,6 +305,8 @@ public:
     // publish lock for the snapshot clear).
     void bumpSessionEpoch();
 
+    // True from an ACCEPTED start until the worker exits (includes the launch
+    // window before the transport is open - see copyStatus for the phase).
     bool isRunning() const { return running_ != 0; }
     // host = 0; client = id from WELCOME. myId_ is written by the NET thread when
     // the WELCOME arrives and read here on the MAIN thread, so it is a volatile
@@ -232,10 +315,20 @@ public:
     // value (Phase 4: myId_ cross-thread safety).
     u32  localId()   const { return (u32)myId_; }
 
+    // MAIN thread: copy one coherent, zeroed-when-stopped traffic sample.
+    void copyDebugStats(NetDebugStats* out) const;
+
 private:
     static DWORD WINAPI threadEntry(LPVOID self);
     void threadLoop();
     bool launchThread();
+    // Status writers (any thread; statusCs_).
+    void setPhase(NetPhase p);
+    void setActiveTransport(NetTransport t);
+    void setError(NetError e, u32 arg, const char* raw);
+    void setMemberBit(u32 id, bool on);
+    void setMembers(u32 mask);
+    void setHandshakeCounts(u32 connectAttempts, u32 pendingHandshakes);
 
     // Net-thread-only: route a received entity through the WAN sim (delay/drop) when
     // enabled, else deliver immediately. flushDelayed() releases matured entries.
@@ -323,7 +416,6 @@ private:
     std::vector<DeedPacket>      outDeed_;
     // Reliable runtime-fixture identity rows (protocol 55). Guarded by outCs_.
     std::vector<FixturePacket>   outFixture_;
-    std::vector<RosterPacket>    outRoster_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;
@@ -352,6 +444,13 @@ private:
     std::vector<LoadReqPacket>   outLoadReq_;
     std::vector<LoadNackPacket>  outLoadNack_;
 
+    void clearDebugStats();
+    mutable CRITICAL_SECTION debugCs_;
+    NetDebugStats debugStats_;
+
+    mutable CRITICAL_SECTION statusCs_;
+    NetStatus                status_;
+
     HANDLE        thread_;
     volatile LONG running_;
     volatile LONG stopFlag_;
@@ -367,11 +466,10 @@ private:
     volatile LONG        sendEpoch_;
     std::map<u32, u32>   epochSeen_; // newest accepted epoch per ownerId
 
-    // Steam P2P transport (set before launch; read-only on the net thread
-    // thereafter). steamMode_ can be true with steamPeer_ == 0 on the host
-    // (accept inbound tunnels). false = stock UDP.
+    // Transport of the current start (set by startHost/startClient before the
+    // launch, read-only on the net thread thereafter). Re-chosen on EVERY start,
+    // so a Steam session never leaks into a following UDP one.
     bool               steamMode_;
-    unsigned long long steamPeer_;
 
     // Handshake nicks. localName_ is written on the MAIN thread (setLocalName)
     // and read on the NET thread when packing HELLO/WELCOME; peerName_ is

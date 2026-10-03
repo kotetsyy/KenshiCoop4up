@@ -25,7 +25,14 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
+#ifdef KENSHICOOP_NET_DIAG
+// Private protocol 63 mirrors the join's complete local log as bounded,
+// reliable chunks in a separate host file. Earlier private binaries cannot
+// silently omit the mirror; the public wire protocol remains version 59.
+const u16 PROTOCOL_VERSION = 63;
+#else
 const u16 PROTOCOL_VERSION = 59;
+#endif
 
 // RELEASE id - a different axis from PROTOCOL_VERSION, and the two are routinely
 // confused. PROTOCOL_VERSION is the WIRE contract: peers with different values
@@ -45,7 +52,7 @@ const u16 PROTOCOL_VERSION = 59;
 // introduced ordering, which is the only moment it was free: those clients
 // install whatever the manifest names regardless of order, so they follow the
 // renumber, and every build after this one is ordered and monotonic.
-const char* const COOP_BUILD_VERSION = "0.1.20";
+const char* const COOP_BUILD_VERSION = "0.1.21";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;
@@ -101,7 +108,10 @@ enum PacketType {
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
     PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
-    PKT_PLAYER_ROSTER    = 49 // RELIABLE display-name table (host -> all, protocol 56); RosterPacket
+    PKT_PLAYER_ROSTER    = 49, // RELIABLE display-name table (host -> all, protocol 56); RosterPacket
+#ifdef KENSHICOOP_NET_DIAG
+    PKT_DEBUG_LOG_FILE   = 250 // private JOIN -> HOST local-log byte stream
+#endif
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1091,6 +1101,9 @@ struct TimePacket {
     u32 ownerId;   // network player id of the sender (either side)
     u32 seq;       // per-sender monotonic (stale-sample guard)
     f64 gameHours; // absolute in-game clock, total hours
+#ifdef KENSHICOOP_NET_DIAG
+    u32 readyLoadId; // join: most recent LOAD_GO whose new world is live (0 until then)
+#endif
 };
 
 // ---- Protocol 26: baked-door open/lock state ----------------------------------
@@ -1225,8 +1238,23 @@ struct DeedPacket {
 struct RosterPacket {
     u8  type;      // = PKT_PLAYER_ROSTER
     u32 ownerId;   // always 0 - the host is the only author of the roster
-    char name[MAX_PLAYERS][HELLO_NAME_MAX + 1]; // index = player id; empty = no such player
+    char name[MAX_PLAYERS][HELLO_NAME_MAX + 1]; // index = player id; empty = no nickname
 };
+// Optional byte after this unchanged prefix: accepted-member mask (bit id).
+// Distinguishes unnamed connected players from vacant slots. Old readers
+// consume the prefix; new readers use names only when the tail is absent.
+
+#ifdef KENSHICOOP_NET_DIAG
+// Private log mirror on the bulk channel, distinct from the live game-event
+// channel. The host derives the player id from the authenticated ENet peer.
+// A 960-byte payload plus this header and ENet framing fits Steam's 1200 B MTU.
+enum { DEBUG_LOG_CHUNK_MAX = 960 };
+struct DebugLogFileHeader {
+    u8 type;                 // = PKT_DEBUG_LOG_FILE
+    unsigned __int64 offset; // byte offset in the join's current log file
+    u16 byteCount;           // exact bytes that follow, 1..DEBUG_LOG_CHUNK_MAX
+};
+#endif
 
 struct FixturePacket {
     u8  type;      // = PKT_FIXTURE

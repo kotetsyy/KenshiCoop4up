@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Package the PLAYER release: a single folder called "KenshiCoop" with the mod
   files inside, that a player copies straight into <Kenshi>\mods\. No install
@@ -9,10 +9,12 @@
     KenshiCoop\                 <- the drop-in mod folder (copy this into mods\)
       KenshiCoop.dll              the plugin (protocol-version-matched; a mismatch
                                   is rejected at handshake by design)
+      KenshiCoopUI.dll            the F2 panel/banner companion; KenshiCoop.dll
+                                  loads it from this folder (same build pair)
       KenshiCoop.mod              mod-list entry so it shows in Kenshi's Mods menu
       RE_Kenshi.json              tells RE_Kenshi to load the plugin
-      coop_config.json            only needed for LAN/direct-UDP; Steam play is
-                                  configured entirely in-game (F2)
+      coop_config.json            defaults and settings remembered by F2;
+                                  both Steam and UDP are configured in-game
     README.txt                  <- plain copy-the-folder instructions (NOT copied
                                   into mods, so it never clutters the game folder)
   ...then zips it to dist\KenshiCoop-kit.zip (the release artifact the README
@@ -45,22 +47,36 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 }
 
-# Resolve the four mod files from the first place each exists.
+# Resolve the mod files from the first place each exists.
 function Resolve-First([string[]]$candidates, [string]$what) {
     foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
     throw "$what not found (looked in: $($candidates -join '; '))"
 }
-$dll  = Resolve-First @(
-    (Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"),
-    (Join-Path $repoRoot "dist\mods\KenshiCoop\KenshiCoop.dll")
-) "KenshiCoop.dll"
+# The two DLLs are one build pair: take both from the same place, never mix a
+# fresh core with a stale UI (or vice versa).
+$pairs = @(
+    @((Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"),
+      (Join-Path $repoRoot "src\ui\x64\Release\KenshiCoopUI.dll")),
+    @((Join-Path $repoRoot "dist\mods\KenshiCoop\KenshiCoop.dll"),
+      (Join-Path $repoRoot "dist\mods\KenshiCoop\KenshiCoopUI.dll"))
+)
+$dll = $null; $uiDll = $null
+foreach ($p in $pairs) {
+    if ((Test-Path $p[0]) -and (Test-Path $p[1])) { $dll = $p[0]; $uiDll = $p[1]; break }
+}
+if (-not $dll) {
+    throw "KenshiCoop.dll + KenshiCoopUI.dll pair not found (looked in: $(($pairs | ForEach-Object { $_ -join ' + ' }) -join '; '))"
+}
 
-# Canonical shipped-DLL hash (Phase 1 provenance). Package from ONE DLL and
-# assert the packaged copy is byte-identical to it, so the release artifact's
+# Canonical shipped-DLL hashes (Phase 1 provenance). Package from ONE pair and
+# assert the packaged copies are byte-identical to it, so the release artifact's
 # SHA-256 is verifiable rather than a mutable file tracked under dist\.
 $canonSha = (Get-FileHash -Algorithm SHA256 $dll).Hash
-Write-Host "Canonical Release DLL SHA-256: $canonSha"
+$canonUiSha = (Get-FileHash -Algorithm SHA256 $uiDll).Hash
+Write-Host "Canonical Release DLL SHA-256:    $canonSha"
 Write-Host "  source: $dll"
+Write-Host "Canonical Release UI DLL SHA-256: $canonUiSha"
+Write-Host "  source: $uiDll"
 $json = Resolve-First @(
     (Join-Path $repoRoot "dist\mods\KenshiCoop\RE_Kenshi.json"),
     (Join-Path $HostDir  "mods\KenshiCoop\RE_Kenshi.json")
@@ -78,21 +94,18 @@ New-Item -ItemType Directory -Force -Path $modDir | Out-Null
 
 Write-Host "=== assembling KenshiCoop mod folder ==="
 Copy-Item $dll  (Join-Path $modDir "KenshiCoop.dll")
+Copy-Item $uiDll (Join-Path $modDir "KenshiCoopUI.dll")
 Copy-Item $json (Join-Path $modDir "RE_Kenshi.json")
 Copy-Item $mod  (Join-Path $modDir "KenshiCoop.mod")
 
-# coop_config.json (LAN/UDP only; Steam play needs no config). Written fresh so
-# the release always ships a clean default.
+# F2 remembers role, transport, nick and endpoint in this file.
+# The release ships clean defaults; editing it is not required for either transport.
 @'
 {
-  // KenshiCoop config. For a normal Steam game you do NOT need to edit this file:
-  // your friend's Steam ID is entered in-game (press F2, click "Copy my Steam ID"
-  // to share yours, then "Paste friend's Steam ID" to enter theirs), and nothing
-  // is written back to disk.
-  //
-  // This file only matters for a LAN / direct-UDP game: set "transport": "udp"
-  // and put the host's address in "ip" (and "port" if you changed it). ip/port are
-  // re-read each time you click Connect, so you can edit them without restarting.
+  // Configure the session in the F2 panel. Type or paste a nick first.
+  // For Steam, the host shares its Steam ID and clients enter that ID.
+  // For UDP, the host chooses a port and clients enter the host's ip:port.
+  // The panel remembers these settings here; connecting is always an explicit action.
   "transport": "steam",
   "ip": "127.0.0.1",
   "port": 27800,
@@ -116,6 +129,7 @@ INSTALL (both players)
        <Kenshi>\mods\
      so you end up with:
        <Kenshi>\mods\KenshiCoop\KenshiCoop.dll   (and the other files)
+     Keep KenshiCoop.dll and KenshiCoopUI.dll together from the same zip.
      The default Steam path is:
        C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\
   3. Launch Kenshi and enable "KenshiCoop" in the Mods menu.
@@ -133,29 +147,29 @@ PLAY (Steam - recommended)
 --------------------------
   1. Press F2 to open the Co-op panel. It works at the MAIN MENU (before loading
      a game) as well as in-game.
-  2. Swap Steam IDs: each player clicks "Copy my Steam ID" and sends it to the
-     other (Steam chat, Discord, etc.). When you receive your friend's ID, copy
-     it, then click "Paste friend's Steam ID" in your panel. The panel shows the
-     ID it captured. (This is per-session - re-paste it if you relaunch Kenshi.)
-  3. HOST: load the save you want to play (or start a new game), set Role: HOST,
-     leave Transport on STEAM, and toggle Connection to ONLINE.
-  4. JOIN: straight from the MAIN MENU - no save needed - set Role: JOIN, leave
-     Transport on STEAM, and toggle Connection to ONLINE. The host sends its
-     world to you on connect and you load right into it. (You do NOT need the
-     host's save beforehand. If you already have an identical copy on disk it is
-     used as-is instead of transferring.)
-  5. The white status line shows live state, and a status banner in the TOP-LEFT
-     corner shows it too - at the main menu as well as in-game, so a joining
-     player can watch the transfer before the world loads. Toggle Connection to
-     OFFLINE to leave.
+  2. Type your nick (Cyrillic/editing/Ctrl+V supported), or click "Вставить".
+     Tab moves between fields; Enter starts. Invalid fields block the start.
+     Choose Host or Client; game controls are suppressed while editing.
+  3. HOST: select Steam, click "Копировать" beside your Steam ID, and send the ID to clients.
+     Click "Создать сессию", then load a save or start a new game.
+  4. CLIENT: select Steam and type or paste the host's Steam ID into its field.
+     Click "Подключиться" from the MAIN MENU; no local save is required.
+     The host transfers its world, or an identical local copy is reused.
+  5. The panel shows connection, world-transfer progress and player readiness.
+     "Диагностика" expands details; "Копировать отчёт" copies the complete report.
+     F2, Esc, the close button and "Скрыть (F2)" only hide the panel.
+     Use "Остановить сессию" (host) or "Отключиться" (client) to stop networking.
 
 PLAY (LAN / direct UDP - advanced)
 ----------------------------------
-  Skip the Steam ID swap. Open <Kenshi>\mods\KenshiCoop\coop_config.json in
-  Notepad, set "transport": "udp", and put the host's address in "ip" (and
-  "port" if you changed it). In the panel set Transport: UDP, pick Host/Join,
-  and go ONLINE. ip/port are re-read whenever you go ONLINE, so no restart is
-  needed after an edit.
+  Enter your nick and choose "Прямой IP (UDP)" in F2; no Steam IDs are needed.
+  HOST: enter a port if different from 27800, then click "Создать сессию".
+  CLIENT: enter the host's ip:port (for example 192.168.1.10:27800), then
+  click "Подключиться". Internet play requires the host's UDP port to be reachable.
+  The UDP port is shared between roles and remembered without resetting on a switch.
+  Mod-update messages are separate from connection status. If diagnostics overflow,
+  use "Копировать отчёт" for the complete report.
+  Role, transport and endpoint are locked while the session is active.
 
 UNINSTALL
 ---------
@@ -166,32 +180,36 @@ TROUBLESHOOTING
   * "The co-op plugin has not started": RE_Kenshi didn't load it. Check
     <Kenshi>\RE_Kenshi_log.txt for 'KenshiCoop'; reinstalling RE_Kenshi
     usually fixes it.
-  * No connection (Steam): both Steams must be RUNNING and ONLINE, and each side
-    must have Pasted the OTHER player's ID (the panel shows the captured ID -
-    confirm it matches). If "Paste friend's Steam ID" says the clipboard wasn't
-    a Steam ID, have your friend re-copy theirs with "Copy my Steam ID". Look for
-    '[steam] session ... active=1' in <Kenshi>\KenshiCoop_*.log.
+  * No connection (Steam): both Steams must be RUNNING and ONLINE. The client
+    must paste the HOST's Steam ID, not a lobby ID. The host has no peer-ID field.
+    If pasting fails, have the host re-copy the ID using "Копировать мой Steam ID".
+    Look for '[steam] session ... active=1' in <Kenshi>\KenshiCoop_*.log.
   * "protocol mismatch": one player has an older/newer build; both should use
     the same release.
 '@ | Set-Content (Join-Path $kitDir "README.txt") -Encoding UTF8
 
-# Provenance: assert the PACKAGED DLL is byte-identical to the canonical build,
-# then record the hash next to the kit so the release artifact is verifiable.
-$packagedDll = Join-Path $modDir "KenshiCoop.dll"
-$packagedSha = (Get-FileHash -Algorithm SHA256 $packagedDll).Hash
+# Provenance: assert the PACKAGED DLLs are byte-identical to the canonical pair,
+# then record the hashes next to the kit so the release artifact is verifiable.
+$packagedSha = (Get-FileHash -Algorithm SHA256 (Join-Path $modDir "KenshiCoop.dll")).Hash
 if ($packagedSha -ne $canonSha) {
     throw "packaged DLL hash ($packagedSha) != canonical Release DLL hash ($canonSha)"
 }
+$packagedUiSha = (Get-FileHash -Algorithm SHA256 (Join-Path $modDir "KenshiCoopUI.dll")).Hash
+if ($packagedUiSha -ne $canonUiSha) {
+    throw "packaged UI DLL hash ($packagedUiSha) != canonical Release UI DLL hash ($canonUiSha)"
+}
+# Release uses the public branch, last in Wire.h; the private NET_DIAG branch is first.
 $protoLine = Select-String -Path (Join-Path $repoRoot "src\netproto\Wire.h") `
-    -Pattern 'PROTOCOL_VERSION\s*=\s*(\d+)' | Select-Object -First 1
+    -Pattern 'PROTOCOL_VERSION\s*=\s*(\d+)' | Select-Object -Last 1
 $proto = if ($protoLine) { $protoLine.Matches[0].Groups[1].Value } else { "?" }
 @{
     dllSha256       = $canonSha
+    uiDllSha256     = $canonUiSha
     protocolVersion = $proto
     builtUtc        = (Get-Date).ToUniversalTime().ToString("o")
     config          = "Release"
 } | ConvertTo-Json | Set-Content (Join-Path $kitDir "PROVENANCE.json") -Encoding UTF8
-Write-Host "Packaged DLL SHA-256 verified == canonical."
+Write-Host "Packaged DLL pair SHA-256 verified == canonical."
 
 # Zip: the archive contains the KenshiCoop\ folder + README.txt + PROVENANCE.json.
 $zip = Join-Path $repoRoot "dist\KenshiCoop-kit.zip"

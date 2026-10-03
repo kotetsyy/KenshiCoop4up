@@ -799,14 +799,16 @@ public:
     void drainSaveReqs(std::deque<InboundSaveReq>& out) {
         EnterCriticalSection(&cs_); out.swap(saveReq_); LeaveCriticalSection(&cs_);
     }
-    void drainSaveBegins(std::deque<InboundSaveBegin>& out) {
-        EnterCriticalSection(&cs_); out.swap(saveBegin_); LeaveCriticalSection(&cs_);
-    }
-    void drainSaveFiles(std::deque<InboundSaveFile>& out) {
-        EnterCriticalSection(&cs_); out.swap(saveFile_); LeaveCriticalSection(&cs_);
-    }
-    void drainSaveDones(std::deque<InboundSaveDone>& out) {
-        EnterCriticalSection(&cs_); out.swap(saveDone_); LeaveCriticalSection(&cs_);
+    // BEGIN/FILE/DONE share one ordered ENet channel. Drain under one lock:
+    // DONE must not overtake FILEs arriving between separate drains.
+    void drainSaveTransfer(std::deque<InboundSaveBegin>& begins,
+                           std::deque<InboundSaveFile>& files,
+                           std::deque<InboundSaveDone>& dones) {
+        EnterCriticalSection(&cs_);
+        begins.swap(saveBegin_);
+        files.swap(saveFile_);
+        dones.swap(saveDone_);
+        LeaveCriticalSection(&cs_);
     }
     void drainSaveAcks(std::deque<InboundSaveAck>& out) {
         EnterCriticalSection(&cs_); out.swap(saveAck_); LeaveCriticalSection(&cs_);

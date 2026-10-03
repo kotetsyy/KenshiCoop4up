@@ -1,7 +1,12 @@
 @echo off
 REM Deploy KenshiCoop into a Kenshi install's mods folder.
-REM Usage:  scripts\deploy.cmd ["C:\path\to\Kenshi"]
+REM Usage:  scripts\deploy.cmd ["C:\path\to\Kenshi"] [Harness|Release|Debug] [ui]
 REM Defaults to the Steam install path if no argument is given.
+REM
+REM KenshiCoop.dll and KenshiCoopUI.dll always land in the same folder: the core
+REM loads the UI companion from its own directory (RE_Kenshi.json lists only the
+REM core). Pass "ui" as the 3rd argument to copy ONLY KenshiCoopUI.dll after
+REM scripts\build_ui.cmd - Kenshi must be closed either way.
 setlocal EnableDelayedExpansion
 
 set "REPO=%~dp0.."
@@ -14,18 +19,24 @@ if "%KENSHI%"=="" set "KENSHI=C:\Program Files (x86)\Steam\steamapps\common\Kens
 
 REM Build config to deploy (Phase 1 build separation). Default = Harness (the
 REM test build with the scenario runner). Pass "Release" as the 2nd argument to
-REM deploy the shipped player DLL instead.
-REM   Usage:  scripts\deploy.cmd ["C:\path\to\Kenshi"] [Harness|Release|Debug]
+REM deploy the shipped player DLLs instead.
 set "CONFIG=%~2"
 if "%CONFIG%"=="" set "CONFIG=Harness"
+set "UIONLY="
+if /I "%~3"=="ui" set "UIONLY=1"
 
 set "DLL=%REPO%\src\plugin\x64\%CONFIG%\KenshiCoop.dll"
+set "UIDLL=%REPO%\src\ui\x64\%CONFIG%\KenshiCoopUI.dll"
 set "JSON=%REPO%\dist\mods\KenshiCoop\RE_Kenshi.json"
 set "MOD=%REPO%\dist\mods\KenshiCoop\KenshiCoop.mod"
 set "DST=%KENSHI%\mods\KenshiCoop"
 
-if not exist "%DLL%" (
-    echo ERROR: %DLL% not found. Build first: scripts\build_plugin.cmd
+if not defined UIONLY if not exist "%DLL%" (
+    echo ERROR: %DLL% not found. Build first: scripts\build_plugin.cmd %CONFIG%
+    exit /b 1
+)
+if not exist "%UIDLL%" (
+    echo ERROR: %UIDLL% not found. Build first: scripts\build_plugin.cmd %CONFIG%
     exit /b 1
 )
 if not exist "%KENSHI%\kenshi_x64.exe" (
@@ -35,6 +46,8 @@ if not exist "%KENSHI%\kenshi_x64.exe" (
 
 if not exist "%DST%" mkdir "%DST%"
 
+if defined UIONLY goto :ui
+
 copy /Y "%DLL%"  "%DST%\KenshiCoop.dll"   >nul
 if errorlevel 1 (
     echo ERROR: could not copy KenshiCoop.dll to "%DST%".
@@ -43,6 +56,18 @@ if errorlevel 1 (
     exit /b 1
 )
 echo Copied KenshiCoop.dll
+
+:ui
+copy /Y "%UIDLL%" "%DST%\KenshiCoopUI.dll" >nul
+if errorlevel 1 (
+    echo ERROR: could not copy KenshiCoopUI.dll to "%DST%".
+    echo        The file is locked - a Kenshi instance is probably still running.
+    echo        Close all Kenshi processes and retry.
+    exit /b 1
+)
+echo Copied KenshiCoopUI.dll
+if defined UIONLY goto :join
+
 copy /Y "%JSON%" "%DST%\RE_Kenshi.json"   >nul
 if errorlevel 1 (
     echo ERROR: could not copy RE_Kenshi.json to "%DST%" ^(locked?^).
@@ -65,6 +90,7 @@ if errorlevel 1 (
 )
 echo Copied KenshiCoop.mod
 
+:join
 echo.
 echo Deployed to: %DST%
 dir /b "%DST%"
@@ -75,15 +101,26 @@ set "JOINDIR=%USERPROFILE%\Kenshi-Join"
 if not "%KENSHI%"=="%JOINDIR%" if exist "%JOINDIR%\kenshi_x64.exe" (
     set "JDST=%JOINDIR%\mods\KenshiCoop"
     if not exist "!JDST!" mkdir "!JDST!"
-    copy /Y "%DLL%"  "!JDST!\KenshiCoop.dll" >nul
+    if not defined UIONLY (
+        copy /Y "%DLL%"  "!JDST!\KenshiCoop.dll" >nul
+        if errorlevel 1 (
+            echo ERROR: could not copy KenshiCoop.dll to join install "!JDST!".
+            echo        The file is locked - a Kenshi-Join instance is probably still running.
+            exit /b 1
+        )
+        echo Copied KenshiCoop.dll  -^> join install
+    )
+    copy /Y "%UIDLL%" "!JDST!\KenshiCoopUI.dll" >nul
     if errorlevel 1 (
-        echo ERROR: could not copy KenshiCoop.dll to join install "!JDST!".
+        echo ERROR: could not copy KenshiCoopUI.dll to join install "!JDST!".
         echo        The file is locked - a Kenshi-Join instance is probably still running.
         exit /b 1
     )
-    echo Copied KenshiCoop.dll  -^> join install
-    copy /Y "%JSON%" "!JDST!\RE_Kenshi.json" >nul && echo Copied RE_Kenshi.json  -^> join install
-    copy /Y "%MOD%"  "!JDST!\KenshiCoop.mod" >nul && echo Copied KenshiCoop.mod   -^> join install
+    echo Copied KenshiCoopUI.dll  -^> join install
+    if not defined UIONLY (
+        copy /Y "%JSON%" "!JDST!\RE_Kenshi.json" >nul && echo Copied RE_Kenshi.json  -^> join install
+        copy /Y "%MOD%"  "!JDST!\KenshiCoop.mod" >nul && echo Copied KenshiCoop.mod   -^> join install
+    )
 )
 
 echo.

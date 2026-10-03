@@ -1454,6 +1454,9 @@ static const unsigned int FIXTURE_MAX_ROWS = 48;
 
 void Replicator::publishFixtures(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+#ifdef KENSHICOOP_NET_DIAG
+    engine::logBedCensus(gw);
+#endif
     if (!fixtureSync_) return;
     const unsigned long SAMPLE_MS = 1000;  // census cadence
     const unsigned long RESEND_MS = 15000; // lost-row AND not-yet-loadable retry
@@ -2476,7 +2479,11 @@ void Replicator::commitSpeedSet(GameWorld* gw, NetLink& net, u32 ownerId,
     // carries the slew on the join (protocol 25). What goes out on the wire
     // is the UNSLEWED multiplier: broadcasting the brake would slow the join
     // by the same factor and close nothing.
-    if (engine::writeGameSpeedQuiet(gw, slewedEffective(mult), paused))
+    bool enginePaused = paused;
+#ifdef KENSHICOOP_NET_DIAG
+    enginePaused = enginePaused || bootstrapHold_;
+#endif
+    if (engine::writeGameSpeedQuiet(gw, slewedEffective(mult), enginePaused))
         speedLastApplied_ = speedLastSet_;
     SpeedPacket pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -2734,11 +2741,15 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     if (speedEffMult_ >= 0.0f) {
         float mult = 0.0f; bool paused = false;
         if (engine::readGameSpeed(gw, &mult, &paused)) {
+            bool enginePaused = speedEffPaused_;
+#ifdef KENSHICOOP_NET_DIAG
+            enginePaused = enginePaused || bootstrapHold_;
+#endif
             float cur  = paused ? 0.0f : mult;
-            float want = speedEffPaused_ ? 0.0f : slewedEffective(speedEffMult_);
+            float want = enginePaused ? 0.0f : slewedEffective(speedEffMult_);
             if (fabs(cur - want) > EPS) {
                 if (engine::writeGameSpeedQuiet(gw, slewedEffective(speedEffMult_),
-                                                speedEffPaused_))
+                                                enginePaused))
                     speedLastApplied_ = speedLastSet_;
             }
         }
@@ -2785,6 +2796,17 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
         const TimePacket* jn = 0;
         for (std::deque<InboundTime>::iterator it = got.begin();
              it != got.end(); ++it) {
+#ifdef KENSHICOOP_NET_DIAG
+            if (it->ownerId < MAX_PLAYERS && it->pkt.readyLoadId != 0 &&
+                peerReadyLoadIds_[it->ownerId] != it->pkt.readyLoadId) {
+                peerReadyLoadIds_[it->ownerId] = it->pkt.readyLoadId;
+                char line[96];
+                _snprintf(line, sizeof(line) - 1,
+                          "[boot] READY<-join id=%u loadId=%u",
+                          (unsigned)it->ownerId, (unsigned)it->pkt.readyLoadId);
+                line[sizeof(line) - 1] = '\0'; coop::logLine(line);
+            }
+#endif
             if (timeSeqSeen_ != 0 && (long)(it->pkt.seq - timeSeqSeen_) <= 0)
                 continue;
             timeSeqSeen_ = it->pkt.seq;
@@ -2822,7 +2844,11 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                 timeSlew_ = newSlew;
                 if (slewChanged && speedLastSet_ > 0.01f) {
                     float want = slewedEffective(speedLastSet_);
-                    if (engine::writeGameSpeedQuiet(gw, want, false))
+                    bool pausedForBootstrap = false;
+#ifdef KENSHICOOP_NET_DIAG
+                    pausedForBootstrap = bootstrapHold_;
+#endif
+                    if (engine::writeGameSpeedQuiet(gw, want, pausedForBootstrap))
                         timeSlewApplied_ = want;
                 }
                 if (slewChanged || timeLastLogMs_ == 0 ||
@@ -2931,6 +2957,9 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
         mine.ownerId   = ownerId;
         mine.seq       = timeSeqOut_++;
         mine.gameHours = local;
+#ifdef KENSHICOOP_NET_DIAG
+        mine.readyLoadId = readyLoadIdOut_;
+#endif
         net.queueTime(mine);
     }
 }

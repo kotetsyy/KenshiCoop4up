@@ -261,6 +261,21 @@ void Replicator::applyTargets(GameWorld* gw) {
     // re-containers world NPCs) so it never hides a body we are driving.
     drivenChars_.clear();
     starveHeldNow_ = 0; // per-tick starved-hold census (stat line)
+#ifdef KENSHICOOP_NET_DIAG
+    // Bounded, read-only probe for the private turn-teleport investigation.
+    // A stream reversal can coincide with three different placements: the
+    // delayed interpolated pose, CharMovement::pos and the Havok/mesh body.
+    // Keep just the last direction per peer PC; no wire fields or traffic.
+    struct TurnProbe {
+        Key key;
+        bool used;
+        unsigned long seenMs, sourceStamp, directionMs, turnMs, nextLogMs;
+        float vx, vy, vz, mx, my, mz;
+        float priorMx, priorMy, priorMz;
+        unsigned int linesLeft;
+    };
+    static TurnProbe turns[32] = { 0 }; // main thread; bounded even with many PCs
+#endif
     // Own-squad positions, for scoping the smoothness/march oracles to the
     // historical near-bubble population (Phase 2). The mid tier drives bodies
     // far outside it, where Kenshi throttles offscreen character updates -
@@ -1818,6 +1833,76 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (segMs * 5 > moveHold) moveHold = segMs * 5; // survive sample droughts
         if (moveHold > 5000) moveHold = 5000;
         float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
+#ifdef KENSHICOOP_NET_DIAG
+        TurnProbe* turn = 0;
+        if (isSquad && haveNewest) {
+            unsigned int slot = 0;
+            for (unsigned int ti = 0; ti < sizeof(turns) / sizeof(turns[0]); ++ti) {
+                if (turns[ti].used &&
+                    turns[ti].key.t == it->first.t &&
+                    turns[ti].key.c == it->first.c &&
+                    turns[ti].key.cs == it->first.cs &&
+                    turns[ti].key.i == it->first.i &&
+                    turns[ti].key.s == it->first.s) {
+                    slot = ti; break;
+                }
+                if (!turns[ti].used ||
+                    (turns[slot].used && (now - turns[ti].seenMs) >
+                                         (now - turns[slot].seenMs))) slot = ti;
+            }
+            turn = &turns[slot];
+            if (!turn->used ||
+                turn->key.t != it->first.t || turn->key.c != it->first.c ||
+                turn->key.cs != it->first.cs || turn->key.i != it->first.i ||
+                turn->key.s != it->first.s) {
+                memset(turn, 0, sizeof(*turn));
+                turn->key = it->first;
+                turn->used = true;
+            }
+            turn->seenMs = now;
+            // lastArrivalMs is currently the mapped sender stamp in push(), not
+            // the packet's receipt time. Compare it only to detect a NEW segment.
+            unsigned long stamp = d.interp.lastArrivalMs();
+            if (stamp != turn->sourceStamp) {
+                float mlen = std::sqrt(newest.cMotionX * newest.cMotionX +
+                                       newest.cMotionY * newest.cMotionY +
+                                       newest.cMotionZ * newest.cMotionZ);
+                float oldMlen = std::sqrt(turn->mx * turn->mx + turn->my * turn->my +
+                                          turn->mz * turn->mz);
+                float oldVlen = std::sqrt(turn->vx * turn->vx + turn->vy * turn->vy +
+                                          turn->vz * turn->vz);
+                float motionDot = newest.cMotionX * turn->mx +
+                                  newest.cMotionY * turn->my +
+                                  newest.cMotionZ * turn->mz;
+                float velocityDot = vx * turn->vx + vy * turn->vy + vz * turn->vz;
+                bool reversed = (mlen > 0.1f && oldMlen > 0.1f &&
+                                 motionDot < -0.5f * mlen * oldMlen) ||
+                                (vlen > 8.0f && oldVlen > 8.0f &&
+                                 velocityDot < -0.5f * vlen * oldVlen);
+                if (reversed && newest.cSpeed > 8.0f &&
+                    turn->directionMs != 0 && (now - turn->directionMs) < 1000 &&
+                    (turn->turnMs == 0 || (now - turn->turnMs) >= 1500)) {
+                    turn->turnMs = now;
+                    turn->nextLogMs = now;
+                    turn->linesLeft = 6; // at most 600 ms / reversal
+                    turn->priorMx = turn->mx;
+                    turn->priorMy = turn->my;
+                    turn->priorMz = turn->mz;
+                }
+                if (mlen > 0.1f) {
+                    turn->mx = newest.cMotionX;
+                    turn->my = newest.cMotionY;
+                    turn->mz = newest.cMotionZ;
+                    turn->directionMs = now;
+                }
+                if (vlen > 8.0f) {
+                    turn->vx = vx; turn->vy = vy; turn->vz = vz;
+                    turn->directionMs = now;
+                }
+                turn->sourceStamp = stamp;
+            }
+        }
+#endif
         if (vlen > d.velPeak) d.velPeak = vlen;
         else                  d.velPeak *= 0.99f; // ~1 s half-life at 75 fps
         if (haveNewest && vlen > NPC_MOVE_VEL) d.moveSeenMs = now;
@@ -2169,6 +2254,21 @@ void Replicator::applyTargets(GameWorld* gw) {
             // builds speed (zeroFrac 0.388 -> 0.474 on leader_move). Waiting for a
             // metre of target movement is the hysteresis.
             bool sourceMoving = vlen > NPC_MOVE_VEL;
+#ifdef KENSHICOOP_NET_DIAG
+            static unsigned long turnWindowMs = 0;
+            static unsigned int turnWindowLines = 0;
+            if ((now - turnWindowMs) >= 1000) {
+                turnWindowMs = now;
+                turnWindowLines = 0;
+            }
+            bool turnLog = turn && turn->linesLeft != 0 &&
+                           (now - turn->turnMs) <= 600 &&
+                           now >= turn->nextLogMs && turnWindowLines < 8;
+            engine::DriveProbe turnBefore;
+            bool turnPreOk = turnLog && engine::readDriveProbe(c, &turnBefore);
+            float turnPreH = 0.0f;
+            if (turnLog) engine::readPose(c, 0, 0, 0, &turnPreH);
+#endif
             if (moved > REISSUE_DIST) {
                 float spd = out.cSpeed + gapNewest * catchupK_;
                 float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
@@ -2243,6 +2343,53 @@ void Replicator::applyTargets(GameWorld* gw) {
                 engine::applyPhysMotion(c, out.cMotionX, out.cMotionY, out.cMotionZ,
                                         out.cSpeed);
             }
+#ifdef KENSHICOOP_NET_DIAG
+            if (turnLog) {
+                engine::DriveProbe turnAfter;
+                bool postOk = engine::readDriveProbe(c, &turnAfter);
+                float postX = 0.0f, postY = 0.0f, postZ = 0.0f, postH = 0.0f;
+                bool poseOk = engine::readPose(c, &postX, &postY, &postZ, &postH);
+                char b[640];
+                _snprintf(b, sizeof(b) - 1,
+                    "[drive] turn hand=%u,%u dt=%lu mode=%d delay=%lu age=%lu "
+                    "reissue=%d halted=%d vis=%d raw=%.1f,%.1f,%.1f/%.2f "
+                    "latest=%.1f,%.1f,%.1f/%.2f srcV=%.1f,%.1f,%.1f "
+                    "mot=%.2f,%.2f,%.2f prior=%.2f,%.2f,%.2f "
+                    "pre=%d:%.1f,%.1f,%.1f/%.2f hk=%d:%.1f,%.1f,%.1f "
+                    "post=%d:%.1f,%.1f,%.1f/%.2f hk=%d:%.1f,%.1f,%.1f "
+                    "hkvel=%.1f,%.1f,%.1f moving=%d",
+                    out.hIndex, out.hSerial, now - turn->turnMs,
+                    d.interp.lastMode(), d.interp.lastDelayMs(),
+                    now - d.interp.lastArrivalMs(),
+                    moved > REISSUE_DIST ? 1 : 0, d.walkHalted ? 1 : 0,
+                    (d.visFollowMs != 0 && now < d.visFollowMs) ? 1 : 0,
+                    out.x, out.y, out.z, out.heading,
+                    newest.x, newest.y, newest.z, newest.heading,
+                    vx, vy, vz, out.cMotionX, out.cMotionY, out.cMotionZ,
+                    turn->priorMx, turn->priorMy, turn->priorMz,
+                    turnPreOk ? 1 : 0,
+                    turnPreOk ? turnBefore.mvX : ax,
+                    turnPreOk ? turnBefore.mvY : ay,
+                    turnPreOk ? turnBefore.mvZ : az, turnPreH,
+                    turnPreOk && turnBefore.haveHk ? 1 : 0,
+                    turnPreOk && turnBefore.haveHk ? turnBefore.hkX * 10.0f : 0.0f,
+                    turnPreOk && turnBefore.haveHk ? turnBefore.hkY * 10.0f : 0.0f,
+                    turnPreOk && turnBefore.haveHk ? turnBefore.hkZ * 10.0f : 0.0f,
+                    poseOk ? 1 : 0, postX, postY, postZ, postH,
+                    postOk && turnAfter.haveHk ? 1 : 0,
+                    postOk && turnAfter.haveHk ? turnAfter.hkX * 10.0f : 0.0f,
+                    postOk && turnAfter.haveHk ? turnAfter.hkY * 10.0f : 0.0f,
+                    postOk && turnAfter.haveHk ? turnAfter.hkZ * 10.0f : 0.0f,
+                    postOk && turnAfter.haveHk ? turnAfter.hkVelX * 10.0f : 0.0f,
+                    postOk && turnAfter.haveHk ? turnAfter.hkVelY * 10.0f : 0.0f,
+                    postOk && turnAfter.haveHk ? turnAfter.hkVelZ * 10.0f : 0.0f,
+                    postOk && turnAfter.curMoving ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                ++turnWindowLines;
+                --turn->linesLeft;
+                turn->nextLogMs = now + 100;
+            }
+#endif
             if (isSquad && haveActual) {
                 float step = d.haveActual ? dist3(ax, ay, az, d.lx, d.ly, d.lz) : 1.0f;
                 if (step < 0.25f && gapNewest > 6.0f)

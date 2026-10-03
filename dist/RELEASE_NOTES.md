@@ -1,113 +1,29 @@
-## Ники третьего игрока
+## Новое нативное окно совместной игры
 
-> **Протокол меняется: 58 → 59.** Со старой сборкой соединения не будет.
-> Обновиться должны **все**. При включённых обновлениях это произойдёт само.
+Раньше ввод и вставка были ограничены, UDP-порт терялся при смене роли, а часть диагностики не помещалась в окно. В F2 теперь полноценные редактируемые поля и две колонки в оформлении Kenshi.
 
-Втроём каждый клиент видел только два ника — хоста и свой. Третий игрок стоял
-безымянным. В логах видно ровно это:
+- Ник и адрес: кириллица, выделение, редактирование, Ctrl+V и Tab; игровые клавиши отключены, пока поле в фокусе.
+- Хост/клиент и Steam/прямой IP — отдельные равноправные переключатели. Основное действие выделено; неверные значения объясняются рядом с полем.
+- Справа — реальные этапы подключения, прогресс передачи мира и игроки. Диагностика свёрнута, полный отчёт копируется отдельно. Ошибки обновления не подменяют состояние соединения.
+- UDP-порт сохраняется при смене роли. Слишком длинная вставка отклоняется, а не обрезается молча. F2/Esc работают только в активной копии игры и не отключают сеть.
+- Интерфейс вынесен в `KenshiCoopUI.dll`; сеть и состояние мира остаются в `KenshiCoop.dll`. Убрана повторная регистрация панели у владельца GUI, приводившая к двойному удалению.
 
-```
-хост:      [nick] applied id=0 'kotetsy'
-           [nick] applied id=1 'qweqweq'
-           [nick] applied id=2 'matiga'
+**Установка:** скачайте `KenshiCoop-kit.zip` и перенесите папку `KenshiCoop` в `mods` при закрытой игре. При ручном обновлении заменяйте **обе DLL из одной сборки**. Со старой сборки, в которой была только одна DLL, предпочтительна ручная установка пары: старый автообновлятор загружает только основной плагин; новый плагин доставит отсутствующую UI при следующей проверке, после чего потребуется ещё один перезапуск.
 
-клиент 1:  [nick] applied id=1 'qweqweq'      <- и всё
-клиент 2:  [nick] applied id=2 'matiga'       <- и всё
-```
+**Проверка:** публичная Release-пара собрана с v100; `prototest` — 566/566. Новый F2 открыт в настоящей игре с версией v0.1.21. Общий интерфейс ранее проверен при 1280×720 и 1920×1080; приватная диагностическая пара передавала мир и повторно доходила до READY (`badCrc=0`). Эта проверка не означает проверенного Steam P2P между двумя аккаунтами. Публичная и приватная диагностическая сборки не совместимы между собой.
 
-Причина простая до обидного. Ник едет в двух пакетах: при подключении клиент
-сообщает своё имя хосту, а хост в ответ сообщает своё. **Для двоих это весь
-список.** Для троих — нет: клиент 1 и клиент 2 между собой не обмениваются ничем,
-и о существовании чужого имени ни один из них не узнаёт никогда.
+**Осталось:** выход через WM_CLOSE давал `0xC0000409` со стеком `RE_Kenshi.dll+0x381e9`, в том числе без UI DLL. RE_Kenshi не изменён; этот сбой не объявляется исправленным. Горячей замены DLL нет; прирост FPS не обещается.
 
-Всё остальное про третьего игрока при этом уже доходит — я проверил по логам:
-клиент 1 ведёт отряд игрока 2, применяет его инвентарь (`items=12`), получает его
-характеристики (29 пакетов) и события. Не хватало **только имени**.
+Соответствующие исходники этой сборки по AGPL-3.0 находятся в `KenshiCoop-source.zip` этого релиза.
 
-Теперь хост рассылает всем таблицу имён целиком, при изменении и раз в десять
-секунд на подстраховку. Подключившийся позже сразу узнаёт тех, кто уже играет.
-Одна строка на всю таблицу, а не по строке на игрока: список крошечный, а половина
-таблицы — это состояние, которого лучше не бывает.
+<details><summary>English</summary>
 
-В лог добавлены строки `[nick] roster` (хост) и `roster id=` (клиент).
+The native two-column F2 panel now supports editable Cyrillic nicknames and addresses, selection, editing, Ctrl+V and Tab, with game hotkeys suppressed during input. It shows real connection/world-transfer stages, players, collapsed diagnostics, a complete copy-report and a separate updater section. The UDP port survives role changes; oversized paste is rejected. F2/Esc affect only the foreground game and never disconnect.
 
-### Почему пришлось менять протокол
+Install the KenshiCoop folder from KenshiCoop-kit.zip into mods while the game is closed. Always replace both KenshiCoop.dll and KenshiCoopUI.dll together. For a first upgrade from a core-only release, manual installation of both is recommended: the old updater downloads only the core; the new core repairs the missing UI on its next check and requires another restart.
 
-Подходящего канала не было: ни один пакет не возит сведения об игроках всем
-сразу. Правило в проекте — не заводить новые типы пакетов, пока не доказано, что
-без них никак. Здесь доказано логом: место, куда клиент кладёт чужое имя, у
-третьего игрока пустует всю сессию.
+The public v100 Release pair builds successfully; prototest passes 566/566. The v0.1.21 F2 panel was opened in the real game. Earlier shared-UI verification covered both resolutions and real/repeated world transfer with the private diagnostic pair. Two-account Steam P2P was not exercised; public and private diagnostic builds cannot connect to each other.
 
-Заодно `prototest` вырос с 562 до 567 проверок — новый пакет закрыт тестами на
-номер, на отсутствие коллизии и на разбор имени предельной длины.
-
-### Что осталось
-
-Живой торговец по-прежнему не реплицируется как таковой, рагдолл всё ещё может
-улететь. Не тронуто.
-
-### Установка
-
-При включённых обновлениях апдейтер подтянет сам. Иначе при закрытой игре
-положите три файла в `<Kenshi>\mods\KenshiCoop\`. Нужны Kenshi 1.0.65 и
-[RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
-
-<details>
-<summary>🇬🇧 English</summary>
-
-## The third player's name
-
-> **Protocol changes: 58 -> 59.** An older build will not connect. **Everyone**
-> must update. With updates on this happens by itself.
-
-With three players, each client saw only two names — the host's and its own. The
-third player stood there unnamed. The logs show exactly that:
-
-```
-host:      [nick] applied id=0 'kotetsy'
-           [nick] applied id=1 'qweqweq'
-           [nick] applied id=2 'matiga'
-
-client 1:  [nick] applied id=1 'qweqweq'      <- that's all
-client 2:  [nick] applied id=2 'matiga'       <- that's all
-```
-
-The cause is almost embarrassingly simple. A name travels in two packets: on
-connect a client tells the host its name, and the host replies with its own.
-**For two players that is the entire roster.** For three it is not: client 1 and
-client 2 exchange nothing with each other, so neither ever learns the other's
-name.
-
-Everything else about the third player already arrives — I checked it in the logs:
-client 1 drives player 2's squad, applies their inventory (`items=12`), receives
-their stats (29 packets) and their events. Only the name was missing.
-
-The host now broadcasts the whole name table, on change and every ten seconds as a
-backstop, so a player who connects later immediately learns who is already
-playing. One row for the entire table rather than a row per player: the list is
-tiny, and half a table is the worst state to be in.
-
-New log lines: `[nick] roster` (host) and `roster id=` (client).
-
-### Why the protocol had to change
-
-There was no suitable channel: no existing packet carries per-player information
-to everyone. The project rule is not to add packet types until it is proven
-necessary. The log proves it here — the slot where a client stores another
-player's name sits empty for the whole session on the third player.
-
-`prototest` also grew from 562 to 567 checks: the new packet is covered for its
-tag, for tag collisions, and for parsing a maximum-length name.
-
-### Still open
-
-A living trader is still not replicated as such, and the ragdoll can still fly
-off. Untouched.
-
-### Install
-
-With updates on, the updater fetches it. Otherwise, with the game closed, drop the
-three files into `<Kenshi>\mods\KenshiCoop\`. Requires Kenshi 1.0.65 and
-[RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847).
+Known limitation: WM_CLOSE produced 0xC0000409 with RE_Kenshi.dll+0x381e9 in the stack, including without a UI DLL. RE_Kenshi is unchanged; this failure is not claimed fixed. No hot reload or FPS gain is promised. Corresponding AGPL-3.0 sources are provided in KenshiCoop-source.zip.
 
 </details>

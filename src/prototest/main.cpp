@@ -102,7 +102,11 @@ static void testSizes() {
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
     CHECK_EQ("sizeof(MoneyDeltaPacket)",        sizeof(MoneyDeltaPacket),        13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
+#ifdef KENSHICOOP_NET_DIAG
+    CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              21);
+#else
     CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              17);
+#endif
     CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              31);
     CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),        94);
     CHECK_EQ("sizeof(BuildStatePacket)",        sizeof(BuildStatePacket),        34);
@@ -134,6 +138,11 @@ static void testSizes() {
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX_STEAM * sizeof(EntityState) <= 1150);
     CHECK("steam cap under hard receive bound",
           ENTITY_BATCH_MAX_STEAM <= ENTITY_BATCH_MAX);
+#ifdef KENSHICOOP_NET_DIAG
+    CHECK_EQ("sizeof(DebugLogFileHeader)", sizeof(DebugLogFileHeader), 11);
+    CHECK("private log chunk fits clamped Steam MTU",
+          sizeof(DebugLogFileHeader) + DEBUG_LOG_CHUNK_MAX <= 1150);
+#endif
     CHECK("world-item batch fits datagram",
           sizeof(WorldItemSnapshotHeader) + WORLD_ITEMS_MAX * sizeof(WorldItemEntry) <= 1400);
 
@@ -315,8 +324,11 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v59: player roster)",
-             (int)PROTOCOL_VERSION, 59);
+#ifdef KENSHICOOP_NET_DIAG
+    CHECK_EQ("PROTOCOL_VERSION (private log mirror)", (int)PROTOCOL_VERSION, 63);
+#else
+    CHECK_EQ("PROTOCOL_VERSION (v59: player roster)", (int)PROTOCOL_VERSION, 59);
+#endif
     // Protocol 56 (v59): the roster table. One row carries EVERY name, so a
     // receiver can never be handed half a table, and the tag must not collide
     // with the fixture row that preceded it.
@@ -933,6 +945,71 @@ static void testSaveXferRoundTrip() {
     }
     CHECK("xfer failed commit discards staging",
           GetFileAttributesA(staging.c_str()) == INVALID_FILE_ATTRIBUTES);
+
+    // 3) FILE and DONE arriving together after an earlier receive pass must
+    // commit both files; no DONE may be applied ahead of a preceding FILE.
+    Inbound inbound;
+    SaveBeginPacket begin;
+    std::memset(&begin, 0, sizeof(begin));
+    begin.type = (u8)PKT_SAVE_BEGIN;
+    begin.xferId = 3;
+    std::strcpy(begin.name, "late");
+    begin.fileCount = 2;
+    begin.totalBytes = quick.size() + zone.size();
+    inbound.pushSaveBegin(1, begin);
+    SaveFileHeader file;
+    std::memset(&file, 0, sizeof(file));
+    file.type = (u8)PKT_SAVE_FILE;
+    file.xferId = 3;
+    file.pathLen = (u16)std::strlen(srcs[0].rel);
+    file.dataLen = SAVE_CHUNK_MAX;
+    inbound.pushSaveFile(1, file, srcs[0].rel, &quick[0]);
+
+    std::deque<InboundSaveBegin> begins;
+    std::deque<InboundSaveFile> files;
+    std::deque<InboundSaveDone> dones;
+    inbound.drainSaveTransfer(begins, files, dones);
+    savexfer::onSaveBegin(begins.front().pkt);
+    savexfer::onSaveFile(files.front().hdr, files.front().path.c_str(),
+                         &files.front().data[0]);
+    begins.clear();
+    files.clear();
+
+    file.offset = SAVE_CHUNK_MAX;
+    file.dataLen = (u16)(quick.size() - SAVE_CHUNK_MAX);
+    inbound.pushSaveFile(1, file, srcs[0].rel, &quick[SAVE_CHUNK_MAX]);
+    file.fileIdx = 1;
+    file.pathLen = (u16)std::strlen(srcs[2].rel);
+    file.offset = 0;
+    file.dataLen = (u16)zone.size();
+    inbound.pushSaveFile(1, file, srcs[2].rel, &zone[0]);
+    u32 expected[2] = {
+        fnv1aUpdate(fnv1aInit(), &quick[0], (unsigned)quick.size()),
+        fnv1aUpdate(fnv1aInit(), &zone[0], (unsigned)zone.size())
+    };
+    SaveDoneHeader done;
+    std::memset(&done, 0, sizeof(done));
+    done.type = (u8)PKT_SAVE_DONE;
+    done.xferId = 3;
+    done.fileCount = 2;
+    inbound.pushSaveDone(1, done, expected);
+    inbound.drainSaveTransfer(begins, files, dones);
+    for (std::deque<InboundSaveFile>::iterator it = files.begin();
+         it != files.end(); ++it)
+        savexfer::onSaveFile(it->hdr, it->path.c_str(), &it->data[0]);
+    u16 committedFiles = 0;
+    unsigned __int64 committedBytes = 0;
+    int lateResult = savexfer::onSaveDone(dones.front().hdr, &dones.front().crcs[0],
+                                          &committedFiles, &committedBytes);
+    std::vector<unsigned char> committedQuick, committedZone;
+    bool quickOk = xferReadWhole(savexfer::saveFolderFor("late") + "\\quick.save",
+                                  &committedQuick);
+    bool zoneOk = xferReadWhole(savexfer::saveFolderFor("late") + "\\" + srcs[2].rel,
+                                 &committedZone);
+    CHECK("xfer late FILEs before DONE commit full files",
+          lateResult == 1 && committedFiles == 2 &&
+          committedBytes == quick.size() + zone.size() &&
+          quickOk && committedQuick == quick && zoneOk && committedZone == zone);
 
     savexfer::setSaveRootForTest(std::string()); // unpin
     xferNukeDir(rootStr);
@@ -1665,9 +1742,12 @@ static void testFlushWorldStateContract() {
     { std::deque<u32> out; in.drainLeaves(out);
       CHECK("session-preserving kept: leave", out.size() == 1); }
     SP_KEPT("saveReq",   InboundSaveReq,   drainSaveReqs);
-    SP_KEPT("saveBegin", InboundSaveBegin, drainSaveBegins);
-    SP_KEPT("saveFile",  InboundSaveFile,  drainSaveFiles);
-    SP_KEPT("saveDone",  InboundSaveDone,  drainSaveDones);
+    { std::deque<InboundSaveBegin> begins;
+      std::deque<InboundSaveFile> files;
+      std::deque<InboundSaveDone> dones;
+      in.drainSaveTransfer(begins, files, dones);
+      CHECK("session-preserving kept: save transfer",
+            begins.size() == 1 && files.size() == 1 && dones.size() == 1); }
     SP_KEPT("saveAck",   InboundSaveAck,   drainSaveAcks);
     SP_KEPT("loadGo",    InboundLoadGo,    drainLoadGos);
     SP_KEPT("loadReq",   InboundLoadReq,   drainLoadReqs);

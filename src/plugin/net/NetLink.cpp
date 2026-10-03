@@ -12,7 +12,12 @@
 namespace coop {
 
 namespace {
-const int        TICK_MS       = 50; // 20 Hz service/transmit cadence
+#ifdef KENSHICOOP_NET_DIAG
+const int        TICK_MS        = 2;  // private experiment: 2 ms max idle ENet wait
+#else
+const int        TICK_MS        = 5;
+#endif
+const DWORD      ENTITY_SEND_MS = 50; // owned-entity snapshots retain their 20 Hz cadence
 // Traffic-class channels (protocol 44). ENet guarantees ordering + reliable
 // retransmit PER channel, so head-of-line blocking is per channel too. The bulk
 // coordinated save/load transfer (multi-MB, dozens of ~4 KB reliable fragments)
@@ -76,6 +81,18 @@ void pushLocked(CRITICAL_SECTION& cs, std::vector<T>& q, const T& v) {
     q.push_back(v);
     LeaveCriticalSection(&cs);
 }
+// The ENet counters are 32-bit monotonic values: subtraction is modulo 2^32.
+DWORD diagnosticRate(enet_uint32 current, enet_uint32 previous, DWORD elapsedMs) {
+    const enet_uint32 delta = current - previous;
+    const unsigned __int64 perSecond =
+        (unsigned __int64)delta * 1000ULL / elapsedMs;
+    return perSecond > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (DWORD)perSecond;
+}
+
+DWORD diagnosticDword(unsigned __int64 value) {
+    return value > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (DWORD)value;
+}
+
 } // namespace
 
 NetLink::NetLink()
@@ -84,16 +101,25 @@ NetLink::NetLink()
       outOwner_(0), outStampMs_(0), haveOut_(false),
       thread_(0), running_(0), stopFlag_(0), myId_(0),
       sendEpoch_(0),
-      steamMode_(false), steamPeer_(0),
+      steamMode_(false),
       simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
     InitializeCriticalSection(&outCs_);
     InitializeCriticalSection(&nameCs_);
+    InitializeCriticalSection(&debugCs_);
+    InitializeCriticalSection(&statusCs_);
+    memset(&debugStats_, 0, sizeof(debugStats_));
+    memset(&status_, 0, sizeof(status_));
+    status_.phase     = NET_IDLE;
+    status_.requested = NET_TRANSPORT_NONE;
+    status_.active    = NET_TRANSPORT_NONE;
     memset(localName_, 0, sizeof(localName_));
     memset(peerName_, 0, sizeof(peerName_));
 }
 
 NetLink::~NetLink() {
     stop();
+    DeleteCriticalSection(&statusCs_);
+    DeleteCriticalSection(&debugCs_);
     DeleteCriticalSection(&nameCs_);
     DeleteCriticalSection(&outCs_);
 }
@@ -129,21 +155,119 @@ bool NetLink::copyPeerName(u32 id, char* out, unsigned cap) const {
     return have;
 }
 
-bool NetLink::startHost(int port, Inbound* inbound) {
+void NetLink::copyDebugStats(NetDebugStats* out) const {
+    if (!out) return;
+    EnterCriticalSection(&debugCs_);
+    *out = debugStats_;
+    LeaveCriticalSection(&debugCs_);
+}
+
+void NetLink::clearDebugStats() {
+    EnterCriticalSection(&debugCs_);
+    memset(&debugStats_, 0, sizeof(debugStats_));
+    LeaveCriticalSection(&debugCs_);
+}
+
+void NetLink::copyStatus(NetStatus* out) const {
+    if (!out) return;
+    EnterCriticalSection(&statusCs_);
+    *out = status_;
+    LeaveCriticalSection(&statusCs_);
+}
+
+void NetLink::setPhase(NetPhase p) {
+    EnterCriticalSection(&statusCs_);
+    if (status_.phase != p) {
+        status_.phase = p;
+        status_.phaseSinceTick = GetTickCount();
+    }
+    LeaveCriticalSection(&statusCs_);
+}
+
+void NetLink::setActiveTransport(NetTransport t) {
+    EnterCriticalSection(&statusCs_);
+    status_.active = t;
+    LeaveCriticalSection(&statusCs_);
+}
+
+void NetLink::setError(NetError e, u32 arg, const char* raw) {
+    EnterCriticalSection(&statusCs_);
+    status_.error    = e;
+    status_.errorArg = arg;
+    memset(status_.errorRaw, 0, sizeof(status_.errorRaw));
+    if (raw) strncpy(status_.errorRaw, raw, sizeof(status_.errorRaw) - 1);
+    LeaveCriticalSection(&statusCs_);
+}
+
+void NetLink::setMemberBit(u32 id, bool on) {
+    if (id >= MAX_PLAYERS) return;
+    EnterCriticalSection(&statusCs_);
+    if (on) status_.memberMask |= (1u << id);
+    else    status_.memberMask &= ~(1u << id);
+    LeaveCriticalSection(&statusCs_);
+}
+
+void NetLink::setMembers(u32 mask) {
+    EnterCriticalSection(&statusCs_);
+    status_.memberMask = mask;
+    LeaveCriticalSection(&statusCs_);
+}
+
+void NetLink::setHandshakeCounts(u32 connectAttempts, u32 pendingHandshakes) {
+    EnterCriticalSection(&statusCs_);
+    status_.connectAttempts   = connectAttempts;
+    status_.pendingHandshakes = pendingHandshakes;
+    LeaveCriticalSection(&statusCs_);
+}
+
+bool NetLink::startHost(int port, Inbound* inbound, NetTransport transport) {
+    stop(); // reap any previous worker, live or already exited on a failure
     isHost_ = true; port_ = port; inbound_ = inbound; myId_ = 0;
+    steamMode_ = (transport == NET_TRANSPORT_STEAM);
     return launchThread();
 }
 
-bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound) {
+bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound,
+                          NetTransport transport) {
+    stop(); // also restarts the NET_DIAG join-log mirror from byte zero
     isHost_ = false; ip_ = ip; port_ = port; inbound_ = inbound; myId_ = 0;
+    steamMode_ = (transport == NET_TRANSPORT_STEAM);
     return launchThread();
 }
 
 bool NetLink::launchThread() {
-    if (enet_initialize() != 0) { netErr("enet_initialize failed"); return false; }
+    clearDebugStats();
+    EnterCriticalSection(&statusCs_);
+    memset(&status_, 0, sizeof(status_));
+    status_.phase          = NET_STARTING;
+    status_.host           = isHost_;
+    status_.requested      = steamMode_ ? NET_TRANSPORT_STEAM : NET_TRANSPORT_UDP;
+    status_.active         = NET_TRANSPORT_NONE;
+    status_.phaseSinceTick = GetTickCount();
+    LeaveCriticalSection(&statusCs_);
+    if (enet_initialize() != 0) {
+        netErr("enet_initialize failed");
+        setError(NET_ERR_ENET_INIT, 0, "enet_initialize failed");
+        setPhase(NET_FAILED);
+        return false;
+    }
     stopFlag_ = 0;
+    // Busy from the accepted launch, not from the worker's first instruction:
+    // the UI must never see an idle gap between Connect and the thread start.
+    InterlockedExchange(&running_, 1);
     thread_ = CreateThread(0, 0, &NetLink::threadEntry, this, 0, 0);
-    if (thread_ == 0) { netErr("CreateThread failed"); enet_deinitialize(); return false; }
+    if (thread_ == 0) {
+        const DWORD gle = GetLastError();
+        InterlockedExchange(&running_, 0);
+        netErr("CreateThread failed");
+        enet_deinitialize();
+        char raw[64];
+        _snprintf(raw, sizeof(raw) - 1, "CreateThread failed (GetLastError=%lu)", gle);
+        raw[sizeof(raw) - 1] = '\0';
+        setError(NET_ERR_THREAD, (u32)gle, raw);
+        setPhase(NET_FAILED);
+        return false;
+    }
     return true;
 }
 
@@ -154,9 +278,11 @@ void NetLink::stop() {
         // removal at the end of threadLoop). Deinitializing ENet or closing the
         // thread handle while the worker is still inside enet_host_service is a
         // use-after-free / double-free, so we MUST wait for it to fully exit
-        // before tearing anything down. The loop services at TICK_MS (50 ms) and
-        // checks stopFlag_ each pass, so a clean exit is prompt; if it somehow
+        // before tearing anything down. Service waits at most TICK_MS when
+        // idle and checks stopFlag_ each pass, so a clean exit is prompt; if it
         // stalls we keep waiting rather than pulling the rug out from under it.
+        // A worker that already exited on a startup failure returns at once, so
+        // this is also where a failed attempt's handle is reaped.
         DWORD wr = WaitForSingleObject(thread_, 5000);
         if (wr != WAIT_OBJECT_0) {
             netErr("net worker still running after 5s; waiting for clean exit "
@@ -167,6 +293,25 @@ void NetLink::stop() {
         thread_ = 0;
         enet_deinitialize();
     }
+    InterlockedExchange(&running_, 0);
+#ifdef KENSHICOOP_NET_DIAG
+    coop::logMirrorCapture(false);
+#endif
+    clearDebugStats();
+    // Names learned in the stopped session are not players of the next one.
+    EnterCriticalSection(&nameCs_);
+    memset(peerName_, 0, sizeof(peerName_));
+    LeaveCriticalSection(&nameCs_);
+    EnterCriticalSection(&statusCs_);
+    const bool host = status_.host;
+    const NetTransport requested = status_.requested;
+    memset(&status_, 0, sizeof(status_));
+    status_.phase          = NET_IDLE;
+    status_.host           = host;
+    status_.requested      = requested;
+    status_.active         = NET_TRANSPORT_NONE;
+    status_.phaseSinceTick = GetTickCount();
+    LeaveCriticalSection(&statusCs_);
 }
 
 void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int count) {
@@ -262,7 +407,6 @@ void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pk
 
 void NetLink::queueFixture(const FixturePacket& pkt) { pushLocked(outCs_, outFixture_, pkt); }
 
-void NetLink::queueRoster(const RosterPacket& pkt) { pushLocked(outCs_, outRoster_, pkt); }
 
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
@@ -324,11 +468,6 @@ void NetLink::setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned in
     simLossPct_  = (lossPct > 100) ? 100 : lossPct;
 }
 
-void NetLink::setSteamTransport(unsigned long long peerSteamId) {
-    steamPeer_ = peerSteamId;
-    steamMode_ = true;
-}
-
 bool NetLink::shouldRelayType(u8 type) {
     // Host-only / handshake / per-peer RTT: never rebroadcast.
     switch (type) {
@@ -344,6 +483,9 @@ bool NetLink::shouldRelayType(u8 type) {
         case PKT_SPAWN_REQ:
         case PKT_COMBAT_HIT:
         case PKT_SPEED_REQ:
+#ifdef KENSHICOOP_NET_DIAG
+        case PKT_DEBUG_LOG_FILE:
+#endif
             return false;
         default:
             return true;
@@ -428,20 +570,33 @@ DWORD WINAPI NetLink::threadEntry(LPVOID self) {
 }
 
 void NetLink::threadLoop() {
-    InterlockedExchange(&running_, 1);
+    // running_ was raised by launchThread (the accepted launch); this worker
+    // lowers it on every exit path below.
 
     // Steam P2P transport: redirect ENet's socket layer through the Steam tunnel
     // BEFORE the host is created (the fake socket is handed out at create time).
     // The tunnel is addressless; ENet still needs an ENetAddress for its peer
-    // routing, so both sides use the fabricated "1.0.0.1:port".
+    // routing, so both sides use the fabricated "1.0.0.1:port". A tunnel that
+    // will not install FAILS the start: carrying on would send the fabricated
+    // Steam endpoint over plain UDP while the player believes Steam is in use.
     const bool steam = steamMode_;
     if (steam) {
-        if (steamp2p::installEnetHooks(port_)) {
-            netLog("transport=steam (ENet tunnelled over Steam P2P)");
-        } else {
-            netErr("steam transport requested but hooks failed; falling back to UDP");
+        if (!steamp2p::installEnetHooks(port_)) {
+            netErr("steam transport requested but hooks failed; not starting (no UDP fallback)");
+            setError(NET_ERR_STEAM_TUNNEL, 0, "steamp2p::installEnetHooks failed");
+            setPhase(NET_FAILED);
+            InterlockedExchange(&running_, 0);
+            return;
         }
+        netLog("transport=steam (ENet tunnelled over Steam P2P)");
     }
+    const NetTransport actual = steam ? NET_TRANSPORT_STEAM : NET_TRANSPORT_UDP;
+
+    // Join handshake facts for the status snapshot (net-thread locals).
+    u32  connectAttempts = 0;
+    bool linkUp          = false; // ENet CONNECT seen on the current attempt
+    bool linkWelcomed    = false; // WELCOME accepted on the current link
+    bool everWelcomed    = false; // WELCOME accepted at any point in this start
 
     if (isHost_) {
         ENetAddress addr;
@@ -449,18 +604,65 @@ void NetLink::threadLoop() {
         addr.port = (enet_uint16)port_;
         enetHost_ = enet_host_create(&addr, (size_t)MAX_PLAYERS /*peers*/,
                                      CH_COUNT /*channels*/, 0, 0);
-        if (!enetHost_) { netErr("host create failed"); InterlockedExchange(&running_, 0); return; }
+        if (!enetHost_) {
+            const int wsa = WSAGetLastError();
+            netErr("host create failed");
+            char raw[128];
+            _snprintf(raw, sizeof(raw) - 1,
+                      "enet_host_create(listen port %d) failed, WSAGetLastError=%d",
+                      port_, wsa);
+            raw[sizeof(raw) - 1] = '\0';
+            setError(steam ? NET_ERR_SOCKET : NET_ERR_BIND, (u32)port_, raw);
+            setPhase(NET_FAILED);
+            if (steam) steamp2p::removeEnetHooks();
+            InterlockedExchange(&running_, 0);
+            return;
+        }
+        setActiveTransport(actual);
+        setMembers(1u); // the host itself (id 0)
+        setPhase(NET_LISTENING);
         netLog("hosting");
     } else {
-        enetHost_ = enet_host_create(0, 1, CH_COUNT, 0, 0);
-        if (!enetHost_) { netErr("client create failed"); InterlockedExchange(&running_, 0); return; }
         ENetAddress addr;
-        if (steam) enet_address_set_host_ip(&addr, "1.0.0.1");
-        else       enet_address_set_host(&addr, ip_.c_str());
+        if (steam) {
+            enet_address_set_host_ip(&addr, "1.0.0.1");
+        } else if (enet_address_set_host(&addr, ip_.c_str()) != 0) {
+            netErr("host address did not resolve");
+            char raw[128];
+            _snprintf(raw, sizeof(raw) - 1, "enet_address_set_host('%s') failed",
+                      ip_.c_str());
+            raw[sizeof(raw) - 1] = '\0';
+            setError(NET_ERR_RESOLVE, 0, raw);
+            setPhase(NET_FAILED);
+            InterlockedExchange(&running_, 0);
+            return;
+        }
         addr.port = (enet_uint16)port_;
+        enetHost_ = enet_host_create(0, 1, CH_COUNT, 0, 0);
+        if (!enetHost_) {
+            const int wsa = WSAGetLastError();
+            netErr("client create failed");
+            char raw[96];
+            _snprintf(raw, sizeof(raw) - 1,
+                      "enet_host_create(client) failed, WSAGetLastError=%d", wsa);
+            raw[sizeof(raw) - 1] = '\0';
+            setError(NET_ERR_SOCKET, 0, raw);
+            setPhase(NET_FAILED);
+            if (steam) steamp2p::removeEnetHooks();
+            InterlockedExchange(&running_, 0);
+            return;
+        }
+        setActiveTransport(actual);
         serverPeer_ = enet_host_connect(enetHost_, &addr, CH_COUNT, 0);
-        if (!serverPeer_) netErr("connect failed");
-        else              netLog("connecting");
+        ++connectAttempts;
+        if (!serverPeer_) {
+            netErr("connect failed");
+            setError(NET_ERR_CONNECT_ALLOC, 0, "enet_host_connect returned no peer");
+        } else {
+            netLog("connecting");
+        }
+        setHandshakeCounts(connectAttempts, 0);
+        setPhase(NET_CONNECTING);
     }
 
     // Steam's unreliable P2P packets cap at 1200 bytes; clamp the MTU so every
@@ -472,6 +674,18 @@ void NetLink::threadLoop() {
     }
 
     DWORD lastConnectAttempt = GetTickCount();
+    // ENet host counters are owned by this thread. Rebase after the first
+    // service pass and on peer edges; never mix rates across reconnects.
+    bool diagReset = true;
+    DWORD lastDiagTick = 0;
+    enet_uint32 lastSentData = 0, lastReceivedData = 0;
+    enet_uint32 lastSentPackets = 0, lastReceivedPackets = 0;
+#ifdef KENSHICOOP_NET_DIAG
+    DWORD servicePasses = 0;
+    DWORD mirrorWindow = GetTickCount();
+    unsigned mirrorSent = 0;
+    bool mirrorFault[MAX_PLAYERS] = { false };
+#endif
 
     // Wall-clock time-sync state (client only). The join pings every ~2 s; each
     // pong yields an (rtt, offset) sample; the minimum-RTT sample wins (NTP
@@ -485,7 +699,18 @@ void NetLink::threadLoop() {
     unsigned int  syncSamples   = 0;
     const long    HALF_DAY_MS   = 12l * 3600l * 1000l;
 
+    DWORD lastEntitySendTick = 0;
+    bool haveEntitySendTick = false;
+    bool forceEntitySend = true;
+    DWORD rosterAt = 0;
+    bool rosterChanged = true;
+    unsigned char lastRoster[sizeof(RosterPacket) + 1] = {0};
+
+
     while (!stopFlag_) {
+#ifdef KENSHICOOP_NET_DIAG
+        ++servicePasses;
+#endif
         // Steam heartbeat: spike ping/echo + session-state change logging.
         // Cheap no-op when Steam isn't initialised (pure-UDP sessions).
         steamp2p::tick();
@@ -502,12 +727,30 @@ void NetLink::threadLoop() {
                 lastConnectAttempt = now;
                 if (serverPeer_) { enet_peer_reset(serverPeer_); serverPeer_ = 0; }
                 ENetAddress addr;
+                bool resolved = true;
                 if (steam) enet_address_set_host_ip(&addr, "1.0.0.1");
-                else       enet_address_set_host(&addr, ip_.c_str());
-                addr.port = (enet_uint16)port_;
-                serverPeer_ = enet_host_connect(enetHost_, &addr, CH_COUNT, 0);
-                if (steam && serverPeer_) serverPeer_->mtu = 1200;
-                netLog(serverPeer_ ? "reconnecting" : "reconnect failed");
+                else       resolved = enet_address_set_host(&addr, ip_.c_str()) == 0;
+                if (resolved) {
+                    addr.port = (enet_uint16)port_;
+                    serverPeer_ = enet_host_connect(enetHost_, &addr, CH_COUNT, 0);
+                    ++connectAttempts;
+                    if (steam && serverPeer_) serverPeer_->mtu = 1200;
+                    if (!serverPeer_)
+                        setError(NET_ERR_CONNECT_ALLOC, 0, "enet_host_connect returned no peer");
+                    netLog(serverPeer_ ? "reconnecting" : "reconnect failed");
+                } else {
+                    // A name that resolved at start may stop resolving (DNS /
+                    // network change); keep retrying, never connect to garbage.
+                    char raw[128];
+                    _snprintf(raw, sizeof(raw) - 1, "enet_address_set_host('%s') failed",
+                              ip_.c_str());
+                    raw[sizeof(raw) - 1] = '\0';
+                    setError(NET_ERR_RESOLVE, 0, raw);
+                    netErr("reconnect failed: host address did not resolve");
+                }
+                setHandshakeCounts(connectAttempts, 0);
+                diagReset = true;
+                clearDebugStats();
             }
         }
 
@@ -515,6 +758,9 @@ void NetLink::threadLoop() {
         while (enet_host_service(enetHost_, &ev, TICK_MS) > 0) {
             switch (ev.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
+                    forceEntitySend = true; // the first owned snapshot after CONNECT must not wait
+                    diagReset = true;
+                    clearDebugStats();
                     // Do NOT wipe epochSeen_ for every other peer: a third join
                     // connecting used to reset join-1's epoch gate and admit
                     // stale batches. Per-owner erase happens on HELLO assign.
@@ -538,6 +784,9 @@ void NetLink::threadLoop() {
                                                              ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send(ev.peer, CH_RELIABLE, out);
                         netLog("connected to host; sent HELLO");
+                        linkUp = true;
+                        linkWelcomed = false;
+                        setPhase(NET_HANDSHAKING);
                     }
                     break;
                 }
@@ -553,6 +802,7 @@ void NetLink::threadLoop() {
                                           (unsigned)h.version, (unsigned)PROTOCOL_VERSION);
                                 b[sizeof(b) - 1] = '\0';
                                 netErr(b);
+                                setError(NET_ERR_PEER_VERSION, (u32)h.version, b);
                                 enet_peer_disconnect(ev.peer, 0);
                             } else {
                                 // LOWEST FREE id, not a monotonic counter. A join
@@ -584,6 +834,8 @@ void NetLink::threadLoop() {
                                 if (id == 0) id = (u32)MAX_JOINS + 1; // forces the reject below
                                 if (id > MAX_JOINS) {
                                     netErr("server full (max 4 players: host + 3 joins); rejecting");
+                                    setError(NET_ERR_SERVER_FULL, 0,
+                                             "server full (host + 3 joins); rejected a HELLO");
                                     enet_peer_disconnect(ev.peer, 0);
                                 } else {
                                     epochSeen_.erase(id);
@@ -631,6 +883,9 @@ void NetLink::threadLoop() {
                                     b[sizeof(b) - 1] = '\0';
                                     netLog(b);
                                     if (inbound_) inbound_->pushConnect(id);
+                                    setMemberBit(id, true);
+                                    rosterChanged = true;
+                                    setError(NET_ERR_NONE, 0, 0); // an admission supersedes an old rejection note
                                 }
                             }
                         }
@@ -644,8 +899,12 @@ void NetLink::threadLoop() {
                                           (unsigned)w.version, (unsigned)PROTOCOL_VERSION);
                                 b[sizeof(b) - 1] = '\0';
                                 netErr(b);
+                                setError(NET_ERR_PROTOCOL, (u32)w.version, b);
                             } else {
                                 InterlockedExchange(&myId_, (LONG)w.playerId);
+#ifdef KENSHICOOP_NET_DIAG
+                                coop::logMirrorCapture(true);
+#endif
                                 {
                                     char nm[64];
                                     if (copyWelcomeName(ev.packet->data,
@@ -667,8 +926,40 @@ void NetLink::threadLoop() {
                                 b[sizeof(b) - 1] = '\0';
                                 netLog(b);
                                 if (inbound_) inbound_->pushConnect(0); // host id = 0
+                                linkWelcomed = true;
+                                everWelcomed = true;
+                                setMembers(w.playerId < MAX_PLAYERS
+                                               ? (1u | (1u << w.playerId)) : 1u);
+                                setError(NET_ERR_NONE, 0, 0);
+                                setPhase(NET_CONNECTED);
                             }
                         }
+#ifdef KENSHICOOP_NET_DIAG
+                    } else if (isHost_ && type == PKT_DEBUG_LOG_FILE) {
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        const u32 id = (u32)(size_t)ev.peer->data;
+                        DebugLogFileHeader hdr;
+                        if (ev.channelID == CH_BULK && id > 0 && id <= MAX_JOINS &&
+                            readPacket(ev.packet->data, len, &hdr) &&
+                            hdr.byteCount > 0 && hdr.byteCount <= DEBUG_LOG_CHUNK_MAX &&
+                            len == sizeof(hdr) + hdr.byteCount) {
+                            const char* bytes = (const char*)ev.packet->data + sizeof(hdr);
+                            if (coop::logRemoteChunk(id, hdr.offset, bytes, hdr.byteCount)) {
+                                mirrorFault[id] = false;
+                                if (hdr.offset == 0) {
+                                    char line[96];
+                                    _snprintf(line, sizeof(line) - 1,
+                                              "[log-mirror] receiving join id=%u in separate file",
+                                              (unsigned)id);
+                                    line[sizeof(line) - 1] = '\0';
+                                    coop::logLine(line);
+                                }
+                            } else if (!mirrorFault[id]) {
+                                mirrorFault[id] = true;
+                                netErr("[log-mirror] unable to write client log or invalid offset");
+                            }
+                        }
+#endif
                     } else if (type == PKT_ENTITY_BATCH) {
                         const unsigned len = (unsigned)ev.packet->dataLength;
                         if (len >= sizeof(EntityBatchHeader) && inbound_) {
@@ -939,6 +1230,10 @@ void NetLink::threadLoop() {
                         RosterPacket rp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)) {
                             u32 me = (u32)InterlockedCompareExchange(&myId_, 0, 0);
+                            const bool hasMembers = ev.packet->dataLength > sizeof(RosterPacket);
+                            const u32 members = hasMembers
+                                ? ev.packet->data[sizeof(RosterPacket)] & ((1u << MAX_PLAYERS) - 1u)
+                                : 0;
                             for (u32 i = 0; i < MAX_PLAYERS; ++i) {
                                 if (i == me) continue;
                                 rp.name[i][HELLO_NAME_MAX] = '\0';
@@ -951,6 +1246,11 @@ void NetLink::threadLoop() {
                                 memset(peerName_[i], 0, sizeof(peerName_[i]));
                                 if (ok) memcpy(peerName_[i], parsed.c_str(), parsed.size());
                                 LeaveCriticalSection(&nameCs_);
+                                // The optional tail separates acceptance from
+                                // nickname. The fixed protocol-56 prefix stays
+                                // readable by older peers.
+                                if (i != 0 && linkWelcomed)
+                                    setMemberBit(i, hasMembers ? (members & (1u << i)) != 0 : ok);
                                 if (changed && ok) {
                                     char lb[96];
                                     _snprintf(lb, sizeof(lb) - 1, "roster id=%u '%s'",
@@ -1156,15 +1456,33 @@ void NetLink::threadLoop() {
                     break;
                 }
                 case ENET_EVENT_TYPE_DISCONNECT: {
+                    diagReset = true;
+                    clearDebugStats();
+#ifdef KENSHICOOP_NET_DIAG
+                    if (!isHost_) coop::logMirrorCapture(false);
+#endif
                     if (isHost_) {
                         u32 id = (u32)(size_t)ev.peer->data;
-                        epochSeen_.erase(id);
                         ev.peer->data = 0;
-                        if (id < MAX_PLAYERS) {
-                            EnterCriticalSection(&nameCs_);
-                            memset(peerName_[id], 0, sizeof(peerName_[id]));
-                            LeaveCriticalSection(&nameCs_);
+                        if (id == 0 || id > MAX_JOINS) {
+                            // Never admitted (rejected HELLO, or it left before
+                            // sending one): no pushConnect was ever reported, so
+                            // reporting a leave would decrement the game
+                            // thread's count of REAL joins - and, at zero, wipe
+                            // the replication state of joins still playing.
+                            netLog("peer disconnected before being admitted (no id)");
+                            break;
                         }
+#ifdef KENSHICOOP_NET_DIAG
+                        coop::logRemoteClose(id);
+                        mirrorFault[id] = false;
+#endif
+                        epochSeen_.erase(id);
+                        EnterCriticalSection(&nameCs_);
+                        memset(peerName_[id], 0, sizeof(peerName_[id]));
+                        LeaveCriticalSection(&nameCs_);
+                        setMemberBit(id, false);
+                        rosterChanged = true;
                         if (inbound_) inbound_->pushLeave(id);
                         char b[64];
                         _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
@@ -1178,12 +1496,128 @@ void NetLink::threadLoop() {
                         LeaveCriticalSection(&nameCs_);
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
                         netLog("disconnected from host");
+                        // Why this attempt ended. A session that had been
+                        // admitted dropping is normal link loss (the phase says
+                        // it); the other two are the attempt's actionable cause.
+                        if (!linkWelcomed) {
+                            if (linkUp) {
+                                setError(NET_ERR_HANDSHAKE_DROPPED, 0,
+                                         "host closed the link after CONNECT, before WELCOME");
+                            } else {
+                                char raw[96];
+                                _snprintf(raw, sizeof(raw) - 1,
+                                          "connect attempt %u timed out (no ENet CONNECT)",
+                                          (unsigned)connectAttempts);
+                                raw[sizeof(raw) - 1] = '\0';
+                                setError(NET_ERR_NO_RESPONSE, connectAttempts, raw);
+                            }
+                        }
+                        linkUp = false;
+                        linkWelcomed = false;
+                        setMembers(0);
+                        setPhase(everWelcomed ? NET_RECONNECTING : NET_CONNECTING);
                     }
                     break;
                 }
                 default:
                     break;
             }
+        }
+
+        // Traffic sample, every build (the F2 diagnostics report reads it).
+        // ENet counts actual UDP datagram payloads (framing/retransmits included),
+        // not game packets and not the IP/UDP headers or Steam tunnel overhead.
+        const DWORD diagNow = GetTickCount();
+        if (diagReset || (DWORD)(diagNow - lastDiagTick) >= 1000) {
+            const enet_uint32 sentData = enetHost_->totalSentData;
+            const enet_uint32 receivedData = enetHost_->totalReceivedData;
+            const enet_uint32 sentPackets = enetHost_->totalSentPackets;
+            const enet_uint32 receivedPackets = enetHost_->totalReceivedPackets;
+            if (isHost_) {
+                // ENet-linked peers whose HELLO has not been admitted yet.
+                u32 pending = 0;
+                for (size_t pi = 0; pi < enetHost_->peerCount; ++pi) {
+                    const ENetPeer* peer = &enetHost_->peers[pi];
+                    if (peer->state == ENET_PEER_STATE_CONNECTED && peer->data == 0)
+                        ++pending;
+                }
+                setHandshakeCounts(0, pending);
+            }
+            if (diagReset) {
+                lastDiagTick = diagNow;
+                diagReset = false;
+#ifdef KENSHICOOP_NET_DIAG
+                servicePasses = 0;
+#endif
+            } else {
+                const DWORD elapsedMs = diagNow - lastDiagTick;
+                NetDebugStats stats;
+                memset(&stats, 0, sizeof(stats));
+                stats.sampleTickMs = diagNow;
+                stats.sentBytesPerSec = diagnosticRate(sentData, lastSentData, elapsedMs);
+                stats.recvBytesPerSec = diagnosticRate(receivedData, lastReceivedData, elapsedMs);
+                stats.sentPacketsPerSec = diagnosticRate(sentPackets, lastSentPackets, elapsedMs);
+                stats.recvPacketsPerSec = diagnosticRate(receivedPackets, lastReceivedPackets, elapsedMs);
+                unsigned __int64 reliableTotal = 0;
+                for (size_t pi = 0; pi < enetHost_->peerCount; ++pi) {
+                    const ENetPeer* peer = &enetHost_->peers[pi];
+                    if (peer->state != ENET_PEER_STATE_CONNECTED) continue;
+                    ++stats.connectedPeers;
+                    if (peer->roundTripTime > stats.maxRttMs)
+                        stats.maxRttMs = peer->roundTripTime;
+                    reliableTotal += peer->reliableDataInTransit;
+                    if (stats.peerStatsCount < MAX_PLAYERS) {
+                        NetDebugPeer& entry = stats.peers[stats.peerStatsCount++];
+                        entry.slot = diagnosticDword(pi);
+                        entry.playerId = isHost_ ? (DWORD)(size_t)peer->data : 0;
+                        entry.rttMs = peer->roundTripTime;
+                        entry.reliableBytesInTransit = peer->reliableDataInTransit;
+                    }
+                }
+                stats.reliableBytesInTransit = diagnosticDword(reliableTotal);
+                EnterCriticalSection(&debugCs_);
+                debugStats_ = stats;
+                LeaveCriticalSection(&debugCs_);
+
+#ifdef KENSHICOOP_NET_DIAG
+                char line[256];
+                _snprintf(line, sizeof(line) - 1,
+                          "[net-diag] local ENetHost UDP payload bytes/s sent=%lu recv=%lu "
+                          "packets/s sent=%lu recv=%lu peers=%lu maxRttMs=%lu "
+                          "reliableInTransitBytes=%lu (incl ENet framing/retransmits; excl IP/UDP headers)",
+                          stats.sentBytesPerSec, stats.recvBytesPerSec,
+                          stats.sentPacketsPerSec, stats.recvPacketsPerSec,
+                          stats.connectedPeers, stats.maxRttMs, stats.reliableBytesInTransit);
+                line[sizeof(line) - 1] = '\0';
+                coop::logLine(line);
+                OutputDebugStringA(line);
+                OutputDebugStringA("\n");
+                for (DWORD pi = 0; pi < stats.peerStatsCount; ++pi) {
+                    const NetDebugPeer& peer = stats.peers[pi];
+                    _snprintf(line, sizeof(line) - 1,
+                              "[net-diag] peer slot=%lu playerId=%lu rttMs=%lu "
+                              "reliableInTransitBytes=%lu (no per-peer wire rate)",
+                              peer.slot, peer.playerId, peer.rttMs,
+                              peer.reliableBytesInTransit);
+                    line[sizeof(line) - 1] = '\0';
+                    coop::logLine(line);
+                    OutputDebugStringA(line);
+                    OutputDebugStringA("\n");
+                }
+                _snprintf(line, sizeof(line) - 1,
+                          "[net-diag] service passes/s=%lu idleWaitMs=%d",
+                          (unsigned long)((unsigned __int64)servicePasses * 1000 / elapsedMs),
+                          TICK_MS);
+                line[sizeof(line) - 1] = '\0';
+                coop::logLine(line);
+                servicePasses = 0;
+#endif
+                lastDiagTick = diagNow;
+            }
+            lastSentData = sentData;
+            lastReceivedData = receivedData;
+            lastSentPackets = sentPackets;
+            lastReceivedPackets = receivedPackets;
         }
 
         if (steam && enetHost_) {
@@ -1225,6 +1659,40 @@ void NetLink::threadLoop() {
             }
         }
 
+#ifdef KENSHICOOP_NET_DIAG
+        // Mirror the current join log verbatim from disk. Reliable ordered
+        // chunks on CH_BULK avoid host-log spam; cap traffic to 8 * 960 B/s
+        // and leave pending bytes on disk when the peer is backed up.
+        const DWORD mirrorNow = GetTickCount();
+        if ((DWORD)(mirrorNow - mirrorWindow) >= 1000) {
+            mirrorWindow = mirrorNow;
+            mirrorSent = 0;
+        }
+        if (!isHost_ && myId_ > 0 && serverPeer_ &&
+            serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+            for (; mirrorSent < 8 &&
+                   serverPeer_->reliableDataInTransit < 65536; ++mirrorSent) {
+                char chunk[DEBUG_LOG_CHUNK_MAX];
+                unsigned __int64 offset = 0;
+                const unsigned n = coop::logMirrorPeek(chunk, sizeof(chunk), &offset);
+                if (n == 0) break;
+                DebugLogFileHeader hdr;
+                hdr.type = (u8)PKT_DEBUG_LOG_FILE;
+                hdr.offset = offset;
+                hdr.byteCount = (u16)n;
+                ENetPacket* out = enet_packet_create(
+                    0, sizeof(hdr) + n, ENET_PACKET_FLAG_RELIABLE);
+                if (!out) break;
+                memcpy(out->data, &hdr, sizeof(hdr));
+                memcpy(out->data + sizeof(hdr), chunk, n);
+                if (enet_peer_send(serverPeer_, CH_BULK, out) != 0) {
+                    enet_packet_destroy(out);
+                    break;
+                }
+                coop::logMirrorCommit(n);
+            }
+        }
+#endif
         // Drain + send any queued reliable events on CH_RELIABLE. ENet guarantees
         // delivery + ordering on that channel, so these survive the unreliable-batch
         // loss the WAN sim injects (the reliability proof the death oracle checks).
@@ -1715,21 +2183,32 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Drain + send the queued player roster on CH_RELIABLE (protocol 56).
-        // HOST ONLY by construction - the host is the only client that knows
-        // every name - so there is no join branch here, unlike the symmetric
-        // channels around it.
-        {
-            std::vector<RosterPacket> rosPkts;
-            EnterCriticalSection(&outCs_);
-            rosPkts.swap(outRoster_);
-            LeaveCriticalSection(&outCs_);
-            for (size_t i = 0; i < rosPkts.size(); ++i) {
-                if (!isHost_) break;
-                ENetPacket* out = enet_packet_create(&rosPkts[i], sizeof(RosterPacket),
-                                                     ENET_PACKET_FLAG_RELIABLE);
+        // Session membership is a network fact, not a gameplay/name fact.
+        // Publish even at the title screen and for players without a nick.
+        // Preserve the existing RosterPacket prefix; its optional one-byte
+        // tail is the accepted-member mask (older receivers ignore the tail).
+        const DWORD rosterNow = GetTickCount();
+        if (isHost_ && (rosterChanged || (DWORD)(rosterNow - rosterAt) >= 1000)) {
+            rosterAt = rosterNow;
+            RosterPacket rp;
+            memset(&rp, 0, sizeof(rp));
+            rp.type = (u8)PKT_PLAYER_ROSTER;
+            EnterCriticalSection(&nameCs_);
+            memcpy(rp.name[0], localName_, sizeof(localName_));
+            for (u32 id = 1; id < MAX_PLAYERS; ++id)
+                memcpy(rp.name[id], peerName_[id], sizeof(peerName_[id]));
+            LeaveCriticalSection(&nameCs_);
+            NetStatus membership;
+            copyStatus(&membership);
+            unsigned char packet[sizeof(RosterPacket) + 1];
+            memcpy(packet, &rp, sizeof(rp));
+            packet[sizeof(rp)] = (u8)membership.memberMask;
+            if (rosterChanged || memcmp(packet, lastRoster, sizeof(packet)) != 0) {
+                ENetPacket* out = enet_packet_create(packet, sizeof(packet), ENET_PACKET_FLAG_RELIABLE);
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+                memcpy(lastRoster, packet, sizeof(packet));
             }
+            rosterChanged = false;
         }
 
         // Drain + send any queued runtime-fixture identity rows on CH_RELIABLE
@@ -2044,48 +2523,75 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Transmit this peer's owned entities (latest snapshot), chunked so each
-        // batch fits one datagram - which on Steam means the 1200 B clamped MTU
-        // (ENet would otherwise send the oversized unreliable packet as RELIABLE
-        // fragments: retransmits + ordering stalls on the motion stream). Raw UDP
-        // keeps the full 17-entity chunk. Unreliable: the newest batch supersedes
-        // loss.
-        const unsigned batchCap = steam ? ENTITY_BATCH_MAX_STEAM : ENTITY_BATCH_MAX;
-        std::vector<EntityState> ents;
-        u32  owner = 0;
-        u32  stamp = 0;
-        bool have  = false;
-        EnterCriticalSection(&outCs_);
-        ents  = out_;
-        owner = outOwner_;
-        stamp = outStampMs_;
-        have  = haveOut_;
-        LeaveCriticalSection(&outCs_);
-
-        if (have && !ents.empty()) {
-            for (size_t off = 0; off < ents.size(); off += batchCap) {
-                unsigned count = (unsigned)(ents.size() - off);
-                if (count > batchCap) count = batchCap;
-
-                unsigned bytes = sizeof(EntityBatchHeader) + count * sizeof(EntityState);
-                ENetPacket* out = enet_packet_create(0, bytes, 0 /*unreliable*/);
-                EntityBatchHeader hdr;
-                hdr.type = (u8)PKT_ENTITY_BATCH; hdr.ownerId = owner; hdr.count = (u8)count;
-                hdr.sendMs = stamp;
-                hdr.epoch  = (u32)sendEpoch_; // v44: current session epoch
-                std::memcpy(out->data, &hdr, sizeof(hdr));
-                std::memcpy(out->data + sizeof(hdr), &ents[off], count * sizeof(EntityState));
-                if (isHost_) {
-                    enet_host_broadcast(enetHost_, CH_UNRELIABLE, out);
-                } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                    enet_peer_send(serverPeer_, CH_UNRELIABLE, out);
-                } else {
-                    enet_packet_destroy(out); // no one to send to yet
+        // ENet is serviced with at most TICK_MS idle wait, but owned snapshots
+        // still go out at most every 50 ms. CONNECT forces the next available
+        // snapshot immediately; do not consume that edge before publication.
+        bool connected = false;
+        if (isHost_) {
+            for (size_t pi = 0; pi < enetHost_->peerCount; ++pi) {
+                if (enetHost_->peers[pi].state == ENET_PEER_STATE_CONNECTED) {
+                    connected = true;
+                    break;
                 }
+            }
+        } else {
+            connected = serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED;
+        }
+        const DWORD entityNow = GetTickCount();
+        if (connected && (forceEntitySend || !haveEntitySendTick ||
+                          (DWORD)(entityNow - lastEntitySendTick) >= ENTITY_SEND_MS)) {
+            // Keep the Steam 1200 B datagram cap: oversized unreliable ENet packets
+            // otherwise become reliable fragments and stall the motion stream.
+            const unsigned batchCap = steam ? ENTITY_BATCH_MAX_STEAM : ENTITY_BATCH_MAX;
+            std::vector<EntityState> ents;
+            u32  owner = 0;
+            u32  stamp = 0;
+            bool have  = false;
+            EnterCriticalSection(&outCs_);
+            have = haveOut_;
+            if (have) {
+                ents  = out_;
+                owner = outOwner_;
+                stamp = outStampMs_;
+            }
+            LeaveCriticalSection(&outCs_);
+
+            if (have && !ents.empty()) {
+                // One unreliable batch per MTU-sized chunk; the newest snapshot
+                // supersedes loss, while its stamp remains the capture-time stamp.
+                for (size_t off = 0; off < ents.size(); off += batchCap) {
+                    unsigned count = (unsigned)(ents.size() - off);
+                    if (count > batchCap) count = batchCap;
+
+                    unsigned bytes = sizeof(EntityBatchHeader) + count * sizeof(EntityState);
+                    ENetPacket* out = enet_packet_create(0, bytes, 0 /*unreliable*/);
+                    EntityBatchHeader hdr;
+                    hdr.type = (u8)PKT_ENTITY_BATCH; hdr.ownerId = owner; hdr.count = (u8)count;
+                    hdr.sendMs = stamp;
+                    hdr.epoch  = (u32)sendEpoch_; // v44: current session epoch
+                    std::memcpy(out->data, &hdr, sizeof(hdr));
+                    std::memcpy(out->data + sizeof(hdr), &ents[off], count * sizeof(EntityState));
+                    if (isHost_) {
+                        enet_host_broadcast(enetHost_, CH_UNRELIABLE, out);
+                    } else {
+                        enet_peer_send(serverPeer_, CH_UNRELIABLE, out);
+                    }
+                }
+                lastEntitySendTick = entityNow;
+                haveEntitySendTick = true;
+                forceEntitySend = false;
             }
         }
     }
 
+#ifdef KENSHICOOP_NET_DIAG
+    if (isHost_) {
+        for (unsigned id = 1; id <= MAX_JOINS; ++id) coop::logRemoteClose(id);
+    } else {
+        coop::logMirrorCapture(false);
+    }
+    clearDebugStats();
+#endif
     if (enetHost_) { enet_host_destroy(enetHost_); enetHost_ = 0; }
     if (steam) steamp2p::removeEnetHooks();
     InterlockedExchange(&running_, 0);

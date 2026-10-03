@@ -1,4 +1,5 @@
-// Updater - in-DLL cloud update of KenshiCoop.dll itself.
+// Updater - in-DLL cloud update of KenshiCoop.dll and its UI companion
+// KenshiCoopUI.dll, always as one pair.
 //
 // WHY THIS EXISTS: every player must run the SAME DLL. PROTOCOL_VERSION is a
 // hard gate in the handshake with no back-compat, so one stale copy shows up as
@@ -8,12 +9,14 @@
 // SHAPE: a background Win32 thread (the game thread must never block on the
 // network - that is the whole reason NetLink is threaded too) fetches a small
 // text manifest over HTTPS, compares it against what this build is, and when it
-// differs downloads the new DLL, verifies its SHA-256, and swaps it into place
-// on disk. Windows lets you RENAME a mapped image even though it will not let
-// you delete or overwrite one, which is what makes the swap possible from
-// inside the very DLL being replaced. The running session keeps executing the
-// old code - only the file on disk changes - so the update takes effect on the
-// NEXT launch. The panel says so rather than pretending it is live.
+// differs downloads BOTH DLLs, verifies each SHA-256, and only then swaps the
+// pair into place on disk (any failed step rolls the pair back, so an install
+// is never a new core beside an old UI). Windows lets you RENAME a mapped image
+// even though it will not let you delete or overwrite one, which is what makes
+// the swap possible from inside the very DLLs being replaced. The running
+// session keeps executing the old code - only the files on disk change - so
+// the update takes effect on the NEXT launch. The panel says so rather than
+// pretending it is live.
 //
 // TRUST: the manifest and the payload come from a pinned owner/repo over TLS,
 // and the payload must match the SHA-256 the manifest names or it is discarded.
@@ -34,9 +37,17 @@
 //                         # unless the manifest also carries allowDowngrade=1.
 //   allowDowngrade=1      # optional; force a deliberate rollback
 //   proto=59              # PROTOCOL_VERSION that build speaks (display only)
-//   sha256=<64 hex>       # of the DLL at `url`
+//   sha256=<64 hex>       # of the core DLL at `url`
 //   url=https://github.com/<owner>/<repo>/releases/download/v0.52/KenshiCoop.dll
+//   uiSha256=<64 hex>     # of the UI companion at `uiUrl` (built with the core)
+//   uiUrl=https://github.com/<owner>/<repo>/releases/download/v0.52/KenshiCoopUI.dll
 //   notes=loot GUI crash  # optional one-liner for the panel
+//
+// A manifest without uiSha256/uiUrl is rejected as incomplete: installing only
+// the core would leave a mismatched UI. sha256/url keep their old meaning, so
+// updaters that predate the split still find the core; when such an install
+// then runs this updater at the same version with no/stale UI, the same-version
+// hash check (core AND UI) reinstalls the pair.
 //
 // Plain key=value rather than the Releases API's JSON: this path is security
 // sensitive and hand-rolling a JSON parser in C++03 to read it would be the
@@ -77,13 +88,13 @@ bool start(const Settings& s, const char* buildVersion, unsigned int protoVersio
 // pointer stays good for the life of the process.
 const char* status();
 
-// True once a new DLL has been staged into place: the player is still running
-// the OLD code and must restart for the update to take effect.
+// True once a new DLL pair has been staged into place: the player is still
+// running the OLD code and must restart for the update to take effect.
 bool restartRequired();
 
-// Remove the previous DLL left behind by an earlier swap. Must be called EARLY
-// at startup, before anything maps it: at that point the old image from the
-// previous session is no longer loaded, so it can finally be deleted. No-op
+// Remove the previous DLLs left behind by an earlier swap. Must be called EARLY
+// at startup, before anything maps them: at that point the old images from the
+// previous session are no longer loaded, so they can finally be deleted. No-op
 // when there is nothing to clean up.
 void sweepOldImage();
 

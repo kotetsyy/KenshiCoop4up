@@ -607,7 +607,12 @@ void onSaveFile(const SaveFileHeader& h, const char* path, const unsigned char* 
                                    g_recvSeen[h.fileIdx] ? OPEN_EXISTING : CREATE_ALWAYS,
                                    FILE_ATTRIBUTE_NORMAL, 0);
         if (g_recvHandle == INVALID_HANDLE_VALUE) {
-            coop::logErrLine("[save] XFER chunk write-open FAILED");
+            char detail[128];
+            _snprintf(detail, sizeof(detail) - 1,
+                      "[save] XFER chunk write-open FAILED idx=%u winerr=%lu",
+                      (unsigned)h.fileIdx, (unsigned long)GetLastError());
+            detail[sizeof(detail) - 1] = '\0';
+            coop::logErrLine(detail);
             return;
         }
         g_recvOpenIdx = (int)h.fileIdx;
@@ -618,8 +623,16 @@ void onSaveFile(const SaveFileHeader& h, const char* path, const unsigned char* 
     SetFilePointer(g_recvHandle, (LONG)h.offset, &hi, FILE_BEGIN);
     DWORD wrote = 0;
     if (h.dataLen > 0) {
-        if (!WriteFile(g_recvHandle, data, h.dataLen, &wrote, 0) || wrote != h.dataLen) {
-            coop::logErrLine("[save] XFER chunk write FAILED");
+        BOOL writeOk = WriteFile(g_recvHandle, data, h.dataLen, &wrote, 0);
+        if (!writeOk || wrote != h.dataLen) {
+            DWORD error = writeOk ? ERROR_WRITE_FAULT : GetLastError();
+            char detail[128];
+            _snprintf(detail, sizeof(detail) - 1,
+                      "[save] XFER chunk write FAILED idx=%u winerr=%lu wrote=%lu/%u",
+                      (unsigned)h.fileIdx, (unsigned long)error,
+                      (unsigned long)wrote, (unsigned)h.dataLen);
+            detail[sizeof(detail) - 1] = '\0';
+            coop::logErrLine(detail);
             return;
         }
         g_recvCrcs[h.fileIdx] = fnv1aUpdate(g_recvCrcs[h.fileIdx], data, h.dataLen);
@@ -653,10 +666,24 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
         if (GetFileAttributesA(finalDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
             hadOld = (MoveFileExA(finalDir.c_str(), oldDir.c_str(),
                                   MOVEFILE_WRITE_THROUGH) != 0);
-            if (!hadOld) ok = false;
+            if (!hadOld) {
+                char detail[128];
+                _snprintf(detail, sizeof(detail) - 1,
+                          "[save] XFER replace-old FAILED winerr=%lu",
+                          (unsigned long)GetLastError());
+                detail[sizeof(detail) - 1] = '\0';
+                coop::logErrLine(detail);
+                ok = false;
+            }
         }
         if (ok && !MoveFileExA(g_recvStaging.c_str(), finalDir.c_str(),
                                MOVEFILE_WRITE_THROUGH)) {
+            char detail[128];
+            _snprintf(detail, sizeof(detail) - 1,
+                      "[save] XFER move-staging FAILED winerr=%lu",
+                      (unsigned long)GetLastError());
+            detail[sizeof(detail) - 1] = '\0';
+            coop::logErrLine(detail);
             ok = false;
             if (hadOld) MoveFileExA(oldDir.c_str(), finalDir.c_str(),
                                     MOVEFILE_WRITE_THROUGH); // restore

@@ -38,8 +38,8 @@ bool loadSave(const std::string& name);
 // the loaded world over a STALE save name (the fixture-clobber bug).
 bool setCurrentGameName(const std::string& name);
 
-// SEH-guarded readiness probe: does the save subsystem report it is up? Returns
-// true when the probe symbol is unavailable (so it never blocks auto-load).
+// SEH-guarded readiness probe: is the SaveManager singleton available?
+// Independent of local save existence so a fresh JOIN can request the host world.
 bool savesReady();
 
 // SEH-guarded: save the running game under 'name' via SaveManager::save (the
@@ -327,11 +327,6 @@ void  markerDestroy(void* label);
 // too. Cheap (a pointer scan of the GUI's own label registry).
 bool  markerAlive(void* label);
 
-// ---- In-game co-op session panel ---------------------------------------------
-// Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
-// CoopDisconnectFn, coopPanelTick, coopOverlayTick. The UI root (Plugin.cpp)
-// includes EngineUi.h directly; the adapter (EngineInternal.h) re-includes it.
-
 // ---- Deterministic test-scene setup (host-side; baked into a save) ---------
 // Moved to EngineScenario.h (Phase 5a domain split): spawnSeatInFront,
 // spawnNpcInFront, spawnMachineInFront, orderWorkAt, findFurnitureNear,
@@ -416,6 +411,14 @@ bool cellProbe(GameWorld* gw, float x, float y, float z, CellProbe* out);
 // SHARED save, so both clients compute the same coord for the same point without
 // exchanging anything. Y is not an input - the grid is 2D, x/z only.
 bool cellAt(GameWorld* gw, float x, float z, int* outCx, int* outCz);
+
+#ifdef KENSHICOOP_NET_DIAG
+// Read-only bed census from ZoneManager's loaded ZoneMapContent::buildingList.
+// Logs each nearby bed's save instance ID, handle, position, parent, and zone
+// every 15 seconds. This is diagnostic, NOT evidence that a missing bed is safe
+// to mint or that an unmatched local bed is safe to remove.
+void logBedCensus(GameWorld* gw);
+#endif
 
 // SEH-guarded (Phase 1 spawn parity): destroy a previously-minted proxy body
 // (GameWorld::destroy, true destruction). Used when the proxy's original hand

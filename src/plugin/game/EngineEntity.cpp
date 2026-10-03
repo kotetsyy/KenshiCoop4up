@@ -3,8 +3,7 @@
 // captureNpcs + interest centers), hand resolve (resolve/resolveCharByHand),
 // motion apply (applyRaw/orderMoveTo/walkTo/park), NPC suppression, and the
 // seat/bed/cage/machine template + work-fixture finders shared by scenario
-// scenes. (The debug marker HUD + co-op panel/overlay moved to EngineUi.cpp in
-// Phase 5e.)
+// scenes. (The debug marker HUD moved to EngineUi.cpp in Phase 5e.)
 //
 // Owner state: section-private statics/anon-namespace helpers only (pose
 // classifiers, marker SEH shims, capture hysteresis buffers).
@@ -14,10 +13,6 @@
 
 #include "EngineInternal.h"
 #include <cstring>
-
-// The co-op session panel + status overlay (the DatapanelGUI/Win32/clipboard
-// surface) moved to EngineUi.cpp in Phase 5e, taking its <kenshi/gui/...>,
-// <mygui/MyGUI_Delegate.h>, <windows.h> and SteamId.h includes with it.
 
 namespace coop {
 namespace engine {
@@ -1089,8 +1084,7 @@ void charSetName(Character* c, const char* name) {
 
 // The debug marker HUD labels (markerColour/markerCreateSeh/markerUpdateSeh/
 // markerDestroySeh + the public markerCreate/markerUpdate/markerDestroy) moved to
-// EngineUi.cpp (Phase 5e code motion) alongside the co-op panel + status overlay
-// that reuse the same ScreenLabel SEH shims. Their public declarations stay in
+// EngineUi.cpp (Phase 5e code motion). Their public declarations stay in
 // Engine.h (the Replicator uses them for KENSHICOOP_DEBUG_MARKERS).
 
 // The helpers from here to readObjectHand have EXTERNAL linkage (declared in
@@ -1334,12 +1328,6 @@ bool readObjectHand(RootObject* obj, unsigned int out[5]) {
     oh.toObjOrder(out);
     return true;
 }
-
-// ---- In-game co-op session panel + status overlay --------------------------
-// Moved to EngineUi.cpp (Phase 5e code motion): the DatapanelGUI panel (clipboard
-// helpers, CoopPanelUi state, button callbacks, panelBuildSeh/uiPanelArmSeh/
-// panelDestroySeh, coopPanelTick) and the persistent status overlay
-// (coopOverlayTick). Their public declarations live in EngineUi.h.
 
 } // namespace engine
 } // namespace coop

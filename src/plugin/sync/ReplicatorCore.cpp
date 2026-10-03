@@ -97,10 +97,16 @@ Replicator::Replicator()
       timeSync_(true), timeBrake_(true),
       timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
+#ifdef KENSHICOOP_NET_DIAG
+      bootstrapHold_(false), readyLoadIdOut_(0),
+#endif
       platoonT0_(0),
       lifeSweepMs_(0) {
     peerCam_[0] = peerCam_[1] = peerCam_[2] = 0.0f;
     memset(peerNick_, 0, sizeof(peerNick_));
+#ifdef KENSHICOOP_NET_DIAG
+    memset(peerReadyLoadIds_, 0, sizeof(peerReadyLoadIds_));
+#endif
     memset(nickHandSet_, 0, sizeof(nickHandSet_));
 }
 
@@ -321,6 +327,13 @@ void Replicator::resetSession() {
     censusScanMs_ = 0;
     // Speed/time: re-seed from the fresh world's live state (the save's
     // speed becomes the new baseline; the join's slew re-measures).
+#ifdef KENSHICOOP_NET_DIAG
+    // The connect-push save is baked WHILE the host is privately paused.
+    // Its speed flag must not replace the pre-join vote after a world reload.
+    const bool keepVote = bootstrapHold_ && speedEffMult_ >= 0.0f;
+    const float keptMult = speedEffMult_;
+    const bool keptPaused = speedEffPaused_;
+#endif
     speedLastApplied_ = -1.0f;
     speedMyReq_       = -1.0f;
     speedMyPaused_    = false;
@@ -340,10 +353,21 @@ void Replicator::resetSession() {
     speedPendMult_    = 1.0f;
     speedPendPaused_  = false;
     speedPendOwner_   = 0;
+#ifdef KENSHICOOP_NET_DIAG
+    if (keepVote) {
+        speedMyReq_ = speedEffMult_ = keptMult;
+        speedMyPaused_ = speedEffPaused_ = keptPaused;
+        speedLastSet_ = keptPaused ? 0.0f : keptMult;
+    }
+#endif
     timeSlew_         = 1.0f;
     timeSeqSeen_      = 0;
     timeLastSendMs_   = 0;
     timeSlewApplied_  = -1.0f;
+#ifdef KENSHICOOP_NET_DIAG
+    readyLoadIdOut_ = 0;
+    memset(peerReadyLoadIds_, 0, sizeof(peerReadyLoadIds_));
+#endif
     // Sample-cadence clocks restart.
     facSampleMs_ = doorSampleMs_ = buildSampleMs_ = bdoorSampleMs_ = 0;
     prodSampleMs_ = 0;

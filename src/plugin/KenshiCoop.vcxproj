@@ -11,6 +11,10 @@
                  test/Scenario*.cpp (~12k lines) and does not define
                  KENSHICOOP_HARNESS, so the scenario runner in Plugin.cpp
                  compiles out. Output: x64\Release.
+    The F2 session panel, connection banner and private diagnostic overlay
+    live in the companion KenshiCoopUI.dll (src\ui\KenshiCoopUI.vcxproj, same
+    configurations). core\UiModule.cpp loads it from this DLL's folder through
+    the C ABI in src\ui\CoopUiApi.h; game\EngineUi.cpp keeps only the marker HUD.
   -->
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -74,7 +78,7 @@
       <WarningLevel>Level3</WarningLevel>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;KENSHICOOP_NET_DIAG;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- PDB for post-mortem minidump triage (2026-07-11 join crash). No codegen impact. -->
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
@@ -122,6 +126,7 @@
     <ClCompile Include="CoopLog.cpp" />
     <ClCompile Include="core\Config.cpp" />
     <ClCompile Include="core\CrashDump.cpp" />
+    <ClCompile Include="core\UiModule.cpp" />
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="net\SteamInvite.cpp" />
@@ -201,6 +206,7 @@
   <ItemGroup>
     <ClInclude Include="CoopLog.h" />
     <ClInclude Include="core\Config.h" />
+    <ClInclude Include="core\UiModule.h" />
     <ClInclude Include="core\Inbound.h" />
     <ClInclude Include="net\NetLink.h" />
     <ClInclude Include="net\SteamP2P.h" />
@@ -212,6 +218,7 @@
     <ClInclude Include="test\ScenarioTimed.h" />
     <ClInclude Include="test\ScenarioSupport.h" />
     <ClInclude Include="..\netproto\Wire.h" />
+    <ClInclude Include="..\ui\CoopUiApi.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

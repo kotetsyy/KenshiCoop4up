@@ -67,6 +67,7 @@
     - [MyGUI (3.2.3)](#155-mygui-323)
     - [Kenshi-side GUI windows (`kenshi/gui`)](#156-kenshi-side-gui-windows-kenshigui)
     - [OIS input](#157-ois-input)
+16. [Native UI companion C ABI](#16-native-ui-companion-c-abi)
 
 ---
 
@@ -550,7 +551,7 @@ screen.
 - `static SaveManager* getSingleton()` (RVA 0x37D7E0) — the singleton (may be null before the save subsystem is up).
 - `void load(const std::string& name)` (RVA 0x47AD00) — **deferred** load by save folder name. Sets the `LOADGAME` signal and returns immediately; the engine's `execute()` performs the load a few frames later. **Must only be issued after the menu/save subsystem has settled**, else the deferred load crashes. *(Overloaded with `load(const SaveInfo&, bool)` — cast to disambiguate.)*
 - `void newGame(const std::string& startId)`; `void save(const std::string& s, bool autosave)`; `void import(const SaveInfo& s, int flags)`.
-- `bool savesExist()` (RVA 0x36B160) — readiness/existence probe (use to confirm the subsystem is up before auto-loading).
+- `bool savesExist()` (RVA 0x36B160) — reports local save existence, **not subsystem readiness**. Do not gate JOIN bootstrap on it: a fresh client must process `LOAD_GO`, NACK the missing copy, then receive the host's world. `engine::savesReady()` checks the singleton instead.
 - `bool saveExists(const std::string& location, const std::string& name)`.
 - `int scanGames(lektor<SaveInfo>& list, bool loadDetails)`; `bool loadInfo(SaveInfo& info)`; `bool checkVersion(const SaveInfo& info)`.
 - `const std::string& getCurrentGame()`; `const std::string& getSavePath() const`.
@@ -635,7 +636,6 @@ called only on the main thread inside `__try/__except`.
 | Lookup template | `&GameDataManager::getData` *(cast to `(const std::string&, itemType)`)* | `GameData* (__fastcall*)(GameDataManager*, const std::string*, itemType)` |
 | Save singleton | `&SaveManager::getSingleton` | `SaveManager* (__fastcall*)()` |
 | Load a save | `&SaveManager::load` *(cast to `(const std::string&)`)* | `void (__fastcall*)(SaveManager*, const std::string*)` |
-| Saves exist? | `&SaveManager::savesExist` | `bool (__fastcall*)(SaveManager*)` |
 
 **Called directly through live objects (virtual dispatch, no resolve needed):**
 - `Character::getPosition()`, `Character::getOrientation().getYaw().valueRadians()`.
@@ -805,10 +805,9 @@ implementations.
   `<mygui/MyGUI.h>`, `<ois/OIS.h>` today.
 - **Linking:** `OgreMain_x64.lib` is linked, so Ogre exported symbols (singletons,
   scene/resource managers, math out-of-line helpers) are **directly callable**.
-  `MyGUIEngine_x64.lib` is shipped in the deps but **not currently linked** — add
-  it to `<AdditionalDependencies>` to call MyGUI functions directly (otherwise you
-  can still read MyGUI types reached through the game's GUI objects). OIS is
-  exercised through Kenshi's own input layer rather than linked directly.
+  `MyGUIEngine_x64.lib` is linked by both native projects. F2 widgets and font
+  resources are owned by `KenshiCoopUI.dll`; OIS is exercised through Kenshi's
+  own input layer rather than linked directly.
 - **ABI caveat (important).** The shipped headers are **stock upstream** Ogre 2.0 /
   MyGUI 3.2.3. Kenshi ships a *modified* build of these libraries, so while the
   public **API surface** matches, exact **struct layouts / vtable orders / private
@@ -952,3 +951,54 @@ in-game input; OIS is the lower layer beneath it.
 - **`OIS::Mouse`** — `MouseState` (abs/rel axes, buttons), `MouseButtonID`
   (`MB_Left`, `MB_Right`, ...), buffered `MouseListener`.
 - **`OIS::JoyStick`** — gamepad/joystick state and listeners.
+
+## 16. Native UI companion C ABI
+
+`src/ui/CoopUiApi.h` is a Windows x64 POD C contract, API version 1, with
+explicit 8-byte packing and `__cdecl`. No STL, engine pointers, ownership
+transfer or network hooks cross this boundary.
+
+- `KenshiCoopUI_GetApi(requestedVersion, apiSize, api)` is the single C export.
+  Unsupported versions or undersized API tables are rejected.
+- `CoopUiHost` carries size, version and a UTF-8 log callback.
+- `CoopUiSnapshot` carries the requested/actual transport, network/world phases,
+  busy state, endpoint, error/diagnostics strings, transfer bytes and four player
+  rows. Borrowed strings are valid during `tick` only; retained text is copied.
+  Player membership is independent of whether a nickname has arrived. Unknown
+  world readiness is not treated as ready.
+- `CoopUiCommand` returns at most one `NONE`, `REMEMBER`, `CONNECT` or
+  `DISCONNECT`, with bounded POD settings. Widget callbacks only queue actions;
+  `Plugin.cpp::coopPanelDrive` executes them after UI tick, on the main thread.
+  Live sessions reject a new CONNECT and changes to role/transport/endpoint.
+- `shutdown` hides the UI and blocks later ticks; it never disconnects or
+  destroys the native widget hierarchy.
+
+`src/plugin/core/UiModule.cpp` loads exactly the companion beside the core,
+validates the table and pins it for process lifetime. Missing, incompatible or
+faulted providers are logged and disabled without stopping networking.
+`RE_Kenshi.json` continues to list only `KenshiCoop.dll`. No hot reload.
+
+The window, Cyrillic font, clipboard and connection banner live in
+`src/ui/CoopUi.cpp`; `src/ui/NativeEdit.h` adapts engine-exported MyGUI text
+and focus methods. It never copies the engine's internal `UString` layout.
+Fields hold editable drafts; valid drafts are committed on blur, hide or start.
+Both UDP forms mirror one canonical port because the C ABI/config expose one.
+The nick editor permits overflow to be validated against the 63-byte UTF-8
+limit; the Paste button rejects oversized input before the truncating parser.
+Tab/Shift+Tab cycle visible fields; Enter queues a validated start. Focus holds
+an `InputHandler::controlEnabled` lease, released on hide/reset/shutdown without
+enabling game controls over another native EditBox's focus. F2/Esc act only in
+the foreground game process.
+
+`createDatapanel` already registers the frame in ForgottenGUI's owning list.
+Do not call `addDatapanelToUpdateList` again: shutdown would delete it twice.
+The GUI owns teardown; an unlink/reset drops cached pointers, not possibly
+recycled entries in the GUI's list.
+
+`game/EngineUi.cpp` retains only the entity marker/damage HUD; the old
+`EngineUi.h` panel facade is removed. Widgets refresh at 10 Hz without rewriting
+active text/carets. The two-column panel shows real network/world milestones,
+bounded transfer progress and accepted players. Diagnostics are collapsed by
+default; overflowing rows point to the complete copy-report. Diagnostic rates
+are sampled once per second. Updater messages have their own secondary section.
+

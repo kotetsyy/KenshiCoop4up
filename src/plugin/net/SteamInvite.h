@@ -18,7 +18,7 @@
 // also pumped: RunCallbacks just drains the message queue, so sequential
 // main-thread calls can't double-deliver a single posted callback. tick() also
 // polls lobby membership. The
-// resolved peer is handed back through the ConnectFn (the plugin's coopUiConnect),
+// resolved peer is handed back through ConnectFn (the plugin's steamInviteConnect),
 // which reuses the normal Steam-transport connect path. Manual ID entry stays as
 // a fallback for setups where the overlay is unavailable.
 
@@ -31,7 +31,7 @@ namespace steaminvite {
 typedef unsigned long long SteamId;
 
 // Fired (on the main thread, from the Steam callback pump / tick) when an invite
-// resolves a peer. Matches Plugin.cpp's coopUiConnect(isHost, useSteam, peerId).
+// resolves a peer. Matches Plugin.cpp's steamInviteConnect(isHost, useSteam, peerId).
 typedef void (*ConnectFn)(bool isHost, bool useSteam, SteamId peerId);
 
 // Resolve ISteamMatchmaking/ISteamFriends from the game's steam_api64.dll and

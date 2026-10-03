@@ -51,17 +51,18 @@
 
 **Первая установка:** из
 [последнего релиза](https://github.com/kotetsyy/KenshiCoop4up/releases/latest)
-скачайте все три файла в `<Kenshi>\mods\KenshiCoop\`:
+скачайте все четыре файла в `<Kenshi>\mods\KenshiCoop\`:
 
 - `KenshiCoop.dll` — сам плагин
+- `KenshiCoopUI.dll` — нативное окно F2, шрифты и статус сессии
 - `RE_Kenshi.json` — говорит RE_Kenshi загрузить эту DLL (без него мод не стартует)
 - `KenshiCoop.mod` — чтобы Kenshi показал мод в меню Mods
 
 Запустите Kenshi и включите **KenshiCoop** в меню модов.
 
-**Потом, при обновлении:** если папка уже есть, достаточно заменить DLL
-(внутриигровой апдейтер так и делает). `.mod` и `RE_Kenshi.json` почти не
-меняются.
+**Потом, при обновлении:** заменяйте **обе DLL из одной сборки** при закрытой
+игре. Внутриигровой апдейтер проверяет SHA-256 обеих DLL и устанавливает пару
+для следующего запуска. `.mod` и `RE_Kenshi.json` почти не меняются.
 
 **У всех должна быть одна и та же сборка.** Разные версии не соединяются.
 
@@ -71,25 +72,54 @@
 ничего предварительно загружать.
 
 1. Нажмите **F2**.
-2. **Введите ник.** Строка **Your nick** — кликните поле под ней и наберите
-   имя. После входа оно ставится на юнит в вашем отряде. Задайте ник до ONLINE.
-3. **Обменяйтесь Steam ID.** Каждый жмёт **Copy my Steam ID** и отправляет
-   остальным. Полученный ID скопируйте и нажмите **Paste friend's Steam ID** —
-   панель покажет, что распознала. Ник и Steam ID запоминаются в
-   `coop_config.json`, поэтому при следующем запуске поля уже заполнены.
-4. **Transport** оставьте на **STEAM**.
-5. **Хост:** загрузите сейв или начните новую игру (в моде есть старты на два
-   отряда), затем **Role: HOST** и **Connection** → **ONLINE**.
-6. **Подключение:** прямо из главного меню — **Role: JOIN** и **ONLINE**. Хост
-   передаст свой мир, и вы загрузитесь в него.
+2. **Введите ник** в поле. Поддерживаются кириллица, выделение, редактирование
+   и **Ctrl+V**; кнопка **«Вставить»** — дополнительный способ вставки.
+3. Выберите **Хост** или **Клиент**, затем **Steam** или **Прямой IP (UDP)**.
+4. **Steam, хост:** скопируйте свой Steam ID кнопкой окна и передайте клиенту.
+   У хоста нет поля для чужого ID.
+5. **Steam, клиент:** введите или вставьте Steam ID хоста, затем нажмите
+   **«Подключиться»**. Хост нажимает **«Создать сессию»** и загружает свой мир.
+6. **UDP, хост:** при необходимости введите номер порта
+   (по умолчанию `27800`), затем создайте сессию.
+7. **UDP, клиент:** введите или вставьте адрес хоста `ip:port`, например
+   `192.168.1.10:27800`, затем подключитесь. Для подключения через интернет
+   нужен доступный UDP-порт хоста; Steam-проброс здесь не используется.
 
-**LAN / прямой UDP:** поставьте **Transport: UDP**. Строки Steam ID скрываются.
-В поле **Host IP:port** наберите или вставьте `ip:port` (например
-`192.168.1.10:27800`).
+**Tab** переключает поля; **Enter** в поле запускает выбранное подключение.
+Пустой или неверный ник/адрес/порт блокирует запуск и показывает причину.
+Пока поле имеет фокус, игровые клавиши отключены. Ник ограничен 63 байтами UTF-8;
+слишком длинная вставка через кнопку отклоняется, а не обрезается незаметно.
+
+Клиент может подключиться из главного меню: хост передаст свой мир.
+Ник, выбранный режим, адрес и единый UDP-порт запоминаются в `coop_config.json`;
+смена роли не возвращает старый порт. Во время сессии поля и переключатели
+заблокированы. **F2, Esc, крестик и «Скрыть (F2)» не отключают сеть**;
+для этого есть отдельная кнопка остановки. Справа показаны реальные этапы,
+передача мира и игроки. **«Диагностика»** раскрывает подробности; при переполнении
+используйте **«Копировать отчёт»**. Обновление мода имеет отдельный блок и не
+меняет состояние подключения.
 
 Каждый игрок управляет своим отрядом: по вкладке отряда на игрока, у хоста отряд
 1, у первого подключившегося — 2, и так далее. Если в сейве только один отряд,
 разнесите юнитов по вкладкам прямо в игре.
+
+## Экспериментальная диагностика сети
+
+Приватная ветка `debug/live-net-telemetry` собирается командой
+`scripts\build_plugin.cmd Harness`: это оптимизированная сборка с диагностикой,
+а не конфигурация VS Debug с отладочной CRT. Статистика находится в
+сворачиваемом блоке **«Диагностика»** окна F2 и в **«Копировать отчёт»**;
+лог содержит строки `[net-diag]` раз в секунду. Байты/пакеты — локальный
+трафик ENet с повторами, не доказательство совпадения миров. Неизвестная
+готовность мира и отсутствующие измерения не выдаются за успешную синхронизацию.
+Ничего не выгружается автоматически.
+
+Для теста отключите автообновление (`"updateEnabled": false` в
+`coop_config.json`), иначе публичный релиз может заменить диагностическую DLL.
+Участникам теста давайте доступ к исходникам приватного репозитория согласно
+AGPL-3.0. Экспериментальные коммиты остаются в приватной ветке; только
+проверенное исправление переносится отдельным коммитом в публичную `main`.
+
 
 ## Благодарности
 
@@ -164,17 +194,18 @@ addresses.
 
 **First install:** from the
 [latest release](https://github.com/kotetsyy/KenshiCoop4up/releases/latest)
-download all three files into `<Kenshi>\mods\KenshiCoop\`:
+download all four files into `<Kenshi>\mods\KenshiCoop\`:
 
 - `KenshiCoop.dll` — the plugin
+- `KenshiCoopUI.dll` — the native F2 window, fonts and session status
 - `RE_Kenshi.json` — tells RE_Kenshi to load that DLL (without it the mod never starts)
 - `KenshiCoop.mod` — so Kenshi lists it in the Mods menu
 
 Launch Kenshi and enable **KenshiCoop** in the Mods menu.
 
-**Later updates:** if that folder already exists, only the DLL needs replacing
-(the in-game updater does exactly that). `.mod` and `RE_Kenshi.json` almost
-never change.
+**Later updates:** replace **both DLLs from the same build**, with the game
+closed. The in-game updater verifies both SHA-256 hashes and installs the pair
+for the next launch. `.mod` and `RE_Kenshi.json` almost never change.
 
 **Everyone must run the same build.** Mismatched versions do not connect.
 
@@ -184,25 +215,65 @@ The Co-op panel works at the **main menu** as well as in-game, so a joining
 player does not need to load anything first.
 
 1. Press **F2**.
-2. **Type a nick.** The row says **Your nick** — click the box under it and
-   type your name. That name is written onto the squad unit you play after you
-   connect. Set it before going ONLINE.
-3. **Swap Steam IDs.** Each player clicks **Copy my Steam ID** and sends it to
-   the others. Copy the one you receive, then click **Paste friend's Steam ID**.
-   The panel shows what it captured. Nick and Steam ID are remembered in
-   `coop_config.json`, so a relaunch pre-fills the panel.
-4. Leave **Transport** on **STEAM**.
-5. **Host:** load a save or start a new game — the mod ships two-squad co-op
-   starts — then set **Role: HOST** and toggle **Connection** to **ONLINE**.
-6. **Join:** straight from the main menu, set **Role: JOIN** and go **ONLINE**.
-   The host streams its world to you and you load into it.
+2. **Type your nick** in the field. Cyrillic, selection, editing and **Ctrl+V**
+   are supported; **Paste** is an optional shortcut.
+3. Choose **Host** or **Client**, then **Steam** or **Direct IP (UDP)**.
+4. **Steam host:** copy your Steam ID using the window's button and send it to
+   the client. The host has no field for a friend's ID.
+5. **Steam client:** type or paste the host's Steam ID and click **Connect**.
+   The host clicks **Create session** and loads their world.
+6. **UDP host:** optionally enter a port number (default `27800`), then create
+   the session.
+7. **UDP client:** type or paste the host's `ip:port`, for example
+   `192.168.1.10:27800`, then connect. Internet UDP requires a reachable host
+   port; Steam's NAT traversal is not used for this transport.
 
-**LAN / direct UDP:** set **Transport: UDP**. Steam ID rows hide. Type or paste
-`ip:port` in **Host IP:port** (e.g. `192.168.1.10:27800`).
+**Tab** moves between fields; **Enter** starts the selected connection.
+Empty or invalid fields prevent a start and show the reason. Game controls
+are suppressed while editing. Nicks are limited to 63 UTF-8 bytes; the Paste
+button rejects oversized text instead of silently truncating it.
+
+Clients can connect from the main menu and receive the host's world. Nick,
+role, endpoint and one shared UDP port are remembered in `coop_config.json`;
+switching roles does not restore an old port. Fields and selectors are locked
+during a session. **F2, Esc, X and Hide never disconnect**; use the separate
+stop/disconnect action. The right column shows real milestones, transfer
+progress and players. **Diagnostics** expands details; **Copy report** includes
+overflowing lines. Mod updates have a separate section, not a connection status.
 
 Each player controls their own squad: one squad tab per player, host runs squad
 1, the first join squad 2, and so on. If your save has only one squad, split
 some units into another squad tab in-game.
+
+## Experimental network diagnostics
+
+Build the private `debug/live-net-telemetry` branch with
+`scripts\build_plugin.cmd Harness`. This optimized diagnostic pair uses **private
+protocol 63**; the ordinary released pair remains on protocol 59. Host and join
+must both use the same build pair. This private build disables public auto-updates
+even if a tester's `coop_config.json` still has `"updateEnabled": true`.
+
+Local ENet rates appear in the collapsible **Diagnostics** block and **Copy
+report**, not a separate always-on overlay. Once a JOIN completes WELCOME, the
+debug DLL forwards selected `[audit]`, `[inv]`, `[net-diag]`, `[save]` and related
+diagnostic lines to the HOST over the existing ENet connection, on the bulk
+channel. The host writes them as `[remote-join id=N clientMs=...] ...` beside its
+own entries in `KenshiCoop_host.log`. The join retains its full
+`KenshiCoop_join.log`. Forwarding is limited to eight lines per second with a
+64-line in-memory queue; `[diag-relay] dropped=N` reports overflow. Save transfer
+can delay the bulk channel. If a save transfer fails, inspect the forwarded
+`[save] XFER-FAILED` and preceding `[save]` errors; the full join log can contain
+additional detail. These are observations from two machines, **not** an automatic
+verdict that their worlds match.
+
+This chat has no direct connection to a tester's PC: live analysis means reading
+the combined log on the host machine during a session. There is no separate
+HTTP upload or outside log collector. With Steam transport, the existing game
+connection may use Valve's relay. Logs may contain player names and game data;
+share them privately. Give testers access to the private source under AGPL-3.0.
+Experimental commits stay on the private branch; move only verified fixes to
+public `main` in separate commits.
+
 
 ## Credits
 

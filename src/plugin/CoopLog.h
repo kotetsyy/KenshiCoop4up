@@ -59,6 +59,23 @@ void logSetFakeSkewMs(long skewMs);
 void logLine(const char* msg);
 void logErrLine(const char* msg);
 
+#ifdef KENSHICOOP_NET_DIAG
+// Client: start reading the current log from byte zero after WELCOME; stop on
+// disconnect. Peek copies raw file bytes without advancing the logical offset.
+// Commit only bytes whose reliable send succeeded. A new capture (or retarget)
+// closes the old read handle and starts a new stream.
+void logMirrorCapture(bool enabled);
+unsigned logMirrorPeek(char* out, unsigned cap, unsigned __int64* offset);
+void logMirrorCommit(unsigned bytes);
+
+// Host: write an ordered stream per join to KenshiCoop_join_<id>_mirror.log
+// alongside the host log. Offset zero starts/truncates a new stream. A file
+// rotates before a chunk would exceed 16 MiB; offsets remain stream-relative.
+bool logRemoteChunk(unsigned peerId, unsigned __int64 offset,
+                    const char* data, unsigned bytes);
+void logRemoteClose(unsigned peerId);
+#endif
+
 // Flush and close the file. Called right before ExitProcess on test self-exit.
 void logClose();
 
