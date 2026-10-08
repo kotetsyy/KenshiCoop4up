@@ -6,7 +6,7 @@
   The archive contains only KenshiCoop.dll, KenshiCoopUI.dll, KenshiCoop.mod
   and RE_Kenshi.json inside KenshiCoop/. No launchers, shipped config,
   README, provenance or source archive. F2 writes the local configuration;
-  release instructions and corresponding sources are provided separately.
+  instructions live in the release body; sources are linked by release tag.
 
   Release -> dist/KenshiCoop-kit.zip
   Harness -> dist/KenshiCoop-dev-kit.zip (private protocol)
@@ -84,7 +84,7 @@ if ($packagedUiSha -ne $canonUiSha) {
 }
 Write-Host "Packaged DLL pair SHA-256 verified == canonical."
 
-# Zip only the mod folder; instructions and sources are separate release assets.
+# Zip only the mod folder; source access is via the release tag, not an asset.
 $zipName = if ($Configuration -eq "Release") { "KenshiCoop-kit.zip" } else { "KenshiCoop-dev-kit.zip" }
 $zip = Join-Path $repoRoot "dist\$zipName"
 if (Test-Path $zip) { Remove-Item $zip }

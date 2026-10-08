@@ -13,6 +13,10 @@
 #
 # It does NOT push or create the GitHub release - it prints the two commands to
 # run, so nothing leaves the machine without you typing it.
+# Do not attach KenshiCoop-source.zip (or another dedicated source archive).
+# Keep each release tag at the exact source commit used for its DLLs; link that
+# tag in the release body. Dependency fetch/build instructions live in
+# docs/BUILD_SETUP.md. GitHub's automatic source downloads need no asset upload.
 #
 # RELEASE NOTES FORMAT (dist/RELEASE_NOTES.md, passed as --notes-file):
 #   * Russian first, plain. English goes in a <details><summary> block at the
@@ -127,6 +131,8 @@ Write-Host "  uiUrl     $uiUrl"
 Write-Host "  extra     $Mod"
 Write-Host "            $Json"
 Write-Host "            (first-time install; the updater downloads only the DLL pair)"
+Write-Host "  sources   https://github.com/$Owner/$Repo/tree/$tag"
+Write-Host "            (release tag; do not upload a separate source ZIP)"
 Write-Host ""
 
 if ($WhatIf) { Write-Host "-WhatIf: not writing $Out"; Write-Host $manifest; exit 0 }

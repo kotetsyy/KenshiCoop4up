@@ -62,7 +62,8 @@
 Запустите Kenshi и включите **KenshiCoop** в меню модов.
 `coop_config.json` создаётся при сохранении настроек F2; при обновлении оставьте
 свой конфиг на месте. `PROVENANCE.json` и лаунчеры не нужны для запуска.
-Соответствующие исходники предоставлены отдельным `KenshiCoop-source.zip` в релизе.
+Исходники доступны в этом репозитории по тегу соответствующего релиза;
+инструкции сборки — в [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 
 
 **Потом, при обновлении:** заменяйте **обе DLL из одной сборки** при закрытой
@@ -210,7 +211,8 @@ The archive contains only four files, also available individually for `<Kenshi>\
 Launch Kenshi and enable **KenshiCoop** in the Mods menu.
 F2 creates `coop_config.json` when saving settings; preserve your config on
 updates. Neither `PROVENANCE.json` nor a launcher is required at runtime.
-Corresponding sources are a separate `KenshiCoop-source.zip` release asset.
+Sources are available in this repository at the matching release tag;
+build instructions are in [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 
 
 **Later updates:** replace **both DLLs from the same build**, with the game

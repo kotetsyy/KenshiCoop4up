@@ -11,6 +11,26 @@
 `scripts\v100_env.cmd` supplies PATH, INCLUDE, LIB and an absolute `MtToolPath`
 from an installed SDK. Build commands fail if either DLL fails.
 
+## Restore external dependencies
+
+From a fresh checkout of the release tag, restore the dependency revisions used
+for v0.1.22. Git LFS is required for KenshiLib libraries and the Boost archive:
+
+```bat
+git clone https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git third_party/KenshiLib_deps
+git -C third_party/KenshiLib_deps checkout b566d74bf3d74629cc2fb632a97595b8202993f1
+git -C third_party/KenshiLib_deps lfs pull
+tar -xf third_party/KenshiLib_deps/boost_1_60_0/boost.zip --directory third_party/KenshiLib_deps/boost_1_60_0
+git clone https://github.com/lsalzman/enet.git third_party/enet/enet
+git -C third_party/enet/enet checkout 5a9c537fd464b3c6d3c55e1d3bd47588faf71b42
+git -C third_party/enet/enet apply ../patches/0001-enet-c89-for-loops.patch
+git -C third_party/enet/enet apply ../patches/0002-enet-socket-hooks.patch
+```
+
+Update the pinned revisions when a release changes its dependencies. Vendored
+libraries remain outside the mod ZIP; the patches and v100 compatibility
+headers are tracked in the project repository.
+
 ## Build and deploy
 
 ```bat
@@ -39,8 +59,13 @@ only the core; the core loads and pins the UI beside itself. No hot reload.
 verified against the build outputs, but no `PROVENANCE.json` is shipped.
 Use `-Configuration Harness -SkipBuild` for `dist\KenshiCoop-dev-kit.zip`.
 F2 creates `coop_config.json` when saving settings; updates do not replace it.
-Instructions live in the release body; corresponding AGPL sources are a
-separate `KenshiCoop-source.zip` release asset, not part of the mod archive.
+Instructions live in the release body. Do not upload `KenshiCoop-source.zip`
+or any other dedicated source archive as a release asset: link the exact
+release tag in the public repository instead. GitHub's automatic source
+downloads are sufficient for the tracked project files; restore the external
+dependencies below to build them. Keep tags tied to the source used for their
+DLLs. Source availability required by AGPL is retained without adding another
+player-facing download.
 On this workstation, use `pwsh -NoProfile -File scripts/make_mod_kit.ps1 -SkipBuild`;
 the legacy `powershell` invocation did not resolve `Get-FileHash`.
 

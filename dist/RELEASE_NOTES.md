@@ -14,7 +14,7 @@
 
 **Сборка:** Release и Harness, обе пары core/UI, успешно собраны с v100. По просьбе пользователя игровые тесты этой версии не запускались; проверка подключения между двумя ПК остаётся за пользователем. Публичная и приватная диагностическая сборки несовместимы друг с другом.
 
-Соответствующие исходники по AGPL-3.0 — отдельный файл `KenshiCoop-source.zip` в этом релизе. В папку игры его копировать не нужно.
+Исходники по AGPL-3.0: [тег v0.1.22 в репозитории](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.22). [Инструкции сборки и получения зависимостей](https://github.com/kotetsyy/KenshiCoop4up/blob/main/docs/BUILD_SETUP.md).
 
 **Известное ограничение:** ранее выход через WM_CLOSE давал `0xC0000409` в RE_Kenshi. RE_Kenshi не изменён; исправление этого внешнего сбоя не заявляется.
 
@@ -24,6 +24,6 @@ The public build includes the current native F2 UI and the save-transfer fixes f
 
 KenshiCoop-kit.zip contains only four runtime files inside KenshiCoop/: the core DLL, companion UI DLL, mod and RE_Kenshi JSON. No launcher, shipped config, README, provenance or nested source archive. Close Kenshi on both machines, copy KenshiCoop/ into mods/, replace both DLLs together, and preserve your existing coop_config.json. F2 creates it when saving settings. RE_Kenshi is still required. Launch normally through Steam or kenshi_x64.exe.
 
-Both Release and Harness core/UI pairs build successfully with v100. In-game tests of this version were skipped at the user's request; two-machine connectivity is not claimed verified. Public and private diagnostic builds cannot connect to each other. Corresponding AGPL-3.0 sources are a separate KenshiCoop-source.zip asset. The previously observed RE_Kenshi exit crash is not claimed fixed.
+Both Release and Harness core/UI pairs build successfully with v100. In-game tests of this version were skipped at the user's request; two-machine connectivity is not claimed verified. Public and private diagnostic builds cannot connect to each other. Corresponding AGPL-3.0 sources are available at the [v0.1.22 repository tag](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.22), with [build/dependency instructions](https://github.com/kotetsyy/KenshiCoop4up/blob/main/docs/BUILD_SETUP.md). The previously observed RE_Kenshi exit crash is not claimed fixed.
 
 </details>
