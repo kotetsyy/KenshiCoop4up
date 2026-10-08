@@ -1,29 +1,26 @@
-## Исправление подключения и компактная установка
+## Поле ника без лишней кнопки
 
-В публичную сборку включён текущий нативный F2-интерфейс и исправления передачи мира из dev-сборки.
+- Убрана кнопка «Вставить» рядом с ником. Поле ника теперь занимает всю ширину строки.
+- Обычный ввод, кириллица, выделение, редактирование, Ctrl+V и переход по Tab сохранены.
+- Кнопки вставки Steam ID, адреса и порта не изменены.
+- Исправления подключения и передачи мира из v0.1.22 сохранены.
 
-- Исправлен доступ к сейвам по кириллическим путям, например `C:\Users\Миша`: перечисление, чтение, запись, проверка содержимого и перенос папок используют Unicode API Windows.
-- Тайм-аут записи мира больше не считается успешным сохранением. Нечитаемый bootstrap не отправляет пустой `LOAD_GO`; при невозможности начать передачу сессия завершается с ошибкой.
-- Приём BEGIN/FILE/DONE происходит одним атомарным срезом очереди, чтобы последний блок файла не терялся перед проверкой CRC.
-- Сохранены редактируемые поля ника и адреса, кириллица, Ctrl+V, Tab, выбор хоста/клиента и Steam/UDP, реальные этапы подключения и прогресс передачи мира.
-- `KenshiCoop-kit.zip` содержит только **четыре файла** в папке `KenshiCoop`: `KenshiCoop.dll`, `KenshiCoopUI.dll`, `KenshiCoop.mod`, `RE_Kenshi.json`. Без лаунчеров, готового конфига, README, PROVENANCE и вложенного архива исходников.
+**Установка:** при закрытой игре на обеих машинах скопируйте папку `KenshiCoop` из `KenshiCoop-kit.zip` в `<Kenshi>\mods\` с заменой файлов. В архиве только четыре файла: `KenshiCoop.dll`, `KenshiCoopUI.dll`, `KenshiCoop.mod`, `RE_Kenshi.json`. Свой `coop_config.json` сохраняйте. RE_Kenshi должен быть установлен; включите KenshiCoop в меню Mods.
 
-**Установка на обеих машинах:** полностью закройте Kenshi, скопируйте папку `KenshiCoop` из `KenshiCoop-kit.zip` в `<Kenshi>\mods\` с заменой файлов. RE_Kenshi должен быть установлен; включите KenshiCoop в меню Mods. Обе DLL берите из одного архива.
+**О номере протокола:** версия сборки — v0.1.23. `proto` обозначает формат сетевых пакетов, а не возраст сборки. Public сохраняет протокол 59; dev использует 63 с дополнительным приватным форматом диагностики и пересылкой логов клиента хосту. Они несовместимы между собой. Удаление кнопки не меняет сетевой формат.
 
-Настройки задаются в F2. `coop_config.json` создаётся при их сохранении; существующий конфиг не удаляйте и не заменяйте. `PROVENANCE.json` не требуется ни публичной, ни dev-сборке для запуска. Запускайте игру обычным способом, через Steam или `kenshi_x64.exe`.
+**Проверка:** пары Release и Harness собраны с v100. По просьбе пользователя игровые тесты не запускались; внешний вид этой правки в запущенной игре не объявляется проверенным.
 
-**Сборка:** Release и Harness, обе пары core/UI, успешно собраны с v100. По просьбе пользователя игровые тесты этой версии не запускались; проверка подключения между двумя ПК остаётся за пользователем. Публичная и приватная диагностическая сборки несовместимы друг с другом.
-
-Исходники по AGPL-3.0: [тег v0.1.22 в репозитории](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.22). [Инструкции сборки и получения зависимостей](https://github.com/kotetsyy/KenshiCoop4up/blob/main/docs/BUILD_SETUP.md).
-
-**Известное ограничение:** ранее выход через WM_CLOSE давал `0xC0000409` в RE_Kenshi. RE_Kenshi не изменён; исправление этого внешнего сбоя не заявляется.
+Исходники по AGPL-3.0 доступны в [теге v0.1.23](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.23); [инструкции сборки](https://github.com/kotetsyy/KenshiCoop4up/blob/main/docs/BUILD_SETUP.md). Отдельный source-архив к релизу не прикладывается.
 
 <details><summary>English</summary>
 
-The public build includes the current native F2 UI and the save-transfer fixes from the development build. Save filesystem operations now use Unicode Windows APIs, including Cyrillic profile paths. A save timeout is no longer treated as successful completion; an unreadable bootstrap never announces an empty LOAD_GO, and a refused transfer ends the session with an error. BEGIN/FILE/DONE reception uses one atomic queue snapshot.
+Removed the Paste button beside the nickname and expanded the input to the full row width. Native typing, Cyrillic, selection/editing, Ctrl+V and Tab navigation are retained. Endpoint Paste buttons are unchanged, as are the v0.1.22 connection/save-transfer fixes.
 
-KenshiCoop-kit.zip contains only four runtime files inside KenshiCoop/: the core DLL, companion UI DLL, mod and RE_Kenshi JSON. No launcher, shipped config, README, provenance or nested source archive. Close Kenshi on both machines, copy KenshiCoop/ into mods/, replace both DLLs together, and preserve your existing coop_config.json. F2 creates it when saving settings. RE_Kenshi is still required. Launch normally through Steam or kenshi_x64.exe.
+Close Kenshi on both machines and install the KenshiCoop folder from KenshiCoop-kit.zip into mods/. The archive contains only the core DLL, UI DLL, mod and RE_Kenshi JSON. Replace the pair together and preserve coop_config.json. RE_Kenshi is required.
 
-Both Release and Harness core/UI pairs build successfully with v100. In-game tests of this version were skipped at the user's request; two-machine connectivity is not claimed verified. Public and private diagnostic builds cannot connect to each other. Corresponding AGPL-3.0 sources are available at the [v0.1.22 repository tag](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.22), with [build/dependency instructions](https://github.com/kotetsyy/KenshiCoop4up/blob/main/docs/BUILD_SETUP.md). The previously observed RE_Kenshi exit crash is not claimed fixed.
+Build version is v0.1.23. Protocol numbers identify the network format, not build age: public remains 59, while private dev is 63 with additional diagnostics/client-log streaming. They cannot connect to each other. This UI change does not alter the wire format.
+
+Both Release and Harness pairs build with v100. In-game tests were skipped at the user's request; this layout change is not claimed visually verified. Sources are available at the [v0.1.23 repository tag](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.23), with [build instructions](https://github.com/kotetsyy/KenshiCoop4up/blob/main/docs/BUILD_SETUP.md). No separate source archive is attached.
 
 </details>

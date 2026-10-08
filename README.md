@@ -79,7 +79,7 @@
 
 1. Нажмите **F2**.
 2. **Введите ник** в поле. Поддерживаются кириллица, выделение, редактирование
-   и **Ctrl+V**; кнопка **«Вставить»** — дополнительный способ вставки.
+   и **Ctrl+V**. Поле ника занимает всю ширину строки, отдельной кнопки вставки нет.
 3. Выберите **Хост** или **Клиент**, затем **Steam** или **Прямой IP (UDP)**.
 4. **Steam, хост:** скопируйте свой Steam ID кнопкой окна и передайте клиенту.
    У хоста нет поля для чужого ID.
@@ -228,7 +228,7 @@ player does not need to load anything first.
 
 1. Press **F2**.
 2. **Type your nick** in the field. Cyrillic, selection, editing and **Ctrl+V**
-   are supported; **Paste** is an optional shortcut.
+   are supported. The nickname field uses the full row width, without a Paste button.
 3. Choose **Host** or **Client**, then **Steam** or **Direct IP (UDP)**.
 4. **Steam host:** copy your Steam ID using the window's button and send it to
    the client. The host has no field for a friend's ID.
@@ -242,8 +242,7 @@ player does not need to load anything first.
 
 **Tab** moves between fields; **Enter** starts the selected connection.
 Empty or invalid fields prevent a start and show the reason. Game controls
-are suppressed while editing. Nicks are limited to 63 UTF-8 bytes; the Paste
-button rejects oversized text instead of silently truncating it.
+are suppressed while editing. Nicks are limited to 63 UTF-8 bytes.
 
 Clients can connect from the main menu and receive the host's world. Nick,
 role, endpoint and one shared UDP port are remembered in `coop_config.json`;

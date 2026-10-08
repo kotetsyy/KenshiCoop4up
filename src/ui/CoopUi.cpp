@@ -46,7 +46,7 @@
 // columns above a footer:
 //   left   = ACTIONS: role and transport selectors (gold = selected), the nick
 //            field, the one endpoint field the chosen flow needs - each a real
-//            native EditBox with a small Paste button (own Steam ID: Copy) -
+//            native EditBox (endpoints: Paste; own Steam ID: Copy) -
 //            and one stateful primary action (create / connect / cancel /
 //            stop / disconnect);
 //   right  = RESULT: one primary status, role / link, real milestones derived
@@ -362,8 +362,6 @@ const char kErrClipAddr[] =
     "\xD0\x92 \xD0\xB1\xD1\x83\xD1\x84\xD0\xB5\xD1\x80\xD0\xB5 \xD0\xBE\xD0\xB1\xD0\xBC\xD0\xB5\xD0\xBD\xD0\xB0 \xD0\xBD\xD0\xB5\xD1\x82 \xD0\xB0\xD0\xB4\xD1\x80\xD0\xB5\xD1\x81\xD0\xB0 \xD0\xB2\xD0\xB8\xD0\xB4\xD0\xB0 IP:\xD0\xBF\xD0\xBE\xD1\x80\xD1\x82."; // В буфере обмена нет адреса вида IP:порт.
 const char kErrClipPort[] =
     "\xD0\x92 \xD0\xB1\xD1\x83\xD1\x84\xD0\xB5\xD1\x80\xD0\xB5 \xD0\xBE\xD0\xB1\xD0\xBC\xD0\xB5\xD0\xBD\xD0\xB0 \xD0\xBD\xD0\xB5\xD1\x82 \xD0\xBD\xD0\xBE\xD0\xBC\xD0\xB5\xD1\x80\xD0\xB0 \xD0\xBF\xD0\xBE\xD1\x80\xD1\x82\xD0\xB0 (1-65535)."; // В буфере обмена нет номера порта (1-65535).
-const char kErrClipNick[] =
-    "\xD0\x92 \xD0\xB1\xD1\x83\xD1\x84\xD0\xB5\xD1\x80\xD0\xB5 \xD0\xBE\xD0\xB1\xD0\xBC\xD0\xB5\xD0\xBD\xD0\xB0 \xD0\xBD\xD0\xB5\xD1\x82 \xD0\xBF\xD0\xBE\xD0\xB4\xD1\x85\xD0\xBE\xD0\xB4\xD1\x8F\xD1\x89\xD0\xB5\xD0\xB3\xD0\xBE \xD0\xB8\xD0\xBC\xD0\xB5\xD0\xBD\xD0\xB8."; // В буфере обмена нет подходящего имени.
 const char kOkCopyId[] =
     "Steam ID \xD1\x81\xD0\xBA\xD0\xBE\xD0\xBF\xD0\xB8\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB0\xD0\xBD \xD0\xB2 \xD0\xB1\xD1\x83\xD1\x84\xD0\xB5\xD1\x80 \xD0\xBE\xD0\xB1\xD0\xBC\xD0\xB5\xD0\xBD\xD0\xB0."; // Steam ID скопирован в буфер обмена.
 const char kOkReport[] =
@@ -1292,7 +1290,6 @@ void onPanelClick(MyGUI::Widget* w) {
     else if (w == u.selJoin.btn.w)   selectRole(false);
     else if (w == u.selSteam.btn.w)  selectTransport(true);
     else if (w == u.selUdp.btn.w)    selectTransport(false);
-    else if (w == u.nick.button.w)   g_pendingPaste = FLD_NICK;
     else if (w == u.hostId.button.w) g_pendingPaste = FLD_HOSTID;
     else if (w == u.addr.button.w)   g_pendingPaste = FLD_ADDR;
     else if (w == u.port.button.w)   g_pendingPaste = FLD_PORT;
@@ -1316,10 +1313,10 @@ void onFrameClose(MyGUI::Window*, const std::string&) { g_panel.closeRequested =
 
 // Paste button: clipboard -> the field, normalised by the field's own parser.
 void runPaste(int f) {
-    if (f != FLD_NICK && g_locked) return;
+    if (g_locked) return;
     Ctl& e = fieldEdit(f);
     if (!e.w) return;
-    const int slot = f == FLD_NICK ? NOTE_NICK : NOTE_EP;
+    const int slot = NOTE_EP;
     std::string clip;
     if (!clipboardGetText(clip) || blank(clip)) {
         setNote(slot, ru::kErrClipEmpty, TONE_BAD);
@@ -1329,11 +1326,6 @@ void runPaste(int f) {
     std::string value;
     const char* err = 0;
     switch (f) {
-    case FLD_NICK: {
-        if (nickTooLong(clip)) err = ru::kErrNickLong;
-        else if (!coop::parsePlayerNick(clip, value) || coop::isPoisonedNick(value)) err = ru::kErrClipNick;
-        break;
-    }
     case FLD_HOSTID: {
         unsigned long long id = 0;
         bool ok = coop::parseSteamId64(clip, id);
@@ -1754,8 +1746,9 @@ void mkSelector(Builder& b, Selector& s, int font, int x, int y, int w, int h) {
     mkRect(b, s.veil, x + 3, y + 3, w - 6, h - 6, C_VEIL_GOLD, 0.30f);
 }
 
-void mkField(Builder& b, Field& f, int x, int y, int w, int h, int maxLen) {
-    const int ew = w - kSmallBtnW - 10;
+void mkField(Builder& b, Field& f, int x, int y, int w, int h, int maxLen,
+             bool pasteButton) {
+    const int ew = pasteButton ? w - kSmallBtnW - 10 : w;
     mkRect(b, f.ring, x - 2, y - 2, ew + 4, h + 4, C_FRAME_GOLD, 1.0f);
     const std::string name = nextName();
     place(b, f.edit, editCreateSeh(b.g, b.parent, &name, x, y, ew, h, maxLen), K_EDIT, F_BODY,
@@ -1768,7 +1761,8 @@ void mkField(Builder& b, Field& f, int x, int y, int w, int h, int maxLen) {
         e->eventEditSelectAccept += MyGUI::newDelegate(&onEditAccept);
         e->eventKeyButtonPressed += MyGUI::newDelegate(&onEditKey);
     }
-    mkButton(b, f.button, F_SMALL, x + ew + 10, y, kSmallBtnW, h);
+    if (pasteButton)
+        mkButton(b, f.button, F_SMALL, x + ew + 10, y, kSmallBtnW, h);
 }
 
 // Every widget of the panel, laid out once for the client size cw x ch.
@@ -1802,7 +1796,7 @@ bool buildPanelWidgets(ForgottenGUI* g, MyGUI::Widget* parent, int cw, int ch) {
     y += kSelH + gapL;
     mkLabel(b, u.hdrNick, F_HEAD, x0, y, lw, kHeadH);
     y += head;
-    mkField(b, u.nick, x0, y, lw, kFieldH, kNickMaxChars);
+    mkField(b, u.nick, x0, y, lw, kFieldH, kNickMaxChars, false);
     y += kFieldH + 4;
     mkLabel(b, u.nickNote, F_SMALL, x0, y, lw, kNoteH);
     y += kNoteH + gapL;
@@ -1814,9 +1808,9 @@ bool buildPanelWidgets(ForgottenGUI* g, MyGUI::Widget* parent, int cw, int ch) {
     mkLabel(b, u.hdrEndpoint, F_HEAD, x0, y, lw, kHeadH);
     y += head;
     // One slot, four occupants: only the selected flow's is shown.
-    mkField(b, u.hostId, x0, y, lw, kFieldH, kIdMaxChars);
-    mkField(b, u.addr, x0, y, lw, kFieldH, kAddrMaxChars);
-    mkField(b, u.port, x0, y, lw, kFieldH, kPortMaxChars);
+    mkField(b, u.hostId, x0, y, lw, kFieldH, kIdMaxChars, true);
+    mkField(b, u.addr, x0, y, lw, kFieldH, kAddrMaxChars, true);
+    mkField(b, u.port, x0, y, lw, kFieldH, kPortMaxChars, true);
     const int sw = lw - kSmallBtnW - 10;
     mkRect(b, u.selfBg, x0, y, sw, kFieldH, C_BLACK, 0.45f);
     mkLabel(b, u.selfText, F_BODY, x0 + 12, y, sw - 24, kFieldH);
@@ -2070,10 +2064,12 @@ void styleField(Field& f, int id, bool visible, bool readOnly, bool buttonEnable
     ctlVisible(f.edit, visible);
     ctlReadOnly(f.edit, readOnly);
     ctlColour(f.edit, readOnly ? C_MUTED : C_TEXT);
-    ctlText(f.button, ru::kPaste);
-    ctlVisible(f.button, visible);
-    ctlEnabled(f.button, buttonEnabled);
-    ctlButtonColour(f.button, buttonEnabled ? C_SOFT : C_DIM, C_HOVER);
+    if (f.button.w) {
+        ctlText(f.button, ru::kPaste);
+        ctlVisible(f.button, visible);
+        ctlEnabled(f.button, buttonEnabled);
+        ctlButtonColour(f.button, buttonEnabled ? C_SOFT : C_DIM, C_HOVER);
+    }
     const bool editing = focused == id && !readOnly;
     const bool bad = !readOnly && badVerdict(g_draft[id].verdict);
     ctlFill(f.ring, (bad && !editing) ? C_BAD : C_FRAME_GOLD, 1.0f);
@@ -2417,7 +2413,7 @@ void refreshPanel(const CoopUiSnapshot* st) {
 void hoverPass() {
     PanelWidgets& u = g_ui;
     Ctl* b[] = { &u.selHost.btn, &u.selJoin.btn, &u.selSteam.btn, &u.selUdp.btn,
-                 &u.nick.button, &u.hostId.button, &u.addr.button, &u.port.button,
+                 &u.hostId.button, &u.addr.button, &u.port.button,
                  &u.copyId, &u.primary.btn, &u.btnDiag, &u.btnReport, &u.btnHide };
     for (size_t i = 0; i < sizeof(b) / sizeof(b[0]); ++i) {
         Ctl& c = *b[i];

@@ -14,7 +14,7 @@ from an installed SDK. Build commands fail if either DLL fails.
 ## Restore external dependencies
 
 From a fresh checkout of the release tag, restore the dependency revisions used
-for v0.1.22. Git LFS is required for KenshiLib libraries and the Boost archive:
+for v0.1.22 and v0.1.23. Git LFS is required for KenshiLib libraries and the Boost archive:
 
 ```bat
 git clone https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git third_party/KenshiLib_deps
