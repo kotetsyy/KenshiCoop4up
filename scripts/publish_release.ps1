@@ -14,8 +14,8 @@
 # It does NOT push or create the GitHub release - it prints the two commands to
 # run, so nothing leaves the machine without you typing it.
 # Do not attach KenshiCoop-source.zip (or another dedicated source archive).
-# Keep each release tag at the exact source commit used for its DLLs; link that
-# tag in the release body. Dependency fetch/build instructions live in
+# Keep each release tag at the exact source commit used for its DLLs. Source
+# access is documented in README.md; dependency fetch/build instructions live in
 # docs/BUILD_SETUP.md. GitHub's automatic source downloads need no asset upload.
 #
 # RELEASE NOTES FORMAT (dist/RELEASE_NOTES.md, passed as --notes-file):
@@ -28,6 +28,9 @@
 #   * Do not repeat the fork attribution or the protocol number in every
 #     release; that belongs in README.md. Mention the protocol only when it
 #     CHANGES, since that is the release where it decides who can still connect.
+#   * Do not repeat the release title as a heading inside its body.
+#   * Keep build/test reports and source-distribution explanations out of the
+#     player-facing notes; retain changes, compatibility and installation.
 #
 # -Amend: same version/tag, replace the assets on the EXISTING GitHub release
 # (window-size, label copy, tiny fixes). Use a new COOP_BUILD_VERSION / tag

@@ -1,5 +1,3 @@
-# v0.1.24 — пауза хоста до READY и ENet 1 мс
-
 ## Изменения
 
 - В public перенесён барьер загрузки из dev: хост держит свою симуляцию на паузе до появления загруженного мира у всех подключённых клиентов. Окончание передачи файлов само по себе больше не снимает эту паузу.
@@ -28,12 +26,6 @@ Dev этой версии использует **протокол 65** с доп
 
 RE_Kenshi должен быть установлен. Свой `coop_config.json` сохраните; новый конфиг создаётся через F2. Лаунчеров, `PROVENANCE.json`, инструкций и исходников внутри игрового архива нет. Обе DLL обновляются вместе, изменения действуют после перезапуска игры.
 
-## Проверка
-
-Release и Harness core/UI DLL собраны успешно. Состав архивов и SHA-256 пары проверены. По просьбе пользователя игру и тестовые наборы для этой версии не запускали; подключение HOST/JOIN, пауза/READY в игре и влияние 1 мс на CPU и задержку оставлены для самостоятельной проверки.
-
-Исходники по AGPL-3.0 доступны в [теге v0.1.24](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.24). Инструкции восстановления зависимостей и сборки — [docs/BUILD_SETUP.md](https://github.com/kotetsyy/KenshiCoop4up/blob/v0.1.24/docs/BUILD_SETUP.md). Отдельный архив исходников к релизу не прикладывается.
-
 <details><summary>English</summary>
 
 The public build now shares the development build's join-load barrier: the host's simulation is held until every connected client has a live world and reports READY for its current `LOAD_GO` id. File-transfer completion or a previous load's READY does not release the barrier. Title-screen joins and in-world reloads are covered by the same implementation. The temporary hold preserves the speed/pause vote and requires save, load, speed and time sync; disconnected clients are removed from the wait.
@@ -43,9 +35,5 @@ Both configurations use a 1 ms maximum idle ENet wait. Entity snapshots remain a
 Public protocol is **64** (`TimePacket` always contains `readyLoadId`); private protocol is **65** with log mirroring. Earlier public 59/private 63 builds and mixed public/private pairs are rejected. Install the same DLL pair on the host and all clients with Kenshi closed.
 
 `KenshiCoop-kit.zip` contains only the core DLL, UI DLL, mod and RE_Kenshi JSON under `KenshiCoop/`. Copy the folder into `<Kenshi>/mods/`, keep the existing `coop_config.json` and restart. RE_Kenshi must already be installed. No launchers, provenance, notes or source archives are bundled.
-
-Release/Harness core/UI builds succeeded; archive contents and hashes were checked. The game and test suites were not run at the user's request. In-game connection, pause/READY and the latency/CPU effect of the shorter wait remain user-verified.
-
-Corresponding AGPL-3.0 source is available at [tag v0.1.24](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.24); dependency restoration and build instructions are in [BUILD_SETUP.md](https://github.com/kotetsyy/KenshiCoop4up/blob/v0.1.24/docs/BUILD_SETUP.md). No separate source asset is uploaded.
 
 </details>
