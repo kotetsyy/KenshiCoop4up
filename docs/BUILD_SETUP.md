@@ -14,7 +14,7 @@ from an installed SDK. Build commands fail if either DLL fails.
 ## Restore external dependencies
 
 From a fresh checkout of the release tag, restore the dependency revisions used
-for v0.1.22 and v0.1.23. Git LFS is required for KenshiLib libraries and the Boost archive:
+for v0.1.22 through v0.1.24. Git LFS is required for KenshiLib libraries and the Boost archive:
 
 ```bat
 git clone https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git third_party/KenshiLib_deps
@@ -78,13 +78,18 @@ An older core-only updater needs the new companion too: manually install both
 DLLs, or let the new core repair the missing UI on its next update check and
 restart again. UI absence/ABI rejection is logged; it does not stop networking.
 
-The private Harness kit uses protocol 63 and `dist/debug-kit/private-update.json`
-with four SHA-256 entries, including both DLLs. The private launcher always
-synchronizes against the latest closed GitHub release before starting Kenshi.
-Replacing only the local kit without publishing its private manifest/assets
-would reinstall the previous remote pair. Public publication is separate.
+The current public Release pair uses protocol 64; the current Harness pair uses
+private protocol 65. Both share the load-specific READY barrier and a 1 ms
+maximum idle ENet wait; only the private pair mirrors the client's local log.
+The packed `TimePacket` is 21 bytes in both configurations (`readyLoadId` is
+always present). Earlier public 59 and private 63 pairs are rejected at handshake.
 
-### Protocol 63 connection hotfix (2026-10-09)
+The private launcher reads `dist/debug-kit/private-update.json` and synchronizes
+against the latest closed GitHub release before starting Kenshi. The current
+manual Harness pair is not published to that feed: starting its old launcher
+would restore the previous remote pair. Public publication is separate.
+
+### Manual installation of v0.1.24
 
 `dist/KenshiCoop-dev-kit.zip` is a four-file manual update for existing private
 installs, identical on HOST and JOIN. With both games closed, copy
@@ -96,7 +101,9 @@ not been published to its update feed, so it would restore the previous release.
 Save filesystem operations use Unicode Windows APIs while engine/wire paths
 remain UTF-8. An unsuccessful host save or refused bootstrap transfer ends
 the session instead of issuing an unreadable `LOAD_GO` or holding the host
-for a READY that cannot arrive. Protocol 63 and the normal load/READY pause
-are unchanged. Harness core/UI builds succeeded; the Unicode save regression
-passed before the user's request to skip further tests. End-to-end connection
-verification is left to the user; no two-account Steam check is claimed.
+for a READY that cannot arrive. The load/READY pause is now shared by Release
+and Harness: READY is sent after the new world becomes live and must match the
+host's current `LOAD_GO` id for each connected join. The temporary hold preserves
+the selected speed/pause vote and requires save, load, speed and time sync.
+Release/Harness core/UI builds succeeded. Game and test suites were not run at
+the user's request; end-to-end HOST/JOIN verification is left to the user.

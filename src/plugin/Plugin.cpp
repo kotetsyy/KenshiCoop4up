@@ -144,15 +144,13 @@ struct SessionController {
     bool         worldFromHost;    // join: the host's world went live here
     bool         worldSyncFailed;  // join: host-world transfer or load failed
 
-#ifdef KENSHICOOP_NET_DIAG
-    // Private protocol 61: pause host simulation from connect through the
-    // join's completed LOAD_GO world swap, not merely through save transfer.
+    // Pause host simulation from connect through the join's completed LOAD_GO
+    // world swap, not merely through save transfer.
     bool         connected[coop::MAX_PLAYERS];
     coop::u32    expectedLoadId[coop::MAX_PLAYERS];
     coop::u32    pendingReadyLoadId; // join: GO awaiting new-world live edge
     bool         pendingReadyLoadIssued; // join: LOAD_GO save was actually issued
     coop::u32    readyLoadId;        // join: acknowledged GO for the live world
-#endif
     SessionController()
       : gameStarted(false), gameStartTick(0), autoLoadDone(false),
         titleFirstTick(0), peerPresent(false), peerCount(0),
@@ -160,15 +158,11 @@ struct SessionController {
         swapStartTick(0), swapHookTicks(0),
         loadSuppressOn(false), loadIdOut(0), loadIdSeen(0), loadReqId(0),
         loadCommitBase(0), loadPumpArmTick(0),
-        worldLoadIssued(false), worldFromHost(false), worldSyncFailed(false)
-#ifdef KENSHICOOP_NET_DIAG
-        , pendingReadyLoadId(0), pendingReadyLoadIssued(false), readyLoadId(0)
-#endif
+        worldLoadIssued(false), worldFromHost(false), worldSyncFailed(false),
+        pendingReadyLoadId(0), pendingReadyLoadIssued(false), readyLoadId(0)
     {
-#ifdef KENSHICOOP_NET_DIAG
         memset(connected, 0, sizeof(connected));
         memset(expectedLoadId, 0, sizeof(expectedLoadId));
-#endif
     }
 };
 SessionController g_session;
@@ -193,7 +187,6 @@ std::string& g_loadXferPending = g_session.loadXferPending;
 std::string& g_loadAfterCommit = g_session.loadAfterCommit;
 coop::u32&   g_loadCommitBase  = g_session.loadCommitBase;
 DWORD&       g_loadPumpArmTick  = g_session.loadPumpArmTick;
-#ifdef KENSHICOOP_NET_DIAG
 void expectJoinLoad(coop::u32 loadId) {
     for (unsigned int id = 1; id < coop::MAX_PLAYERS; ++id)
         if (g_session.connected[id]) g_session.expectedLoadId[id] = loadId;
@@ -210,7 +203,6 @@ bool hostWaitingForJoinLoad() {
             return true;
     return false;
 }
-#endif
 
 // Scenario harness state. Harness/Debug builds only - the shipped Release DLL
 // excludes test/Scenario*.cpp and does not define KENSHICOOP_HARNESS (Phase 1).
@@ -311,13 +303,11 @@ void sessionResetForUi() {
     g_loadAfterCommit.clear();
     g_loadPumpArmTick = 0;
     coop::savexfer::abortAll();
-#ifdef KENSHICOOP_NET_DIAG
     memset(g_session.connected, 0, sizeof(g_session.connected));
     memset(g_session.expectedLoadId, 0, sizeof(g_session.expectedLoadId));
     g_session.pendingReadyLoadId = 0;
     g_session.pendingReadyLoadIssued = false;
     g_session.readyLoadId = 0;
-#endif
     if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
     else          g_repl.resetSession();
     g_inbound.flushWorldState();
@@ -392,12 +382,10 @@ void processNetEvents(GameWorld* gw) {
         if (g_cfg.latejoinSync) g_repl.onPeerConnected(g_net, g_net.localId());
         else coopLog("[latejoin] connect edge seen, resync OFF (gate)");
         ++g_peerCount;
-#ifdef KENSHICOOP_NET_DIAG
         if (g_cfg.isHost && *it < coop::MAX_PLAYERS) {
             g_session.connected[*it] = true;
             g_session.expectedLoadId[*it] = 0;
         }
-#endif
         g_peerPresent = true;
         // Join learns its squad-tab rank from WELCOME playerId (1, 2 or 3).
         if (!g_cfg.isHost && !g_cfg.ownRanksFromEnv) {
@@ -435,7 +423,6 @@ void processNetEvents(GameWorld* gw) {
         if (*it == coop::OWNER_ID_ALL) g_peerCount = 0;
         else if (g_peerCount > 0) --g_peerCount;
         g_peerPresent = g_peerCount > 0;
-#ifdef KENSHICOOP_NET_DIAG
         if (g_cfg.isHost) {
             if (*it == coop::OWNER_ID_ALL) {
                 memset(g_session.connected, 0, sizeof(g_session.connected));
@@ -445,7 +432,6 @@ void processNetEvents(GameWorld* gw) {
                 g_session.expectedLoadId[*it] = 0;
             }
         }
-#endif
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync && g_peerCount == 0) {
             coop::engine::setSaveSuppress(false);
@@ -598,9 +584,7 @@ void driveSaveSync() {
                     }
                     strncpy(go.name, g_bootstrapName.c_str(), sizeof(go.name) - 1);
                     g_net.queueLoadGo(go);
-#ifdef KENSHICOOP_NET_DIAG
                     expectJoinLoad(go.loadId);
-#endif
                     g_loadPumpArmTick = GetTickCount();
                     char b2[192];
                     _snprintf(b2, sizeof(b2) - 1,
@@ -682,9 +666,7 @@ void driveLoadSync(GameWorld* gw) {
             go.fingerprint = coop::savexfer::folderFingerprint(name);
             strncpy(go.name, name.c_str(), sizeof(go.name) - 1);
             g_net.queueLoadGo(go);
-#ifdef KENSHICOOP_NET_DIAG
             expectJoinLoad(go.loadId);
-#endif
             g_loadPumpArmTick = GetTickCount();
             char b[160];
             _snprintf(b, sizeof(b) - 1,
@@ -806,11 +788,9 @@ void driveLoadSync(GameWorld* gw) {
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
             if (!name[0]) continue;
-#ifdef KENSHICOOP_NET_DIAG
             g_session.pendingReadyLoadId = it->pkt.loadId;
             g_session.pendingReadyLoadIssued = false;
             g_session.readyLoadId = 0;
-#endif
             // A new GO supersedes whatever world state the panel reported.
             g_session.worldFromHost   = false;
             g_session.worldLoadIssued = false;
@@ -838,10 +818,8 @@ void driveLoadSync(GameWorld* gw) {
                 const bool issued = coop::engine::loadSave(name);
                 if (!issued)
                     coopErr("[load] coordinated load FAILED to issue");
-#ifdef KENSHICOOP_NET_DIAG
                 else
                     g_session.pendingReadyLoadIssued = true;
-#endif
                 g_session.worldLoadIssued = issued;
                 g_session.worldSyncFailed = !issued;
             } else {
@@ -885,10 +863,8 @@ void driveLoadSync(GameWorld* gw) {
                 const bool issued = coop::engine::loadSave(g_loadAfterCommit);
                 if (!issued)
                     coopErr("[load] post-transfer load FAILED to issue");
-#ifdef KENSHICOOP_NET_DIAG
                 else
                     g_session.pendingReadyLoadIssued = true;
-#endif
                 g_session.worldLoadIssued = issued;
                 g_session.worldSyncFailed = !issued;
                 g_loadAfterCommit.clear();
@@ -1025,13 +1001,11 @@ void fillPanelPlayers(CoopUiSnapshot& ps, const coop::NetStatus& ns) {
                                        : ps.worldPhase == COOP_WORLD_READY;
         } else {
             g_net.copyPeerName(id, p.name, sizeof(p.name));
-#ifdef KENSHICOOP_NET_DIAG
-            // Private protocol 61: the join acknowledges its completed load.
+            // The join acknowledges the completed load, not just the transfer.
             if (g_cfg.isHost && g_session.expectedLoadId[id] != 0) {
                 p.worldReadyKnown = true;
                 p.worldReady = g_repl.peerReadyLoadId(id) == g_session.expectedLoadId[id];
             }
-#endif
         }
     }
 }
@@ -1422,7 +1396,6 @@ void tickWorldSwapEdge(GameWorld* gw) {
                 if (g_cfg.loadSync)
                     sessionResetForWorldReload();
                 noteJoinWorldLive();
-#ifdef KENSHICOOP_NET_DIAG
                 if (!g_cfg.isHost && g_session.pendingReadyLoadId != 0 &&
                     g_session.pendingReadyLoadIssued) {
                     g_session.readyLoadId = g_session.pendingReadyLoadId;
@@ -1434,7 +1407,6 @@ void tickWorldSwapEdge(GameWorld* gw) {
                               (unsigned)g_session.readyLoadId);
                     ready[sizeof(ready) - 1] = '\0'; coopLog(ready);
                 }
-#endif
             }
         }
     }
@@ -2180,7 +2152,6 @@ void mainLoop_hook(GameWorld* gw, float dt) {
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
             }
         }
-#ifdef KENSHICOOP_NET_DIAG
         // A join that receives LOAD_GO on the title screen has no previous
         // gameplay world to transition FROM. Its first live tick is the load
         // completion edge; waiting only for WORLD-RELOAD strands the host paused.
@@ -2195,7 +2166,6 @@ void mainLoop_hook(GameWorld* gw, float dt) {
                       (unsigned)g_session.readyLoadId);
             ready[sizeof(ready) - 1] = '\0'; coopLog(ready);
         }
-#endif
         // Speed-intent capture (vote/effective decoupling): detour the engine's
         // speed setters so every USER action (button, keyboard pause, simulated
         // click) registers as a vote, while our own quiet applies stay invisible.
@@ -2333,7 +2303,6 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // needs worldLive handed to it: a world load creates every building in the
     // save through that same factory and none of them are player placements.
     coop::engine::setBuildCaptureArmed(worldLive);
-#ifdef KENSHICOOP_NET_DIAG
     const bool joinHold = hostWaitingForJoinLoad();
     static bool wasJoinHold = false;
     if (joinHold != wasJoinHold) {
@@ -2346,7 +2315,6 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     }
     g_repl.setBootstrapHold(joinHold);
     g_repl.setReadyLoadId(g_cfg.isHost ? 0 : g_session.readyLoadId);
-#endif
 
     // Replication publish (pre-engine, worldLive-gated): ingest received targets,
     // then stream every owned channel so applied state is current this tick.

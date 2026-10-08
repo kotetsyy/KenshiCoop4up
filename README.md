@@ -72,6 +72,15 @@
 
 **У всех должна быть одна и та же сборка.** Разные версии не соединяются.
 
+В public `v0.1.24` используется протокол **64**. Хост держит симуляцию на паузе
+до загрузки мира всеми подключёнными клиентами: каждый подтверждает READY
+именно для текущего `LOAD_GO`, а не просто окончание передачи файлов.
+Пауза не заменяет выбранную игроками скорость или пользовательскую паузу.
+Этот барьер работает при включённой синхронизации сейвов, загрузки, скорости
+и времени. Максимальное ожидание ENet в простое — **1 мс**; снимки сущностей
+по-прежнему отправляются с частотой 20 Гц. Это не гарантия пинга 1 мс;
+более частые пробуждения могут увеличить нагрузку CPU.
+
 ## Подключение в игре (F2)
 
 Панель работает и в **главном меню**, и в игре, так что подключающемуся не нужно
@@ -260,22 +269,26 @@ some units into another squad tab in-game.
 
 Build the private `debug/live-net-telemetry` branch with
 `scripts\build_plugin.cmd Harness`. This optimized diagnostic pair uses **private
-protocol 63**; the ordinary released pair remains on protocol 59. Host and join
+protocol 65**; the ordinary released pair uses protocol 64. Host and join
 must both use the same build pair. This private build disables public auto-updates
 even if a tester's `coop_config.json` still has `"updateEnabled": true`.
 
+Both configurations pause the host simulation until every connected join reports
+the READY id for its current `LOAD_GO` after the new world becomes live, including
+a join connecting from the title screen. The temporary hold does not replace the
+speed/pause vote and requires save, load, speed and time sync to remain enabled.
+Both configurations use a 1 ms maximum idle ENet wait; entity snapshots remain
+at 20 Hz. This is not a 1 ms ping guarantee; CPU wakeups may increase.
+
 Local ENet rates appear in the collapsible **Diagnostics** block and **Copy
 report**, not a separate always-on overlay. Once a JOIN completes WELCOME, the
-debug DLL forwards selected `[audit]`, `[inv]`, `[net-diag]`, `[save]` and related
-diagnostic lines to the HOST over the existing ENet connection, on the bulk
-channel. The host writes them as `[remote-join id=N clientMs=...] ...` beside its
-own entries in `KenshiCoop_host.log`. The join retains its full
-`KenshiCoop_join.log`. Forwarding is limited to eight lines per second with a
-64-line in-memory queue; `[diag-relay] dropped=N` reports overflow. Save transfer
-can delay the bulk channel. If a save transfer fails, inspect the forwarded
-`[save] XFER-FAILED` and preceding `[save]` errors; the full join log can contain
-additional detail. These are observations from two machines, **not** an automatic
-verdict that their worlds match.
+debug DLL mirrors its full local log over the existing ENet connection, on the
+bulk channel. The host writes it to `KenshiCoop_join_N_mirror.log` separately
+from its own `KenshiCoop_host.log`; the join retains `KenshiCoop_join.log`.
+Forwarding is bounded to eight chunks of up to 960 bytes per second; pending
+bytes stay on disk. Save transfer can delay the bulk channel. These are
+observations from two machines, **not** an automatic verdict that their worlds
+match. Public builds do not forward client logs.
 
 This chat has no direct connection to a tester's PC: live analysis means reading
 the combined log on the host machine during a session. There is no separate

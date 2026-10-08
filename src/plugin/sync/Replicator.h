@@ -648,8 +648,7 @@ public:
     // enforcement; when speedSync is off the channel degrades to offset logging
     // (no lever to compose with).
     void syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
-#ifdef KENSHICOOP_NET_DIAG
-    // Private join-load barrier: pause the host simulation without changing
+    // Join-load barrier: pause the host simulation without changing
     // the voted multiplier or the speed sent to the join. A join reports the
     // LOAD_GO id in its clock packet only after the new world is live.
     void setBootstrapHold(bool hold) { bootstrapHold_ = hold; }
@@ -657,7 +656,6 @@ public:
     u32 peerReadyLoadId(u32 ownerId) const {
         return ownerId < MAX_PLAYERS ? peerReadyLoadIds_[ownerId] : 0;
     }
-#endif
 
     // Game-clock sync master enable (KENSHICOOP_TIME_SYNC).
     void setTimeSync(bool v) { timeSync_ = v; }
@@ -2683,11 +2681,9 @@ private:
     // The engine speed the slewed value was derived from; lets the enforcement
     // distinguish "our slewed write" from a real user click.
     float         timeSlewApplied_;   // join: last effective*slew written (-1 = none)
-#ifdef KENSHICOOP_NET_DIAG
     bool bootstrapHold_;
     u32 readyLoadIdOut_;
     u32 peerReadyLoadIds_[MAX_PLAYERS];
-#endif
     // The consensus effective with the clock slew folded in (what the quiet
     // writes actually drive; clamped to the engine's sane speed range).
     float slewedEffective(float eff) const {

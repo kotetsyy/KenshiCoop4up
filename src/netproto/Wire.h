@@ -20,18 +20,14 @@ typedef unsigned int   u32;
 typedef float          f32;
 typedef double         f64;
 
-// Protocol version. The full version-by-version history (what each bump added
-// and why) lives in resources/PROTOCOL_HISTORY.md - keep it there, not here, so
-// this header stays a definition file. When you bump PROTOCOL_VERSION, add the
-// matching entry at the bottom of that doc. The version is checked at handshake
-// and a mismatch is rejected (no back-compat).
+// Protocol version is checked at handshake; a mismatch is rejected (no back-compat).
+// Public 64 adds the completed LOAD_GO id to clock packets for the join-load barrier.
 #ifdef KENSHICOOP_NET_DIAG
-// Private protocol 63 mirrors the join's complete local log as bounded,
-// reliable chunks in a separate host file. Earlier private binaries cannot
-// silently omit the mirror; the public wire protocol remains version 59.
-const u16 PROTOCOL_VERSION = 63;
+// Private 65 uses the same join-load barrier plus bounded, reliable join-log
+// chunks in a separate host file. Both peers must use the same protocol.
+const u16 PROTOCOL_VERSION = 65;
 #else
-const u16 PROTOCOL_VERSION = 59;
+const u16 PROTOCOL_VERSION = 64;
 #endif
 
 // RELEASE id - a different axis from PROTOCOL_VERSION, and the two are routinely
@@ -52,7 +48,7 @@ const u16 PROTOCOL_VERSION = 59;
 // introduced ordering, which is the only moment it was free: those clients
 // install whatever the manifest names regardless of order, so they follow the
 // renumber, and every build after this one is ordered and monotonic.
-const char* const COOP_BUILD_VERSION = "0.1.23";
+const char* const COOP_BUILD_VERSION = "0.1.24";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;
@@ -1101,9 +1097,7 @@ struct TimePacket {
     u32 ownerId;   // network player id of the sender (either side)
     u32 seq;       // per-sender monotonic (stale-sample guard)
     f64 gameHours; // absolute in-game clock, total hours
-#ifdef KENSHICOOP_NET_DIAG
     u32 readyLoadId; // join: most recent LOAD_GO whose new world is live (0 until then)
-#endif
 };
 
 // ---- Protocol 26: baked-door open/lock state ----------------------------------

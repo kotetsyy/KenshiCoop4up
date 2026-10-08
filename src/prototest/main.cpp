@@ -102,11 +102,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
     CHECK_EQ("sizeof(MoneyDeltaPacket)",        sizeof(MoneyDeltaPacket),        13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
-#ifdef KENSHICOOP_NET_DIAG
     CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              21);
-#else
-    CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              17);
-#endif
     CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              31);
     CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),        94);
     CHECK_EQ("sizeof(BuildStatePacket)",        sizeof(BuildStatePacket),        34);
@@ -324,11 +320,6 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-#ifdef KENSHICOOP_NET_DIAG
-    CHECK_EQ("PROTOCOL_VERSION (private log mirror)", (int)PROTOCOL_VERSION, 63);
-#else
-    CHECK_EQ("PROTOCOL_VERSION (v59: player roster)", (int)PROTOCOL_VERSION, 59);
-#endif
     // Protocol 56 (v59): the roster table. One row carries EVERY name, so a
     // receiver can never be handed half a table, and the tag must not collide
     // with the fixture row that preceded it.

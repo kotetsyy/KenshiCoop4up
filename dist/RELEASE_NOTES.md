@@ -1,26 +1,51 @@
-## Поле ника без лишней кнопки
+# v0.1.24 — пауза хоста до READY и ENet 1 мс
 
-- Убрана кнопка «Вставить» рядом с ником. Поле ника теперь занимает всю ширину строки.
-- Обычный ввод, кириллица, выделение, редактирование, Ctrl+V и переход по Tab сохранены.
-- Кнопки вставки Steam ID, адреса и порта не изменены.
-- Исправления подключения и передачи мира из v0.1.22 сохранены.
+## Изменения
 
-**Установка:** при закрытой игре на обеих машинах скопируйте папку `KenshiCoop` из `KenshiCoop-kit.zip` в `<Kenshi>\mods\` с заменой файлов. В архиве только четыре файла: `KenshiCoop.dll`, `KenshiCoopUI.dll`, `KenshiCoop.mod`, `RE_Kenshi.json`. Свой `coop_config.json` сохраняйте. RE_Kenshi должен быть установлен; включите KenshiCoop в меню Mods.
+- В public перенесён барьер загрузки из dev: хост держит свою симуляцию на паузе до появления загруженного мира у всех подключённых клиентов. Окончание передачи файлов само по себе больше не снимает эту паузу.
+- READY содержит идентификатор конкретного `LOAD_GO`. Подтверждение предыдущей загрузки не разрешает текущую; READY отправляется только после появления живого мира, включая подключение из главного меню и перезагрузку уже открытого мира.
+- Временная пауза не заменяет выбранную скорость или пользовательскую паузу. Барьер работает при включённых save/load/speed/time sync; при отключении клиента его ожидание убирается.
+- Максимальное ожидание ENet в простое уменьшено до **1 мс** в public и dev. Снимки сущностей по-прежнему отправляются на 20 Гц. Это не гарантия пинга 1 мс или измеренного ускорения; более частые пробуждения могут увеличить нагрузку CPU.
+- Сохранены исправления Unicode-путей сейвов и ошибок bootstrap, атомарный приём блоков передачи мира и поле ника без отдельной кнопки вставки.
+- Пересылка клиентского лога хосту остаётся только в dev и не включена в public.
 
-**О номере протокола:** версия сборки — v0.1.23. `proto` обозначает формат сетевых пакетов, а не возраст сборки. Public сохраняет протокол 59; dev использует 63 с дополнительным приватным форматом диагностики и пересылкой логов клиента хосту. Они несовместимы между собой. Удаление кнопки не меняет сетевой формат.
+## Совместимость
 
-**Проверка:** пары Release и Harness собраны с v100. По просьбе пользователя игровые тесты не запускались; внешний вид этой правки в запущенной игре не объявляется проверенным.
+Public использует **протокол 64**: в `TimePacket` теперь всегда есть `readyLoadId`.
+Dev этой версии использует **протокол 65** с дополнительным зеркалом клиентского лога.
+Старые public 59 и dev 63 отвергаются при рукопожатии. Public и dev друг с другом не соединяются. Установите одну и ту же пару DLL на хоста и всех клиентов.
 
-Исходники по AGPL-3.0 доступны в [теге v0.1.23](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.23); [инструкции сборки](https://github.com/kotetsyy/KenshiCoop4up/blob/main/docs/BUILD_SETUP.md). Отдельный source-архив к релизу не прикладывается.
+## Установка и обновление
+
+Скачайте `KenshiCoop-kit.zip`. Полностью закройте Kenshi и скопируйте папку `KenshiCoop` в `<Kenshi>\mods\` с заменой файлов **на обеих машинах**.
+
+В архиве только четыре runtime-файла:
+
+- `KenshiCoop.dll`
+- `KenshiCoopUI.dll`
+- `KenshiCoop.mod`
+- `RE_Kenshi.json`
+
+RE_Kenshi должен быть установлен. Свой `coop_config.json` сохраните; новый конфиг создаётся через F2. Лаунчеров, `PROVENANCE.json`, инструкций и исходников внутри игрового архива нет. Обе DLL обновляются вместе, изменения действуют после перезапуска игры.
+
+## Проверка
+
+Release и Harness core/UI DLL собраны успешно. Состав архивов и SHA-256 пары проверены. По просьбе пользователя игру и тестовые наборы для этой версии не запускали; подключение HOST/JOIN, пауза/READY в игре и влияние 1 мс на CPU и задержку оставлены для самостоятельной проверки.
+
+Исходники по AGPL-3.0 доступны в [теге v0.1.24](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.24). Инструкции восстановления зависимостей и сборки — [docs/BUILD_SETUP.md](https://github.com/kotetsyy/KenshiCoop4up/blob/v0.1.24/docs/BUILD_SETUP.md). Отдельный архив исходников к релизу не прикладывается.
 
 <details><summary>English</summary>
 
-Removed the Paste button beside the nickname and expanded the input to the full row width. Native typing, Cyrillic, selection/editing, Ctrl+V and Tab navigation are retained. Endpoint Paste buttons are unchanged, as are the v0.1.22 connection/save-transfer fixes.
+The public build now shares the development build's join-load barrier: the host's simulation is held until every connected client has a live world and reports READY for its current `LOAD_GO` id. File-transfer completion or a previous load's READY does not release the barrier. Title-screen joins and in-world reloads are covered by the same implementation. The temporary hold preserves the speed/pause vote and requires save, load, speed and time sync; disconnected clients are removed from the wait.
 
-Close Kenshi on both machines and install the KenshiCoop folder from KenshiCoop-kit.zip into mods/. The archive contains only the core DLL, UI DLL, mod and RE_Kenshi JSON. Replace the pair together and preserve coop_config.json. RE_Kenshi is required.
+Both configurations use a 1 ms maximum idle ENet wait. Entity snapshots remain at 20 Hz. This is not a 1 ms ping guarantee or a measured performance improvement; CPU wakeups may increase. Unicode save-path, bootstrap failure and atomic world-transfer fixes remain, as does the full-width nickname input without its separate Paste button. Client-log mirroring remains private-only.
 
-Build version is v0.1.23. Protocol numbers identify the network format, not build age: public remains 59, while private dev is 63 with additional diagnostics/client-log streaming. They cannot connect to each other. This UI change does not alter the wire format.
+Public protocol is **64** (`TimePacket` always contains `readyLoadId`); private protocol is **65** with log mirroring. Earlier public 59/private 63 builds and mixed public/private pairs are rejected. Install the same DLL pair on the host and all clients with Kenshi closed.
 
-Both Release and Harness pairs build with v100. In-game tests were skipped at the user's request; this layout change is not claimed visually verified. Sources are available at the [v0.1.23 repository tag](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.23), with [build instructions](https://github.com/kotetsyy/KenshiCoop4up/blob/main/docs/BUILD_SETUP.md). No separate source archive is attached.
+`KenshiCoop-kit.zip` contains only the core DLL, UI DLL, mod and RE_Kenshi JSON under `KenshiCoop/`. Copy the folder into `<Kenshi>/mods/`, keep the existing `coop_config.json` and restart. RE_Kenshi must already be installed. No launchers, provenance, notes or source archives are bundled.
+
+Release/Harness core/UI builds succeeded; archive contents and hashes were checked. The game and test suites were not run at the user's request. In-game connection, pause/READY and the latency/CPU effect of the shorter wait remain user-verified.
+
+Corresponding AGPL-3.0 source is available at [tag v0.1.24](https://github.com/kotetsyy/KenshiCoop4up/tree/v0.1.24); dependency restoration and build instructions are in [BUILD_SETUP.md](https://github.com/kotetsyy/KenshiCoop4up/blob/v0.1.24/docs/BUILD_SETUP.md). No separate source asset is uploaded.
 
 </details>

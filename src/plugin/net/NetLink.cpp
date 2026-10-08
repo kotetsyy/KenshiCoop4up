@@ -12,11 +12,7 @@
 namespace coop {
 
 namespace {
-#ifdef KENSHICOOP_NET_DIAG
-const int        TICK_MS        = 2;  // private experiment: 2 ms max idle ENet wait
-#else
-const int        TICK_MS        = 5;
-#endif
+const int        TICK_MS        = 1;  // max idle ENet wait; not the entity-send cadence
 const DWORD      ENTITY_SEND_MS = 50; // owned-entity snapshots retain their 20 Hz cadence
 // Traffic-class channels (protocol 44). ENet guarantees ordering + reliable
 // retransmit PER channel, so head-of-line blocking is per channel too. The bulk
