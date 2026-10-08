@@ -46,14 +46,44 @@ std::string pathJoin(const std::string& a, const std::string& b) {
     if (last == '\\' || last == '/') return a + b;
     return a + "\\" + b;
 }
+// Kenshi paths and wire-relative names are UTF-8, not the Windows ANSI page.
+// Use Unicode file APIs on both sides; never create a mojibake staging folder.
+std::wstring widePath(const std::string& path) {
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(),
+                                (int)path.size(), 0, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out((size_t)n, L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(),
+                             (int)path.size(), &out[0], n)) return std::wstring();
+    return out;
+}
+
+std::string utf8Name(const wchar_t* name) {
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, name, -1,
+                                0, 0, 0, 0);
+    if (n <= 0) return std::string();
+    std::string out((size_t)n, '\0');
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, name, -1,
+                             &out[0], n, 0, 0)) return std::string();
+    out.resize((size_t)n - 1);
+    return out;
+}
+
+std::string localSaveRoot() {
+    wchar_t local[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (!n || n >= MAX_PATH) return std::string();
+    return pathJoin(utf8Name(local), "kenshi\\save");
+}
+
 
 // Recursive walk helper: accumulate count/bytes/latest-write. Depth-capped so
 // a pathological symlink loop cannot hang the main thread.
 void walkFolder(const std::string& folder, int depth, unsigned int* files,
                 unsigned __int64* bytes, unsigned __int64* latest) {
     if (depth > 4) return;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pathJoin(folder, "*").c_str(), &fd);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(widePath(pathJoin(folder, "*")).c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (fd.cFileName[0] == '.' &&
@@ -61,7 +91,9 @@ void walkFolder(const std::string& folder, int depth, unsigned int* files,
              (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0')))
             continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            walkFolder(pathJoin(folder, fd.cFileName), depth + 1, files, bytes, latest);
+            const std::string child = utf8Name(fd.cFileName);
+            if (!child.empty())
+                walkFolder(pathJoin(folder, child), depth + 1, files, bytes, latest);
         } else {
             ++*files;
             *bytes += ((unsigned __int64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
@@ -70,7 +102,7 @@ void walkFolder(const std::string& folder, int depth, unsigned int* files,
                 fd.ftLastWriteTime.dwLowDateTime;
             if (wt > *latest) *latest = wt;
         }
-    } while (FindNextFileA(h, &fd));
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
 
@@ -80,34 +112,39 @@ struct XferFile { std::string rel; unsigned __int64 size; };
 void collectFiles(const std::string& folder, const std::string& prefix, int depth,
                   std::vector<XferFile>* out) {
     if (depth > 4) return;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pathJoin(folder, "*").c_str(), &fd);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(widePath(pathJoin(folder, "*")).c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (fd.cFileName[0] == '.' &&
             (fd.cFileName[1] == '\0' ||
              (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0')))
             continue;
-        std::string rel = prefix.empty() ? std::string(fd.cFileName)
-                                         : prefix + "\\" + fd.cFileName;
+        const std::string child = utf8Name(fd.cFileName);
+        if (child.empty()) continue;
+        std::string rel = prefix.empty() ? child : prefix + "\\" + child;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            collectFiles(pathJoin(folder, fd.cFileName), rel, depth + 1, out);
+            collectFiles(pathJoin(folder, child), rel, depth + 1, out);
         } else if (rel.size() <= SAVE_PATH_MAX) {
             XferFile xf;
             xf.rel  = rel;
             xf.size = ((unsigned __int64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             out->push_back(xf);
         }
-    } while (FindNextFileA(h, &fd));
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
 
 // Create every intermediate directory of 'fullPath' (a FILE path) that is
 // missing. The staging root itself is created by onSaveBegin.
 void ensureParentDirs(const std::string& fullPath) {
-    for (size_t i = 0; i < fullPath.size(); ++i) {
-        if (fullPath[i] == '\\' || fullPath[i] == '/') {
-            if (i > 2) CreateDirectoryA(fullPath.substr(0, i).c_str(), 0);
+    std::wstring path = widePath(fullPath);
+    for (size_t i = 0; i < path.size(); ++i) {
+        if ((path[i] == L'\\' || path[i] == L'/') && i > 2) {
+            const wchar_t separator = path[i];
+            path[i] = L'\0';
+            CreateDirectoryW(path.c_str(), 0);
+            path[i] = separator;
         }
     }
 }
@@ -116,25 +153,28 @@ void ensureParentDirs(const std::string& fullPath) {
 // capped like the walkers.
 void removeTree(const std::string& folder, int depth) {
     if (depth > 6) return;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pathJoin(folder, "*").c_str(), &fd);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(widePath(pathJoin(folder, "*")).c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (fd.cFileName[0] == '.' &&
                 (fd.cFileName[1] == '\0' ||
                  (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0')))
                 continue;
-            std::string child = pathJoin(folder, fd.cFileName);
+            const std::string name = utf8Name(fd.cFileName);
+            if (name.empty()) continue;
+            std::string child = pathJoin(folder, name);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 removeTree(child, depth + 1);
             } else {
-                SetFileAttributesA(child.c_str(), FILE_ATTRIBUTE_NORMAL);
-                DeleteFileA(child.c_str());
+                const std::wstring wide = widePath(child);
+                SetFileAttributesW(wide.c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(wide.c_str());
             }
-        } while (FindNextFileA(h, &fd));
+        } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    RemoveDirectoryA(folder.c_str());
+    RemoveDirectoryW(widePath(folder).c_str());
 }
 
 // A rejected path must never escape the staging folder: reject absolute
@@ -243,8 +283,7 @@ std::string saveFolderFor(const std::string& name) {
     if (!g_testSaveRoot.empty()) {
         root = g_testSaveRoot;
     } else {
-        const char* lad = getenv("LOCALAPPDATA");
-        root = pathJoin(lad ? lad : "", "kenshi\\save");
+        root = localSaveRoot();
     }
 #else
     char curGame[96], savePath[512];
@@ -252,10 +291,10 @@ std::string saveFolderFor(const std::string& name) {
         savePath[0] != '\0') {
         root = savePath;
     } else {
-        const char* lad = getenv("LOCALAPPDATA");
-        root = pathJoin(lad ? lad : "", "kenshi\\save");
+        root = localSaveRoot();
     }
 #endif
+    if (root.empty()) return std::string();
     return pathJoin(root, name);
 }
 
@@ -263,7 +302,7 @@ bool folderInventory(const std::string& folder, unsigned int* outFiles,
                      unsigned __int64* outBytes, unsigned __int64* outLatestWrite) {
     unsigned int files = 0;
     unsigned __int64 bytes = 0, latest = 0;
-    DWORD attrs = GetFileAttributesA(folder.c_str());
+    DWORD attrs = GetFileAttributesW(widePath(folder).c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         if (outFiles) *outFiles = 0;
         if (outBytes) *outBytes = 0;
@@ -289,14 +328,16 @@ u32 folderFingerprint(const std::string& name) {
     std::vector<unsigned char> buf(65536);
     for (size_t i = 0; i < files.size(); ++i) {
         paths[i] = files[i].rel.c_str();
-        HANDLE h = CreateFileA(pathJoin(folder, files[i].rel).c_str(), GENERIC_READ,
-                               FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+        HANDLE h = CreateFileW(widePath(pathJoin(folder, files[i].rel)).c_str(),
+                               GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
         if (h == INVALID_HANDLE_VALUE) return 0; // unreadable = unknown
         unsigned int crc = fnv1aInit();
         DWORD got = 0;
-        while (ReadFile(h, &buf[0], (DWORD)buf.size(), &got, 0) && got > 0)
+        bool readOk = true;
+        while ((readOk = (ReadFile(h, &buf[0], (DWORD)buf.size(), &got, 0) != 0)) && got > 0)
             crc = fnv1aUpdate(crc, &buf[0], (unsigned int)got);
         CloseHandle(h);
+        if (!readOk) return 0;
         crcs[i] = crc;
     }
     return folderFingerprintOf(&paths[0], &crcs[0], (unsigned int)files.size());
@@ -356,7 +397,7 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
             g_watchBaseWrite = latest;
         } else if (now - g_watchArmTick >= WATCH_CHANGE_MS) {
             g_watchArmed = false;
-            return 2; // never saw the save land - existing content is the save
+            return 2; // never saw the save land; caller must not announce it
         }
         return 0;
     }
@@ -370,13 +411,13 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
     // Stable since the last change: complete once the settle window elapses
     // AND the folder holds a loadable core (quick.save).
     if (now - g_watchLastChange >= WATCH_SETTLE_MS) {
-        DWORD qs = GetFileAttributesA(pathJoin(g_watchFolder, "quick.save").c_str());
+        DWORD qs = GetFileAttributesW(widePath(pathJoin(g_watchFolder, "quick.save")).c_str());
         if (qs != INVALID_FILE_ATTRIBUTES) {
             // Portrait gate (protocol 36): the atlas is written late; hold a
             // settled-looking folder for it (bounded) so the transferred /
             // reloaded save doesn't blank the squad-tab avatars.
-            DWORD pt = GetFileAttributesA(
-                pathJoin(g_watchFolder, "portraits_texture.png").c_str());
+            DWORD pt = GetFileAttributesW(
+                widePath(pathJoin(g_watchFolder, "portraits_texture.png")).c_str());
             if (pt == INVALID_FILE_ATTRIBUTES &&
                 now - g_watchArmTick < WATCH_PORTRAIT_MS)
                 return 0; // keep watching; any write re-enters the change path
@@ -400,7 +441,7 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
     g_sendActive = false;
 
     std::string folder = saveFolderFor(name);
-    DWORD attrs = GetFileAttributesA(folder.c_str());
+    DWORD attrs = GetFileAttributesW(widePath(folder).c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         char b[640];
         _snprintf(b, sizeof(b) - 1, "[save] XFER-BEGIN refused: no folder '%s'",
@@ -463,7 +504,7 @@ bool tickSend(NetLink& net, u32 localId) {
         const XferFile& xf = g_sendFiles[g_sendFileIdx];
 
         if (g_sendHandle == INVALID_HANDLE_VALUE) {
-            g_sendHandle = CreateFileA(pathJoin(g_sendFolder, xf.rel).c_str(),
+            g_sendHandle = CreateFileW(widePath(pathJoin(g_sendFolder, xf.rel)).c_str(),
                                        GENERIC_READ, FILE_SHARE_READ, 0,
                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
             if (g_sendHandle == INVALID_HANDLE_VALUE) {
@@ -576,7 +617,7 @@ void onSaveBegin(const SaveBeginPacket& b) {
     // otherwise pollute the CRC verify.
     removeTree(g_recvStaging, 0);
     ensureParentDirs(pathJoin(g_recvStaging, "x")); // save root may not exist yet
-    g_recvActive = (CreateDirectoryA(g_recvStaging.c_str(), 0) != 0) ||
+    g_recvActive = (CreateDirectoryW(widePath(g_recvStaging).c_str(), 0) != 0) ||
                    (GetLastError() == ERROR_ALREADY_EXISTS);
 
     char lb[704];
@@ -603,7 +644,7 @@ void onSaveFile(const SaveFileHeader& h, const char* path, const unsigned char* 
         // CREATE_ALWAYS on the file's first chunk; OPEN_EXISTING when a later
         // chunk re-opens it (only happens after an interleave, which the
         // ordered channel + sequential sender never produce - belt/braces).
-        g_recvHandle = CreateFileA(full.c_str(), GENERIC_WRITE, 0, 0,
+        g_recvHandle = CreateFileW(widePath(full).c_str(), GENERIC_WRITE, 0, 0,
                                    g_recvSeen[h.fileIdx] ? OPEN_EXISTING : CREATE_ALWAYS,
                                    FILE_ATTRIBUTE_NORMAL, 0);
         if (g_recvHandle == INVALID_HANDLE_VALUE) {
@@ -663,8 +704,10 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
         std::string oldDir   = finalDir + "__old";
         removeTree(oldDir, 0);
         bool hadOld = false;
-        if (GetFileAttributesA(finalDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            hadOld = (MoveFileExA(finalDir.c_str(), oldDir.c_str(),
+        const std::wstring finalWide = widePath(finalDir);
+        const std::wstring oldWide = widePath(oldDir);
+        if (GetFileAttributesW(finalWide.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            hadOld = (MoveFileExW(finalWide.c_str(), oldWide.c_str(),
                                   MOVEFILE_WRITE_THROUGH) != 0);
             if (!hadOld) {
                 char detail[128];
@@ -676,7 +719,7 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
                 ok = false;
             }
         }
-        if (ok && !MoveFileExA(g_recvStaging.c_str(), finalDir.c_str(),
+        if (ok && !MoveFileExW(widePath(g_recvStaging).c_str(), finalWide.c_str(),
                                MOVEFILE_WRITE_THROUGH)) {
             char detail[128];
             _snprintf(detail, sizeof(detail) - 1,
@@ -685,7 +728,7 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
             detail[sizeof(detail) - 1] = '\0';
             coop::logErrLine(detail);
             ok = false;
-            if (hadOld) MoveFileExA(oldDir.c_str(), finalDir.c_str(),
+            if (hadOld) MoveFileExW(oldWide.c_str(), finalWide.c_str(),
                                     MOVEFILE_WRITE_THROUGH); // restore
         }
         if (ok && hadOld) removeTree(oldDir, 0);

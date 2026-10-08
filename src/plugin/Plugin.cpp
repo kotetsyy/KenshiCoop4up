@@ -263,6 +263,7 @@ void logStartupBanner();
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId,
                    const CoopUiSettings* ui);
 void coopUiDisconnect();
+void failWorldSync(const char* reason);
 void rememberUiSettings(const CoopUiSettings& ui);
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
@@ -277,7 +278,10 @@ void coopErr(const char* msg) { coop::logErrLine(msg); ErrorLog(msg); }
 // copy that shipped without the atlas).
 void warnIfNoPortraits(const std::string& name) {
     std::string p = coop::savexfer::saveFolderFor(name) + "\\portraits_texture.png";
-    if (GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    wchar_t wide[MAX_PATH];
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p.c_str(), -1,
+                                wide, MAX_PATH);
+    if (!n || GetFileAttributesW(wide) == INVALID_FILE_ATTRIBUTES) {
         char b[224];
         _snprintf(b, sizeof(b) - 1,
                   "[load] WARN save '%s' has no portraits_texture.png "
@@ -300,6 +304,20 @@ void sessionResetForUi() {
     g_peerCount = 0;
     g_joinTabClaimed = false;
     g_joinTabTries = 0;
+    g_bootstrapArmed = false;
+    g_bootstrapName.clear();
+    g_savePending.clear();
+    g_loadXferPending.clear();
+    g_loadAfterCommit.clear();
+    g_loadPumpArmTick = 0;
+    coop::savexfer::abortAll();
+#ifdef KENSHICOOP_NET_DIAG
+    memset(g_session.connected, 0, sizeof(g_session.connected));
+    memset(g_session.expectedLoadId, 0, sizeof(g_session.expectedLoadId));
+    g_session.pendingReadyLoadId = 0;
+    g_session.pendingReadyLoadIssued = false;
+    g_session.readyLoadId = 0;
+#endif
     if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
     else          g_repl.resetSession();
     g_inbound.flushWorldState();
@@ -350,8 +368,7 @@ void armConnectPush() {
               "[boot] baking save '%s' to push to join on connect", name.c_str());
     b[sizeof(b) - 1] = '\0'; coopLog(b);
     if (!coop::engine::saveGameAs(name)) {
-        coopErr("[boot] connect-push save FAILED to issue");
-        g_bootstrapArmed = false; // no LOAD_GO can follow a failed save
+        failWorldSync("[boot] connect-push save FAILED to issue");
     }
 }
 
@@ -545,12 +562,22 @@ void driveSaveSync() {
             unsigned __int64 bytes = 0;
             unsigned long waited = 0;
             int rc = coop::savexfer::tickWatch(&files, &bytes, &waited);
-            if (rc == 1 || rc == 2) {
+            if (rc == 2) {
+                char error[640];
+                _snprintf(error, sizeof(error) - 1,
+                          "[boot] save TIMEOUT name='%s' folder='%s' files=%u bytes=%I64u waitMs=%lu",
+                          g_savePending.c_str(),
+                          coop::savexfer::saveFolderFor(g_savePending).c_str(),
+                          files, bytes, waited);
+                error[sizeof(error) - 1] = '\0';
+                failWorldSync(error);
+                return; // no LOAD_GO for an absent or unchanged save
+            }
+            if (rc == 1) {
                 char b[176];
                 _snprintf(b, sizeof(b) - 1,
-                          "[save] QUIESCED kind=%s name='%s' files=%u bytes=%I64u waitMs=%lu",
-                          rc == 1 ? "settled" : "timeout", g_savePending.c_str(),
-                          files, bytes, waited);
+                          "[save] QUIESCED kind=settled name='%s' files=%u bytes=%I64u waitMs=%lu",
+                          g_savePending.c_str(), files, bytes, waited);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
                 if (g_bootstrapArmed && g_savePending == g_bootstrapName) {
                     // Connect-push: announce the freshly-baked save with a
@@ -565,6 +592,10 @@ void driveSaveSync() {
                     go.ownerId     = g_net.localId();
                     go.loadId      = ++g_loadIdOut;
                     go.fingerprint = coop::savexfer::folderFingerprint(g_bootstrapName);
+                    if (!go.fingerprint) {
+                        failWorldSync("[boot] saved world unreadable; LOAD_GO not sent");
+                        return;
+                    }
                     strncpy(go.name, g_bootstrapName.c_str(), sizeof(go.name) - 1);
                     g_net.queueLoadGo(go);
 #ifdef KENSHICOOP_NET_DIAG
@@ -580,8 +611,12 @@ void driveSaveSync() {
                     g_bootstrapArmed = false;
                     g_bootstrapName.clear();
                     g_savePending.clear();
-                } else if (g_peerPresent)
-                    coop::savexfer::beginSend(g_net, g_net.localId(), g_savePending);
+                } else if (g_peerPresent) {
+                    if (!coop::savexfer::beginSend(g_net, g_net.localId(), g_savePending)) {
+                        failWorldSync("[save] could not start world transfer");
+                        return;
+                    }
+                }
                 else
                     coopLog("[save] no peer connected; transfer skipped");
             }
@@ -735,7 +770,10 @@ void driveLoadSync(GameWorld* gw) {
                       "[load] starting fallback transfer name='%s'",
                       g_loadXferPending.c_str());
             b[sizeof(b) - 1] = '\0'; coopLog(b);
-            coop::savexfer::beginSend(g_net, g_net.localId(), g_loadXferPending);
+            if (!coop::savexfer::beginSend(g_net, g_net.localId(), g_loadXferPending)) {
+                failWorldSync("[load] could not start bootstrap fallback transfer");
+                return;
+            }
             g_loadXferPending.clear();
         }
         // The chunk pump normally lives in driveSaveSync; keep the fallback
@@ -877,9 +915,26 @@ void driveLoadSync(GameWorld* gw) {
 // MyGUI renders UTF-8 (a raw literal would be re-encoded via the ANSI page).
 // ---------------------------------------------------------------------------
 
-// Russian reason the plugin refused a start before NetLink ran (Steam not
-// available, no host endpoint). Empty = none. Cleared by Connect / Disconnect.
+// Russian reason a start or world bootstrap failed. Cleared by Connect /
+// Disconnect; a stopped failed bootstrap must not look like a ready session.
 std::string g_panelStartError;
+
+void failWorldSync(const char* reason) {
+    coopErr(reason);
+    // Keeping peers connected to different worlds is unsafe. End the session,
+    // which also clears the private READY wait and releases the host pause.
+    coopUiDisconnect();
+    g_panelStartError =
+        "\xD0\x9D\xD0\xB5 \xD1\x83\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x8C "
+        "\xD1\x81\xD0\xBE\xD1\x85\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB8\xD1\x82\xD1\x8C/"
+        "\xD0\xBF\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB4\xD0\xB0\xD1\x82\xD1\x8C "
+        "\xD0\xBC\xD0\xB8\xD1\x80 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0. "
+        "\xD0\xA1\xD0\xB5\xD1\x81\xD1\x81\xD0\xB8\xD1\x8F "
+        "\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0\xD0\xBD\xD0\xBE\xD0\xB2\xD0\xBB\xD0\xB5\xD0\xBD\xD0\xB0. "
+        "\xD0\x9F\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB5\xD1\x80\xD1\x8C\xD1\x82\xD0\xB5 "
+        "\xD0\xBF\xD1\x83\xD1\x82\xD1\x8C \xD0\xBA \xD1\x81\xD0\xB5\xD0\xB9\xD0\xB2\xD1\x83 "
+        "\xD0\xB8 \xD0\xB6\xD1\x83\xD1\x80\xD0\xBD\xD0\xB0\xD0\xBB KenshiCoop.";
+}
 
 const char* netPhaseTag(coop::NetPhase p) {
     switch (p) {

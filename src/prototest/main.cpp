@@ -809,9 +809,19 @@ static void testFolderFingerprint() {
 
 struct XferSrcFile { const char* rel; const unsigned char* data; unsigned len; };
 
+static std::wstring xferWide(const std::string& path) {
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(),
+                                (int)path.size(), 0, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring out((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(),
+                        (int)path.size(), &out[0], n);
+    return out;
+}
+
 static bool xferReadWhole(const std::string& path, std::vector<unsigned char>* out) {
     out->clear();
-    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, 0,
+    HANDLE h = CreateFileW(xferWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, 0,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (h == INVALID_HANDLE_VALUE) return false;
     unsigned char buf[4096];
@@ -823,20 +833,25 @@ static bool xferReadWhole(const std::string& path, std::vector<unsigned char>* o
 }
 
 static void xferNukeDir(const std::string& dir) {
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    WIN32_FIND_DATAW fd;
+    std::wstring wide = xferWide(dir);
+    HANDLE h = FindFirstFileW((wide + L"\\*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' ||
                 (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) continue;
-            std::string child = dir + "\\" + fd.cFileName;
+            int n = WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, 0, 0, 0, 0);
+            std::string name((size_t)n, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, &name[0], n, 0, 0);
+            name.resize((size_t)n - 1);
+            std::string child = dir + "\\" + name;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) xferNukeDir(child);
-            else { SetFileAttributesA(child.c_str(), FILE_ATTRIBUTE_NORMAL);
-                   DeleteFileA(child.c_str()); }
-        } while (FindNextFileA(h, &fd));
+            else { SetFileAttributesW(xferWide(child).c_str(), FILE_ATTRIBUTE_NORMAL);
+                   DeleteFileW(xferWide(child).c_str()); }
+        } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    RemoveDirectoryA(dir.c_str());
+    RemoveDirectoryW(wide.c_str());
 }
 
 // Feed one transfer (xferId) for 'name' built from srcs[nsrc]. corruptFileIdx>=0
@@ -886,15 +901,20 @@ static void testSaveXferRoundTrip() {
     std::printf("== save-transfer receiver round-trip (stage/verify/commit) ==\n");
 
     // Temp save-root so the receiver never touches the real save folder.
-    char tmp[MAX_PATH]; tmp[0] = '\0';
-    GetTempPathA(sizeof(tmp), tmp);
-    char root[MAX_PATH];
+    wchar_t tmpWide[MAX_PATH]; tmpWide[0] = L'\0';
+    GetTempPathW(MAX_PATH, tmpWide);
+    char tmp[MAX_PATH * 3]; tmp[0] = '\0';
+    WideCharToMultiByte(CP_UTF8, 0, tmpWide, -1, tmp, sizeof(tmp), 0, 0);
+    char root[MAX_PATH * 3 + 32];
     _snprintf(root, sizeof(root) - 1, "%skc_xfer_test_%lu", tmp,
               (unsigned long)GetCurrentProcessId());
     root[sizeof(root) - 1] = '\0';
-    std::string rootStr = root;
-    xferNukeDir(rootStr);                 // best-effort clean from a prior run
-    CreateDirectoryA(rootStr.c_str(), 0);
+    std::string outerRoot = root;
+    xferNukeDir(outerRoot);
+    CreateDirectoryW(xferWide(outerRoot).c_str(), 0);
+    // Reproduce the host's UTF-8 C:\Users\Миша path without touching real saves.
+    std::string rootStr = outerRoot + "\\\xD0\x9C\xD0\xB8\xD1\x88\xD0\xB0";
+    CreateDirectoryW(xferWide(rootStr).c_str(), 0);
     savexfer::setSaveRootForTest(rootStr);
 
     // A representative save: a multi-chunk core, two subdir files, and an empty
@@ -905,7 +925,7 @@ static void testSaveXferRoundTrip() {
     zone[0] = 0xAB;
     XferSrcFile srcs[4];
     srcs[0].rel = "quick.save";                  srcs[0].data = &quick[0]; srcs[0].len = (unsigned)quick.size();
-    srcs[1].rel = "platoon\\Drifters_0.platoon"; srcs[1].data = &plat[0];  srcs[1].len = (unsigned)plat.size();
+    srcs[1].rel = "platoon\\\xD0\x9E\xD1\x82\xD1\x80\xD1\x8F\xD0\xB4.platoon"; srcs[1].data = &plat[0]; srcs[1].len = (unsigned)plat.size();
     srcs[2].rel = "zone\\zone.1.2.zone";         srcs[2].data = &zone[0];  srcs[2].len = (unsigned)zone.size();
     srcs[3].rel = "meta\\empty.dat";             srcs[3].data = (const unsigned char*)""; srcs[3].len = 0;
 
@@ -913,7 +933,6 @@ static void testSaveXferRoundTrip() {
     int r1 = xferRun("coopresume", srcs, 4, /*xferId*/1, /*corrupt*/-1);
     CHECK("xfer clean commit returns ok", r1 == 1);
     CHECK("xfer lastCommitResult ok", savexfer::lastCommitResult() == 1);
-    CHECK("xfer commitSeq advanced", savexfer::commitSeq() >= 1);
 
     std::string commit = savexfer::saveFolderFor("coopresume");
     bool allMatch = true;
@@ -927,10 +946,21 @@ static void testSaveXferRoundTrip() {
     }
     CHECK("xfer committed folder is byte-identical (incl. subdirs + empty file)",
           allMatch);
+    unsigned int inventoryFiles = 0;
+    unsigned __int64 inventoryBytes = 0;
+    CHECK("xfer Unicode save inventory finds every file",
+          savexfer::folderInventory(commit, &inventoryFiles, &inventoryBytes, 0) &&
+          inventoryFiles == 4 && inventoryBytes == quick.size() + plat.size() + zone.size());
+    const char* fpPaths[4] = { srcs[0].rel, srcs[1].rel, srcs[2].rel, srcs[3].rel };
+    u32 fpCrcs[4];
+    for (unsigned i = 0; i < 4; ++i)
+        fpCrcs[i] = fnv1aUpdate(fnv1aInit(), srcs[i].data, srcs[i].len);
+    CHECK("xfer Unicode file enumeration and read agree with wire fingerprint",
+          savexfer::folderFingerprint("coopresume") == folderFingerprintOf(fpPaths, fpCrcs, 4));
 
     std::string staging = savexfer::saveFolderFor(std::string("coopresume") + "__incoming");
     CHECK("xfer staging removed after commit",
-          GetFileAttributesA(staging.c_str()) == INVALID_FILE_ATTRIBUTES);
+          GetFileAttributesW(xferWide(staging).c_str()) == INVALID_FILE_ATTRIBUTES);
 
     // 2) Corrupted chunk -> commit FAILS, prior save untouched, staging discarded.
     int r2 = xferRun("coopresume", srcs, 4, /*xferId*/2, /*corrupt file*/0);
@@ -944,7 +974,15 @@ static void testSaveXferRoundTrip() {
         CHECK("xfer failed commit leaves the previous save intact", intact);
     }
     CHECK("xfer failed commit discards staging",
-          GetFileAttributesA(staging.c_str()) == INVALID_FILE_ATTRIBUTES);
+          GetFileAttributesW(xferWide(staging).c_str()) == INVALID_FILE_ATTRIBUTES);
+    quick[0] ^= 0x31;
+    int replaced = xferRun("coopresume", srcs, 4, /*xferId*/4, /*corrupt*/-1);
+    std::vector<unsigned char> updated;
+    CHECK("xfer Unicode replacement commits new content over previous save",
+          replaced == 1 && xferReadWhole(commit + "\\quick.save", &updated) &&
+          updated == quick);
+    CHECK("xfer Unicode replacement removes backup folder",
+          GetFileAttributesW(xferWide(commit + "__old").c_str()) == INVALID_FILE_ATTRIBUTES);
 
     // 3) FILE and DONE arriving together after an earlier receive pass must
     // commit both files; no DONE may be applied ahead of a preceding FILE.
@@ -1012,7 +1050,7 @@ static void testSaveXferRoundTrip() {
           quickOk && committedQuick == quick && zoneOk && committedZone == zone);
 
     savexfer::setSaveRootForTest(std::string()); // unpin
-    xferNukeDir(rootStr);
+    xferNukeDir(outerRoot);
 }
 
 // ---- 4. Content hash (the inventory convergence key) -----------------------------

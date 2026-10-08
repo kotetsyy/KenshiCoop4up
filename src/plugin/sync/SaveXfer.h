@@ -67,8 +67,8 @@ bool watching();
 
 // Poll the watch (throttled internally; call every main-loop tick). Returns:
 //   0 = pending; 1 = COMPLETE (change seen, then stable + quick.save);
-//   2 = TIMEOUT (no change within the change window - treat the folder's
-//       existing content as the save); -1 = not armed.
+//   2 = TIMEOUT (no change within the change window; NOT a completed save,
+//       do not announce/transfer old or missing content); -1 = not armed.
 // outFiles/outBytes report the latest inventory; outWaitedMs the time since arm.
 int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
               unsigned long* outWaitedMs);

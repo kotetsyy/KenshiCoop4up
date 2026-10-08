@@ -51,7 +51,8 @@
 
 **Первая установка:** из
 [последнего релиза](https://github.com/kotetsyy/KenshiCoop4up/releases/latest)
-скачайте все четыре файла в `<Kenshi>\mods\KenshiCoop\`:
+скачайте `KenshiCoop-kit.zip` и скопируйте папку `KenshiCoop` в `<Kenshi>\mods\`.
+В архиве только четыре файла; их также можно скачать отдельно в `<Kenshi>\mods\KenshiCoop\`:
 
 - `KenshiCoop.dll` — сам плагин
 - `KenshiCoopUI.dll` — нативное окно F2, шрифты и статус сессии
@@ -59,6 +60,10 @@
 - `KenshiCoop.mod` — чтобы Kenshi показал мод в меню Mods
 
 Запустите Kenshi и включите **KenshiCoop** в меню модов.
+`coop_config.json` создаётся при сохранении настроек F2; при обновлении оставьте
+свой конфиг на месте. `PROVENANCE.json` и лаунчеры не нужны для запуска.
+Соответствующие исходники предоставлены отдельным `KenshiCoop-source.zip` в релизе.
+
 
 **Потом, при обновлении:** заменяйте **обе DLL из одной сборки** при закрытой
 игре. Внутриигровой апдейтер проверяет SHA-256 обеих DLL и устанавливает пару
@@ -193,8 +198,9 @@ is the whole network setup: no port forwarding, no router configuration, no IP
 addresses.
 
 **First install:** from the
-[latest release](https://github.com/kotetsyy/KenshiCoop4up/releases/latest)
-download all four files into `<Kenshi>\mods\KenshiCoop\`:
+[latest release](https://github.com/kotetsyy/KenshiCoop4up/releases/latest),
+download `KenshiCoop-kit.zip` and copy its `KenshiCoop` folder into `<Kenshi>\mods\`.
+The archive contains only four files, also available individually for `<Kenshi>\mods\KenshiCoop\`:
 
 - `KenshiCoop.dll` — the plugin
 - `KenshiCoopUI.dll` — the native F2 window, fonts and session status
@@ -202,6 +208,10 @@ download all four files into `<Kenshi>\mods\KenshiCoop\`:
 - `KenshiCoop.mod` — so Kenshi lists it in the Mods menu
 
 Launch Kenshi and enable **KenshiCoop** in the Mods menu.
+F2 creates `coop_config.json` when saving settings; preserve your config on
+updates. Neither `PROVENANCE.json` nor a launcher is required at runtime.
+Corresponding sources are a separate `KenshiCoop-source.zip` release asset.
+
 
 **Later updates:** replace **both DLLs from the same build**, with the game
 closed. The in-game updater verifies both SHA-256 hashes and installs the pair

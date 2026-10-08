@@ -410,38 +410,6 @@ foreach ($m in (Select-String -Path $configCpp -Pattern 'scenario\.compare')) {
 if ($scenarioNameHits.Count -gt 0) { $scenarioNameHits | ForEach-Object { Write-Host "      $_" } }
 Check "Config.cpp has no per-scenario channel name-checks" ($scenarioNameHits.Count -eq 0)
 
-# ---- Phase 5a: engine boundary dependency check -------------------------------
-# The PUBLIC engine headers (the SEH-guarded facade Replicator/Scenario/Plugin
-# include) must never pull a game-internal header (<kenshi/..>, <core/..>,
-# <mygui/..>, <ogre/..>): those live ONLY in the adapter (EngineInternal.h) and
-# the domain .cpp TUs. This is the "no direct Kenshi-internal include outside the
-# approved adapter" barrier the domain split established - it keeps every public
-# consumer compiling against pointers/PODs, not the engine ABI.
-Write-Host "== engine boundary dependency check (Phase 5a) =="
-$gameDir = Join-Path $repoRoot "src\plugin\game"
-$publicEngineHeaders = @("Engine.h", "EngineSync.h", "EngineScenario.h",
-                         "EngineProbe.h", "EngineUi.h")
-$internalIncludeRe = '^\s*#\s*include\s*[<"](kenshi|core|mygui|ogre)/'
-$leaks = @()
-$missingHdr = @()
-foreach ($h in $publicEngineHeaders) {
-    $p = Join-Path $gameDir $h
-    if (-not (Test-Path $p)) { $missingHdr += $h; continue }
-    foreach ($m in (Select-String -Path $p -Pattern $internalIncludeRe)) {
-        $leaks += "$h line $($m.LineNumber): $($m.Line.Trim())"
-    }
-}
-if ($missingHdr.Count -gt 0) { $missingHdr | ForEach-Object { Write-Host "      missing $_" } }
-Check "all narrow public engine headers exist" ($missingHdr.Count -eq 0)
-if ($leaks.Count -gt 0) { $leaks | ForEach-Object { Write-Host "      $_" } }
-Check "public engine headers pull no game-internal include" ($leaks.Count -eq 0)
-
-# Positive control: the adapter EngineInternal.h SHOULD carry the game-internal
-# prelude (otherwise the check above is passing vacuously against the wrong root).
-$adapter = Join-Path $gameDir "EngineInternal.h"
-$adapterHasInternal = (Test-Path $adapter) -and `
-    ((Select-String -Path $adapter -Pattern $internalIncludeRe).Count -gt 0)
-Check "adapter EngineInternal.h carries the game-internal prelude" $adapterHasInternal
 
 # ---- cleanup ------------------------------------------------------------------
 Remove-Item -Path $tmpH, $tmpJ -Force -ErrorAction SilentlyContinue

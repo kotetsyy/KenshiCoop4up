@@ -468,3 +468,45 @@ asserting a fact that can stop being true has to be re-asserted on a cadence and
 withdrawn when it lapses — otherwise the instrument manufactures the failure it
 was built to detect, and it does so most convincingly in exactly the long
 sessions where you are least able to check it.
+
+## 19. Reliable transport ordering does not imply ordered application across queues
+
+On a join bootstrap, the host sent 34 files / 3,964,020 bytes, but the join
+verified only 3,499,846 bytes (`badCrc=4`, `XFER-ACK ok=0`). Reconnecting
+produced `XFER-COMMIT badCrc=0`. The first failure did not retry or issue
+`READY`; the host remained paused until the reconnect.
+
+`SAVE_BEGIN`, `SAVE_FILE` and `SAVE_DONE` arrive in order on reliable `CH_BULK`,
+but `pumpSaveReceive()` used to drain three separate inbound queues one at a
+time. The net thread could append the last FILE chunks after the file drain and
+before the DONE drain; the game thread then verified and discarded the staging
+folder before applying those chunks. It now snapshots the three queues under
+one lock so every DONE is processed with its preceding FILE chunks.
+
+**Rule.** When a completion marker gates a commit, dequeue its data and marker
+atomically even if the transport itself guarantees ordering. This fixes the
+identified queue race; reproducing the two-machine bootstrap after deploying
+the same DLL to both players is still necessary to confirm that it caused this
+particular failed transfer.
+
+## 20. Save existence is not save-manager readiness
+
+The UDP handshake completed (`WELCOME`, proto v63, RTT about 58 ms), and the
+host baked and announced its world with `LOAD_GO`. The join stayed at the
+title screen exchanging traffic without a load decision or a transfer request.
+
+`titleUpdate_hook` gated `driveLoadSync` on `savesReady`, which called
+`SaveManager::savesExist()`. With no local saves, this blocked the very NACK
+that would request the host's save: the client could not obtain the content
+required to pass its gate. `savesReady` now checks the SaveManager singleton,
+independently of local content. The unused existence probe was removed.
+
+Verification: a real game client with an isolated empty save folder received
+`LOAD_GO`, replied `MISSING -> NACK`, committed 27 files / 3,376,186 bytes with
+`badCrc=0`, loaded the world, and emitted `READY->host loadId=1 first-world-live`.
+The sender used the actual NetLink / SaveXfer implementations and host save.
+This local UDP smoke proves the missing-save path, not remote WAN conditions.
+
+**Rule.** A bootstrap prerequisite must not depend on the content the bootstrap
+itself is responsible for fetching.
+

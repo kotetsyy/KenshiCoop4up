@@ -1,29 +1,29 @@
-## Новое нативное окно совместной игры
+## Исправление подключения и компактная установка
 
-Раньше ввод и вставка были ограничены, UDP-порт терялся при смене роли, а часть диагностики не помещалась в окно. В F2 теперь полноценные редактируемые поля и две колонки в оформлении Kenshi.
+В публичную сборку включён текущий нативный F2-интерфейс и исправления передачи мира из dev-сборки.
 
-- Ник и адрес: кириллица, выделение, редактирование, Ctrl+V и Tab; игровые клавиши отключены, пока поле в фокусе.
-- Хост/клиент и Steam/прямой IP — отдельные равноправные переключатели. Основное действие выделено; неверные значения объясняются рядом с полем.
-- Справа — реальные этапы подключения, прогресс передачи мира и игроки. Диагностика свёрнута, полный отчёт копируется отдельно. Ошибки обновления не подменяют состояние соединения.
-- UDP-порт сохраняется при смене роли. Слишком длинная вставка отклоняется, а не обрезается молча. F2/Esc работают только в активной копии игры и не отключают сеть.
-- Интерфейс вынесен в `KenshiCoopUI.dll`; сеть и состояние мира остаются в `KenshiCoop.dll`. Убрана повторная регистрация панели у владельца GUI, приводившая к двойному удалению.
+- Исправлен доступ к сейвам по кириллическим путям, например `C:\Users\Миша`: перечисление, чтение, запись, проверка содержимого и перенос папок используют Unicode API Windows.
+- Тайм-аут записи мира больше не считается успешным сохранением. Нечитаемый bootstrap не отправляет пустой `LOAD_GO`; при невозможности начать передачу сессия завершается с ошибкой.
+- Приём BEGIN/FILE/DONE происходит одним атомарным срезом очереди, чтобы последний блок файла не терялся перед проверкой CRC.
+- Сохранены редактируемые поля ника и адреса, кириллица, Ctrl+V, Tab, выбор хоста/клиента и Steam/UDP, реальные этапы подключения и прогресс передачи мира.
+- `KenshiCoop-kit.zip` содержит только **четыре файла** в папке `KenshiCoop`: `KenshiCoop.dll`, `KenshiCoopUI.dll`, `KenshiCoop.mod`, `RE_Kenshi.json`. Без лаунчеров, готового конфига, README, PROVENANCE и вложенного архива исходников.
 
-**Установка:** скачайте `KenshiCoop-kit.zip` и перенесите папку `KenshiCoop` в `mods` при закрытой игре. При ручном обновлении заменяйте **обе DLL из одной сборки**. Со старой сборки, в которой была только одна DLL, предпочтительна ручная установка пары: старый автообновлятор загружает только основной плагин; новый плагин доставит отсутствующую UI при следующей проверке, после чего потребуется ещё один перезапуск.
+**Установка на обеих машинах:** полностью закройте Kenshi, скопируйте папку `KenshiCoop` из `KenshiCoop-kit.zip` в `<Kenshi>\mods\` с заменой файлов. RE_Kenshi должен быть установлен; включите KenshiCoop в меню Mods. Обе DLL берите из одного архива.
 
-**Проверка:** публичная Release-пара собрана с v100; `prototest` — 566/566. Новый F2 открыт в настоящей игре с версией v0.1.21. Общий интерфейс ранее проверен при 1280×720 и 1920×1080; приватная диагностическая пара передавала мир и повторно доходила до READY (`badCrc=0`). Эта проверка не означает проверенного Steam P2P между двумя аккаунтами. Публичная и приватная диагностическая сборки не совместимы между собой.
+Настройки задаются в F2. `coop_config.json` создаётся при их сохранении; существующий конфиг не удаляйте и не заменяйте. `PROVENANCE.json` не требуется ни публичной, ни dev-сборке для запуска. Запускайте игру обычным способом, через Steam или `kenshi_x64.exe`.
 
-**Осталось:** выход через WM_CLOSE давал `0xC0000409` со стеком `RE_Kenshi.dll+0x381e9`, в том числе без UI DLL. RE_Kenshi не изменён; этот сбой не объявляется исправленным. Горячей замены DLL нет; прирост FPS не обещается.
+**Сборка:** Release и Harness, обе пары core/UI, успешно собраны с v100. По просьбе пользователя игровые тесты этой версии не запускались; проверка подключения между двумя ПК остаётся за пользователем. Публичная и приватная диагностическая сборки несовместимы друг с другом.
 
-Соответствующие исходники этой сборки по AGPL-3.0 находятся в `KenshiCoop-source.zip` этого релиза.
+Соответствующие исходники по AGPL-3.0 — отдельный файл `KenshiCoop-source.zip` в этом релизе. В папку игры его копировать не нужно.
+
+**Известное ограничение:** ранее выход через WM_CLOSE давал `0xC0000409` в RE_Kenshi. RE_Kenshi не изменён; исправление этого внешнего сбоя не заявляется.
 
 <details><summary>English</summary>
 
-The native two-column F2 panel now supports editable Cyrillic nicknames and addresses, selection, editing, Ctrl+V and Tab, with game hotkeys suppressed during input. It shows real connection/world-transfer stages, players, collapsed diagnostics, a complete copy-report and a separate updater section. The UDP port survives role changes; oversized paste is rejected. F2/Esc affect only the foreground game and never disconnect.
+The public build includes the current native F2 UI and the save-transfer fixes from the development build. Save filesystem operations now use Unicode Windows APIs, including Cyrillic profile paths. A save timeout is no longer treated as successful completion; an unreadable bootstrap never announces an empty LOAD_GO, and a refused transfer ends the session with an error. BEGIN/FILE/DONE reception uses one atomic queue snapshot.
 
-Install the KenshiCoop folder from KenshiCoop-kit.zip into mods while the game is closed. Always replace both KenshiCoop.dll and KenshiCoopUI.dll together. For a first upgrade from a core-only release, manual installation of both is recommended: the old updater downloads only the core; the new core repairs the missing UI on its next check and requires another restart.
+KenshiCoop-kit.zip contains only four runtime files inside KenshiCoop/: the core DLL, companion UI DLL, mod and RE_Kenshi JSON. No launcher, shipped config, README, provenance or nested source archive. Close Kenshi on both machines, copy KenshiCoop/ into mods/, replace both DLLs together, and preserve your existing coop_config.json. F2 creates it when saving settings. RE_Kenshi is still required. Launch normally through Steam or kenshi_x64.exe.
 
-The public v100 Release pair builds successfully; prototest passes 566/566. The v0.1.21 F2 panel was opened in the real game. Earlier shared-UI verification covered both resolutions and real/repeated world transfer with the private diagnostic pair. Two-account Steam P2P was not exercised; public and private diagnostic builds cannot connect to each other.
-
-Known limitation: WM_CLOSE produced 0xC0000409 with RE_Kenshi.dll+0x381e9 in the stack, including without a UI DLL. RE_Kenshi is unchanged; this failure is not claimed fixed. No hot reload or FPS gain is promised. Corresponding AGPL-3.0 sources are provided in KenshiCoop-source.zip.
+Both Release and Harness core/UI pairs build successfully with v100. In-game tests of this version were skipped at the user's request; two-machine connectivity is not claimed verified. Public and private diagnostic builds cannot connect to each other. Corresponding AGPL-3.0 sources are a separate KenshiCoop-source.zip asset. The previously observed RE_Kenshi exit crash is not claimed fixed.
 
 </details>

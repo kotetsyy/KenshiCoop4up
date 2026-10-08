@@ -34,7 +34,13 @@ only the core; the core loads and pins the UI beside itself. No hot reload.
 ## Distribution and updates
 
 `scripts\make_mod_kit.ps1 -SkipBuild` packages the Release pair into
-`dist\KenshiCoop-kit.zip` and verifies both hashes in `PROVENANCE.json`.
+`dist\KenshiCoop-kit.zip`, containing only the four runtime files under
+`KenshiCoop/`: core DLL, UI DLL, mod and RE_Kenshi JSON. Packaged hashes are
+verified against the build outputs, but no `PROVENANCE.json` is shipped.
+Use `-Configuration Harness -SkipBuild` for `dist\KenshiCoop-dev-kit.zip`.
+F2 creates `coop_config.json` when saving settings; updates do not replace it.
+Instructions live in the release body; corresponding AGPL sources are a
+separate `KenshiCoop-source.zip` release asset, not part of the mod archive.
 On this workstation, use `pwsh -NoProfile -File scripts/make_mod_kit.ps1 -SkipBuild`;
 the legacy `powershell` invocation did not resolve `Get-FileHash`.
 
@@ -52,3 +58,20 @@ with four SHA-256 entries, including both DLLs. The private launcher always
 synchronizes against the latest closed GitHub release before starting Kenshi.
 Replacing only the local kit without publishing its private manifest/assets
 would reinstall the previous remote pair. Public publication is separate.
+
+### Protocol 63 connection hotfix (2026-10-09)
+
+`dist/KenshiCoop-dev-kit.zip` is a four-file manual update for existing private
+installs, identical on HOST and JOIN. With both games closed, copy
+`KenshiCoop/` into `<Kenshi>/mods/`, replacing the two DLLs, mod and RE_Kenshi
+JSON while leaving `coop_config.json` intact. Launch through Steam or
+`kenshi_x64.exe`, not the private launcher: the manual connection hotfix has
+not been published to its update feed, so it would restore the previous release.
+
+Save filesystem operations use Unicode Windows APIs while engine/wire paths
+remain UTF-8. An unsuccessful host save or refused bootstrap transfer ends
+the session instead of issuing an unreadable `LOAD_GO` or holding the host
+for a READY that cannot arrive. Protocol 63 and the normal load/READY pause
+are unchanged. Harness core/UI builds succeeded; the Unicode save regression
+passed before the user's request to skip further tests. End-to-end connection
+verification is left to the user; no two-account Steam check is claimed.

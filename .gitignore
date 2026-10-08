@@ -3,14 +3,14 @@ dist/public-export/
 
 # Build outputs (all configs: Debug / Harness / Release)
 src/plugin/x64/
+src/ui/x64/
 # Stray IDE build output: an out-of-tree v143 build once wrote objs/pdb here.
 src/plugin/KenshiCoop/
 build/
 dist/*.exe
-# Generated packages + mutable DLL artifacts under dist/ (the canonical shipped
-# DLL is built on demand and its SHA-256 is recorded in the kit's PROVENANCE.json;
-# we do not track multiple mutable copies). dist/mods/ (RE_Kenshi.json + .mod
-# template) stays tracked - it is a packaging SOURCE, not an output.
+# Generated packages + mutable DLL artifacts under dist/; packaged DLL hashes
+# are checked against build outputs and recorded in the update manifest.
+# dist/mods/ (RE_Kenshi.json + .mod template) stays tracked as packaging input.
 dist/*.zip
 dist/*.dll
 # The shipped DLL is published as a GitHub Release asset (that is what the
@@ -18,6 +18,7 @@ dist/*.dll
 dist/mods/KenshiCoop/*.dll
 dist/mod-kit/KenshiCoop/*.dll
 dist/mod-kit/
+dist/dev-mod-kit/
 dist/remote-kit/
 dist/KenshiCoop-remote-kit-*.zip
 
