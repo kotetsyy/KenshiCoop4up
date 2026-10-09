@@ -2223,10 +2223,10 @@ enum SpeedIntentKind {
 // Speed-intent capture (the vote source). Two complementary detectors,
 // because the MainBar click handler writes the speed INLINE (2026-07-08
 // manual-session finding: real UI clicks never reach a setGameSpeed detour):
-//   * hooks on setGameSpeed/userPause/togglePause catch every call that DOES
-//     route through the public setters (scenario writeGameSpeed clicks);
-//   * a per-tick poll catches the rest: engine state deviating from our last
-//     QUIET write = a real click / keyboard pause / RE_Kenshi; the button
+//   * setGameSpeed/userPause hooks capture requests through public setters;
+//     togglePause explains engine-only changes, including save completion;
+//   * a per-tick poll catches the rest: an unexplained engine state change
+//     = a real click / keyboard pause / RE_Kenshi; the button
 //     highlight deviating from the vote snapshot = a click on the speed
 //     EQUAL to the current effective (the stuck-vote case - engine state
 //     doesn't move, but the UI highlight does).
@@ -2237,7 +2237,7 @@ enum SpeedIntentKind {
 // from a speed-tier click.
 bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused, int* kind = 0);
 
-// Install the three intent detours (setGameSpeed / userPause / togglePause)
+// Install speed request capture and engine-pause explanation hooks,
 // and seed the intent state from the live engine so the first vote reflects
 // the save's starting speed. Call once, from the main thread, after gameplay
 // is live. Returns false when any target fails to resolve or hook.

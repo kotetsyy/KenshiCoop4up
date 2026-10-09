@@ -48,7 +48,7 @@ const u16 PROTOCOL_VERSION = 64;
 // introduced ordering, which is the only moment it was free: those clients
 // install whatever the manifest names regardless of order, so they follow the
 // renumber, and every build after this one is ordered and monotonic.
-const char* const COOP_BUILD_VERSION = "0.1.25";
+const char* const COOP_BUILD_VERSION = "0.1.26";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;

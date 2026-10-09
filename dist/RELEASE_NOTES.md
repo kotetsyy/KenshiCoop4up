@@ -1,15 +1,13 @@
 ## Изменения
 
-- Целевая частота отправки снимков сущностей повышена до **100 Гц** в public и dev: интервал уменьшен до **10 мс**.
-- Расписание отправки использует монотонный QPC-таймер вместо грубого `GetTickCount`. Снимки сохраняют время захвата; буфер отправки переиспользуется между отправками.
-- Ожидание ENet в простое остаётся **1 мс**. Пауза хоста до READY конкретной загрузки и предыдущие исправления подключения сохранены.
-- Ротация дальних NPC остаётся на 50 мс; отдельные интервалы инвентаря, сейвов и часов не изменены. Это повышение частоты снимков, а не всех сетевых каналов.
-
-Свежие состояния захватываются игровым потоком, поэтому их частота зависит от FPS. 100 Гц — цель планировщика отправки, не гарантия пинга или 100 новых состояний мира в секунду. Более частая отправка увеличивает сетевую нагрузку.
+- Исправлен сброс пользовательской паузы хоста при сохранении мира для подключения клиента. Завершение сохранения больше не считается нажатием игрока.
+- Хост ждёт READY конкретной загрузки; если до подключения была включена пользовательская пауза, после READY она сохраняется.
+- Настоящие нажатия паузы и кнопок скорости продолжают менять общее состояние сессии.
+- Снимки сущностей остаются на **100 Гц** (цель отправки, 10 мс); максимальное ожидание ENet в простое — **1 мс**. Частота свежих состояний зависит от FPS; остальные каналы не переводятся на 100 Гц.
 
 ## Совместимость
 
-Формат пакетов не изменён: **public — протокол 64, dev — протокол 65**. Внутри соответствующей ветки v0.1.24 и v0.1.25 совместимы; для отправки на 100 Гц в обе стороны обновите хоста и клиентов. Public и dev между собой не соединяются.
+Формат пакетов не изменён: **public — протокол 64, dev — протокол 65**. Версии v0.1.24–v0.1.26 совместимы внутри соответствующей ветки; для исправленной паузы обновите хост, рекомендуется обновить и клиентов. Public и dev между собой не соединяются.
 
 ## Установка и обновление
 
@@ -26,11 +24,11 @@
 
 <details><summary>English</summary>
 
-The entity-snapshot sender now targets **100 Hz** in public and dev, with a **10 ms** interval paced by the monotonic QPC clock instead of coarse `GetTickCount`. Capture-time stamps are preserved and the send buffer is reused between sends. ENet's maximum idle wait remains 1 ms; the load-specific READY host pause and prior connection fixes remain.
+Fixed host user-pause loss when saving the world for a connecting client. Save completion no longer counts as a player action. The host still waits for the READY matching the current load; an existing user pause remains active afterward. Real pause and speed-button actions still update the session.
 
-The distant-NPC slice still rotates every 50 ms. Inventory, save and clock channel intervals are unchanged. Fresh captures remain game-frame-paced: the 100 Hz sender target is not a ping guarantee or a promise of 100 new world states per second. More frequent sends increase network load.
+Entity snapshots still target **100 Hz** (10 ms); ENet's maximum idle wait remains **1 ms**. Fresh captures depend on game FPS; other channel intervals are unchanged.
 
-Packet formats are unchanged: public protocol **64**, private protocol **65**. v0.1.24 and v0.1.25 interoperate within their respective build families; update both host and clients for bidirectional 100 Hz sending. Public/private pairs do not connect.
+Packet formats are unchanged: public protocol **64**, private protocol **65**. v0.1.24–v0.1.26 interoperate within their respective build families. Update the host for the pause fix; updating clients is recommended. Public/private pairs do not connect.
 
 With Kenshi closed, copy the `KenshiCoop/` folder from `KenshiCoop-kit.zip` into `<Kenshi>/mods/`, replacing both DLLs, the mod and RE_Kenshi JSON. RE_Kenshi must already be installed. Keep the existing `coop_config.json` and restart the game.
 

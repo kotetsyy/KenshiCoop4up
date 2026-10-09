@@ -497,13 +497,10 @@ typedef float   (__fastcall* GetHourLenFn)(GameWorld* self);
 GetTimeHoursFn g_getTimeHoursFn = 0;
 GetHourLenFn   g_getHourLenFn   = 0;
 
-// Speed-intent capture (the vote source). Detours on the three user-reachable
-// speed entries record every call NOT made by our own quiet writer as user
-// intent: UI button clicks, keyboard pause, RE_Kenshi speed controls and the
-// scenario's simulated writeGameSpeed clicks all funnel through these -
-// INCLUDING clicks equal to the current effective speed, which a state-diff
-// detector can never see (the stuck-vote bug). Main-thread only (the engine
-// calls these from its own tick; our writers run from the main-loop hook).
+// Speed-intent capture: setGameSpeed and userPause record user requests,
+// including same-value clicks. togglePause is also called by the engine
+// when a deferred save completes; it explains an engine-state change,
+// not a new player vote. Main-thread only.
 SetGameSpeedFn g_setGameSpeedOrig = 0;
 UserPauseFn    g_userPauseOrig    = 0;
 UserPauseFn    g_togglePauseOrig  = 0;
@@ -604,16 +601,16 @@ void __fastcall userPause_hook(GameWorld* self, bool p) {
 
 void __fastcall togglePause_hook(GameWorld* self, bool p) {
     if (speedDbgOn()) speedDbgLog("togglePause", 0.0f, p ? 1 : 0);
-    if (!g_speedGuardWrite) {
-        g_speedIntentPaused = p;
-        if (p)
-            g_speedIntentKind = SPEED_INTENT_PAUSE;
-        else if (!g_speedIntentFresh || g_speedIntentKind != SPEED_INTENT_LEVEL)
-            g_speedIntentKind = SPEED_INTENT_UNPAUSE;
-        g_speedIntentFresh = true;
-    }
     g_togglePauseOrig(self, p);
-    if (!g_speedGuardWrite) snapshotVoteButtons();
+    // Save completion can release the engine pause without a user action.
+    // Explain that change to the poll fallback, retaining any real intent
+    // already captured by the enclosing userPause/setGameSpeed hook.
+    float mult = 0.0f; bool paused = false;
+    if (readGameSpeed(self, &mult, &paused)) {
+        g_quietHave = true;
+        g_quietPaused = paused;
+        if (!paused && mult > 0.0f) g_quietMult = mult;
+    }
 }
 
 // Re-apply the vote snapshot after a quiet write's userPause disturbed the
