@@ -48,7 +48,7 @@ const u16 PROTOCOL_VERSION = 64;
 // introduced ordering, which is the only moment it was free: those clients
 // install whatever the manifest names regardless of order, so they follow the
 // renumber, and every build after this one is ordered and monotonic.
-const char* const COOP_BUILD_VERSION = "0.1.24";
+const char* const COOP_BUILD_VERSION = "0.1.25";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;
@@ -59,7 +59,7 @@ enum PacketType {
     PKT_HELLO            = 1, // client -> host on connect: version + name
     PKT_WELCOME          = 2, // host -> client: version echo + assigned playerId
     PKT_LEAVE            = 3, // net thread -> game thread marker: a peer left
-    PKT_ENTITY_BATCH     = 4, // either direction: owner-tagged EntityState batch (20 Hz)
+    PKT_ENTITY_BATCH     = 4, // either direction: owner-tagged EntityState batch (100 Hz target)
     PKT_EVENT            = 5, // RELIABLE one-shot transition (KO/death/revive); see EventPacket
     PKT_INV_SNAPSHOT     = 6, // RELIABLE container-contents snapshot (Phase 4a); InvSnapshotHeader
     PKT_WORLD_ITEM       = 7, // RELIABLE world-item snapshot (Phase W1); WorldItemSnapshotHeader
@@ -111,7 +111,7 @@ enum PacketType {
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
-// (EntityState.bodyState) self-heals at 20 Hz over the unreliable channel, but a
+// (EntityState.bodyState) self-heals over the unreliable snapshot channel, but a
 // transition that MUST be observed exactly once - a death, a KO landing, later a
 // combat hit - cannot tolerate a dropped datagram. These ride the reliable channel
 // so they are never lost or reordered. Doctrine 16: state unreliable, events reliable.
@@ -464,7 +464,7 @@ const unsigned int ENTITY_BATCH_MAX = 17;
 
 // Steam sender chunk size: the Steam P2P transport clamps ENet's MTU to
 // 1200 B, and ENet sends an oversized UNRELIABLE packet as RELIABLE
-// fragments - retransmits and ordering stalls on the 20 Hz motion stream,
+// fragments - retransmits and ordering stalls on the motion stream,
 // on exactly the transport real sessions use (architecture review
 // 2026-07-10). 14 * 79 B + 14 B header = 1120 B, inside 1200 with ENet's
 // per-packet overhead. Sender-side only - the receiver validates by

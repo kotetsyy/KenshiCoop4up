@@ -79,8 +79,8 @@ public:
     bool latest(EntityState* out, float* vx, float* vy, float* vz) const;
 
     // Sender-stamped duration of the newest ring segment (ms; 0 = fewer than
-    // two snapshots). This is the stream's CURRENT per-entity cadence: ~50 ms
-    // on the 20 Hz near tier, ~500+ ms on the round-robin mid tier. The
+    // two snapshots). Actual spacing follows fresh captures, not the nominal
+    // 100 Hz sender: frame cadence and mid-band selection gaps still apply. The
     // walk-drive scales its lead point and the walk/rest debounce by it so a
     // sparsely-sampled NPC keeps a continuous gait instead of reaching the
     // lead point and idling until the next sample (Phase 2 mid-band tier).

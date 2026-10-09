@@ -13,7 +13,7 @@ namespace coop {
 
 namespace {
 const int        TICK_MS        = 1;  // max idle ENet wait; not the entity-send cadence
-const DWORD      ENTITY_SEND_MS = 50; // owned-entity snapshots retain their 20 Hz cadence
+const DWORD      ENTITY_SEND_MS = 10; // target 100 Hz for owned-entity snapshots
 // Traffic-class channels (protocol 44). ENet guarantees ordering + reliable
 // retransmit PER channel, so head-of-line blocking is per channel too. The bulk
 // coordinated save/load transfer (multi-MB, dozens of ~4 KB reliable fragments)
@@ -50,10 +50,9 @@ void netErr(const char* msg) {
     coop::logErrLine(buf);
 }
 
-// Monotonic ms clock for the batch send stamp (v35). QPC, not GetTickCount:
-// the receiver reconstructs snapshot SPACING from consecutive stamps, and
-// GetTickCount's ~15 ms granularity would re-introduce the very quantization
-// the stamp exists to remove (the Replicator's nowMs rationale).
+// Monotonic ms clock for snapshot capture stamps and the 10 ms send cadence.
+// QPC, not GetTickCount: its ~15 ms granularity would quantize both the send
+// schedule and the snapshot spacing reconstructed by the receiver.
 u32 monoMs() {
     static LARGE_INTEGER freq = { 0 };
     if (freq.QuadPart == 0) {
@@ -698,6 +697,7 @@ void NetLink::threadLoop() {
     DWORD lastEntitySendTick = 0;
     bool haveEntitySendTick = false;
     bool forceEntitySend = true;
+    std::vector<EntityState> ents; // retain capacity across snapshot sends
     DWORD rosterAt = 0;
     bool rosterChanged = true;
     unsigned char lastRoster[sizeof(RosterPacket) + 1] = {0};
@@ -2519,9 +2519,9 @@ void NetLink::threadLoop() {
             }
         }
 
-        // ENet is serviced with at most TICK_MS idle wait, but owned snapshots
-        // still go out at most every 50 ms. CONNECT forces the next available
-        // snapshot immediately; do not consume that edge before publication.
+        // ENet is serviced with at most TICK_MS idle wait; owned snapshots target
+        // a 10 ms interval. CONNECT forces the next available snapshot immediately;
+        // do not consume that edge before publication.
         bool connected = false;
         if (isHost_) {
             for (size_t pi = 0; pi < enetHost_->peerCount; ++pi) {
@@ -2533,13 +2533,12 @@ void NetLink::threadLoop() {
         } else {
             connected = serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED;
         }
-        const DWORD entityNow = GetTickCount();
+        const DWORD entityNow = connected ? monoMs() : 0;
         if (connected && (forceEntitySend || !haveEntitySendTick ||
                           (DWORD)(entityNow - lastEntitySendTick) >= ENTITY_SEND_MS)) {
             // Keep the Steam 1200 B datagram cap: oversized unreliable ENet packets
             // otherwise become reliable fragments and stall the motion stream.
             const unsigned batchCap = steam ? ENTITY_BATCH_MAX_STEAM : ENTITY_BATCH_MAX;
-            std::vector<EntityState> ents;
             u32  owner = 0;
             u32  stamp = 0;
             bool have  = false;

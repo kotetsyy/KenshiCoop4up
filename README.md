@@ -70,16 +70,18 @@
 игре. Внутриигровой апдейтер проверяет SHA-256 обеих DLL и устанавливает пару
 для следующего запуска. `.mod` и `RE_Kenshi.json` почти не меняются.
 
-**У всех должна быть одна и та же сборка.** Разные версии не соединяются.
+**Рекомендуем всем одну и ту же сборку.** Разные версии протокола не соединяются.
 
-В public `v0.1.24` используется протокол **64**. Хост держит симуляцию на паузе
+В public `v0.1.25` используется протокол **64**. Хост держит симуляцию на паузе
 до загрузки мира всеми подключёнными клиентами: каждый подтверждает READY
 именно для текущего `LOAD_GO`, а не просто окончание передачи файлов.
 Пауза не заменяет выбранную игроками скорость или пользовательскую паузу.
 Этот барьер работает при включённой синхронизации сейвов, загрузки, скорости
-и времени. Максимальное ожидание ENet в простое — **1 мс**; снимки сущностей
-по-прежнему отправляются с частотой 20 Гц. Это не гарантия пинга 1 мс;
-более частые пробуждения могут увеличить нагрузку CPU.
+и времени. Максимальное ожидание ENet в простое — **1 мс**; целевая частота
+снимков сущностей — **100 Гц** (10 мс, монотонный QPC-таймер). Свежие состояния
+по-прежнему захватываются игровым потоком, поэтому их частота зависит от FPS.
+Ротация дальних NPC остаётся на 50 мс; остальные каналы не переводятся на 100 Гц.
+Это не гарантия пинга 1 мс; повышение частоты снимков увеличивает сетевую нагрузку.
 
 ## Подключение в игре (F2)
 
@@ -228,7 +230,7 @@ build instructions are in [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 closed. The in-game updater verifies both SHA-256 hashes and installs the pair
 for the next launch. `.mod` and `RE_Kenshi.json` almost never change.
 
-**Everyone must run the same build.** Mismatched versions do not connect.
+**The same build is recommended for everyone.** Mismatched protocol versions do not connect.
 
 ## Connect in-game (F2)
 
@@ -277,8 +279,11 @@ Both configurations pause the host simulation until every connected join reports
 the READY id for its current `LOAD_GO` after the new world becomes live, including
 a join connecting from the title screen. The temporary hold does not replace the
 speed/pause vote and requires save, load, speed and time sync to remain enabled.
-Both configurations use a 1 ms maximum idle ENet wait; entity snapshots remain
-at 20 Hz. This is not a 1 ms ping guarantee; CPU wakeups may increase.
+Both configurations use a 1 ms maximum idle ENet wait and target 100 Hz entity
+snapshots (10 ms, paced by the monotonic QPC clock). Fresh captures still come
+from the game thread and depend on its frame rate. The 50 ms distant-NPC slice
+rotation and other channel budgets are unchanged. This is not a 1 ms ping
+guarantee; the higher snapshot rate increases network load.
 
 Local ENet rates appear in the collapsible **Diagnostics** block and **Copy
 report**, not a separate always-on overlay. Once a JOIN completes WELCOME, the

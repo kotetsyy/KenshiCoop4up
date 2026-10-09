@@ -14,7 +14,7 @@ from an installed SDK. Build commands fail if either DLL fails.
 ## Restore external dependencies
 
 From a fresh checkout of the release tag, restore the dependency revisions used
-for v0.1.22 through v0.1.24. Git LFS is required for KenshiLib libraries and the Boost archive:
+for v0.1.22 through v0.1.25. Git LFS is required for KenshiLib libraries and the Boost archive:
 
 ```bat
 git clone https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git third_party/KenshiLib_deps
@@ -84,12 +84,19 @@ maximum idle ENet wait; only the private pair mirrors the client's local log.
 The packed `TimePacket` is 21 bytes in both configurations (`readyLoadId` is
 always present). Earlier public 59 and private 63 pairs are rejected at handshake.
 
+v0.1.25 targets 100 Hz entity snapshots with a 10 ms send interval on the existing
+monotonic QPC clock, not the coarse `GetTickCount` clock. The sender retains its
+snapshot buffer capacity between sends and preserves capture-time wire stamps.
+Fresh captures remain game-frame-paced; interpolation adapts to those stamps
+and ignores duplicate captures. The 50 ms distant-NPC slice selection and other
+channel budgets are unchanged. Public 64/private 65 packet formats do not change.
+
 The private launcher reads `dist/debug-kit/private-update.json` and synchronizes
 against the latest closed GitHub release before starting Kenshi. The current
 manual Harness pair is not published to that feed: starting its old launcher
 would restore the previous remote pair. Public publication is separate.
 
-### Manual installation of v0.1.24
+### Manual installation of v0.1.25
 
 `dist/KenshiCoop-dev-kit.zip` is a four-file manual update for existing private
 installs, identical on HOST and JOIN. With both games closed, copy

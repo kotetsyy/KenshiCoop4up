@@ -1,39 +1,37 @@
 ## Изменения
 
-- В public перенесён барьер загрузки из dev: хост держит свою симуляцию на паузе до появления загруженного мира у всех подключённых клиентов. Окончание передачи файлов само по себе больше не снимает эту паузу.
-- READY содержит идентификатор конкретного `LOAD_GO`. Подтверждение предыдущей загрузки не разрешает текущую; READY отправляется только после появления живого мира, включая подключение из главного меню и перезагрузку уже открытого мира.
-- Временная пауза не заменяет выбранную скорость или пользовательскую паузу. Барьер работает при включённых save/load/speed/time sync; при отключении клиента его ожидание убирается.
-- Максимальное ожидание ENet в простое уменьшено до **1 мс** в public и dev. Снимки сущностей по-прежнему отправляются на 20 Гц. Это не гарантия пинга 1 мс или измеренного ускорения; более частые пробуждения могут увеличить нагрузку CPU.
-- Сохранены исправления Unicode-путей сейвов и ошибок bootstrap, атомарный приём блоков передачи мира и поле ника без отдельной кнопки вставки.
-- Пересылка клиентского лога хосту остаётся только в dev и не включена в public.
+- Целевая частота отправки снимков сущностей повышена до **100 Гц** в public и dev: интервал уменьшен до **10 мс**.
+- Расписание отправки использует монотонный QPC-таймер вместо грубого `GetTickCount`. Снимки сохраняют время захвата; буфер отправки переиспользуется между отправками.
+- Ожидание ENet в простое остаётся **1 мс**. Пауза хоста до READY конкретной загрузки и предыдущие исправления подключения сохранены.
+- Ротация дальних NPC остаётся на 50 мс; отдельные интервалы инвентаря, сейвов и часов не изменены. Это повышение частоты снимков, а не всех сетевых каналов.
+
+Свежие состояния захватываются игровым потоком, поэтому их частота зависит от FPS. 100 Гц — цель планировщика отправки, не гарантия пинга или 100 новых состояний мира в секунду. Более частая отправка увеличивает сетевую нагрузку.
 
 ## Совместимость
 
-Public использует **протокол 64**: в `TimePacket` теперь всегда есть `readyLoadId`.
-Dev этой версии использует **протокол 65** с дополнительным зеркалом клиентского лога.
-Старые public 59 и dev 63 отвергаются при рукопожатии. Public и dev друг с другом не соединяются. Установите одну и ту же пару DLL на хоста и всех клиентов.
+Формат пакетов не изменён: **public — протокол 64, dev — протокол 65**. Внутри соответствующей ветки v0.1.24 и v0.1.25 совместимы; для отправки на 100 Гц в обе стороны обновите хоста и клиентов. Public и dev между собой не соединяются.
 
 ## Установка и обновление
 
-Скачайте `KenshiCoop-kit.zip`. Полностью закройте Kenshi и скопируйте папку `KenshiCoop` в `<Kenshi>\mods\` с заменой файлов **на обеих машинах**.
+Скачайте `KenshiCoop-kit.zip`. Полностью закройте Kenshi и скопируйте папку `KenshiCoop` в `<Kenshi>\mods\` с заменой файлов на хосте и клиентах. RE_Kenshi должен быть установлен. Свой `coop_config.json` сохраните.
 
-В архиве только четыре runtime-файла:
+В архиве только четыре файла:
 
 - `KenshiCoop.dll`
 - `KenshiCoopUI.dll`
 - `KenshiCoop.mod`
 - `RE_Kenshi.json`
 
-RE_Kenshi должен быть установлен. Свой `coop_config.json` сохраните; новый конфиг создаётся через F2. Лаунчеров, `PROVENANCE.json`, инструкций и исходников внутри игрового архива нет. Обе DLL обновляются вместе, изменения действуют после перезапуска игры.
+Обе DLL заменяются вместе; изменения действуют после перезапуска игры.
 
 <details><summary>English</summary>
 
-The public build now shares the development build's join-load barrier: the host's simulation is held until every connected client has a live world and reports READY for its current `LOAD_GO` id. File-transfer completion or a previous load's READY does not release the barrier. Title-screen joins and in-world reloads are covered by the same implementation. The temporary hold preserves the speed/pause vote and requires save, load, speed and time sync; disconnected clients are removed from the wait.
+The entity-snapshot sender now targets **100 Hz** in public and dev, with a **10 ms** interval paced by the monotonic QPC clock instead of coarse `GetTickCount`. Capture-time stamps are preserved and the send buffer is reused between sends. ENet's maximum idle wait remains 1 ms; the load-specific READY host pause and prior connection fixes remain.
 
-Both configurations use a 1 ms maximum idle ENet wait. Entity snapshots remain at 20 Hz. This is not a 1 ms ping guarantee or a measured performance improvement; CPU wakeups may increase. Unicode save-path, bootstrap failure and atomic world-transfer fixes remain, as does the full-width nickname input without its separate Paste button. Client-log mirroring remains private-only.
+The distant-NPC slice still rotates every 50 ms. Inventory, save and clock channel intervals are unchanged. Fresh captures remain game-frame-paced: the 100 Hz sender target is not a ping guarantee or a promise of 100 new world states per second. More frequent sends increase network load.
 
-Public protocol is **64** (`TimePacket` always contains `readyLoadId`); private protocol is **65** with log mirroring. Earlier public 59/private 63 builds and mixed public/private pairs are rejected. Install the same DLL pair on the host and all clients with Kenshi closed.
+Packet formats are unchanged: public protocol **64**, private protocol **65**. v0.1.24 and v0.1.25 interoperate within their respective build families; update both host and clients for bidirectional 100 Hz sending. Public/private pairs do not connect.
 
-`KenshiCoop-kit.zip` contains only the core DLL, UI DLL, mod and RE_Kenshi JSON under `KenshiCoop/`. Copy the folder into `<Kenshi>/mods/`, keep the existing `coop_config.json` and restart. RE_Kenshi must already be installed. No launchers, provenance, notes or source archives are bundled.
+With Kenshi closed, copy the `KenshiCoop/` folder from `KenshiCoop-kit.zip` into `<Kenshi>/mods/`, replacing both DLLs, the mod and RE_Kenshi JSON. RE_Kenshi must already be installed. Keep the existing `coop_config.json` and restart the game.
 
 </details>

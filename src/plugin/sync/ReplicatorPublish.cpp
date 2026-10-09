@@ -347,7 +347,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 //
                 // Anything the peer is streaming to us right now is, by that
                 // fact, theirs to write - whatever our cell map says. This
-                // subsumes the census hold above with a 20 Hz signal instead of
+                // subsumes the census hold above with the full snapshot stream instead of
                 // a 1 Hz one, but does not replace it: the census also speaks
                 // for bodies too far out to stream.
                 //
@@ -387,15 +387,15 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
     // Phase 2 mid-band tier (host): append a rotating slice of the census-walk
     // NPCs beyond the stream bubble (midBand_, nearest-first, rebuilt at 1 Hz
-    // by publishNpcCensus). Quota = |midBand|/10 puts each mid NPC in ~1 of
-    // every 10 snapshots; the net thread samples snapshots at 20 Hz, so each
-    // NPC hits the wire at ~2 Hz aggregate - real movement between census
-    // beats instead of a frozen local sim (the "zombie NPC" report). The
-    // wrap-around phase bump (midRot_) keeps a fixed frame-rate/net-tick
+    // by publishNpcCensus). Quota = |midBand|/10 selects roughly a tenth of
+    // the list per slice (capped below); the slice still advances every 50 ms.
+    // That selection budget is independent of the 100 Hz snapshot sender:
+    // a selected slice remains in subsequent snapshots until the next advance.
+    // The wrap-around phase bump (midRot_) keeps a fixed frame-rate/net-tick
     // ratio from aliasing the same slice positions into every sampled
     // snapshot. Hands are resolved fresh each frame: a despawn since the
     // census walk degrades to a skip, and the near tier is deduped by hand
-    // (an NPC walking into the bubble is already in buf at 20 Hz).
+    // (an NPC walking into the bubble is already in the full-rate stream).
     // Carrier promotion: a body CARRYING someone owns that PASSENGER's
     // transform on both clients, so every unit the carrier's copy trails is
     // inherited by the passenger - and the passenger can be the peer's own
@@ -421,7 +421,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // a single charging hand snapped 9-15 times in 52 s at a median drift of
     // 87-196 u, every snap classified "chase". Nearest-first and capped, so a
     // stampede cannot crowd out the near band or hand the peer a whole field to
-    // drive at 20 Hz (the sim-cost lesson behind MID_BAND_MAX).
+    // drive at the full snapshot rate (the sim-cost lesson behind MID_BAND_MAX).
     if (streamNpcs_ && !midBand_.empty() && n < MAX_PUBLISH) {
         // Where to put the bar, measured rather than guessed: the cSpeed of the
         // bodies that actually needed a mid-tier snap on camp_approach clusters
@@ -449,7 +449,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         // ...and a distance ceiling, which is the other half of affording it. A
         // runner 1500 u out is not a chase anyone can see; it is just a body the
         // census will place correctly a second from now. Only inside this ring
-        // does the difference between 2 Hz and 20 Hz show on the peer's screen,
+        // does the difference between sparse rotation and full-rate streaming show,
         // and confining the spend there is what keeps a busy camp - which always
         // has more than eight bodies running somewhere - from paying for all of
         // them. The mid band starts at MID_NEAR_EDGE (260 u).
@@ -492,14 +492,11 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned int sz = (unsigned int)midBand_.size();
         unsigned int quota = (sz + 9) / 10;
         if (quota > 16) quota = 16;
-        // Advance the slice on the NET-TICK cadence (50 ms), not per frame:
-        // publishOwned runs every render frame but the net thread samples
-        // the latest snapshot only at 20 Hz, so per-frame rotation dropped
-        // 2/3 of the slices on the floor at 75 fps and starved entries for
-        // whole rotations (run 103044: starve=5..10, driven bodies flapping
-        // out of the driven set). A slice that persists >= one net tick is
-        // guaranteed on the wire: quota/10th of the list every 50 ms = each
-        // mid NPC at ~2 Hz, deterministically.
+        // Hold each mid-band slice for 50 ms, independently of the 10 ms sender.
+        // publishOwned runs every render frame; advancing every frame could let
+        // the sender skip slices entirely (the old 20 Hz stream starved entries
+        // at 75 fps in run 103044). Keep the existing selection budget rather
+        // than accelerating all distant NPCs with the owned/near snapshot rate.
         unsigned long nowPub = nowMs();
         if (midSliceMs_ == 0 || (nowPub - midSliceMs_) >= 50) {
             midSliceMs_ = nowPub;

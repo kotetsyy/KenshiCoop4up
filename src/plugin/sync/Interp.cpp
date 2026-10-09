@@ -106,7 +106,7 @@ unsigned long EntityInterp::renderDelay(const InterpConfig& cfg) const {
     float d = avgIntervalMs_ + 2.0f * jitterMs_ + lagMs_;
 
     // The ceiling has to scale with the cadence THIS entity is sent at. A flat
-    // 200 ms is sized for the 20 Hz near band; the round-robin mid band sends
+    // 200 ms covers the dense near band; the round-robin mid band sends
     // every ~500 ms, and once the ceiling is below the send interval, renderTime
     // (now - 200 ms) sits past the newest snapshot for 300 ms of every 500 ms
     // segment, so sample() takes the dead-reckoning branch 60% of the time by

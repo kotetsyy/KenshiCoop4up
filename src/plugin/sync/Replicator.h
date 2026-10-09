@@ -804,7 +804,7 @@ public:
 
     // Stage 2 smoothness oracle: emit a "SCENARIO SMOOTH ..." summary describing
     // how often the driven body moved per frame while its source was in motion.
-    // Per-frame interpolation keeps zeroFrac low; raw 20 Hz stepping makes it high.
+    // Per-frame interpolation avoids the gaps from raw snapshot stepping.
     void logSmoothSummary();
 
 private:
@@ -962,7 +962,7 @@ private:
                                      //   edge-detect against this (a cooldown-exempt combat
                                      //   snap keyed on the level fired 67x at drift 0.0).
         // Last tick this body's stream cadence classified MID-tier. A body
-        // that just handed off mid -> near (raid walking into the 20 Hz
+        // that just handed off mid -> near (raid walking into the full-rate
         // bubble) may owe one large reconciliation snap for divergence
         // accrued under sparse mid coverage - classed to the mid ledger
         // (like young-ring coverage snaps), not steady-state near tracking.
@@ -1151,11 +1151,10 @@ private:
     // authors - the host half of the tie-break. Pairs with cellYields_, which
     // counts the join half.
     unsigned long             hostDriveRefusals_;
-    // How long a peer sample keeps a hand "theirs" for the echo guard. Two net
-    // ticks (50 ms each) plus slack: long enough that a single dropped snapshot
-    // does not hand the body back and forth, short enough that a real handover
-    // - the peer walking out of the cell and falling silent - completes within
-    // a beat instead of leaving the body unwritten.
+    // How long a peer sample keeps a hand "theirs" for the echo guard.
+    // This grace period is independent of the snapshot send interval: packet
+    // loss must not hand the body back and forth, while a peer that falls
+    // silent must eventually release authorship.
     enum { PEER_STREAM_FRESH_MS = 1000 };
     // Phase 0.5 census diagnostics (2026-08-02 field report: "join sees local
     // NPCs the host does not, worsening over long travel"). Four mechanisms in
@@ -1172,10 +1171,9 @@ private:
     unsigned long             proxyDriftLogMs_;  // join: last [proxy] drift sample sweep
     // Phase 2 mid-band streaming tier (HOST): census-walk NPCs OUTSIDE the
     // ~200/260 u stream bubble, nearest-first, refreshed at the 1 Hz census
-    // cadence. publishOwned round-robins a small slice of them through the
-    // entity batch every frame (quota sized so each NPC hits the 20 Hz wire
-    // at ~MID_HZ aggregate) - between census beats a far NPC keeps receiving
-    // real positions instead of freezing under divergent local AI (the
+    // cadence. publishOwned round-robins a small slice every 50 ms, independently
+    // of the full-rate snapshot sender. Between census beats a far NPC keeps
+    // receiving real positions instead of freezing under divergent local AI (the
     // "zombie NPC" report). Keys only (no Character*): each publish resolves
     // the hand fresh, so a despawn between census walks degrades to a skip.
     struct MidBandEntry {
@@ -1184,9 +1182,7 @@ private:
     };
     std::vector<MidBandEntry> midBand_;
     unsigned int              midCursor_;  // start of the CURRENT slice
-    unsigned long             midSliceMs_; // last slice advance (50 ms cadence:
-                                           // the slice must persist across a
-                                           // whole net tick to be sampled)
+    unsigned long             midSliceMs_; // last slice advance; 50 ms selection budget
     unsigned int              midFastPromoted_; // mid bodies streamed at the full
                                            // near-band rate last tick because they
                                            // were RUNNING (see the promotion pass)
