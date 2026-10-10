@@ -78,11 +78,17 @@ An older core-only updater needs the new companion too: manually install both
 DLLs, or let the new core repair the missing UI on its next update check and
 restart again. UI absence/ABI rejection is logged; it does not stop networking.
 
-The current public Release pair uses protocol 64; the current Harness pair uses
-private protocol 65. Both share the load-specific READY barrier and a 1 ms
+The current public Release pair uses protocol 70; the current Harness pair uses
+private protocol 71. Both share the load-specific READY barrier and a 1 ms
 maximum idle ENet wait; only the private pair mirrors the client's local log.
 The packed `TimePacket` is 21 bytes in both configurations (`readyLoadId` is
-always present). Earlier public 59 and private 63 pairs are rejected at handshake.
+always present). Earlier public 59/64/66/68 and private 63/65/67/69 pairs are rejected at handshake.
+`InvItemEntry` is 165 bytes: stock snapshots also carry the native loose section
+and two grid coordinates. Complete building stock restores the host's physical
+stacks at those positions instead of attempting a different greedy packing.
+`SpawnInfoPacket` is 211 bytes: a merchant description includes its shop home
+and the actual host platoon template SID. Native `isATrader` reads that
+template's `is trader` flag; the character SID and squad role alone are insufficient.
 
 v0.1.25 targets 100 Hz entity snapshots with a 10 ms send interval on the existing
 monotonic QPC clock, not the coarse `GetTickCount` clock. The sender retains its
@@ -96,7 +102,7 @@ against the latest closed GitHub release before starting Kenshi. The current
 manual Harness pair is not published to that feed: starting its old launcher
 would restore the previous remote pair. Public publication is separate.
 
-### Manual installation of v0.1.25
+### Manual installation of v0.1.27
 
 `dist/KenshiCoop-dev-kit.zip` is a four-file manual update for existing private
 installs, identical on HOST and JOIN. With both games closed, copy
@@ -112,5 +118,10 @@ for a READY that cannot arrive. The load/READY pause is now shared by Release
 and Harness: READY is sent after the new world becomes live and must match the
 host's current `LOAD_GO` id for each connected join. The temporary hold preserves
 the selected speed/pause vote and requires save, load, speed and time sync.
-Release/Harness core/UI builds succeeded. Game and test suites were not run at
-the user's request; end-to-end HOST/JOIN verification is left to the user.
+Release/Harness core/UI builds succeeded; protocol checks passed 565/565 and
+contract fixtures 29/29. All 11 paired native game regressions passed in disposable
+installations on nonprimary DISPLAY1, never in the user's primary installation.
+The launcher may exit after starting a new native game process; the batch run
+waits on the actual game PIDs, not the bootstrap process.
+The named-shop oracle compares complete native trade quantities and content
+fingerprints on both peers; a nonempty but different shop still fails.

@@ -17,6 +17,11 @@ class GameWorld;
 
 namespace coop {
 namespace engine {
+// Harness fixture preparation: native Import, retaining the player squad but
+// rebuilding world NPCs. Only disposable local saves may be used by the caller.
+bool probeImportFixture(const char* name);
+bool probeApproachShop(GameWorld* gw, const unsigned int traderHand[5]);
+
 
 // ---- Weapon-mint fabrication probes (spike 451) -----------------------------
 
@@ -88,6 +93,14 @@ int mintGradedGearForTest(GameWorld* gw, const unsigned int cHand[5], const char
 // second isolated container. Does NOT apply the snapshot to the live object.
 // Returns 1 round-trip ok / 0 unavailable or empty / -1 native save/load failed.
 int probeNativeSnapshot(GameWorld* gw);
+
+// Disposable real-shop fixtures: relocate only locally owned PCs and the camera
+// to Squin, or the waystation nearest Squin. Native loading may pause simulation.
+// The trade probe reads the complete native aggregate; the final sample can stay
+// visible for desktop inspection, while earlier samples hide the window again.
+bool probeShopTown(GameWorld* gw, bool waystation, float outPosition[3]);
+bool probeTraderWindow(const unsigned int traderHand[5], unsigned int* outHash,
+                       unsigned int* outQuantity, bool keepVisible = false);
 
 } // namespace engine
 } // namespace coop

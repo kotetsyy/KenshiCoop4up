@@ -669,6 +669,7 @@ Character* findWorkerNear(GameWorld* gw, RootObject* fixture);
 unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                           unsigned int maxOut, bool* outTruncated = 0,
                           bool includeNested = false);
+void fillItemProvenance(Item* item, InvItemEntry& entry);
 
 // Item::quality - CONDITION, a 0..100 float, NOT the craft grade (see gradeLevelOf and
 // InvItemEntry::level) - as the wire's integer hundredths, so a pristine item is 10000.

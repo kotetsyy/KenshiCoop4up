@@ -82,19 +82,25 @@ bool inventoryGuiRefresh(Inventory* inv) {
     }
 }
 
-// SEH-guarded helper: copy an item's manufacturer + material GameData stringIDs into the
-// snapshot entry. WEAPONS need them to be reconstructable on the peer (createItem requires
-// the manufacturer/mesh GameData); armour/items leave them empty (the pointers are null).
+
+} // namespace
+// Copy native provenance for reconstruction and identity. For weapons these are
+// manufacturer/material records; blueprints carry research and trade goods also
+// retain native material data needed for stack compatibility.
 void fillItemProvenance(Item* it, InvItemEntry& e) {
     __try {
         GameData* man = it->manufacturerData;
         GameData* mat = it->materialData;
         if (man) { const char* s = man->stringID.c_str(); strncpy(e.manufacturer, s ? s : "", sizeof(e.manufacturer) - 1); }
         if (mat) { const char* s = mat->stringID.c_str(); strncpy(e.material,     s ? s : "", sizeof(e.material) - 1); }
+        if (!e.equipped && it->isInInventory &&
+            it->inventoryPos.x>=0 && it->inventoryPos.y>=0) {
+            e.gridSection=sectionNameHash(it->inventorySection.c_str());
+            e.gridX=(unsigned short)it->inventoryPos.x;
+            e.gridY=(unsigned short)it->inventoryPos.y;
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
-
-} // namespace
 
 // SEH-guarded: read a container's contents - both LOOSE items and EQUIPPED gear
 // (each tagged with its equipped flag + slot) - into out[] and, when outItems != 0,
@@ -400,29 +406,35 @@ GameData* fallbackWeaponManufacturer(GameWorld* gw) {
     return cached;
 }
 
-// SEH-guarded: create `qty` of the template (sid, typeCat) and add it to inv. The
-// join reconstructs items locally (their hands are host-only / unresolvable), so a
-// fresh blank handle is fine - the host stays authoritative for the contents. When
-// `equip` is set, the created item is moved into its equipment slot (equipItem) so
-// the reconstructed item is WORN, matching the author's equipped state.
-// External linkage (Phase 5e): declared in EngineInternal.h (default args live on
-// that declaration) so probeFabricateWeaponLoose (now in EngineProbe.cpp) can reuse it.
-bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
-                      unsigned int typeCat, int qty, int qualityBucket, bool equip,
-                      const char* manufacturer, const char* material,
-                      unsigned char level) {
-    if (!gw || !gw->theFactory || !g_createItemFn || !inv || !sid || qty <= 0) return false;
+typedef GameData* (__fastcall* RecordBySidFn)(GameDataContainer*, const std::string&);
+static GameData* recordBySidSeh(GameWorld* gw, const std::string& sid, RecordBySidFn get) {
+    __try { return gw && get ? get(&gw->gamedata,sid) : 0; }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static GameData* recordBySid(GameWorld* gw, const char* sid) {
+    if (!sid || !sid[0]) return 0;
+    static RecordBySidFn get=(RecordBySidFn)KenshiLib::GetRealAddress(
+        static_cast<GameData* (GameDataContainer::*)(const std::string&)>(&GameDataContainer::getData));
+    return recordBySidSeh(gw,std::string(sid),get);
+}
+
+
+// Fabricate detached native items so stock layout can be validated before mutation.
+static Item* fabricateItem(GameWorld* gw, const char* sid, unsigned int typeCat,
+                           int qualityBucket, const char* manufacturer,
+                           const char* material, unsigned char level) {
+    if (!gw || !gw->theFactory || !g_createItemFn || !sid) return 0;
     static int dbg = -1;
     if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
     __try {
         GameData* tmpl = findItemTemplateImpl(gw, sid, typeCat);
-        if (!tmpl) { if (dbg) coop::logLine("[mk] tmpl-null"); return false; }
-        // A WEAPON needs its manufacturer (company) GameData; resolve it (and the material
-        // spec) by the replicated stringIDs. Armour and items pass null for both (their
-        // templates instantiate directly).
-        GameData* man = (manufacturer && manufacturer[0])
-                        ? findItemTemplateImpl(gw, manufacturer, (unsigned int)WEAPON_MANUFACTURER) : 0;
-        GameData* mat = findMaterialSpec(gw, material, typeCat);
+        if (!tmpl) { if (dbg) coop::logLine("[mk] tmpl-null"); return 0; }
+        // Blueprint research and ordinary trade-item provenance use these same
+        // native fields; they are not restricted to weapon manufacturers/materials.
+        GameData* man=recordBySid(gw,manufacturer);
+        GameData* mat=recordBySid(gw,material);
+        if ((manufacturer && manufacturer[0] && !man) ||
+            (material && material[0] && !mat)) return 0;
         // THE GRADE. Kenshi's named grades (Prototype 5, Shoddy 20, Standard 40, High 60,
         // Specialist 80, Masterwork 95) are points on a 1-100 craft level that the factory
         // bakes into Gear::level / level_0_100 at construction, from THIS argument, and that
@@ -449,7 +461,7 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
             if (fabOn < 0) { const char* e = getenv("KENSHICOOP_WEAPON_FAB"); fabOn = (e && e[0] == '0') ? 0 : 1; }
             if (!fabOn) {
                 if (dbg) coop::logLine("[mk] weapon-fab disabled (KENSHICOOP_WEAPON_FAB=0)");
-                return false;
+                return 0;
             }
             // Spike 451: for WEAPONS the 6-arg createItem's first two GameData roles
             // are SWAPPED - the engine passes the WEAPON_MANUFACTURER record FIRST and
@@ -472,31 +484,39 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
             char buf[sizeof(hand) + 16];
             memset(buf, 0, sizeof(buf));
             hand* h = reinterpret_cast<hand*>(buf);
-            g_handCtorFn(h, 0, 0, (itemType)typeCat, 0, 0); // blank handle (factory owns id)
-            it = g_createItemFn(gw->theFactory, tmpl, h, man, mat, gradeLevel, 0);
+            g_handCtorFn(h, 0, 0, (itemType)typeCat, 0, 0);
+            // Native factory makes a BlueprintItem from RESEARCH, not from
+            // the shared BLUEPRINT_ITEM display template.
+            GameData* recipe=(man && man->type==RESEARCH) ? man : tmpl;
+            it = g_createItemFn(gw->theFactory, recipe, h, 0, 0, gradeLevel, 0);
+            if (it) {
+                // Null means native fabrication without a supplied snapshot.
+                // An explicit wire string (including empty) restores provenance.
+                if (manufacturer) it->manufacturerData=man;
+                if (material) it->materialData=mat;
+            }
         }
-        if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; }
+        if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return 0; }
         if (qualityBucket > 0) it->quality = (float)qualityBucket / 100.0f;
-        if (!inv->tryAddItem(it, qty)) { if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] tryAddItem-fail sid='%s' type=%u equip=%d",sid,typeCat,equip?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; } // virtual
-        // Equipment is non-stackable (qty 1); move the just-added item into its slot.
-        if (equip && g_equipItemFn) g_equipItemFn(inv, it);
-        // gotLvl is what the factory actually baked in; when it disagrees with the wire's
-        // want= the grade did not survive the rebuild, which is the whole failure mode.
-        if (dbg) {
-            int gotLvl = -1;
-            Gear* g = it->isGear();                              // virtual
-            if (g) gotLvl = it->getLevel();                      // virtual
-            char b[200];
-            _snprintf(b,sizeof(b)-1,
-                "[mk] OK sid='%s' type=%u equip=%d qty=%d qual=%d wantLvl=%d gotLvl=%d mat=%d",
-                sid,typeCat,equip?1:0,qty,qualityBucket,gradeLevel,gotLvl,mat?1:0);
-            b[sizeof(b)-1]='\0'; coop::logLine(b);
-        }
-        return true;
+        return it;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (dbg) coop::logLine("[mk] SEH-except");
-        return false;
+        return 0;
     }
+}
+
+bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
+                      unsigned int typeCat, int qty, int qualityBucket, bool equip,
+                      const char* manufacturer, const char* material,
+                      unsigned char level) {
+    if (!inv || qty<=0) return false;
+    Item* it=fabricateItem(gw,sid,typeCat,qualityBucket,manufacturer,material,level);
+    if (!it) return false;
+    __try {
+        if (!inv->tryAddItem(it,qty)) return false;
+        if (equip && g_equipItemFn) g_equipItemFn(inv,it);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 namespace {
@@ -506,7 +526,8 @@ namespace {
 // touched again. `wantEquipped` keeps loose and worn copies of the same item distinct
 // (so unequipping/dropping a worn item doesn't accidentally remove the loose one).
 int removeByKey(Inventory* inv, Item** items, InvItemEntry* meta, unsigned int n,
-                const char* sid, unsigned int typeCat, int qty, int wantEquipped) {
+                const char* sid, unsigned int typeCat, const char* manufacturer,
+                const char* material, int qty, int wantEquipped) {
     if (!inv || !items || !meta || !sid || qty <= 0) return 0;
     int removed = 0;
     __try {
@@ -515,10 +536,14 @@ int removeByKey(Inventory* inv, Item** items, InvItemEntry* meta, unsigned int n
             if (meta[i].itemType != typeCat) continue;
             if ((int)meta[i].equipped != wantEquipped) continue;
             if (strcmp(meta[i].stringID, sid) != 0) continue;
+            if ((manufacturer && strcmp(meta[i].manufacturer,manufacturer)!=0) ||
+                (material && strcmp(meta[i].material,material)!=0)) continue;
             int have = meta[i].quantity; if (have < 1) have = 1;
             int take = qty - removed; if (take > have) take = have;
             inv->removeItemAutoDestroy(items[i], take); // virtual; destroys the stack
             removed += take;
+            meta[i].quantity-=take;
+            if (meta[i].quantity==0) items[i]=0;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return removed;
@@ -615,6 +640,11 @@ int correctWeaponSlot(Inventory* inv, const char* sid, unsigned int type,
 
 } // namespace
 
+bool containerInventoryAvailable(const unsigned int cHand[5]) {
+    RootObject* ro = resolveObjectByHand(cHand);
+    return ro && invOf(ro) != 0;
+}
+
 unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
                                       InvItemEntry* out, unsigned int maxOut,
                                       unsigned int* outHash, bool* outTruncated,
@@ -633,6 +663,92 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
         *outHash = h; // 0 == empty container (a meaningful, distinct fingerprint)
     }
     return n;
+}
+
+static bool sameStockItem(const InvItemEntry& a, const InvItemEntry& b) {
+    return a.itemType==b.itemType && a.quality==b.quality && a.level==b.level &&
+        a.locked==b.locked && strcmp(a.stringID,b.stringID)==0 &&
+        strcmp(a.manufacturer,b.manufacturer)==0 && strcmp(a.material,b.material)==0;
+}
+
+// Complete stock uses the host's physical stacks and positions, not greedy packing.
+// Reuse native items and validate every rectangle before detaching anything.
+static bool applyStockLayout(GameWorld* gw, Inventory* inv,
+                             const InvItemEntry* desired, unsigned int count,
+                             const InvItemEntry* cur, Item** curItems, unsigned int ncur) {
+    Item* placed[INV_ITEMS_MAX]={0};
+    InventorySection* sections[INV_ITEMS_MAX]={0};
+    bool reused[INV_ITEMS_MAX]={0};
+    bool used[INV_ITEMS_MAX]={0};
+    bool changed=count!=ncur;
+    bool valid=true;
+    // Snapshot relocation is not a mouse drag or a new transfer intent.
+    const bool vetoSaved=g_invVetoSuspend;
+    g_invVetoSuspend=true;
+    __try {
+        lektor<InventorySection*>* all=g_getSectionsFn(inv);
+        for (unsigned int i=0; i<count && valid; ++i) {
+            const InvItemEntry& e=desired[i];
+            if (e.equipped || !e.gridSection || !e.quantity) { valid=false; break; }
+            for (unsigned int s=0; all && s<all->size(); ++s) {
+                InventorySection* sec=(*all)[s];
+                if (sec && !sec->isAnEquippedItemSection &&
+                    sectionNameHash(sec->name.c_str())==e.gridSection) {
+                    sections[i]=sec; break;
+                }
+            }
+            if (!sections[i]) { valid=false; break; }
+            for (unsigned int j=0; j<ncur; ++j) {
+                if (!used[j] && !cur[j].equipped && sameStockItem(e,cur[j])) {
+                    placed[i]=curItems[j]; reused[i]=true; used[j]=true;
+                    if (e.quantity!=cur[j].quantity || e.gridSection!=cur[j].gridSection ||
+                        e.gridX!=cur[j].gridX || e.gridY!=cur[j].gridY) changed=true;
+                    break;
+                }
+            }
+            if (!placed[i]) {
+                changed=true;
+                placed[i]=fabricateItem(gw,e.stringID,e.itemType,e.quality,
+                                        e.manufacturer,e.material,e.level);
+            }
+            Item* it=placed[i];
+            InventorySection* sec=sections[i];
+            if (!it || it->itemWidth<=0 || it->itemHeight<=0 ||
+                e.gridX+it->itemWidth>sec->width || e.gridY+it->itemHeight>sec->height ||
+                (e.quantity>1 && e.quantity>it->isStackable(sec))) { valid=false; break; }
+            for (unsigned int j=0; j<i; ++j) {
+                if (sections[j]!=sec) continue;
+                if (e.gridX<desired[j].gridX+placed[j]->itemWidth &&
+                    desired[j].gridX<e.gridX+it->itemWidth &&
+                    e.gridY<desired[j].gridY+placed[j]->itemHeight &&
+                    desired[j].gridY<e.gridY+it->itemHeight) { valid=false; break; }
+            }
+        }
+        if (valid && changed) {
+            for (unsigned int j=0; j<ncur; ++j) {
+                if (used[j]) {
+                    if (inv->removeItemDontDestroy_returnsItem(curItems[j],cur[j].quantity,false)
+                        !=curItems[j]) { valid=false; break; }
+                } else {
+                    inv->removeItemAutoDestroy(curItems[j],cur[j].quantity);
+                }
+            }
+            if (valid) for (unsigned int i=0; i<count; ++i) {
+                placed[i]->quantity=desired[i].quantity;
+                sections[i]->_addItem(placed[i],desired[i].gridX,desired[i].gridY);
+                if (!inv->hasItem(placed[i])) { valid=false; break; }
+                placed[i]=0; // native section callback owns it now
+            }
+            inventoryGuiRefresh(inv);
+        }
+        for (unsigned int i=0; i<count; ++i) {
+            if (placed[i] && !reused[i])
+                g_destroyObjFn(gw,placed[i],false,"coop-stock-staging");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { valid=false; }
+    g_invVetoSuspend=vetoSaved;
+    if (!valid) coop::logLine("[stock] native layout could not be applied");
+    return valid && changed;
 }
 
 // The reconcile itself, against ONE inventory. Split out from applyContainerContents so the
@@ -655,9 +771,14 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     Item* curItems[64];
     bool curTruncated = false;
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC, &curTruncated);
+    if (inv->owner && inv->owner->getDataType()==BUILDING && !truncated &&
+        !curTruncated && count<=INV_ITEMS_MAX && g_getSectionsFn && g_destroyObjFn) {
+        if (inventoryGuiOpen(inv) && !g_invGuiRefreshFn) return false;
+        return applyStockLayout(gw,inv,items,count,cur,curItems,ncur);
+    }
 
-    // Group desired + current by TEMPLATE (stringID,itemType), tracking the EQUIPPED vs
-    // LOOSE split separately. A change in the split while the template's TOTAL count is
+    // Group by template AND native provenance, tracking the EQUIPPED vs LOOSE
+    // split separately. A change in the split while the group's TOTAL count is
     // unchanged is an in-place MOVE (equip/unequip an existing item): we transition the
     // REAL item rather than destroy+recreate, so (a) identity/quality survive and (b) the
     // equip PERSISTS - fabricated blank-handle equips are discarded by the engine (d25),
@@ -677,7 +798,9 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     for (unsigned int i = 0; i < count; ++i) {
         unsigned int j = 0;
         for (; j < ng; ++j)
-            if (g[j].type == items[i].itemType && strcmp(g[j].sid, items[i].stringID) == 0) break;
+            if (g[j].type == items[i].itemType && strcmp(g[j].sid, items[i].stringID) == 0 &&
+                strcmp(g[j].manufacturer,items[i].manufacturer)==0 &&
+                strcmp(g[j].material,items[i].material)==0) break;
         if (j == ng && ng < 128) {
             memset(&g[ng], 0, sizeof(Grp));
             g[ng].lvlEq = g[ng].lvlLoose = GRADE_NA; // 0 would mean "mint at level 0"
@@ -688,8 +811,8 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
             int q = (items[i].quantity < 1) ? 1 : items[i].quantity;
             if (items[i].equipped) { g[j].desiredEq += q; g[j].qualEq = items[i].quality; g[j].lvlEq = items[i].level; }
             else                   { g[j].desiredLoose += q; g[j].qualLoose = items[i].quality; g[j].lvlLoose = items[i].level; }
-            // Carry the weapon's manufacturer/material (first desired entry of the group);
-            // empty for non-weapons. Needed when the create path fabricates the item.
+            // Immutable provenance distinguishes otherwise identical templates,
+            // including different research blueprints.
             if (!g[j].manufacturer[0] && items[i].manufacturer[0])
                 strncpy(g[j].manufacturer, items[i].manufacturer, sizeof(g[j].manufacturer) - 1);
             if (!g[j].material[0] && items[i].material[0])
@@ -699,11 +822,15 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     for (unsigned int i = 0; i < ncur; ++i) {
         unsigned int j = 0;
         for (; j < ng; ++j)
-            if (g[j].type == cur[i].itemType && strcmp(g[j].sid, cur[i].stringID) == 0) break;
+            if (g[j].type == cur[i].itemType && strcmp(g[j].sid, cur[i].stringID) == 0 &&
+                strcmp(g[j].manufacturer,cur[i].manufacturer)==0 &&
+                strcmp(g[j].material,cur[i].material)==0) break;
         if (j == ng && ng < 128) {
             memset(&g[ng], 0, sizeof(Grp));
             g[ng].lvlEq = g[ng].lvlLoose = GRADE_NA; // 0 would mean "mint at level 0"
             strncpy(g[ng].sid, cur[i].stringID, sizeof(g[ng].sid) - 1);
+            strncpy(g[ng].manufacturer,cur[i].manufacturer,sizeof(g[ng].manufacturer)-1);
+            strncpy(g[ng].material,cur[i].material,sizeof(g[ng].material)-1);
             g[ng].type = cur[i].itemType; j = ng; ++ng;
         }
         if (j < ng) {
@@ -744,6 +871,8 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
             for (unsigned int i = 0; i < ncur; ++i) {
                 if (!curItems[i] || cur[i].equipped || cur[i].itemType != g[k].type) continue;
                 if (strcmp(cur[i].stringID, g[k].sid) != 0) continue;
+                if (strcmp(cur[i].manufacturer,g[k].manufacturer)!=0 ||
+                    strcmp(cur[i].material,g[k].material)!=0) continue;
                 f = (int)i; break;
             }
             int ok = (f < 0) ? -1 : equipExisting(inv, curItems[f]);
@@ -762,6 +891,8 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
             for (unsigned int i = 0; i < ncur; ++i) {
                 if (!curItems[i] || !cur[i].equipped || cur[i].itemType != g[k].type) continue;
                 if (strcmp(cur[i].stringID, g[k].sid) != 0) continue;
+                if (strcmp(cur[i].manufacturer,g[k].manufacturer)!=0 ||
+                    strcmp(cur[i].material,g[k].material)!=0) continue;
                 f = (int)i; break;
             }
             int ok = (f < 0) ? -1 : unequipToLoose(inv, curItems[f]);
@@ -770,47 +901,7 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
             curItems[f] = 0;                 // consumed: now loose, not worn
             g[k].curEq--; g[k].curLoose++; changed = true;
         }
-        // 3) RESIDUAL CREATE (genuine additions). ALWAYS create LOOSE - a fabricated loose
-        //    item persists, but a fabricated-AND-equipped one is discarded within a tick by
-        //    the engine's equipment validation (d25; this is the "picked-up weapon flickers
-        //    into slot 1 then vanishes" bug). So any EQUIP shortfall for which we have no
-        //    real copy to MOVE-UP is created loose here and equipped on a LATER reconcile
-        //    tick: by then the loose copy is a real, established factory item, and MOVE-UP's
-        //    equipExisting moves it into its slot persistently (the inv_reequip path). The
-        //    freshly-created loose items are NOT in curItems[], so step-4 REMOVE-LOOSE (which
-        //    only scans captured pre-existing items) can never strip them this tick.
-        int createLoose = 0;
-        if (g[k].desiredLoose > g[k].curLoose) createLoose += g[k].desiredLoose - g[k].curLoose;
-        if (g[k].desiredEq    > g[k].curEq)    createLoose += g[k].desiredEq    - g[k].curEq;
-        if (createLoose > 0 && curTruncated) {
-            if (dbg) { char b[160]; _snprintf(b, sizeof(b) - 1,
-                "[recon]   CREATE-SKIP (local truncated) sid='%s' shortfall=%d",
-                g[k].sid, createLoose); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-            createLoose = 0;
-        }
-        //    NEVER fabricate a CONTAINER (a backpack). createItemAndAdd would mint an EMPTY
-        //    one, and the wire snapshot describes the bag itself, not what is nested inside
-        //    it - so the "restored" backpack silently swallows its own contents. Containers
-        //    move only through the W2 conservation channel, which relocates the real object
-        //    with its nesting intact; leaving the shortfall unfilled keeps the two sides
-        //    diverged until that channel lands the real bag.
-        if (createLoose > 0 && isContainerItemType(g[k].type)) {
-            char b[180]; _snprintf(b, sizeof(b) - 1,
-                "[recon]   CREATE-SKIP-CONTAINER sid='%s' type=%u shortfall=%d (a fabricated "
-                "backpack would be empty)", g[k].sid, g[k].type, createLoose);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            createLoose = 0;
-        }
-        if (createLoose > 0) {
-            bool fromEq = (g[k].desiredEq > g[k].curEq);
-            int qb = fromEq ? g[k].qualEq : g[k].qualLoose;
-            unsigned char lv = fromEq ? g[k].lvlEq : g[k].lvlLoose;
-            bool ok = createItemAndAdd(gw, inv, g[k].sid, g[k].type, createLoose, qb, false,
-                                       g[k].manufacturer, g[k].material, lv);
-            if (dbg) { char b[120]; _snprintf(b, sizeof(b)-1, "[recon]   CREATE-LOOSE n=%d (loose+eqDefer) ok=%d", createLoose, ok?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b); }
-            if (ok) changed = true;
-        }
-        // 4) RESIDUAL REMOVE (genuine removals; destroy surplus). Moved items were nulled
+        // 3) RESIDUAL REMOVE (genuine removals; destroy surplus). Moved items were nulled
         //    in curItems above, so removeByKey won't touch them.
         //    SKIPPED ENTIRELY when the desired list is TRUNCATED: an incomplete snapshot
         //    cannot distinguish "the author no longer has this" from "it didn't fit on the
@@ -842,15 +933,47 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
         }
         if (g[k].curLoose > g[k].desiredLoose) {
             int r = removeByKey(inv, curItems, cur, ncur, g[k].sid, g[k].type,
-                            g[k].curLoose - g[k].desiredLoose, 0);
+                            g[k].manufacturer,g[k].material,g[k].curLoose - g[k].desiredLoose, 0);
             if (dbg) { char b[96]; _snprintf(b, sizeof(b)-1, "[recon]   REMOVE-LOOSE n=%d got=%d", g[k].curLoose-g[k].desiredLoose, r); b[sizeof(b)-1]='\0'; coop::logLine(b); }
             if (r > 0) changed = true;
         }
         if (g[k].curEq > g[k].desiredEq) {
             int r = removeByKey(inv, curItems, cur, ncur, g[k].sid, g[k].type,
-                            g[k].curEq - g[k].desiredEq, 1);
+                            g[k].manufacturer,g[k].material,g[k].curEq - g[k].desiredEq, 1);
             if (dbg) { char b[96]; _snprintf(b, sizeof(b)-1, "[recon]   REMOVE-EQ n=%d got=%d", g[k].curEq-g[k].desiredEq, r); b[sizeof(b)-1]='\0'; coop::logLine(b); }
             if (r > 0) changed = true;
+        }
+    }
+    for (unsigned int k = 0; k < ng; ++k) {
+        // 4) RESIDUAL CREATE (genuine additions). ALWAYS create LOOSE - a fabricated loose
+        //    item persists, but a fabricated-AND-equipped one is discarded within a tick by
+        //    the engine's equipment validation (d25; this is the "picked-up weapon flickers
+        //    into slot 1 then vanishes" bug). So any EQUIP shortfall for which we have no
+        //    real copy to MOVE-UP is created loose here and equipped on a LATER reconcile
+        //    tick: by then the loose copy is a real, established factory item, and MOVE-UP's
+        //    equipExisting moves it into its slot persistently (the inv_reequip path).
+        //    All removals have already run, so they cannot strip these new items.
+        int createLoose = 0;
+        if (g[k].desiredLoose > g[k].curLoose) createLoose += g[k].desiredLoose - g[k].curLoose;
+        if (g[k].desiredEq    > g[k].curEq)    createLoose += g[k].desiredEq    - g[k].curEq;
+        if (createLoose > 0 && curTruncated) {
+            if (dbg) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[recon]   CREATE-SKIP (local truncated) sid='%s' shortfall=%d",
+                g[k].sid, createLoose); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            createLoose = 0;
+        }
+        // A complete snapshot includes the bag's children (or explicitly none).
+        // applyContainerContents fills them after this top-level creation.
+        // An incomplete snapshot cannot safely reconstruct a container.
+        if (truncated && isContainerItemType(g[k].type)) createLoose = 0;
+        if (createLoose > 0) {
+            bool fromEq = (g[k].desiredEq > g[k].curEq);
+            int qb = fromEq ? g[k].qualEq : g[k].qualLoose;
+            unsigned char lv = fromEq ? g[k].lvlEq : g[k].lvlLoose;
+            bool ok = createItemAndAdd(gw, inv, g[k].sid, g[k].type, createLoose, qb, false,
+                                       g[k].manufacturer, g[k].material, lv);
+            if (dbg) { char b[120]; _snprintf(b, sizeof(b)-1, "[recon]   CREATE-LOOSE n=%d (loose+eqDefer) ok=%d", createLoose, ok?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+            if (ok) changed = true;
         }
     }
     // SLOT-FIDELITY pass (weapons). The count reconcile above equips the right NUMBER of
@@ -1013,14 +1136,10 @@ int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const cha
     return total;
 }
 
-bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
-                            const InvItemEntry* items, unsigned int count,
-                            bool truncated) {
-    if (!gw) return false;
-    RootObject* ro = resolveObjectByHand(cHand);
-    if (!ro) return false;
-    Inventory* inv = invOf(ro);
-    if (!inv) return false;
+static bool applyInventoryContents(GameWorld* gw, Inventory* inv,
+                                   const InvItemEntry* items, unsigned int count,
+                                   bool truncated) {
+    if (!gw || !inv) return false;
 
     bool changed = false;
     __try {
@@ -1039,7 +1158,6 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         top[nTop++] = items[i];
     }
     changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated);
-    if (nNested == 0) return changed;
 
     // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about
     // to fill, and a bag identified from the stale read would be the wrong object (or gone).
@@ -1065,7 +1183,7 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         unsigned int nk = 0;
         for (unsigned int i = 0; i < count && nk < INV_ITEMS_MAX; ++i)
             if (items[i].parentIdx == (unsigned char)(topSrcIdx[t] + 1)) kids[nk++] = items[i];
-        if (nk == 0) continue;
+        if (!isContainerItemType(top[t].itemType)) continue;
         claimed += nk;
 
         // Which copy of this template is it, in the SENDER's order? The sender's Nth bag of a
@@ -1141,6 +1259,44 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         return changed;
     }
     return changed;
+}
+
+bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
+                            const InvItemEntry* items, unsigned int count,
+                            bool truncated) {
+    RootObject* ro = resolveObjectByHand(cHand);
+    return ro && applyInventoryContents(gw, invOf(ro), items, count, truncated);
+}
+
+bool captureBagContents(Item* bag, std::vector<InvItemEntry>& contents) {
+    contents.clear();
+    __try {
+        if (!bag || !isContainerItemType((unsigned int)bag->getDataType())) return false;
+        Inventory* inv = bag->getInventory();
+        if (!inv) return false;
+        InvItemEntry items[INV_ITEMS_MAX + 1];
+        bool truncated = false;
+        unsigned int n = readInvItems(inv, items, 0, INV_ITEMS_MAX + 1, &truncated, true);
+        if (truncated || n > INV_ITEMS_MAX) return false;
+        contents.assign(items, items + n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool applyTransferredBagContents(GameWorld* gw, Item* bag,
+                                  const std::vector<InvItemEntry>& contents) {
+    bool saved = g_invVetoSuspend;
+    g_invVetoSuspend = true;
+    bool valid = false;
+    __try {
+        if (bag && isContainerItemType((unsigned int)bag->getDataType()) && bag->getInventory()) {
+            applyInventoryContents(gw, bag->getInventory(), contents.empty() ? 0 : &contents[0],
+                                    (unsigned int)contents.size(), false);
+            valid = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_invVetoSuspend = saved;
+    return valid;
 }
 
 // True while ANY inventory panel is open on this container - its own window, or a
@@ -1323,7 +1479,7 @@ int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int
     InvItemEntry cur[64];
     Item* curItems[64];
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
-    return removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty, /*wantEquipped=*/0);
+    return removeByKey(inv, curItems, cur, ncur, sid, typeCat, 0, 0, qty, /*wantEquipped=*/0);
 }
 
 int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
@@ -1331,8 +1487,9 @@ int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
     if (outSid && outLen) outSid[0] = '\0';
     if (outType) *outType = 0;
     if (!gw || !outSid || outLen == 0) return 0;
-    unsigned int typeCat = 0;
-    GameData* gd = findCommonItemTemplate(gw, &typeCat);
+    unsigned int typeCat = (unsigned int)ITEM;
+    // Both peers may use different languages; template names are localized.
+    GameData* gd = findItemTemplateImpl(gw, "42159-gamedata.base", typeCat);
     if (!gd) return 0;
     __try {
         const char* s = gd->stringID.c_str();
@@ -1400,7 +1557,9 @@ int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
 int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                               const unsigned int dstHand[5],
                               const char* sid, unsigned int typeCat, int qty,
-                              bool suspendVeto) {
+                              bool suspendVeto,
+                              const std::vector<InvItemEntry>* suppliedBag,
+                              std::vector<InvItemEntry>* actualBag) {
     if (!gw || !sid || !sid[0] || qty <= 0) return 0;
     RootObject* srcRo = resolveObjectByHand(srcHand);
     RootObject* dstRo = resolveObjectByHand(dstHand);
@@ -1411,7 +1570,7 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
     const unsigned int MAXC = 64;
     InvItemEntry cur[64];
     Item* curItems[64];
-    unsigned int ncur = readInvItems(src, cur, curItems, MAXC);
+    unsigned int ncur = readInvItems(src, cur, curItems, MAXC, 0, true);
     int moved = 0;
     // This is normally a SANCTIONED cross-owner relocation (Protocol 37
     // conservation), so suspend the trade veto for its duration - the veto only
@@ -1430,10 +1589,39 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                 if (strcmp(cur[i].stringID, sid) != 0) continue;
                 int have = cur[i].quantity; if (have < 1) have = 1;
                 int take = qty - moved; if (take > have) take = have;
-                Item* taken = src->removeItemDontDestroy_returnsItem(curItems[i], take, false); // virtual
+                Inventory* from = src;
+                if (cur[i].parentIdx) {
+                    unsigned int p = cur[i].parentIdx - 1;
+                    if (p >= ncur || !curItems[p]) continue;
+                    from = curItems[p]->getInventory();
+                    if (!from) continue;
+                }
+                Item* taken = from->removeItemDontDestroy_returnsItem(curItems[i], take, true);
                 if (!taken) continue;
-                if (!dst->tryAddItem(taken, take)) {          // virtual: real-object relocation
-                    src->tryAddItem(taken, take);             // destination refused - put it back
+                if (isContainerItemType(typeCat)) {
+                    if (suppliedBag && !applyTransferredBagContents(gw, taken, *suppliedBag)) {
+                        from->tryAddItem(taken, take);
+                        continue;
+                    }
+                    if (actualBag) captureBagContents(taken, *actualBag);
+                }
+                bool added = dst->tryAddItem(taken, take);
+                if (!added && !isContainerItemType(typeCat)) {
+                    InvItemEntry bags[64]; Item* bagItems[64];
+                    unsigned int nb = readInvItems(dst,bags,bagItems,64,0);
+                    for (unsigned int b=0;b<nb && !added;++b) {
+                        if (!bagItems[b]) continue;
+                        Inventory* sub=bagItems[b]->getInventory();
+                        if (sub && sub!=dst) added=sub->tryAddItem(taken,take);
+                    }
+                }
+                if (!added && isContainerItemType(typeCat)) added=equipExisting(dst,taken)!=0;
+                if (!added) {
+                    // Restore the actual object, including contents and its worn slot.
+                    g_invVetoSuspend = true;
+                    bool restored = cur[i].equipped && equipExisting(from,taken);
+                    if (!restored) restored=from->tryAddItem(taken,take);
+                    if (!restored) coop::logLine("[xfer] real-item rollback refused");
                     g_invVetoSuspend = vetoSav;
                     return moved;
                 }
@@ -2231,7 +2419,7 @@ int removeEquippedItem(GameWorld* gw, const unsigned int cHand[5],
     InvItemEntry cur[64];
     Item* curItems[64];
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
-    return removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty, /*wantEquipped=*/1);
+    return removeByKey(inv, curItems, cur, ncur, sid, typeCat, 0, 0, qty, /*wantEquipped=*/1);
 }
 
 // SEH-guarded: create and EQUIP `qty` of (sid, type) onto the object at cHand (the

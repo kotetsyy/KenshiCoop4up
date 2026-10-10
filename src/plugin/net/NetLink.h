@@ -182,11 +182,12 @@ public:
 
     // MAIN thread: queue a reliable cross-owner TRANSFER intent (protocol 37). The peer
     // relocates the real item between its own copies of the two containers.
-    void queueInvXfer(const InvXferPacket& pkt);
+    void queueInvXfer(const InvXferPacket& pkt, std::vector<InvItemEntry>& contents);
 
     // MAIN thread: queue the reliable VERDICT for an intent we just applied
     // (protocol 50) - how many units actually landed here.
-    void queueInvXferAck(const InvXferAckPacket& pkt);
+    void queueInvXferAck(const InvXferAckPacket& pkt,
+                         const std::vector<InvItemEntry>& contents);
 
     // MAIN thread: queue a reliable owner-authoritative medical snapshot (phase 2,
     // player-squad only). Change-gated by the caller so the channel stays quiet.
@@ -391,9 +392,9 @@ private:
     std::vector<WorldDropPacket> outWorldDrops_;
     std::vector<WorldPickupPacket> outWorldPickups_;
     // Reliable cross-owner transfer intents (protocol 37). Guarded by outCs_.
-    std::vector<InvXferPacket>   outInvXfers_;
+    std::deque<InboundInvXfer> outInvXfers_;
     // Reliable transfer verdicts (protocol 50). Guarded by outCs_.
-    std::vector<InvXferAckPacket> outInvXferAcks_;
+    std::deque<InboundInvXferAck> outInvXferAcks_;
     // Reliable medical snapshots + treatment deltas (phase 2). Guarded by outCs_.
     std::vector<MedicalPacket>   outMedical_;
     std::vector<TreatmentPacket> outTreatments_;

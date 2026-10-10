@@ -133,6 +133,7 @@ function Invoke-OneOracle {
         "wallet_probe"  { return (Test-WalletProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "money_sync"    { return (Test-MoneySync       -HostFile $HostLog -JoinFile $JoinLog) }
         "vendor_trade"  { return (Test-VendorTrade     -HostFile $HostLog -JoinFile $JoinLog) }
+        "critical_inventory" { return (Test-CriticalInventory -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_probe" { return (Test-RecruitProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_sync"  { return (Test-RecruitSync     -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_ctl"   { return (Test-RecruitCtl      -HostFile $HostLog -JoinFile $JoinLog) }

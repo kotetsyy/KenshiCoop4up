@@ -510,3 +510,116 @@ This local UDP smoke proves the missing-save path, not remote WAN conditions.
 **Rule.** A bootstrap prerequisite must not depend on the content the bootstrap
 itself is responsible for fetching.
 
+## 21. A transfer cannot create its source shortfall
+
+Two players taking the last unit must compete for one authoritative stock.
+The old transfer apply accepted a request against an empty source by creating
+the missing unit (`moved=0 fab=1`). A paired native-inventory regression reproduced
+the extra item on v0.1.26.
+
+Transfers now acknowledge only units actually detached from the authoritative
+source. The optimistic sender returns rejected units from destination to source
+before publishing its inventory. Client loot snapshots no longer overwrite the
+host's stock, and an exhausted stock is not a permanent cap on later deposits
+or production. `critical_stock` and `critical_npc` check the last-unit race,
+returning the winning item, and subsequent replenishment on both game processes.
+
+## 22. A backpack transfer includes its contents at the commit
+
+Adding two items and immediately handing over their backpack used to transfer
+an older, empty mirror; the next destination snapshot then erased both items.
+The old build failed this paired-game regression.
+
+`PKT_INV_XFER` now carries the complete captured bag contents, including an
+explicit empty payload. When the receiver owns the source, its acknowledgement
+carries the source's actual contents instead. An acquired foreign bag cannot
+be edited until that acknowledgement is applied to the exact local bag instance.
+`critical_bag` and `critical_bag_take` assert one destination bag, no source bag,
+and both nested items after immediate transfers in either direction.
+
+## 23. Loading a native ground item is not dropping an item
+
+A newly streamed-in save-native item exists independently on both game copies.
+Treating its first spatial discovery as a session drop minted a second copy on
+the peer. Spatial discovery now seeds native ground stock without announcing a
+drop; an actual native inventory-drop edge promotes the item into session stock.
+`critical_ground` introduces a native item after the initial census and asserts
+one, not two, on both copies.
+
+
+## 24. A merchant's pockets are not the merchant's stock
+
+The real Squin travel-shop regression found 109 stock units on the host and zero
+on the client proxy of the same canonical merchant. The host's ordinary character
+inventory contained only seven entries. Native trade aggregates furniture inventories
+from the platoon's home building; a minted merchant had no home on the client.
+
+`SpawnInfoPacket` carries the host merchant's shop home and platoon template SID.
+Minted and adopted proxies borrow that template and bind the home through native
+`Ownerships::setHomeBuilding`, deferring the description until the building loads.
+This does not edit shared GameData or generate/replenish goods.
+
+A clean-source repeat exposed a second failure: both client shopkeepers existed
+but native `isATrader` returned false. Changing `SQ_ROAMING` to `SQ_RESIDENT`
+did not fix it. The native predicate reads `platoon->squadTemplate`'s `is trader`
+flag; an arbitrary mint template loses that flag. Preserving the actual host
+template made both minted merchants valid and their native trade windows converge:
+175 units / `B7D99E13` and 93 units / `7AD9CC7F`. Keep the strict canonical-key
+and complete-content checks; a nearby unsynchronized local merchant is not a pass.
+
+Shop shelves are `BCTYPE_USABLE`, not `BCTYPE_STORAGE`. Inventory-bearing usable
+furniture now joins the authoritative container census; inventory-less beds and
+seats do not. Fixture identities use the same 400-unit radius and 96-row limit
+as inventory publication, so those runtime shelves can be resolved on the peer.
+
+`critical_shops_squin` compares the complete native trade view under the same
+canonical merchant key on both game processes, including item characteristics.
+One measured run converged to 85 units and hash `DE53641B` on both peers; its
+physical source inventories also had identical content fingerprints.
+
+**Rule.** Trace the consumer's actual backing inventory, then publish both its
+state and its identity. Nonempty but different shops are still a failed regression.
+
+## 25. Native provenance and placement are part of stock reconstruction
+
+Waystation regressions exposed different research blueprints with the same
+`BLUEPRINT_ITEM` template. Grouping only by template preserved the wrong research
+when quantities happened to match. Native manufacturer/material fields also
+carry research and ordinary trade-item data, not only weapon provenance.
+
+Reconcile groups, in-place gear moves and removals now include both native
+provenance fields. Reconstruction resolves those records without a weapon-only
+category restriction. A blueprint is created from its native research record;
+ordinary non-weapon metadata is restored after the correct native constructor.
+Unresolved provenance is not replaced with an arbitrary blueprint or material.
+
+A later clean-source smoke disproved the compaction workaround: a Waystation
+shop held 84 units on the host but only 81 on the client. Three Water items were
+rejected repeatedly; each occupies a 5x5 rectangle in an 18x18 shelf.
+Native auto-arrange did not guarantee the host's valid packing.
+
+Protocol 68 carries each loose stack's native section and grid position.
+Complete building stock validates all target rectangles before mutation,
+reuses matching native items, and places each physical stack at the host's
+coordinates through native section callbacks. It does not increase capacity,
+invent goods or rearrange player bags. The first paired-game run converged both
+Waystation shops completely (152 units / `32AFC767`, 120 units / `D254F474`).
+
+Snapshot relocation runs under the existing `g_invVetoSuspend` guard: native
+detach/add callbacks must not capture mirror maintenance as a player's drag.
+
+Native fabrication without supplied provenance preserves factory defaults;
+explicit snapshot strings, including empty strings, restore the source fields.
+Clearing factory defaults broke stacking of native-produced ore and bag contents.
+The full paired-game regression caught this before distribution.
+
+Critical fixtures choose the same item by native string ID on both peers rather
+than localized names. Bag transfer fixtures empty the source bag explicitly,
+then transfer two freshly added children immediately, without waiting for their
+ordinary snapshot. The clean-build eleven-scenario suite passed on nonprimary
+DISPLAY1, including Squin, both Waystation shops, simultaneous loot/deposit/
+replenishment, native ore production and both backpack transfer directions.
+
+**Rule.** Preserve the native identity and constructor semantics; matching total
+counts alone cannot distinguish different blueprints. A valid host inventory can
+still fail to fit a peer's fragmented native grid.

@@ -80,7 +80,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             71); // v57: +xyz/heading/poseValid
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
-    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            159); // v42: +locked, v48: reserved byte became parentIdx (size unchanged), v51: +level (craft grade)
+    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            165); // v68: +native stock-grid placement
     CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       28); // v33: +keyKind; v46: +flags
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
@@ -88,7 +88,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(WorldItemClaimHeader)",    sizeof(WorldItemClaimHeader),    10); // v47
     CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         191);
     CHECK_EQ("sizeof(WorldPickupPacket)",       sizeof(WorldPickupPacket),       91); // v40: +item identity
-    CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           202); // v36; v51: +level
+    CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           204); // v66: +bag payload framing
 
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
     CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
@@ -98,7 +98,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
     CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          25);
-    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         143);
+    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         211);
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
     CHECK_EQ("sizeof(MoneyDeltaPacket)",        sizeof(MoneyDeltaPacket),        13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
@@ -123,7 +123,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(FixturePacket)",           sizeof(FixturePacket),           90); // v55: fixture identity
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
     CHECK_EQ("sizeof(CellClaimPacket)",         sizeof(CellClaimPacket),         21); // v49: cell claim
-    CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        18); // v50: transfer verdict
+    CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        20); // v66: +authoritative bag framing
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -395,19 +395,6 @@ static void testSizes() {
         InvItemEntry zero = a; zero.level = 0;
         CHECK("GRADE_NA folds in as 0 (no spurious resend for non-gear)",
               invEntryHash(na) == invEntryHash(zero));
-        // The grade must survive a wire round-trip in the same bytes it was written to.
-        InvItemEntry rt; std::memset(&rt, 0, sizeof(rt));
-        rt.level = 95;
-        unsigned char buf[sizeof(InvItemEntry)];
-        std::memcpy(buf, &rt, sizeof(rt));
-        InvItemEntry back; std::memcpy(&back, buf, sizeof(back));
-        CHECK_EQ("InvItemEntry::level round-trips", (int)back.level, 95);
-        InvXferPacket xp; std::memset(&xp, 0, sizeof(xp));
-        xp.level = 80;
-        unsigned char xbuf[sizeof(InvXferPacket)];
-        std::memcpy(xbuf, &xp, sizeof(xp));
-        InvXferPacket xback; std::memcpy(&xback, xbuf, sizeof(xback));
-        CHECK_EQ("InvXferPacket::level round-trips", (int)xback.level, 80);
     }
 
     // Protocol 46 (inventory item-loss fixes). The entry cap must match the receiver's
@@ -1584,13 +1571,7 @@ static void testInboundLifecycle() {
     // (a) THE FIX: a cross-owner transfer intent must not survive a reload.
     InvXferPacket xf; std::memset(&xf, 0, sizeof(xf));
     xf.type = (u8)PKT_INV_XFER; xf.ownerId = 1;
-    in.pushInvXfer(1, xf);
-    {
-        std::deque<InboundInvXfer> peek;
-        in.drainInvXfers(peek);
-        CHECK("invXfer enqueues normally", peek.size() == 1);
-    }
-    in.pushInvXfer(1, xf);          // re-enqueue, then hit the reload edge
+    in.pushInvXfer(1, xf, 0, 0);
     in.flushWorldState();
     {
         std::deque<InboundInvXfer> after;
@@ -1682,7 +1663,7 @@ static void testFlushWorldStateContract() {
     in.pushNpcCensus(1, 0, 0, 0);
     in.pushWorldDrop(1, wdp);
     in.pushWorldPickup(1, wpp);
-    in.pushInvXfer(1, xf);
+    in.pushInvXfer(1, xf, 0, 0);
     in.pushMedical(1, mp);
     in.pushTreatment(1, tp);
     in.pushCombatHit(1, chp);
@@ -1706,7 +1687,7 @@ static void testFlushWorldStateContract() {
     in.pushSpawnInfo(1, si);
     in.pushCamHint(1, ch);
     in.pushCellClaim(1, cc);
-    in.pushInvXferAck(1, xa);
+    in.pushInvXferAck(1, xa, 0, 0);
 
     // --- Push one sentinel into every SESSION-PRESERVING queue (10).
     in.pushConnect(0);

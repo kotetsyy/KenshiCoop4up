@@ -2000,6 +2000,61 @@
         }
 
         # ---- inventory ---------------------------------------------------------------
+        critical_ground = @{
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $false; Seconds = 140
+        }
+        critical_stock = @{
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $true; Seconds = 140
+        }
+        critical_npc = @{
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $false; Seconds = 140
+        }
+        critical_vendor = @{
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $false; Seconds = 140
+        }
+        critical_workstation = @{
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $false; Seconds = 140
+        }
+        critical_ore = @{
+            Save = 'mine1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $true; Seconds = 140
+        }
+        critical_ore_split = @{
+            Save = 'mine1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $false; Seconds = 140
+        }
+        critical_shops_squin = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $false; Seconds = 140
+        }
+        critical_shops_waystation = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $false; Seconds = 140
+        }
+        critical_bag = @{
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $true; Seconds = 140
+        }
+        critical_bag_take = @{
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
+            Advisory = @(); Tier = 'full'; WanVariant = $true; Seconds = 140
+        }
         inv_order = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0

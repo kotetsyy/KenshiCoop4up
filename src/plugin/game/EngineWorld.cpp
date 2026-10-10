@@ -1520,11 +1520,10 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
 
 // ---- Protocol 34: storage/machine container sync ---------------------------
 
-// Container-bearing filter for the census: STORAGE chests plus the machine
-// classes - a machine's crafted whole ITEMS land in the same Building
-// inventory the chest uses, so both ride the container channel.
+// Shop shelves use USABLE, not STORAGE. Include only inventory-bearing usable
+// furniture in the census below; beds/seats keep their existing pose identities.
 static bool isContainerClassType(int t) {
-    return t == (int)BCTYPE_STORAGE || isMachineClassType(t);
+    return t == (int)BCTYPE_STORAGE || t == (int)BCTYPE_USABLE || isMachineClassType(t);
 }
 
 // Every player-squad body (not just two tab leaders) plus camera anchors.
@@ -1657,6 +1656,7 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
                 if (!isContainerClassType((int)b->classType)) continue;
+                if (b->classType == BCTYPE_USABLE && !invOf(o)) continue;
                 if (!b->_buildState.isComplete) continue;
                 unsigned int h[5];
                 if (!readObjectHand(o, h)) continue;
@@ -1678,8 +1678,23 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
     return n;
 }
 
-unsigned int enumCorpseInventoriesNear(GameWorld* gw, float radius,
-                                       ContRead* out, unsigned int maxOut) {
+static bool initializeLootTrader(Character* ch, bool initializeStock) {
+    typedef bool (__fastcall* IsTraderFn)(const Character*);
+    typedef bool (__fastcall* IsUnsetFn)(const TimeOfDay*);
+    static IsTraderFn isTrader = (IsTraderFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    static IsUnsetFn isUnset = (IsUnsetFn)KenshiLib::GetRealAddress(&TimeOfDay::isUnset);
+    if (!isTrader || !isTrader(ch)) return false;
+    // Native refresh time distinguishes an uninitialized shop from exhausted stock.
+    if (initializeStock && isUnset && g_getPlatoonFn && g_platoonRefreshInvFn) {
+        ActivePlatoon* ap = g_getPlatoonFn(ch);
+        if (ap && ap->me && isUnset(&ap->me->traderInventoryRefreshTime))
+            g_platoonRefreshInvFn(ap, true);
+    }
+    return true;
+}
+
+unsigned int enumLootInventoriesNear(GameWorld* gw, float radius,
+                                     ContRead* out, unsigned int maxOut, bool initializeStock) {
     if (!gw || !out || maxOut == 0 || !g_getCharsFn) return 0;
     static ContCand cand[128]; // main-thread only
     unsigned int nCand = 0;
@@ -1698,7 +1713,8 @@ unsigned int enumCorpseInventoriesNear(GameWorld* gw, float radius,
                 if (isPlayerSquad(gw, o)) continue;
                 Character* ch = static_cast<Character*>(o);
                 unsigned short bs = readBodyState(ch);
-                if (!bodyIsDown(bs)) continue;
+                bool trader = initializeLootTrader(ch, initializeStock);
+                if (!bodyIsDown(bs) && !trader) continue;
                 unsigned int h[5];
                 if (!readObjectHand(o, h)) continue;
                 bool dup = false;
@@ -1707,6 +1723,7 @@ unsigned int enumCorpseInventoriesNear(GameWorld* gw, float radius,
                         cand[k].r.hand[1] == h[1]) { dup = true; break; }
                 if (dup) continue;
                 fillContReadFromChar(ch, &cand[nCand].r);
+                cand[nCand].r.isTrader = trader ? 1 : 0;
                 if (!cand[nCand].r.hasInv) continue;
                 cand[nCand].d2 = minDist2ToCenters(cand[nCand].r.x, cand[nCand].r.y,
                                                    cand[nCand].r.z, centers, nc);
@@ -1920,6 +1937,7 @@ int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
         return -1;
     }
 }
+
 
 
 } // namespace engine

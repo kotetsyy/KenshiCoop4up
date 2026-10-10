@@ -72,7 +72,7 @@
 
 **Рекомендуем всем одну и ту же сборку.** Разные версии протокола не соединяются.
 
-В public `v0.1.26` используется протокол **64**. Хост держит симуляцию на паузе
+В сборке Release `v0.1.27` используется протокол **70**. Хост держит симуляцию на паузе
 до загрузки мира всеми подключёнными клиентами: каждый подтверждает READY
 именно для текущего `LOAD_GO`, а не просто окончание передачи файлов.
 Пауза не заменяет выбранную игроками скорость или пользовательскую паузу.
@@ -84,6 +84,13 @@
 по-прежнему захватываются игровым потоком, поэтому их частота зависит от FPS.
 Ротация дальних NPC остаётся на 50 мс; остальные каналы не переводятся на 100 Гц.
 Это не гарантия пинга 1 мс; повышение частоты снимков увеличивает сетевую нагрузку.
+
+В `v0.1.27` исправлены повторный лут и гонка за последним предметом: перенос
+подтверждается только для реально забранного количества, отказ откатывает
+временную клиентскую копию. Передача рюкзака включает его содержимое.
+Загрузка уже лежащих в мире вещей больше не объявляется новым выбрасыванием.
+Товар торговца синхронизируется из полок его магазина, включая разные чертежи,
+а не только из инвентаря NPC. Всем участникам нужно обновить обе DLL.
 
 ## Подключение в игре (F2)
 
@@ -107,7 +114,7 @@
 **Tab** переключает поля; **Enter** в поле запускает выбранное подключение.
 Пустой или неверный ник/адрес/порт блокирует запуск и показывает причину.
 Пока поле имеет фокус, игровые клавиши отключены. Ник ограничен 63 байтами UTF-8;
-слишком длинная вставка через кнопку отклоняется, а не обрезается незаметно.
+слишком длинная вставка отклоняется, а не обрезается незаметно.
 
 Клиент может подключиться из главного меню: хост передаст свой мир.
 Ник, выбранный режим, адрес и единый UDP-порт запоминаются в `coop_config.json`;
@@ -273,7 +280,7 @@ some units into another squad tab in-game.
 
 Build the private `debug/live-net-telemetry` branch with
 `scripts\build_plugin.cmd Harness`. This optimized diagnostic pair uses **private
-protocol 65**; the ordinary released pair uses protocol 64. Host and join
+protocol 71**; the ordinary Release pair uses protocol 70. Host and join
 must both use the same build pair. This private build disables public auto-updates
 even if a tester's `coop_config.json` still has `"updateEnabled": true`.
 
@@ -286,6 +293,13 @@ snapshots (10 ms, paced by the monotonic QPC clock). Fresh captures still come
 from the game thread and depend on its frame rate. The 50 ms distant-NPC slice
 rotation and other channel budgets are unchanged. This is not a 1 ms ping
 guarantee; the higher snapshot rate increases network load.
+
+v0.1.27 fixes repeated loot and competing takes of the last item: a transfer is
+acknowledged only for the quantity actually removed, and rejection rolls back
+the provisional client copy. Backpack transfers include their contents.
+Streaming an existing ground item no longer announces a fresh drop. Merchant
+stock comes from the actual shop furniture, including distinct blueprints,
+not just the NPC's character inventory. All peers must update both DLLs.
 
 Local ENet rates appear in the collapsible **Diagnostics** block and **Copy
 report**, not a separate always-on overlay. Once a JOIN completes WELCOME, the

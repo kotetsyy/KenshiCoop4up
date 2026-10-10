@@ -93,6 +93,74 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
     }
 }
 
+namespace {
+typedef bool (__fastcall* MerchantCheckFn)(const Character*);
+typedef void (__fastcall* MerchantHomeFn)(Ownerships*, const hand&, SquadType);
+static bool readMerchantHomeSeh(Character* c, unsigned int outHome[5],
+                                char* outSquadSid, unsigned int maxSid,
+                                MerchantCheckFn isTrader) {
+    __try {
+        if (!c || !outHome || !isTrader || !isTrader(c) || !g_getPlatoonFn) return false;
+        ActivePlatoon* ap = g_getPlatoonFn(c);
+        if (!ap || !ap->me) return false;
+        const hand& h = ap->me->ownerships._homeBuilding;
+        if (h.type != BUILDING || !h.index) return false;
+        GameData* squad = ap->me->squadTemplate;
+        if (!squad || squad->stringID.empty() || squad->stringID.size() >= maxSid)
+            return false;
+        memcpy(outSquadSid,squad->stringID.c_str(),squad->stringID.size()+1);
+        outHome[0]=h.type; outHome[1]=h.container; outHome[2]=h.containerSerial;
+        outHome[3]=h.index; outHome[4]=h.serial;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool merchantHomeMatches(const hand& h,const unsigned int home[5]) {
+    return (unsigned int)h.type == home[0] && h.container == home[1] &&
+        h.containerSerial == home[2] && h.index == home[3] && h.serial == home[4];
+}
+static bool bindMerchantHomeSeh(Character* c, const unsigned int home[5],
+                                GameData* squad, MerchantHomeFn setHome,
+                                MerchantCheckFn isTrader) {
+    __try {
+        if (!c || !home || home[0] != BUILDING || !home[3] || !g_getPlatoonFn ||
+            !squad || !setHome || !isTrader) return false;
+        RootObject* building = resolveObjectByHand(home);
+        if (!building) return false;
+        ActivePlatoon* ap = g_getPlatoonFn(c);
+        if (!ap || !ap->me) return false;
+        // Native isATrader reads the platoon's template, not the character SID
+        // or squad role. Borrow the actual host template; never edit shared data.
+        ap->me->squadTemplate = squad;
+        Ownerships& ownership = ap->me->ownerships;
+        if (!merchantHomeMatches(ownership._homeBuilding,home))
+            setHome(&ownership,building->getHandle(),ap->me->squadType);
+        return merchantHomeMatches(ownership._homeBuilding,home) && isTrader(c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+}
+
+bool readMerchantHome(Character* c, unsigned int outHome[5],
+                      char* outSquadSid, unsigned int maxSid) {
+    if (!outHome || !outSquadSid || !maxSid) return false;
+    memset(outHome,0,5*sizeof(unsigned int)); outSquadSid[0]=0;
+    static MerchantCheckFn isTrader =
+        (MerchantCheckFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    return readMerchantHomeSeh(c,outHome,outSquadSid,maxSid,isTrader);
+}
+
+bool bindMerchantHome(GameWorld* gw, Character* c, const unsigned int home[5],
+                      const char* squadSid) {
+    if (!gw || !squadSid || !squadSid[0]) return false;
+    GameData* squad=findItemTemplateImpl(gw,squadSid,(unsigned int)SQUAD_TEMPLATE);
+    if (!squad) squad=findItemTemplateImpl(gw,squadSid,(unsigned int)UNIQUE_SQUAD_TEMPLATE);
+    if (!squad) return false;
+    static MerchantHomeFn setHome =
+        (MerchantHomeFn)KenshiLib::GetRealAddress(&Ownerships::setHomeBuilding);
+    static MerchantCheckFn isTrader =
+        (MerchantCheckFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    return bindMerchantHomeSeh(c,home,squad,setHome,isTrader);
+}
+
 // SEH-guarded (join, mint duplicate guard 2026-07-11): return a world NPC with
 // the SAME template stringID standing within 'radius' of (x,y,z), or 0. The
 // census-missing hand may be THAT body under a hand we cannot correlate

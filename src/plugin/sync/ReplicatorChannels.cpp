@@ -1445,12 +1445,11 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
 // this channel (the same mine carrying hand 50.2399902464 on the host and
 // 104.1377319296 on the join, at an identical world position).
 
-// The census both halves share: the container/machine classes within the
-// interest radius, i.e. exactly the set protocol 33 and 34 key their rows to.
-// Seats and beds are save-baked and deliberately outside it - restricting what
-// is ANNOUNCED is what keeps the furniture protocols on their existing path.
-static const float FIXTURE_CENSUS_RADIUS = 100.0f; // matches prod/store census
-static const unsigned int FIXTURE_MAX_ROWS = 48;
+// Publish identities for the complete container census used by inventory sync.
+// A narrower radius left shop stock authored but unresolvable on the peer.
+// Inventory-less seats and beds remain outside the census.
+static const float FIXTURE_CENSUS_RADIUS = 400.0f;
+static const unsigned int FIXTURE_MAX_ROWS = 96;
 
 void Replicator::publishFixtures(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;

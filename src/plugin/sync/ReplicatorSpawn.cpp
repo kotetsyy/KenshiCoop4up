@@ -158,6 +158,8 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 &pkt.x, &pkt.y, &pkt.z, &pkt.heading, &dead, &age);
             pkt.found = found ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
+            if (found && isHost) engine::readMerchantHome(c,pkt.shopHome,
+                pkt.shopSquadSid,sizeof(pkt.shopSquadSid));
             u16 bs = c ? engine::readBodyState(c) : 0;
             bool isDead = dead || (bs & BODY_DEAD) != 0;
             bool isKo   = !isDead && bodyDownNotCrawling(bs);
@@ -311,7 +313,13 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             it = spawnInfoPend_.erase(it);
             continue;
         }
-        if (proxyByKey_.find(k) != proxyByKey_.end()) {
+        std::map<Key,Character*>::iterator bound = proxyByKey_.find(k);
+        if (bound != proxyByKey_.end()) {
+            if (!isHost && p.ownerId == 0 && p.shopHome[3] &&
+                pinOwned_.find(k)==pinOwned_.end() &&
+                !engine::bindMerchantHome(gw,bound->second,p.shopHome,p.shopSquadSid)) {
+                ++it; continue; // keep the description until its shop streams in
+            }
             applySpawnDeadFlag(k, p.dead);
             it = spawnInfoPend_.erase(it);
             continue;
@@ -475,6 +483,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 ++censusAdopts_;
                 lifeSet(k, LIFE_RESOLVED, "adopt");
                 applySpawnDeadFlag(k, p.dead);
+                if (!isHost && p.ownerId == 0 && p.shopHome[3] &&
+                    !engine::bindMerchantHome(gw,twin,p.shopHome,p.shopSquadSid)) {
+                    ++it; continue;
+                }
                 char b[240]; _snprintf(b, sizeof(b) - 1,
                     "[spawn] proxy ADOPT hand=%u,%u,%u,%u,%u sid='%s' fac='%s' "
                     "d=%.0f radius=%.0f hidden=%d dead=%d mintDist=%.0f "
@@ -687,6 +699,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         // Dead/KO on arrival: latch now so the proxy spawns into ragdoll
         // instead of standing up for a frame. Latched entries never age out.
         applySpawnDeadFlag(k, p.dead);
+        if (!isHost && p.ownerId == 0 && p.shopHome[3] &&
+            !engine::bindMerchantHome(gw,proxy,p.shopHome,p.shopSquadSid)) {
+            ++it; continue;
+        }
         // mintDist (Phase 1 telemetry): how far from our squad the proxy
         // appeared - the spawn-parity oracle gates its distribution.
         char b[224]; _snprintf(b, sizeof(b) - 1,

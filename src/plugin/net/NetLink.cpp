@@ -423,9 +423,24 @@ void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) { pushLocked(outCs_, ou
 
 void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) { pushLocked(outCs_, outWorldPickups_, pkt); }
 
-void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInvXfers_, pkt); }
+void NetLink::queueInvXfer(const InvXferPacket& pkt, std::vector<InvItemEntry>& contents) {
+    EnterCriticalSection(&outCs_);
+    outInvXfers_.push_back(InboundInvXfer());
+    InboundInvXfer& x = outInvXfers_.back();
+    x.ownerId = pkt.ownerId; x.pkt = pkt; x.contents.swap(contents);
+    x.pkt.contentsCount = (u8)x.contents.size();
+    LeaveCriticalSection(&outCs_);
+}
 
-void NetLink::queueInvXferAck(const InvXferAckPacket& pkt) { pushLocked(outCs_, outInvXferAcks_, pkt); }
+void NetLink::queueInvXferAck(const InvXferAckPacket& pkt,
+                             const std::vector<InvItemEntry>& contents) {
+    EnterCriticalSection(&outCs_);
+    outInvXferAcks_.push_back(InboundInvXferAck());
+    InboundInvXferAck& x = outInvXferAcks_.back();
+    x.ownerId = pkt.ownerId; x.pkt = pkt; x.contents = contents;
+    x.pkt.contentsCount = (u8)x.contents.size();
+    LeaveCriticalSection(&outCs_);
+}
 
 void NetLink::queueSaveReq(const SaveReqPacket& pkt) { pushLocked(outCs_, outSaveReq_, pkt); }
 
@@ -1096,8 +1111,14 @@ void NetLink::threadLoop() {
                         // Reliable cross-owner transfer intent (protocol 37).
                         InvXferPacket ixp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ixp)
+                            && ixp.contentsCount <= INV_ITEMS_MAX &&
+                            ixp.contentsPresent <= 1 &&
+                            (ixp.contentsPresent || ixp.contentsCount == 0) &&
+                            ev.packet->dataLength == sizeof(ixp) + ixp.contentsCount * sizeof(InvItemEntry)
                             && inbound_) {
-                            inbound_->pushInvXfer(ixp.ownerId, ixp);
+                            const InvItemEntry* contents = reinterpret_cast<const InvItemEntry*>(
+                                ev.packet->data + sizeof(ixp));
+                            inbound_->pushInvXfer(ixp.ownerId, ixp, contents, ixp.contentsCount);
                         }
                     } else if (type == PKT_INV_XFER_ACK) {
                         // Reliable transfer verdict (protocol 50). Must be as
@@ -1105,8 +1126,14 @@ void NetLink::threadLoop() {
                         // the author back on the wall-clock guess it replaces.
                         InvXferAckPacket iap;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &iap)
+                            && iap.contentsCount <= INV_ITEMS_MAX &&
+                            iap.contentsPresent <= 1 &&
+                            (iap.contentsPresent || iap.contentsCount == 0) &&
+                            ev.packet->dataLength == sizeof(iap) + iap.contentsCount * sizeof(InvItemEntry)
                             && inbound_) {
-                            inbound_->pushInvXferAck(iap.ownerId, iap);
+                            const InvItemEntry* contents = reinterpret_cast<const InvItemEntry*>(
+                                ev.packet->data + sizeof(iap));
+                            inbound_->pushInvXferAck(iap.ownerId, iap, contents, iap.contentsCount);
                         }
                     } else if (type == PKT_MEDICAL) {
                         // Reliable owner-authoritative vitals snapshot (phase 2).
@@ -1317,6 +1344,7 @@ void NetLink::threadLoop() {
                         SpawnInfoPacket sip;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sip)
                             && inbound_) {
+                            sip.shopSquadSid[sizeof(sip.shopSquadSid)-1]=0;
                             inbound_->pushSpawnInfo(sip.ownerId, sip);
                         }
                     } else if (type == PKT_SAVE_REQ) {
@@ -1902,15 +1930,17 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Drain + send any queued cross-owner TRANSFER intents on CH_RELIABLE
-        // (protocol 37). Fixed-size PODs like the drop/pickup intents.
-        std::vector<InvXferPacket> xfers;
+        // Transfers include only their actual bag payload, never a fixed-size empty tail.
+        std::deque<InboundInvXfer> xfers;
         EnterCriticalSection(&outCs_);
         xfers.swap(outInvXfers_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < xfers.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&xfers[i], sizeof(InvXferPacket),
+            size_t bytes = xfers[i].contents.size() * sizeof(InvItemEntry);
+            ENetPacket* out = enet_packet_create(0, sizeof(InvXferPacket) + bytes,
                                                  ENET_PACKET_FLAG_RELIABLE);
+            memcpy(out->data, &xfers[i].pkt, sizeof(InvXferPacket));
+            if (bytes) memcpy(out->data + sizeof(InvXferPacket), &xfers[i].contents[0], bytes);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
@@ -1921,13 +1951,16 @@ void NetLink::threadLoop() {
         }
 
         // Transfer VERDICTS (protocol 50), same channel as the intents.
-        std::vector<InvXferAckPacket> xferAcks;
+        std::deque<InboundInvXferAck> xferAcks;
         EnterCriticalSection(&outCs_);
         xferAcks.swap(outInvXferAcks_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < xferAcks.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&xferAcks[i], sizeof(InvXferAckPacket),
+            size_t bytes = xferAcks[i].contents.size() * sizeof(InvItemEntry);
+            ENetPacket* out = enet_packet_create(0, sizeof(InvXferAckPacket) + bytes,
                                                  ENET_PACKET_FLAG_RELIABLE);
+            memcpy(out->data, &xferAcks[i].pkt, sizeof(InvXferAckPacket));
+            if (bytes) memcpy(out->data + sizeof(InvXferAckPacket), &xferAcks[i].contents[0], bytes);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {

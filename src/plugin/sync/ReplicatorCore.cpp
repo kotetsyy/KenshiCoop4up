@@ -44,7 +44,7 @@ Replicator::Replicator()
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
       nextWorldNetId_(1), worldSeeded_(false),
       nextDropId_(1), nextPickupId_(1), nextXferId_(1),
-      xferScanMs_(0), nextTreatId_(1),
+      nextTreatId_(1),
       quietRelapse_(0), crawlPhysRestore_(0),
       sitOrders_(0), detachUses_(0), noDetach_(false),
       dmgGuard_(false), reportCombat_(false), nextHitId_(1),
@@ -260,12 +260,9 @@ void Replicator::resetSession() {
     facRows_.clear();
     invPub_.clear();
     invRecv_.clear();
+    invPending_.clear();
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
-    censusEverFilled_.clear();
-    censusMuteSaid_.clear();
-    lootRemain_.clear();
-    lootAdopt_.clear();
     guiDefer_.clear();
     guiDeferSaid_.clear();
     worldTrack_.clear();
@@ -277,15 +274,12 @@ void Replicator::resetSession() {
     groundedWeapons_.clear();
     pendingPickups_.clear(); // the objects those intents named belong to the old world
     // Protocol 37: every container hand and Item* baseline is stale in the new world.
-    xferBase_.clear();
-    xferSeeded_.clear();
-    xferPend_.clear();
     xferLatch_.clear();
-    xferDefer_.clear();
     xferOut_.clear();
     appliedXfers_.clear();
+    pendingXfers_.clear();
+    engine::clearItemTransfers();
     wdSuppress_.clear();
-    xferScanMs_ = 0;
     medPub_.clear();
     medRecv_.clear();
     medNpc_.clear();
@@ -470,53 +464,24 @@ void Replicator::setOwnedContainerHand(const unsigned int hand[5]) {
 }
 
 void Replicator::ingestInv(Inbound& in) {
-    std::deque<InboundInv> got;
-    in.drainInv(got);
-    for (std::deque<InboundInv>::iterator it = got.begin(); it != got.end(); ++it) {
-        Key k; k.t = it->cKey[0]; k.c = it->cKey[1]; k.cs = it->cKey[2];
-        k.i = it->cKey[3]; k.s = it->cKey[4];
-        // Protocol 34: a placer-key row resolves through OUR build maps to
-        // the LOCAL building hand (own placement = own hand; the host's
-        // placement = our minted proxy). An unresolvable key (mint not
-        // landed yet / refused / tombstoned) is dropped - the sender's 5 s
-        // safety resend re-delivers once the mint exists.
-        if (it->keyKind == 1) {
-            std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(k);
-            if (ob != ownBuilds_.end()) {
-                if (ob->second.removed) continue;
-                k.t = ob->second.hand[0]; k.c = ob->second.hand[1];
-                k.cs = ob->second.hand[2]; k.i = ob->second.hand[3];
-                k.s = ob->second.hand[4];
-            } else {
-                std::map<Key, PeerBuild>::iterator pb = peerBuilds_.find(k);
-                if (pb == peerBuilds_.end() || pb->second.minted != 1 ||
-                    pb->second.removed)
-                    continue;
-                k.t = pb->second.localHand[0]; k.c = pb->second.localHand[1];
-                k.cs = pb->second.localHand[2]; k.i = pb->second.localHand[3];
-                k.s = pb->second.localHand[4];
-            }
+    std::deque<InboundInv> got; in.drainInv(got);
+    typedef std::pair<u32,Key> PendingKey;
+    for (std::deque<InboundInv>::iterator it=got.begin();it!=got.end();++it) {
+        Key wire=keyForInvLocalHand(it->cKey);
+        invPending_[PendingKey(it->ownerId,wire)]=*it;
+    }
+    for (std::map<PendingKey,InboundInv>::iterator it=invPending_.begin();it!=invPending_.end();) {
+        unsigned int local[5];
+        if (!resolveInvWireHand(it->first.second,local)) { ++it; continue; }
+        Key k=keyForInvLocalHand(local);
+        // Ignore claims to our pockets or to the host's world; only its authority writes.
+        bool own=ownHands_.count(k) || ownedContainers_.count(k);
+        if (!own && !(isHostRole() && ownerClassForHand(local)==0)) {
+            InvRecv& r=invRecv_[k];
+            r.ownerId=it->second.ownerId; r.items=it->second.items; r.dirty=true;
+            r.truncated=(it->second.flags & INV_FLAG_TRUNCATED)!=0;
         }
-        unsigned int inUnits = 0;
-        for (unsigned int i = 0; i < it->items.size(); ++i) {
-            int q = it->items[i].quantity; if (q < 1) q = 1;
-            inUnits += (unsigned int)q;
-        }
-        std::map<Key, LootCap>::iterator lr = lootRemain_.find(k);
-        if (lr != lootRemain_.end() && inUnits > lr->second.units) {
-            // Stale host snapshot of a corpse the join already emptied (open
-            // loot GUI on the host). Do not dirty-apply it back onto the join.
-            continue;
-        }
-        if (lr != lootRemain_.end() && inUnits <= lr->second.units) {
-            lr->second.units = inUnits;
-            if (inUnits == 0) lootRemain_.erase(lr);
-        }
-        InvRecv& r = invRecv_[k];
-        r.ownerId   = it->ownerId;
-        r.items     = it->items; // latest snapshot supersedes
-        r.dirty     = true;
-        r.truncated = (it->flags & INV_FLAG_TRUNCATED) != 0;
+        invPending_.erase(it++);
     }
 }
 

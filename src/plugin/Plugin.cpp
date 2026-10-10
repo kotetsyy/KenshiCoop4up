@@ -44,6 +44,7 @@
 #include "sync/SaveXfer.h"
 #ifdef KENSHICOOP_HARNESS
 #include "test/Scenario.h" // scenario runner: Harness/Debug builds only (Phase 1)
+#include "game/EngineProbe.h"
 #endif
 
 namespace {
@@ -1703,6 +1704,8 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // means that signal is current rather than one tick stale. Otherwise a bag snapshot
         // can be authored ahead of the intent that explains it, and the peer's reconcile
         // destroys the copy the intent was going to relocate.
+        if (g_cfg.xferSync)
+            g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
         if (g_cfg.worldSync)
             g_repl.detectAndPublishWeaponDrops(gw, g_net, g_net.localId());
         // Phase W3 convergence: prune ground-gear tracks whose object is gone (a stale
@@ -1719,17 +1722,6 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // no inventory traffic; the peer reconciles via applyInventories (skips own).
         if (g_cfg.invSync)
             g_repl.publishInventories(gw, g_net, g_net.localId());
-        // Protocol 37: BOTH clients diff every tracked container (own + received)
-        // against its baseline to catch a completed cross-owner UI drag - the one
-        // inventory write the single-writer snapshots cannot represent - and author
-        // a reliable PKT_INV_XFER so the peer relocates its own copy (conservation).
-        // RETIRED by the trade veto (blockXfer): a refused drag can never complete,
-        // so there is nothing to detect/replicate - Config forces xferSync off when
-        // blockXfer is on, making this (and applyTransfers below) a no-op. The
-        // xferLatch_/xferDefer_ reconcile-race machinery then stays dormant (never
-        // populated). KENSHICOOP_BLOCK_XFER=0 restores this replicate-the-trade path.
-        if (g_cfg.xferSync)
-            g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
         // Phase W1 (bidirectional): BOTH clients stream the free ground items they
         // author in their interest sphere - owner-scoped netId spaces, peer items
         // filtered by the proxy echo guard - so a join-side drop of materials/food
@@ -1937,12 +1929,10 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // beats the stale-snapshot dupe/wipe (and traded gear survives - no
         // fabrication on this path).
         if (g_cfg.xferSync) {
+            // Capture this frame's completed UI actions before stale snapshots can apply.
+            g_repl.detectAndPublishTransfers(gw,g_net,g_net.localId());
             g_repl.applyTransfers(gw, g_inbound, g_net, g_net.localId());
-            // Protocol 50: settle our own outstanding intents on the receiver's
-            // verdict. Before the reconcile, because a rejected transfer works
-            // by DROPPING our latch and letting applyInventories restore the
-            // owner's version - one tick later and the reconcile would run once
-            // more while still defending a move that was refused.
+            // Rejected units are physically returned, including owned pockets and bag contents.
             g_repl.applyXferAcks(gw, g_inbound, g_net.localId());
         }
         // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
@@ -2413,7 +2403,18 @@ void titleUpdate_hook(TitleScreen* self) {
     if ((now - g_titleFirstTick) < g_cfg.autoLoadDelayMs) return;
     if (!coop::engine::savesReady()) return;
 
-    if (coop::engine::loadSave(g_cfg.save)) {
+    bool loadIssued = false;
+#ifdef KENSHICOOP_HARNESS
+    if (g_cfg.scenario == "critical_shops_squin" || g_cfg.scenario == "critical_shops_waystation") {
+        loadIssued = coop::engine::probeImportFixture(g_cfg.save.c_str());
+        coopLog(loadIssued ? "CRITSHOP IMPORT fixture world NPCs issued"
+                           : "CRITSHOP IMPORT fixture preparation FAILED");
+    } else
+#endif
+    {
+        loadIssued = coop::engine::loadSave(g_cfg.save);
+    }
+    if (loadIssued) {
         g_autoLoadDone = true;
         char m[128];
         _snprintf(m, sizeof(m) - 1,
@@ -2907,19 +2908,14 @@ void installEngineDetours() {
             coopLog("[shop] FAILED to install buyItem detour; purchase logging off");
     }
 
-    // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER, default ON in real sessions):
-    // refuse a UI inventory drag whose source + destination squad characters are
-    // owned by different clients (item stays in the source bag) so ground drops
-    // are the only cross-client transfer path. Retires Protocol 37 (Config forces
-    // xferSync off when this is on). The classifier is always registered (cheap);
-    // the detours install only when the veto is on or the xfer_block test runs.
+    // Exact completed native inventory/equipment moves; the trade veto remains opt-in.
     coop::engine::setInvOwnerClassifier(&coopInvOwnerClass);
     coop::engine::setBlockXfer(g_cfg.blockXfer);
-    if (g_cfg.blockXfer || g_cfg.scenario == "xfer_block") {
+    if (g_cfg.xferSync || g_cfg.blockXfer || g_cfg.scenario == "xfer_block") {
         if (coop::engine::installXferBlockHook())
             coopLog(g_cfg.blockXfer
                 ? "[xfer] drag detours installed; cross-owner trade veto ON (drop to transfer)"
-                : "[xfer] drag detours installed; drag logging ON");
+                : "[xfer] drag/equipment detours installed; completed transfers captured");
         else
             coopLog("[xfer] FAILED to install drag detours; cross-owner trade veto degraded");
     }
@@ -2933,7 +2929,7 @@ void installEngineDetours() {
         if (coop::engine::installItemDropHook())
             coopLog("[wi] dropItem detour installed; query-free drop capture ON");
         else
-            coopLog("[wi] FAILED to install dropItem detour; drop capture falls back to the spatial scan");
+            coopLog("[wi] FAILED to install dropItem detour; session drops cannot be authored");
     }
 
     // Recruitment sync (protocol 23, default ON): detour PlayerInterface::

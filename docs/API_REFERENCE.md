@@ -695,14 +695,21 @@ engine directly) so all mutation stays SEH-guarded on the main thread.
 ## 10. Wire protocol (`netproto/Protocol.h`)
 
 > **Note:** this section documents the original milestone protocol. The **live
-> protocol is `src/netproto/Wire.h`** (`PROTOCOL_VERSION = 36`, checked during
-> handshake), which extends the same conventions (plain C++03, little-endian,
+> protocol is `src/netproto/Wire.h`** (public `PROTOCOL_VERSION = 70`, private
+> diagnostic protocol `71`, checked during handshake), with the same conventions
+> (plain C++03, little-endian,
 > packed structs, `packetType`/`readPacket` helpers) with the full packet set:
 > inventory/equipment sync, cross-owner transfer intents (`PKT_INV_XFER`),
 > world items (bidirectional), medical/stats/stealth, buildings and production,
 > money/faction/time/speed, coordinated save/load streaming, and NPC census.
 > `Wire.h` is heavily commented per-packet and is the source of truth;
 > `src/prototest/main.cpp` asserts every struct size and round-trip.
+>
+> Inventory transfers carry complete bag children (or an explicit empty bag),
+> and successful ACKs carry the contents actually captured from the source.
+> ACK quantities never include a fabricated source shortfall. Spawn descriptions
+> additionally carry a merchant's five-field `shopHome` handle so a peer can
+> bind the native shop's furniture inventory, not merely copy NPC pockets.
 
 namespace `coop`. Plain C++03, little-endian, packed structs sent as raw bytes.
 `PROTOCOL_VERSION = 5` (checked during handshake).

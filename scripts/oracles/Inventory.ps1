@@ -1611,3 +1611,80 @@ function Test-WeaponLoot {
                             sidMatch = $sidMatch; hostQual = $hostQual; joinQual = $joinQual })
 }
 
+function Test-CriticalInventory {
+    param([string]$HostFile, [string]$JoinFile)
+    $ok = $true
+    $scenario = ""
+    $shopSets = @()
+    foreach ($file in @($HostFile, $JoinFile)) {
+        if (-not (Test-Path $file)) { $ok = $false; continue }
+        $start = Select-String -Path $file -Pattern 'SCENARIO (critical_[a-z_]+) start' |
+            Select-Object -Last 1
+        if ($null -eq $start) { $ok = $false; continue }
+        $name = $start.Matches[0].Groups[1].Value
+        if ($scenario -ne "" -and $scenario -ne $name) { $ok = $false }
+        $scenario = $name
+        $result = Select-String -Path $file -Pattern 'SCENARIO RESULT (PASS|FAIL)' |
+            Select-Object -Last 1
+        if ($null -eq $result -or $result.Matches[0].Groups[1].Value -ne 'PASS') {
+            $ok = $false
+        }
+        if ($name -eq 'critical_ground') {
+            $last = Select-String -Path $file -Pattern 'CRIT GROUND host=\d t=\d+ ground=(-?\d+) expected=(\d+)' |
+                Select-Object -Last 1
+            if ($null -eq $last -or
+                [int]$last.Matches[0].Groups[1].Value -ne [int]$last.Matches[0].Groups[2].Value) {
+                $ok = $false
+            }
+        } elseif ($name -in @('critical_bag', 'critical_bag_take')) {
+            $last = Select-String -Path $file -Pattern 'CRIT BAG host=\d t=\d+ src=(\d+) dst=(\d+) inside=(\d+) expected=(\d+) moved=\d+ pass=\d' |
+                Select-Object -Last 1
+            if ($null -eq $last) { $ok = $false; continue }
+            $g = $last.Matches[0].Groups
+            if ([int]$g[1].Value -ne 0 -or [int]$g[2].Value -ne 1 -or
+                [int]$g[3].Value -ne [int]$g[4].Value) { $ok = $false }
+        } elseif ($name -in @('critical_shops_squin', 'critical_shops_waystation')) {
+            $samples = @(Select-String -Path $file -Pattern 'CRIT SHOP host=\d t=(\d+) key=([\d,]+) open=(\d) qty=(\d+) hash=([0-9A-F]+)' |
+                Where-Object { [int]$_.Matches[0].Groups[1].Value -ge 40000 })
+            $rows = @{}
+            if ($samples.Count -eq 0) { $ok = $false } else {
+                $lastTick = $samples[-1].Matches[0].Groups[1].Value
+                foreach ($sample in $samples) {
+                    $g = $sample.Matches[0].Groups
+                    if ($g[1].Value -ne $lastTick) { continue }
+                    $key = $g[2].Value
+                    if ($g[3].Value -ne '1' -or [int]$g[4].Value -le 0 -or $rows.ContainsKey($key)) {
+                        $ok = $false
+                    }
+                    $rows[$key] = $g[4].Value + '/' + $g[5].Value
+                }
+            }
+            $required = if ($name -eq 'critical_shops_waystation') { 2 } else { 1 }
+            if ($rows.Count -ne $required) { $ok = $false }
+            $shopSets += ,$rows
+        } else {
+            $last = Select-String -Path $file -Pattern 'CRIT STOCK host=\d t=\d+ step=(\d+) chest=(\d+) r0=(\d+) r1=(\d+) race=(\d) deposit=(\d) restock=(\d)' |
+                Select-Object -Last 1
+            if ($null -eq $last) { $ok = $false; continue }
+            $g = $last.Matches[0].Groups
+            $expectedStock = if ($name -eq 'critical_ore_split') { 3 } else { 2 }
+            if ([int]$g[1].Value -ne 5 -or [int]$g[2].Value -ne $expectedStock -or
+                [int]$g[3].Value -ne 0 -or [int]$g[4].Value -ne 0 -or
+                $g[5].Value -ne '1' -or $g[6].Value -ne '1' -or $g[7].Value -ne '1') {
+                $ok = $false
+            }
+        }
+    }
+    if ($scenario -in @('critical_shops_squin', 'critical_shops_waystation')) {
+        if ($shopSets.Count -ne 2) { $ok = $false } else {
+            foreach ($key in $shopSets[0].Keys) {
+                if (-not $shopSets[1].ContainsKey($key) -or $shopSets[0][$key] -ne $shopSets[1][$key]) {
+                    $ok = $false
+                    Write-Host "  CRITICAL SHOP mismatch key=$key host=$($shopSets[0][$key]) join=$($shopSets[1][$key])"
+                }
+            }
+        }
+    }
+    return (Add-GateResult -Name 'critical_inventory' -Status $(if ($ok) { 'PASS' } else { 'FAIL' }) `
+        -Metrics @{ scenario = $scenario } -Detail 'native item conservation and convergence on both peers')
+}

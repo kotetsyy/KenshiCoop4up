@@ -32,6 +32,7 @@
 class GameWorld;
 class Character;
 class RootObject;
+class Item;
 
 namespace coop {
 
@@ -1442,6 +1443,7 @@ private:
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
+    std::map<std::pair<u32,Key>,InboundInv> invPending_;
     // Protocol 34: the host's ~1 Hz container census (STORAGE/machine buildings
     // plus down/dead world-NPC inventories). Folded into the authored set each
     // publishInventories pass while storeSync_ is on. Refreshed wholesale each
@@ -1449,21 +1451,6 @@ private:
     bool           storeSync_;
     unsigned long  contCensusMs_;
     std::set<Key>  censusContainers_;
-    // Census-adopted containers we have seen hold something at least once, and
-    // the one-line-per-container gate for the mute that depends on it. Kenshi
-    // builds a shop's stock and a machine's output LAZILY, so "empty" on a
-    // container this machine has never populated is a fact about US, not about
-    // the world - see publishInventories.
-    std::set<Key>  censusEverFilled_;
-    std::set<Key>  censusMuteSaid_;
-    // Join remaining-loot cap after SEND-LOOT: a host snapshot with MORE units
-    // is the open-GUI echo (host window still lists items the join already
-    // took). Ignore it so reopen does not restore the corpse. Host lootAdopt_
-    // is the same cap on the publisher: skip SEND while local capture (open
-    // loot GUI) still has more units than the join reported.
-    struct LootCap { unsigned int units; u32 hash; unsigned long ms; };
-    std::map<Key, LootCap> lootRemain_;
-    std::map<Key, LootCap> lootAdopt_;
     // Containers whose apply is parked because a local inventory PANEL is open on
     // them (destroying a stack under a live window is the loot use-after-free; see
     // engine::containerGuiOpen). Value = when the hold started, for the log only -
@@ -1639,38 +1626,18 @@ private:
                            unsigned int itemType, u32 refOwnerId, u32 refDropId);
     void retryPendingPickups(GameWorld* gw);
 
-    // Protocol 37 cross-owner transfer state.
-    // xferBase_: last-known per-item totals (sid,type)->qty per tracked container - the
-    //   reference the drag detector diffs against. Rebased after every mutation WE make
-    //   (reconcile, transfer apply, W2/W3 relocation) so only USER actions register.
-    // xferPend_: currently-observed unpaired diffs + when each first appeared (a pair of
-    //   matching loss/gain older than the settle window becomes an intent; a diff that
-    //   never pairs is folded back into the baseline after a timeout).
-    // xferLatch_: per PEER container, the pending local delta a sent/applied transfer
-    //   implies. While active, applyInventories ADJUSTS the received snapshot by it
-    //   (suppressing the reconcile-back that caused the dupe/wipe); cleared when the
-    //   owner's snapshot catches up to the local total, or on deadline.
+    // Exact native cross-owner moves. A peer snapshot is held as a whole until
+    // its owner has incorporated the move; nested bag entries stay intact.
     // wdSuppress_: (character key, sid) -> expiry; a gear transfer must not be read by
     //   the W2 weapon census as a ground drop / pickup of that sid on those characters.
     typedef std::pair<std::string, u32> XKey; // (stringID, itemType)
-    struct XferPend  { int delta; unsigned long sinceMs; };
     struct XferLatch { int delta; unsigned long deadlineMs; };
-    std::map<Key, std::map<XKey, int> >       xferBase_;
-    std::map<Key, bool>                       xferSeeded_;
-    std::map<Key, std::map<XKey, XferPend> >  xferPend_;
     std::map<Key, std::map<XKey, XferLatch> > xferLatch_;
-    // Per peer container: when applyInventories first saw a LOCAL diff vs the
-    // detector baseline (an unadjudicated user mutation - possibly one end of a
-    // cross-owner drag). The reconcile DEFERS while it is younger than the defer
-    // window, giving the detector time to pair the drag and author the intent
-    // (otherwise the reconcile undoes the drag and the rebase erases the evidence).
-    std::map<Key, unsigned long>              xferDefer_;
     u32                                       nextXferId_;
-    std::set<std::pair<u32, u32> >            appliedXfers_;
-    // Protocol 50: intents we authored and are still waiting on a verdict for,
-    // keyed by our own xferId. Holds exactly what the verdict has to undo - the
-    // two peer ends and the item key - because by the time the answer arrives
-    // the detector has long since rebased and cannot reconstruct it.
+    std::map<std::pair<u32, u32>, InboundInvXferAck> appliedXfers_;
+    std::map<std::pair<u32, u32>, InboundInvXfer> pendingXfers_;
+    // Locally completed moves awaiting the other endpoint's authority verdict.
+    // A refusal reverses the actual unaccepted units before publishing our pockets.
     struct XferOut {
         Key           src;
         Key           dst;
@@ -1679,16 +1646,17 @@ private:
         bool          srcPeer;   // we latched src (it is peer-authored)
         bool          dstPeer;
         unsigned long sentMs;
+        u32           peerId;
+        int           rollbackQty;
+        bool          answered;
+        Item* bagItem;
+        bool hasCanonicalBag;
+        std::vector<InvItemEntry> canonicalBag;
     };
     std::map<u32, XferOut>                    xferOut_;
-    // Undo one intent's contribution to a peer end's reconcile-suppression
-    // latch (protocol 50). See the definition for why every verdict does this.
+    // Undo only rejected units; ACCEPT must wait for the authority's later snapshot.
     void releaseXferLatch(const Key& k, const XKey& key, int delta);
     std::map<std::pair<Key, std::string>, unsigned long> wdSuppress_;
-    unsigned long                             xferScanMs_; // last detector scan
-    // Recapture `k`'s container and overwrite its baseline (clears its pends): call
-    // after ANY local mutation we make ourselves so the detector only sees the user.
-    void xferRebase(GameWorld* gw, const Key& k);
     // True while the transfer detector is watching an unresolved LOSS of `sid` from
     // container `k` - the W2 census fallback defers its drop verdict for it.
     bool xferPendingLoss(const Key& k, const char* sid);
@@ -2207,9 +2175,12 @@ private:
             return;
         out[0] = k.t; out[1] = k.c; out[2] = k.cs; out[3] = k.i; out[4] = k.s;
     }
-    // Same as handForContainerKey, then the entity-proxy remap applyInventories
-    // already uses for runtime NPC corpses (host hand -> join-local mint).
-    bool resolveInvLocalHand(const Key& k, unsigned int cHand[5]) const;
+    // Internal inventory keys are ALWAYS actual local hands. Only decode/encode
+    // packet boundaries consult claim, proxy, build and runtime-fixture remaps.
+    bool resolveInvLocalHand(const Key& k,unsigned int out[5]) const;
+    bool resolveInvWireHand(const Key& k,unsigned int out[5]) const;
+    Key keyForInvLocalHand(const unsigned int hand[5]) const;
+    Key invWireKeyForLocal(const Key& local) const;
     // The same host-hand -> local-instance remap, for EVENTS.
     //
     // An event names a body by the AUTHOR's hand. For a save-native body that

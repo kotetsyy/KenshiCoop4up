@@ -12,12 +12,14 @@
 #define KENSHICOOP_ENGINE_H
 
 #include <string>
+#include <vector>
 #include "../../netproto/Wire.h"
 
 class GameWorld;
 class Character;
 class RootObject;
 class Faction;
+class Item;
 
 namespace coop {
 namespace engine {
@@ -361,6 +363,14 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
                        float* x, float* y, float* z, float* heading, bool* dead,
                        float* age);
 
+// Merchant stock lives in the shop's furniture, not the character's pockets.
+// Read only a native trader's home. Binding never generates or refreshes stock;
+// false means the building/platoon is not loaded yet and the caller must defer.
+bool readMerchantHome(Character* c, unsigned int outHome[5],
+                      char* outSquadSid, unsigned int maxSid);
+bool bindMerchantHome(GameWorld* gw, Character* c, const unsigned int home[5],
+                      const char* squadSid);
+
 // SEH-guarded (join): mint a LOCAL proxy body from a host description: template
 // by CHARACTER stringID, faction by FACTION stringID (FactionManager::
 // getFactionByStringID; falls back to a nearby non-player faction when the sid
@@ -597,6 +607,7 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
                                       InvItemEntry* out, unsigned int maxOut,
                                       unsigned int* outHash, bool* outTruncated = 0,
                                       bool includeNested = false);
+bool containerInventoryAvailable(const unsigned int cHand[5]);
 
 // SEH-guarded: reconcile the local container (cHand) to the desired item multiset:
 // add any shortfall (createItem of the template + tryAddItem) and remove any excess
@@ -746,7 +757,9 @@ int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
 int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                               const unsigned int dstHand[5],
                               const char* sid, unsigned int typeCat, int qty,
-                              bool suspendVeto = true);
+                              bool suspendVeto = true,
+                              const std::vector<InvItemEntry>* suppliedBag = 0,
+                              std::vector<InvItemEntry>* actualBag = 0);
 
 // ---- Cross-owner trade veto (block direct squad-to-squad transfers) --------
 // The engine has no single "drag" entry point (the squad-move problem), so a
@@ -765,6 +778,7 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
 // A move is cross-owner iff one end is 1 and the other is 2.
 typedef int (*InvOwnerClassFn)(const unsigned int ownerHand[5]);
 void setInvOwnerClassifier(InvOwnerClassFn fn);
+int inventoryOwnerClass(const unsigned int ownerHand[5]);
 
 // Enable/disable the cross-owner drag veto (KENSHICOOP_BLOCK_XFER). Off by
 // default until set; the veto only fires when a classifier is also registered.
@@ -774,6 +788,23 @@ void setBlockXfer(bool on);
 // (and for diagnostic drag-sequence logging under KENSHICOOP_INV_DUMP=1).
 // Returns true if both detours installed.
 bool installXferBlockHook();
+
+// Completed native remove/add pairs. Nested bag inventories name their carrier.
+// Sync relocations suspend capture; only real local actions enter this bounded queue.
+struct ItemTransferEdge {
+    unsigned int src[5], dst[5];
+    InvItemEntry item;
+    Item* transferredItem;       // local only; bags never merge during native add
+    unsigned int contentsSlot;   // native queue's separately owned variable payload
+};
+unsigned int drainItemTransfers(ItemTransferEdge* out, unsigned int maxOut);
+void clearItemTransfers();
+bool itemTransferPending(const unsigned int ownerHand[5]);
+bool captureBagContents(Item* bag, std::vector<InvItemEntry>& contents);
+void takeItemTransferContents(unsigned int slot, std::vector<InvItemEntry>& contents);
+bool applyTransferredBagContents(GameWorld* gw, Item* bag,
+                                  const std::vector<InvItemEntry>& contents);
+void finishTransferredBag(Item* bag);
 
 // SEH-guarded (store_probe): like addTestItemsToContainer, but walks the common
 // stackable templates until the container ACCEPTS one - storage buildings are
@@ -2065,6 +2096,7 @@ struct ContRead {
     unsigned int hand[5]; // local hand [type, container, containerSerial, index, serial]
     float x, y, z;        // world position (census diagnostics)
     int   classType;      // BuildingClassType (BCTYPE_STORAGE or a machine class)
+    int   isTrader;       // character census only: native Character::isATrader()
     int   complete;       // ConstructionState::isComplete (incomplete rides protocol 27)
     int   hasInv;         // getInventory() != null (lazy-inventory evidence)
     int   nEntries;       // distinct (sid,type,equipped) entries captured
@@ -2082,11 +2114,11 @@ struct ContRead {
 // count written.
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                                 unsigned int maxOut);
-// World-NPC corpses (down/dead, not player-squad). Same ContRead shape;
-// classType = -1. Hand is the character's save-stable object hand (the
-// entity-stream key). Nearest-first if over maxOut. Returns count written.
-unsigned int enumCorpseInventoriesNear(GameWorld* gw, float radius,
-                                       ContRead* out, unsigned int maxOut);
+// Lootable world NPCs and living traders, excluding player squads. Host-only
+// census: initialize a trader's stock once, never refill a legitimately empty shop.
+// classType = -1; hand is the character's save-stable entity-stream key.
+unsigned int enumLootInventoriesNear(GameWorld* gw, float radius,
+                                     ContRead* out, unsigned int maxOut, bool initializeStock);
 // SEH-guarded single-container read by local hand. Returns false when the hand
 // does not resolve locally or is not a container-bearing building class.
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out);

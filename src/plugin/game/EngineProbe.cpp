@@ -19,9 +19,170 @@
 // declared in EngineInternal.h / Engine.h and defined in their owning TUs.
 
 #include "EngineInternal.h"
+#include <kenshi/SharedKing.h>
+#include <kenshi/Town.h>
+#include <kenshi/gui/InventoryGUI.h>
 
 namespace coop {
 namespace engine {
+namespace {
+bool importFixtureNative(const char* name) {
+    if (!name || !name[0] || !g_getFn) return false;
+    SaveManager* mgr = g_getFn();
+    if (!mgr) return false;
+    lektor<SaveInfo> saves;
+    mgr->scanGames(saves, false);
+    for (unsigned int i = 0; i < saves.size(); ++i) {
+        if (saves[i].name != name) continue;
+        const int flags = SaveManager::IMPORT_SQUAD | SaveManager::IMPORT_BUILDINGS
+                        | SaveManager::IMPORT_RESEARCH | SaveManager::IMPORT_RELATIONS;
+        mgr->import(saves[i], flags);
+        return mgr->signal == SaveManager::IMPORTGAME;
+    }
+    return false;
+}
+}
+
+bool probeImportFixture(const char* name) {
+    __try {
+        return importFixtureNative(name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+typedef lektor<RootObject*>& (__fastcall* ShopAllTownsFn)(TownList*);
+typedef void (__fastcall* ShopRelocateFn)(Character*, const Ogre::Vector3&);
+static bool probeShopTownSeh(GameWorld* gw, bool waystation, float outPosition[3],
+                             ShopAllTownsFn allTowns, ShopRelocateFn relocate) {
+    if (!gw || !outPosition || !allTowns || !::shou || !::shou->townList) return false;
+    __try {
+        Character* lead = leader(gw);
+        if (!lead) return false;
+        Ogre::Vector3 origin = lead->getPosition();
+        lektor<RootObject*>& towns = allTowns(::shou->townList);
+        if (waystation) {
+            bool foundSquin = false;
+            for (unsigned int i = 0; i < towns.size(); ++i) {
+                RootObject* town = towns[i]; if (!town) continue;
+                GameData* gd = town->getGameData();
+                if (gd && gd->stringID == "1079-gamedata.base") {
+                    origin = town->getPosition(); foundSquin = true; break;
+                }
+            }
+            if (!foundSquin) return false;
+        }
+        float best = 3.4e38f; RootObject* chosen = 0;
+        for (unsigned int i = 0; i < towns.size(); ++i) {
+            RootObject* town = towns[i]; if (!town) continue;
+            GameData* gd = town->getGameData(); if (!gd) continue;
+            const char* name = gd->name.c_str();
+            bool match = waystation ? (strstr(name, "Waystation") != 0 ||
+                strstr(name, "\xD0\x9F\xD1\x83\xD1\x82\xD0\xB5\xD0\xB2\xD0\xB0\xD1\x8F") != 0) :
+                (strcmp(name, "Squin") == 0 ||
+                 strcmp(name, "\xD0\xA1\xD0\xBA\xD1\x83\xD0\xB8\xD0\xBD") == 0);
+            if (!match) continue;
+            Ogre::Vector3 p = town->getPosition();
+            float d = (p.x-origin.x)*(p.x-origin.x)+(p.z-origin.z)*(p.z-origin.z);
+            if (d < best) { best = d; chosen = town; }
+        }
+        if (!chosen) return false;
+        Ogre::Vector3 p = chosen->getPosition();
+        terrainHeightAt(p.x, p.z, &p.y);
+        outPosition[0] = p.x; outPosition[1] = p.y + 1.0f; outPosition[2] = p.z;
+        if (relocate) {
+            Character* players[32];
+            unsigned int np = listPlayerChars(gw, players, 32);
+            for (unsigned int i = 0; i < np; ++i) {
+                unsigned int h[5];
+                if (!readObjectHand(players[i], h) || inventoryOwnerClass(h) != 1) continue;
+                Ogre::Vector3 before = players[i]->getPosition();
+                Ogre::Vector3 delta(p.x-before.x, p.y+1.0f-before.y, p.z-before.z);
+                relocate(players[i], delta);
+                Ogre::Vector3 after = players[i]->getPosition();
+                char log[160]; _snprintf(log,sizeof(log)-1,
+                    "CRIT SHOP WARP hand=%u,%u from=%.1f,%.1f to=%.1f,%.1f",
+                    h[3],h[4],before.x,before.z,after.x,after.z);
+                log[sizeof(log)-1]=0;coop::logLine(log);
+                cameraFocusOn(gw, players[i]);
+            }
+        }
+        char b[192]; _snprintf(b, sizeof(b)-1, "CRIT SHOP TOWN name='%s' sid='%s' pos=%.1f,%.1f,%.1f",
+            chosen->getGameData()->name.c_str(), chosen->getGameData()->stringID.c_str(), p.x,p.y,p.z);
+        b[sizeof(b)-1] = 0; coop::logLine(b);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool probeShopTown(GameWorld* gw, bool waystation, float outPosition[3]) {
+    static ShopAllTownsFn allTowns =
+        (ShopAllTownsFn)KenshiLib::GetRealAddress(&TownList::getAllTowns);
+    static ShopRelocateFn relocate =
+        (ShopRelocateFn)KenshiLib::GetRealAddress(&Character::relocationTeleport);
+    return probeShopTownSeh(gw, waystation, outPosition, allTowns, relocate);
+}
+typedef InventoryGUI* (__fastcall* ShopShowFn)(ForgottenGUI*, const hand&);
+static bool probeTraderWindowSeh(const unsigned int traderHand[5], unsigned int* outHash,
+                                 unsigned int* outQuantity, ShopShowFn show, bool keepVisible) {
+    if (!traderHand || !outHash || !outQuantity || !::gui || !show) return false;
+    __try {
+        RootObject* ro = resolveObjectByHand(traderHand);
+        if (!ro) return false;
+        InventoryGUI* window = show(::gui, ro->getHandle());
+        if (!window) return false;
+        // Exercise the same native refresh as a visible trade window before reading
+        // its aggregate; a show/hide probe must not skip the window update.
+        window->update();
+        Inventory* inventory = window->getInventory();
+        if (!inventory) { window->show(false); return false; }
+        static InvItemEntry entries[512]; // main thread; inspect the full trade view
+        unsigned int n = readInvItems(inventory, entries, 0, 512);
+        *outHash = 0; *outQuantity = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            *outHash += invEntryHash(entries[i]); *outQuantity += entries[i].quantity;
+        }
+        window->show(keepVisible);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool probeTraderWindow(const unsigned int traderHand[5], unsigned int* outHash,
+                       unsigned int* outQuantity, bool keepVisible) {
+    static ShopShowFn show =
+        (ShopShowFn)KenshiLib::GetRealAddress(&ForgottenGUI::showTraderInventory);
+    return probeTraderWindowSeh(traderHand, outHash, outQuantity, show, keepVisible);
+}
+namespace {
+typedef void (__fastcall* ApproachShopFn)(Character*, const Ogre::Vector3&);
+bool approachShopSeh(GameWorld* gw, const unsigned int traderHand[5], ApproachShopFn relocate) {
+    if (!gw || !traderHand || !relocate) return false;
+    __try {
+        Character* trader = resolveCharByHand(traderHand[3], traderHand[4], traderHand[0],
+                                               traderHand[1], traderHand[2]);
+        if (!trader) return false;
+        Ogre::Vector3 target = trader->getPosition();
+        Character* players[32]; unsigned int moved = 0;
+        unsigned int n = listPlayerChars(gw, players, 32);
+        for (unsigned int i = 0; i < n; ++i) {
+            unsigned int h[5];
+            if (!readObjectHand(players[i], h) || inventoryOwnerClass(h) != 1) continue;
+            Ogre::Vector3 p = players[i]->getPosition();
+            Ogre::Vector3 delta(target.x+4.0f-p.x, target.y-p.y, target.z-p.z);
+            relocate(players[i], delta);
+            cameraFocusOn(gw, players[i]);
+            ++moved;
+        }
+        return moved != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+}
+
+bool probeApproachShop(GameWorld* gw, const unsigned int traderHand[5]) {
+    static ApproachShopFn relocate =
+        (ApproachShopFn)KenshiLib::GetRealAddress(&Character::relocationTeleport);
+    return approachShopSeh(gw, traderHand, relocate);
+}
+
+
 
 // ---- Spike 451: weapon-mint recipe trace ------------------------------------
 // The engine mints weapons at runtime constantly (armed NPC spawns, vendor stock,

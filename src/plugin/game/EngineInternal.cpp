@@ -750,14 +750,105 @@ typedef Item* (__fastcall* RemoveDontDestroyFn)(Inventory* self, Item* it,
 typedef bool  (__fastcall* TryAddItemFn)(Inventory* self, Item* item, int quantity);
 RemoveDontDestroyFn g_removeDontDestroyOrig = 0;
 TryAddItemFn        g_tryAddItemOrig        = 0;
+typedef bool (__fastcall* EquipItemFn)(Inventory* self, Item* item);
+static EquipItemFn g_equipItemOrig = 0;
+typedef bool (__fastcall* RemoveAutoDestroyFn)(Inventory* self,Item* item,int quantity);
+static RemoveAutoDestroyFn g_removeAutoDestroyOrig=0;
 
 bool g_invVetoSuspend = false;            // Replicator's own move in progress (extern)
 static bool           g_blockXfer   = false;
 static InvOwnerClassFn g_invOwnerClass = 0;
-static Inventory*     g_pendRemInv   = 0; // last remove's source inventory (main thread)
-static Item*          g_pendRemItem  = 0; // last item removed onto the cursor
-static unsigned int   g_pendRemOwnerHand[5] = { 0, 0, 0, 0, 0 }; // its owner-char hand
-static bool           g_havePendRemOwner = false;                 // hand above is valid
+struct PendingRemoval {
+    Item* item;
+    Inventory* inventory;
+    unsigned int owner[5],itemHand[5];
+    bool hasItemHand;
+    bool wasEquipped;
+    unsigned __int64 stamp;
+};
+static PendingRemoval g_pendingRemovals[256];
+static unsigned int g_pendingRemovalCount=0;
+static unsigned __int64 g_pendingRemovalStamp=0;
+
+static void erasePendingRemoval(unsigned int i) {
+    g_pendingRemovals[i]=g_pendingRemovals[--g_pendingRemovalCount];
+}
+
+static void erasePendingStamp(unsigned __int64 stamp) {
+    for (unsigned int i=0;i<g_pendingRemovalCount;++i)
+        if (g_pendingRemovals[i].stamp==stamp) { erasePendingRemoval(i); return; }
+}
+
+static int pendingRemovalFor(Item* item) {
+    if (!item) return -1;
+    __try {
+        for (unsigned int i=0;i<g_pendingRemovalCount;++i) {
+            if (g_pendingRemovals[i].item!=item) continue;
+            if (g_pendingRemovals[i].hasItemHand) {
+                unsigned int hand[5];
+                if (!readObjectHand(static_cast<RootObject*>(item),hand) ||
+                    memcmp(hand,g_pendingRemovals[i].itemHand,sizeof(hand))!=0) continue;
+            }
+            return (int)i;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return -1;
+}
+static ItemTransferEdge g_itemTransfers[256];
+static unsigned int g_itemTransferCount = 0;
+static std::vector<InvItemEntry> g_transferContents[256];
+static bool g_transferContentsUsed[256] = { false };
+static Item* g_unconfirmedBags[256];
+static unsigned int g_unconfirmedBagCount = 0;
+
+void takeItemTransferContents(unsigned int slot, std::vector<InvItemEntry>& contents) {
+    if (slot >= 256) return;
+    contents.swap(g_transferContents[slot]);
+    g_transferContentsUsed[slot] = false;
+}
+
+void finishTransferredBag(Item* bag) {
+    for (unsigned int i = 0; i < g_unconfirmedBagCount; ++i)
+        if (g_unconfirmedBags[i] == bag) {
+            g_unconfirmedBags[i] = g_unconfirmedBags[--g_unconfirmedBagCount];
+            return;
+        }
+}
+
+static bool bagVerdictPending(Inventory* inventory, Item* item) {
+    for (unsigned int i = 0; i < g_unconfirmedBagCount; ++i)
+        if (g_unconfirmedBags[i] == item ||
+            (inventory && inventory->owner == g_unconfirmedBags[i])) return true;
+    return false;
+}
+
+unsigned int drainItemTransfers(ItemTransferEdge* out, unsigned int maxOut) {
+    unsigned int n = g_itemTransferCount < maxOut ? g_itemTransferCount : maxOut;
+    if (!out) return 0;
+    if (n) memcpy(out, g_itemTransfers, n * sizeof(*out));
+    g_itemTransferCount -= n;
+    if (g_itemTransferCount)
+        memmove(g_itemTransfers, g_itemTransfers + n,
+                g_itemTransferCount * sizeof(g_itemTransfers[0]));
+    return n;
+}
+
+void clearItemTransfers() {
+    g_itemTransferCount = 0;
+    g_pendingRemovalCount=0;
+    g_unconfirmedBagCount = 0;
+    for (unsigned int i = 0; i < 256; ++i) {
+        g_transferContents[i].clear();
+        g_transferContentsUsed[i] = false;
+    }
+}
+
+bool itemTransferPending(const unsigned int ownerHand[5]) {
+    for (unsigned int i=0;i<g_pendingRemovalCount;++i)
+        if (memcmp(ownerHand,g_pendingRemovals[i].owner,sizeof(g_pendingRemovals[i].owner))==0)
+            return true;
+    return false;
+}
 
 // KENSHICOOP_INV_DUMP diagnostic gate (read once). When on, EVERY squad<->squad
 // drag logs a "[xfer] DRAG" line (src/dst owner class + block decision) - the A1
@@ -772,42 +863,75 @@ static int xferDumpFlag() {
 // (readObjectHand layout). Caller holds SEH.
 static bool ownerHandOfInventory(Inventory* inv, unsigned int out[5]) {
     if (!inv) return false;
-    RootObject* o = inv->owner; // Inventory::owner (member 0x88)
-    if (!o) return false;
-    return readObjectHand(o, out);
-}
-
-// Read the hand of the inventory an item last belonged to (its drag source, which
-// survives removeItemDontDestroy until the next add rewrites it). Caller holds SEH.
-static bool sourceHandOfItem(Item* item, unsigned int out[5]) {
-    if (!item) return false;
-    const hand& h = item->_whosInventoryWeAreIn;
-    out[0] = (unsigned int)h.type; out[1] = h.container; out[2] = h.containerSerial;
-    out[3] = h.index; out[4] = h.serial;
-    return (out[0] || out[1] || out[2] || out[3] || out[4]);
-}
-
-Item* __fastcall removeDontDestroy_hook(Inventory* self, Item* it, int howmany,
-                                        bool returnCopyIfSomeLeft) {
-    Item* r = g_removeDontDestroyOrig(self, it, howmany, returnCopyIfSomeLeft);
-    if ((g_blockXfer || xferDumpFlag()) && !g_invVetoSuspend) {
-        __try {
-            g_pendRemItem = r ? r : it; g_pendRemInv = self;
-            // Resolve + cache the SOURCE owner-character hand NOW, at remove time.
-            // A UI drag is a strict remove->add on this frame; the add may receive a
-            // COPY of the removed Item* (pointer != g_pendRemItem), so pairing on the
-            // pointer alone let cross-squad drags slip through unclassified. The cached
-            // hand makes the source reliable regardless of the pointer.
-            g_havePendRemOwner = ownerHandOfInventory(self, g_pendRemOwnerHand);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) { g_havePendRemOwner = false; }
+    RootObject* o = inv->owner;
+    for (unsigned int depth = 0; o && depth < 3; ++depth) {
+        if (!isContainerItemType((unsigned int)o->getDataType()))
+            return readObjectHand(o, out);
+        const hand& h = static_cast<Item*>(o)->_whosInventoryWeAreIn;
+        unsigned int carrier[5] = {(unsigned int)h.type,h.container,h.containerSerial,h.index,h.serial};
+        o = resolveObjectByHand(carrier);
     }
-    return r;
+    return false;
 }
 
-bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
-    if ((g_blockXfer || xferDumpFlag()) && !g_invVetoSuspend && g_invOwnerClass &&
-        self && item) {
+// A trader aggregate can remove from a shelf's actual inventory. Preserve that
+// item's real parent, not the aggregate's transient/empty owner handle.
+static bool sourceHandOfItem(Item* item,unsigned int out[5]) {
+    if (!item) return false;
+    const hand& h=item->_whosInventoryWeAreIn;
+    unsigned int raw[5]={(unsigned int)h.type,h.container,h.containerSerial,h.index,h.serial};
+    if (!(raw[1] || raw[2] || raw[3] || raw[4])) return false;
+    RootObject* owner=resolveObjectByHand(raw);
+    return owner && ownerHandOfInventory(invOf(owner),out);
+}
+
+Item* __fastcall removeDontDestroy_hook(Inventory* self,Item* item,int quantity,bool copy) {
+    unsigned int source[5]={0,0,0,0,0};
+    bool known=false;
+    bool wasEquipped = false;
+    if (!g_invVetoSuspend) {
+        __try {
+            if (bagVerdictPending(self, item)) return 0;
+            wasEquipped = item && item->isEquipped;
+            known=sourceHandOfItem(item,source) || ownerHandOfInventory(self,source);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        // No silent overflow: a refused native remove leaves the item in its source.
+        if (known && g_pendingRemovalCount==256) return 0;
+    }
+    Item* removed=g_removeDontDestroyOrig(self,item,quantity,copy);
+    if (known && removed) {
+        __try {
+            PendingRemoval& p=g_pendingRemovals[g_pendingRemovalCount];
+            p.item=removed;p.inventory=self;memcpy(p.owner,source,sizeof(source));
+            p.wasEquipped = wasEquipped;
+            p.hasItemHand=readObjectHand(static_cast<RootObject*>(removed),p.itemHand) &&
+                          (p.itemHand[3]!=0 || p.itemHand[4]!=0);
+            p.stamp=++g_pendingRemovalStamp;
+            ++g_pendingRemovalCount;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return removed;
+}
+
+bool __fastcall removeAutoDestroy_hook(Inventory* self,Item* item,int quantity) {
+    if (!g_invVetoSuspend && bagVerdictPending(self, item)) return false;
+    unsigned __int64 before=g_pendingRemovalStamp;
+    bool ok=g_removeAutoDestroyOrig(self,item,quantity);
+    for (unsigned int i=0;i<g_pendingRemovalCount;)
+        if (g_pendingRemovals[i].item==item ||
+            (g_pendingRemovals[i].stamp>before && g_pendingRemovals[i].inventory==self))
+            erasePendingRemoval(i);
+        else ++i;
+    return ok;
+}
+
+static bool addItemWithCapture(Inventory* self, Item* item, int quantity, bool equip) {
+    ItemTransferEdge edge;
+    bool capture = false;
+    int pending=g_invVetoSuspend ? -1 : pendingRemovalFor(item);
+    unsigned __int64 pendingStamp=pending>=0 ? g_pendingRemovals[pending].stamp : 0;
+    if (!g_invVetoSuspend && g_invOwnerClass && self && item) {
         int decision = 0; // 1 = block
         int srcClass = 0, dstClass = 0;
         bool haveSrc = false, haveDst = false;
@@ -815,23 +939,35 @@ bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
         unsigned int srcHand[5] = { 0, 0, 0, 0, 0 };
         __try {
             haveDst = ownerHandOfInventory(self, dstHand);
-            // Source (in priority): the owner hand cached at the paired remove this
-            // frame; else the exact remove/add pointer pairing; else the item's
-            // last-inventory hand. The cached hand is the robust path - it survives
-            // the engine handing us a COPY of the removed Item*.
-            if (g_havePendRemOwner && g_pendRemInv && g_pendRemInv != self) {
-                memcpy(srcHand, g_pendRemOwnerHand, sizeof(srcHand)); haveSrc = true;
+            if (pending>=0) {
+                memcpy(srcHand,g_pendingRemovals[pending].owner,sizeof(srcHand));haveSrc=true;
             }
-            if (!haveSrc && item == g_pendRemItem && g_pendRemInv && g_pendRemInv != self)
-                haveSrc = ownerHandOfInventory(g_pendRemInv, srcHand);
-            if (!haveSrc) haveSrc = sourceHandOfItem(item, srcHand);
             if (haveDst && haveSrc) {
                 dstClass = g_invOwnerClass(dstHand);
                 srcClass = g_invOwnerClass(srcHand);
                 if ((srcClass == 1 && dstClass == 2) || (srcClass == 2 && dstClass == 1))
                     decision = 1;
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { decision = 0; }
+            if (haveSrc && haveDst && (srcClass == 1 || dstClass == 1) &&
+                memcmp(srcHand, dstHand, sizeof(srcHand)) != 0) {
+                GameData* gd = item->getGameData();
+                if (gd && gd->stringID.size() < sizeof(edge.item.stringID)) {
+                    memset(&edge, 0, sizeof(edge));
+                    edge.contentsSlot = 256;
+                    edge.transferredItem = item;
+                    memcpy(edge.src, srcHand, sizeof(srcHand));
+                    memcpy(edge.dst, dstHand, sizeof(dstHand));
+                    strcpy(edge.item.stringID, gd->stringID.c_str());
+                    edge.item.itemType = (unsigned int)gd->type;
+                    int q = quantity > 0 ? quantity : item->quantity;
+                    edge.item.quantity = (u16)(q > 65535 ? 65535 : q);
+                    edge.item.quality = qualityBucketOf(item->quality);
+                    edge.item.level = gradeLevelOf(item);
+                    fillItemProvenance(item, edge.item);
+                    capture = q > 0;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { decision = 0; capture = false; }
         // Diagnostic (A1): under dump, log every add that touches a squad member on
         // EITHER end (srcClass||dstClass) - including the misses (class 0 / unresolved
         // hand), so a cross-squad drag that fails to block is no longer silent.
@@ -850,7 +986,22 @@ bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
-        if (g_blockXfer && decision == 1) {
+        bool bagUnavailable = false;
+        if (capture && isContainerItemType(edge.item.itemType) &&
+            !(g_blockXfer && decision == 1) && g_itemTransferCount < 256) {
+            unsigned int slot = 0;
+            while (slot < 256 && g_transferContentsUsed[slot]) ++slot;
+            bagUnavailable = slot == 256 ||
+                (srcClass != 1 && dstClass == 1 && g_unconfirmedBagCount == 256);
+            if (!bagUnavailable) {
+                bagUnavailable = !captureBagContents(item, g_transferContents[slot]);
+                if (!bagUnavailable) {
+                    edge.contentsSlot = slot;
+                    g_transferContentsUsed[slot] = true;
+                }
+            }
+        }
+        if ((g_blockXfer && decision == 1) || (capture && g_itemTransferCount == 256) || bagUnavailable) {
             __try {
                 char sid[48]; sid[0] = '\0';
                 GameData* gd = item->getGameData();
@@ -868,14 +1019,18 @@ bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
             // DROP and leaks the item to the peer as a ground item (observed bug).
             // Restoring the count in the same frame also keeps the detector quiet.
             bool restored = false;
-            Inventory* src = g_pendRemInv;
+            Inventory* src=pending>=0 ? g_pendingRemovals[pending].inventory : 0;
             if (src && item) {
                 bool sav = g_invVetoSuspend; g_invVetoSuspend = true;
-                __try { restored = g_tryAddItemOrig(src, item, quantity); }
+                __try {
+                    if (pending >= 0 && g_pendingRemovals[pending].wasEquipped)
+                        restored = g_equipItemOrig(src, item);
+                    if (!restored) restored = g_tryAddItemOrig(src, item, quantity);
+                }
                 __except (EXCEPTION_EXECUTE_HANDLER) { restored = false; }
                 g_invVetoSuspend = sav;
             }
-            g_pendRemItem = 0; g_pendRemInv = 0; g_havePendRemOwner = false;
+            if (restored && pendingStamp) erasePendingStamp(pendingStamp);
             // If we returned it to the source, report the destination add as handled
             // so the engine clears the cursor (item safe in source, nothing crossed).
             // If the source was unresolved, refuse (item stays on cursor) rather than
@@ -883,9 +1038,30 @@ bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
             return restored ? true : false;
         }
     }
-    bool ok = g_tryAddItemOrig(self, item, quantity);
-    g_pendRemItem = 0; g_pendRemInv = 0; g_havePendRemOwner = false;
+    bool saved = g_invVetoSuspend;
+    g_invVetoSuspend = true; // one logical add may recurse into a carried bag
+    bool ok = false;
+    __try { ok = equip ? g_equipItemOrig(self,item) : g_tryAddItemOrig(self,item,quantity); }
+    __finally { g_invVetoSuspend = saved; }
+    if (ok && capture) {
+        g_itemTransfers[g_itemTransferCount++] = edge;
+        if (isContainerItemType(edge.item.itemType) &&
+            g_invOwnerClass(edge.src) != 1 && g_invOwnerClass(edge.dst) == 1)
+            g_unconfirmedBags[g_unconfirmedBagCount++] = item;
+    } else if (capture && edge.contentsSlot < 256) {
+        g_transferContents[edge.contentsSlot].clear();
+        g_transferContentsUsed[edge.contentsSlot] = false;
+    }
+    if (ok && !saved && pendingStamp) erasePendingStamp(pendingStamp);
     return ok;
+}
+
+bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
+    return addItemWithCapture(self,item,quantity,false);
+}
+
+bool __fastcall equipItem_hook(Inventory* self, Item* item) {
+    return addItemWithCapture(self,item,1,true);
 }
 
 // ---- Phase W1b: query-free ground-drop capture -----------------------------
@@ -901,11 +1077,14 @@ DropItemFn g_dropItemOrig = 0;
 std::vector<ItemDropEdge> g_dropEdges;
 
 void __fastcall dropItem_hook(Inventory* self, Item* it) {
+    unsigned __int64 before=g_pendingRemovalStamp;
     g_dropItemOrig(self, it);
-    // A drop may internally remove the item (setting the veto's pending-remove
-    // state) but is NOT a bag->bag transfer, so invalidate any pending remove here
-    // - otherwise a later unrelated add could be mis-paired to this drop's source.
-    g_pendRemItem = 0; g_pendRemInv = 0; g_havePendRemOwner = false;
+    // Retire only this drop, not another player's item still held on the cursor.
+    for (unsigned int i=0;i<g_pendingRemovalCount;)
+        if (g_pendingRemovals[i].item==it ||
+            (g_pendingRemovals[i].stamp>before && g_pendingRemovals[i].inventory==self))
+            erasePendingRemoval(i);
+        else ++i;
     __try {
         if (it) {
             ItemDropEdge e;
@@ -2236,16 +2415,25 @@ bool installXferBlockHook() {
     intptr_t addRem = KenshiLib::GetRealAddress(
         &Inventory::_NV_removeItemDontDestroy_returnsItem);
     intptr_t addAdd = KenshiLib::GetRealAddress(&Inventory::_NV_tryAddItem);
-    if (!addRem || !addAdd) return false;
+    intptr_t addEquip = KenshiLib::GetRealAddress(&Inventory::equipItem);
+    intptr_t addDestroy=KenshiLib::GetRealAddress(&Inventory::_NV_removeItemAutoDestroy);
+    if (!addRem || !addAdd || !addEquip || !addDestroy) return false;
     if (KenshiLib::AddHook(addRem, (void*)&removeDontDestroy_hook,
                            (void**)&g_removeDontDestroyOrig) != KenshiLib::SUCCESS)
         return false;
-    return KenshiLib::AddHook(addAdd, (void*)&tryAddItem_hook,
-                              (void**)&g_tryAddItemOrig) == KenshiLib::SUCCESS;
+    if (KenshiLib::AddHook(addAdd,(void*)&tryAddItem_hook,(void**)&g_tryAddItemOrig) != KenshiLib::SUCCESS)
+        return false;
+    if (KenshiLib::AddHook(addDestroy,(void*)&removeAutoDestroy_hook,
+                         (void**)&g_removeAutoDestroyOrig)!=KenshiLib::SUCCESS) return false;
+    return KenshiLib::AddHook(addEquip,(void*)&equipItem_hook,
+                              (void**)&g_equipItemOrig) == KenshiLib::SUCCESS;
 }
 
 void setBlockXfer(bool on)                    { g_blockXfer = on; }
 void setInvOwnerClassifier(InvOwnerClassFn fn) { g_invOwnerClass = fn; }
+int inventoryOwnerClass(const unsigned int h[5]) {
+    return g_invOwnerClass ? g_invOwnerClass(h) : 0;
+}
 
 // Query-free ground-drop capture: detour the dropItem _NV_ twin.
 bool installItemDropHook() {

@@ -21,13 +21,12 @@ typedef float          f32;
 typedef double         f64;
 
 // Protocol version is checked at handshake; a mismatch is rejected (no back-compat).
-// Public 64 adds the completed LOAD_GO id to clock packets for the join-load barrier.
+// Public 70 carries complete bag transfers and exact merchant stock/template state.
 #ifdef KENSHICOOP_NET_DIAG
-// Private 65 uses the same join-load barrier plus bounded, reliable join-log
-// chunks in a separate host file. Both peers must use the same protocol.
-const u16 PROTOCOL_VERSION = 65;
+// Private 71 additionally carries bounded, reliable join-log chunks.
+const u16 PROTOCOL_VERSION = 71;
 #else
-const u16 PROTOCOL_VERSION = 64;
+const u16 PROTOCOL_VERSION = 70;
 #endif
 
 // RELEASE id - a different axis from PROTOCOL_VERSION, and the two are routinely
@@ -48,7 +47,7 @@ const u16 PROTOCOL_VERSION = 64;
 // introduced ordering, which is the only moment it was free: those clients
 // install whatever the manifest names regardless of order, so they follow the
 // renumber, and every build after this one is ordered and monotonic.
-const char* const COOP_BUILD_VERSION = "0.1.26";
+const char* const COOP_BUILD_VERSION = "0.1.27";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;
@@ -524,6 +523,9 @@ struct InvItemEntry {
                      // the two weapon slots ('hip' vs 'back'), which share AttachSlot
                      // ATTACH_WEAPON and so are identical in `slot`; lets the peer place
                      // a worn weapon in the SAME slot (Weapon I vs II) as the author.
+    u16 gridSection; // native loose section; separate from equipment-slot identity
+    u16 gridX;       // source position preserves a valid stock-grid packing
+    u16 gridY;
     // THE GRADE (protocol 51). Kenshi's named item grades - Prototype 5, Shoddy 20,
     // Standard 40, High 60, Specialist 80, Masterwork 95 - are preset points on a 1..100
     // craft level, held in Gear::level / level_0_100 and read back as getLevel(). Per-template
@@ -767,45 +769,26 @@ struct InvXferPacket {
     u32  itemType;   // GameData::type category
     u16  quantity;   // units moved
     u16  quality;    // condition*100 of the moved stack (advisory; see InvItemEntry::quality)
-    u8   level;      // craft grade (protocol 51), GRADE_NA when not applicable. Only used if
-                     // the receiver has to FABRICATE - a transfer normally relocates the real
-                     // Item*, which carries its own grade and needs nothing from the wire.
+    u8   level;      // craft grade; GRADE_NA when not applicable
     char manufacturer[48];
     char material[48];
+    u8 contentsPresent; // complete bag inventory follows this header, including empty bags
+    u8 contentsCount;
 };
 
-// ---- Protocol 50: transfer VERDICT ------------------------------------------
-// PKT_INV_XFER is optimistic. The author moves the item locally, latches both
-// peer ends so the owner's in-flight snapshots cannot reconcile the move away,
-// and then waits out a 10 s wall clock - because nothing ever comes back. That
-// deadline is a guess standing in for an answer: too short and a slow receiver
-// looks like a refusal, too long and a genuinely refused transfer stays visibly
-// duped for ten seconds. It is also a guess the author cannot improve on,
-// because whether the move succeeded is a fact only the RECEIVER has.
-//
-// So the receiver states it. One ack per intent, reliable, carrying how many
-// units actually landed:
-//   applied == quantity  ACCEPT  - the author drops its latches now, not on a
-//                                  timer, and the two worlds agree immediately
-//   0 < applied < qty    PARTIAL - the author keeps a latch for the shortfall
-//   applied == 0         REJECT  - the author drops every latch for the intent,
-//                                  which lets the owner's next snapshot
-//                                  reconcile the optimistic local move away.
-//                                  That is the rollback, and it happens through
-//                                  the existing reconcile path rather than a
-//                                  second mutation path that could itself dupe.
-// The wall clock stays as a BACKSTOP for a peer that never answers (an older
-// build, or a drop on a channel that is nominally reliable but disconnected),
-// so this strictly narrows the window rather than replacing one guess with a
-// dependency.
+// An authority verdict rolls back only unaccepted units. A bag taken from a
+// foreign source carries that source owner's actual contents in the verdict:
+// the optimistic local mirror may have been stale when the player took it.
 struct InvXferAckPacket {
     u8  type;        // = PKT_INV_XFER_ACK
     u32 ownerId;     // sender of the ACK (the receiver that applied it)
     u32 xferOwnerId; // ownerId of the intent being answered
     u32 xferId;      // xferId of the intent being answered
-    u16 applied;     // units actually moved + fabricated (0 = rejected)
+    u16 applied;     // existing units actually moved (0 = rejected)
     u16 requested;   // units the intent asked for (echo, for log/audit clarity)
     u8  verdict;     // XFER_ACK_* below
+    u8 contentsPresent;
+    u8 contentsCount;
 };
 
 enum XferAckVerdict {
@@ -1429,6 +1412,10 @@ struct SpawnInfoPacket {
     // value or every proxy creature spawns full-grown ("giant goats", manual
     // session 2026-07-12). <= 0 = unreadable -> join uses its adult default.
     f32 age;
+    // Host merchant's shop building. Zero means no shop; runtime NPC proxies
+    // otherwise have no home and native trade cannot find the stock containers.
+    u32 shopHome[5];
+    char shopSquadSid[48]; // native merchant platoon template ("is trader" flag)
 };
 
 // SpawnInfoPacket.dead (v58). 1 used to mean only "dead"; unconscious mints

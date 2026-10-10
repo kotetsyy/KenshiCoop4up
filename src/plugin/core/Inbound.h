@@ -104,6 +104,7 @@ struct InboundWorldPickup {
 struct InboundInvXfer {
     u32           ownerId;
     InvXferPacket pkt;
+    std::vector<InvItemEntry> contents;
 };
 
 // One received transfer VERDICT (protocol 50): the answer to an intent WE
@@ -113,6 +114,7 @@ struct InboundInvXfer {
 struct InboundInvXferAck {
     u32              ownerId;
     InvXferAckPacket pkt;
+    std::vector<InvItemEntry> contents;
 };
 
 // One received owner-authoritative medical snapshot (phase 2): the subject's
@@ -384,9 +386,10 @@ public:
     // continuous state (Phase 4d bounded mailboxes).
     explicit WorldQ(std::vector<IClearableQueue*>& reg, size_t cap = 0)
       : cap_(cap) { reg.push_back(this); }
-    void push_back(const T& v) {
+    T& push_back(const T& v) {
         if (cap_ && q_.size() >= cap_) q_.pop_front();
         q_.push_back(v);
+        return q_.back();
     }
     operator std::deque<T>&() { return q_; }
     virtual void clearQueue() { q_.clear(); }
@@ -526,14 +529,22 @@ public:
         EnterCriticalSection(&cs_); wp_.push_back(wp); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received cross-owner transfer intent (protocol 37), owner-tagged.
-    void pushInvXfer(u32 ownerId, const InvXferPacket& pkt) {
-        InboundInvXfer ix; ix.ownerId = ownerId; ix.pkt = pkt;
-        EnterCriticalSection(&cs_); invXfer_.push_back(ix); LeaveCriticalSection(&cs_);
+    void pushInvXfer(u32 ownerId, const InvXferPacket& pkt,
+                      const InvItemEntry* contents, unsigned int count) {
+        EnterCriticalSection(&cs_);
+        InboundInvXfer& ix = invXfer_.push_back(InboundInvXfer());
+        ix.ownerId = ownerId; ix.pkt = pkt;
+        if (count) ix.contents.assign(contents, contents + count);
+        LeaveCriticalSection(&cs_);
     }
-    // NET thread: one received transfer verdict (protocol 50), owner-tagged.
-    void pushInvXferAck(u32 ownerId, const InvXferAckPacket& pkt) {
-        InboundInvXferAck ia; ia.ownerId = ownerId; ia.pkt = pkt;
-        EnterCriticalSection(&cs_); invXferAck_.push_back(ia); LeaveCriticalSection(&cs_);
+    // NET thread: one received authority verdict and optional complete bag contents.
+    void pushInvXferAck(u32 ownerId, const InvXferAckPacket& pkt,
+                         const InvItemEntry* contents, unsigned int count) {
+        EnterCriticalSection(&cs_);
+        InboundInvXferAck& ia = invXferAck_.push_back(InboundInvXferAck());
+        ia.ownerId = ownerId; ia.pkt = pkt;
+        if (count) ia.contents.assign(contents, contents + count);
+        LeaveCriticalSection(&cs_);
     }
     // NET thread: one received medical snapshot, owner-tagged.
     void pushMedical(u32 ownerId, const MedicalPacket& pkt) {
