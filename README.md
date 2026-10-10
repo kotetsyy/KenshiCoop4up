@@ -69,10 +69,12 @@
 **Потом, при обновлении:** заменяйте **обе DLL из одной сборки** при закрытой
 игре. Внутриигровой апдейтер проверяет SHA-256 обеих DLL и устанавливает пару
 для следующего запуска. `.mod` и `RE_Kenshi.json` почти не меняются.
+В `v0.1.28` сокращено описание мода в лаунчере. Чтобы получить его, замените
+`KenshiCoop.mod` из полного комплекта; апдейтер скачивает только DLL.
 
 **Рекомендуем всем одну и ту же сборку.** Разные версии протокола не соединяются.
 
-В сборке Release `v0.1.27` используется протокол **70**. Хост держит симуляцию на паузе
+В сборке Release `v0.1.28` используется протокол **70**. Хост держит симуляцию на паузе
 до загрузки мира всеми подключёнными клиентами: каждый подтверждает READY
 именно для текущего `LOAD_GO`, а не просто окончание передачи файлов.
 Пауза не заменяет выбранную игроками скорость или пользовательскую паузу.
@@ -124,6 +126,10 @@
 передача мира и игроки. **«Диагностика»** раскрывает подробности; при переполнении
 используйте **«Копировать отчёт»**. Обновление мода имеет отдельный блок и не
 меняет состояние подключения.
+
+Кнопка **Discord** в нижней строке, перед «Диагностикой», открывает
+[сервер сообщества](https://discord.gg/UYcNPMrtup) в браузере по умолчанию.
+Она не запускает и не отключает игровую сессию.
 
 Каждый игрок управляет своим отрядом: по вкладке отряда на игрока, у хоста отряд
 1, у первого подключившегося — 2, и так далее. Если в сейве только один отряд,
@@ -238,6 +244,8 @@ build instructions are in [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 **Later updates:** replace **both DLLs from the same build**, with the game
 closed. The in-game updater verifies both SHA-256 hashes and installs the pair
 for the next launch. `.mod` and `RE_Kenshi.json` almost never change.
+In `v0.1.28`, the launcher description is shorter. Replace `KenshiCoop.mod`
+from the full kit to get it; the updater downloads only the DLL pair.
 
 **The same build is recommended for everyone.** Mismatched protocol versions do not connect.
 
@@ -271,6 +279,10 @@ during a session. **F2, Esc, X and Hide never disconnect**; use the separate
 stop/disconnect action. The right column shows real milestones, transfer
 progress and players. **Diagnostics** expands details; **Copy report** includes
 overflowing lines. Mod updates have a separate section, not a connection status.
+
+The **Discord** button in the footer, before Diagnostics, opens the
+[community server invite](https://discord.gg/UYcNPMrtup) in your default browser.
+It does not start or disconnect the game session.
 
 Each player controls their own squad: one squad tab per player, host runs squad
 1, the first join squad 2, and so on. If your save has only one squad, split

@@ -30,6 +30,7 @@
 #include <mygui/MyGUI_XmlDocument.h>
 #include <sstream>
 #include <windows.h>
+#include <shellapi.h>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -53,7 +54,7 @@
 //            from the snapshot's network and world phases, transfer progress,
 //            the real roster, and the mod-updater line as its own section.
 //            Folded diagnostics replace milestones + roster while open;
-//   footer = version + hide hint, Diagnostics, Copy report, Hide.
+//   footer = version + hide hint, Discord, Diagnostics, Copy report, Hide.
 // Widgets persist while the window lives: a tick only rewrites the captions,
 // colours and visibility that changed, at most 10 times a second.
 //
@@ -534,6 +535,8 @@ const char kHdrDiag[] =
     "\xD0\x94\xD0\x98\xD0\x90\xD0\x93\xD0\x9D\xD0\x9E\xD0\xA1\xD0\xA2\xD0\x98\xD0\x9A\xD0\x90"; // ДИАГНОСТИКА
 const char kCopyReport[] =
     "\xD0\x9A\xD0\xBE\xD0\xBF\xD0\xB8\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB0\xD1\x82\xD1\x8C \xD0\xBE\xD1\x82\xD1\x87\xD1\x91\xD1\x82"; // Копировать отчёт
+const char kErrBrowser[] =
+    "\xD0\x9D\xD0\xB5 \xD1\x83\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xBE\xD1\x81\xD1\x8C \xD0\xBE\xD1\x82\xD0\xBA\xD1\x80\xD1\x8B\xD1\x82\xD1\x8C \xD0\xB1\xD1\x80\xD0\xB0\xD1\x83\xD0\xB7\xD0\xB5\xD1\x80."; // Не удалось открыть браузер.
 const char kDiagNone[] =
     "\xD0\x94\xD0\xB8\xD0\xB0\xD0\xB3\xD0\xBD\xD0\xBE\xD1\x81\xD1\x82\xD0\xB8\xD0\xBA\xD0\xB0 \xD0\xBD\xD0\xB5\xD0\xB4\xD0\xBE\xD1\x81\xD1\x82\xD1\x83\xD0\xBF\xD0\xBD\xD0\xB0"; // Диагностика недоступна
 const char kRepError[] =
@@ -899,7 +902,7 @@ struct PanelWidgets {
     Ctl      diagCard, hdrDiag, diagKey[kDiagRowsMax], diagVal[kDiagRowsMax];
     int      diagRows;
     // chrome
-    Ctl      colRule, footRule, footText, btnDiag, btnReport, btnHide;
+    Ctl      colRule, footRule, footText, btnDiscord, btnDiag, btnReport, btnHide;
     PanelWidgets() : msgRows(0), diagRows(0) {}
 };
 
@@ -1239,6 +1242,7 @@ bool noteLive(int slot) {
 int  g_pendingPaste = -1; // field whose Paste button was pressed
 int  g_tabDir = 0;        // +1 Tab, -1 Shift+Tab, from a field
 bool g_enterPressed = false;
+bool g_pendingDiscord = false;
 
 void selectRole(bool host) {
     if (g_locked || g_panel.hostFlag == host) return;
@@ -1295,6 +1299,7 @@ void onPanelClick(MyGUI::Widget* w) {
     else if (w == u.port.button.w)   g_pendingPaste = FLD_PORT;
     else if (w == u.copyId.w)        copySelfId();
     else if (w == u.primary.btn.w)   onPrimary();
+    else if (w == u.btnDiscord.w)    g_pendingDiscord = true;
     else if (w == u.btnDiag.w)       g_panel.diagOpen = !g_panel.diagOpen;
     else if (w == u.btnReport.w)     copyReport();
     else if (w == u.btnHide.w)       g_panel.closeRequested = true;
@@ -1776,12 +1781,14 @@ bool buildPanelWidgets(ForgottenGUI* g, MyGUI::Widget* parent, int cw, int ch) {
     const int rx = x0 + lw + colGap;
     const int rw = cw - kPad - rx;
     const int top = 12;
-    const int bottom = ch - kFooterH - 8;
+    const bool stackedFooter = cw < 1000;
+    const int footerH = stackedFooter ? kFooterH + kNoteH : kFooterH;
+    const int bottom = ch - footerH - 8;
     const int avail = bottom - top;
     const int head = kHeadH + kHeadGap;
 
     mkRect(b, u.colRule, x0 + lw + colGap / 2, top, 1, bottom - top, C_RULE, 0.45f);
-    mkRect(b, u.footRule, kPad, ch - kFooterH, cw - 2 * kPad, 1, C_RULE, 0.45f);
+    mkRect(b, u.footRule, kPad, ch - footerH, cw - 2 * kPad, 1, C_RULE, 0.45f);
 
     // Left column: fixed blocks; the slack is spread over the four section gaps.
     const int leftFixed = 4 * head + 2 * kSelH + 2 * (kFieldH + 4) + 3 * kNoteH +
@@ -1906,13 +1913,22 @@ bool buildPanelWidgets(ForgottenGUI* g, MyGUI::Widget* parent, int cw, int ch) {
     // Footer.
     const int fbH = 36;
     const int fy = ch - kFooterH + (kFooterH - fbH) / 2;
-    int fx = cw - kPad - 160;
-    mkButton(b, u.btnHide, F_SMALL, fx, fy, 160, fbH);
-    fx -= 10 + 200;
-    mkButton(b, u.btnReport, F_SMALL, fx, fy, 200, fbH);
-    fx -= 10 + 190;
-    mkButton(b, u.btnDiag, F_SMALL, fx, fy, 190, fbH);
-    mkLabel(b, u.footText, F_SMALL, kPad, fy, fx - 10 - kPad, fbH);
+    const int buttonSpace = clampi(cw - 2 * kPad - 30, 1, 670);
+    const int hideW = buttonSpace * 160 / 670;
+    const int reportW = buttonSpace * 200 / 670;
+    const int diagW = buttonSpace * 190 / 670;
+    const int discordW = buttonSpace - hideW - reportW - diagW;
+    int fx = cw - kPad - hideW;
+    mkButton(b, u.btnHide, F_SMALL, fx, fy, hideW, fbH);
+    fx -= 10 + reportW;
+    mkButton(b, u.btnReport, F_SMALL, fx, fy, reportW, fbH);
+    fx -= 10 + diagW;
+    mkButton(b, u.btnDiag, F_SMALL, fx, fy, diagW, fbH);
+    fx -= 10 + discordW;
+    mkButton(b, u.btnDiscord, F_SMALL, fx, fy, discordW, fbH);
+    mkLabel(b, u.footText, F_SMALL, kPad, stackedFooter ? ch - footerH : fy,
+            stackedFooter ? cw - 2 * kPad : fx - 10 - kPad,
+            stackedFooter ? kNoteH : fbH);
 
     char m[160];
     _snprintf(m, sizeof(m) - 1,
@@ -2372,10 +2388,10 @@ void refreshFooter(const CoopUiSnapshot* st) {
         foot += ru::kTitleHint;
         lineIf(u.footText, foot, C_MUTED, true);
     }
-    Ctl* buttons[3] = { &u.btnDiag, &u.btnReport, &u.btnHide };
-    const char* text[3] = { g_panel.diagOpen ? ru::kDiagHide : ru::kDiagShow, ru::kCopyReport,
-                            ru::kHide };
-    for (int i = 0; i < 3; ++i) {
+    Ctl* buttons[4] = { &u.btnDiscord, &u.btnDiag, &u.btnReport, &u.btnHide };
+    const char* text[4] = { "Discord", g_panel.diagOpen ? ru::kDiagHide : ru::kDiagShow,
+                            ru::kCopyReport, ru::kHide };
+    for (int i = 0; i < 4; ++i) {
         ctlText(*buttons[i], text[i]);
         ctlVisible(*buttons[i], true);
         ctlEnabled(*buttons[i], true);
@@ -2414,7 +2430,7 @@ void hoverPass() {
     PanelWidgets& u = g_ui;
     Ctl* b[] = { &u.selHost.btn, &u.selJoin.btn, &u.selSteam.btn, &u.selUdp.btn,
                  &u.hostId.button, &u.addr.button, &u.port.button,
-                 &u.copyId, &u.primary.btn, &u.btnDiag, &u.btnReport, &u.btnHide };
+                 &u.copyId, &u.primary.btn, &u.btnDiscord, &u.btnDiag, &u.btnReport, &u.btnHide };
     for (size_t i = 0; i < sizeof(b) / sizeof(b[0]); ++i) {
         Ctl& c = *b[i];
         if (c.w && c.colSet)
@@ -2529,6 +2545,17 @@ void panelTick(const CoopUiSnapshot* st, CoopUiCommand* cmd) {
     }
     // Queued Start/Stop first, so "Hide" pressed in the same frame cannot drop it.
     emitCommand(cmd);
+    if (g_pendingDiscord) {
+        g_pendingDiscord = false;
+        const INT_PTR result = reinterpret_cast<INT_PTR>(
+            ShellExecuteW(0, L"open", L"https://discord.gg/UYcNPMrtup", 0, 0, SW_SHOWNORMAL));
+        if (result <= 32) {
+            setNote(NOTE_FOOT, ru::kErrBrowser, TONE_BAD);
+            logErrLine("[coop-ui] Discord browser launch FAILED");
+        } else {
+            logLine("[coop-ui] Discord invite opened in browser");
+        }
+    }
     if (!g) {
         return;
     }

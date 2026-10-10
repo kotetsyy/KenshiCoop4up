@@ -183,11 +183,8 @@ Item[] items = [wanderer2, wandererSquad2, wandererStart, plusWanderer, plusSqua
 
 // ---- 4) Assemble and write ---------------------------------------------------
 var header = new Header(1, "",
-    "The data half of KenshiCoop: two co-op game starts. \"Multiplayer (Wanderer x2)\" is the " +
-    "vanilla Wanderer start with two wanderers, each already in their own squad, so the host plays " +
-    "squad 1 and the joining player takes squad 2. \"Multiplayer+ (Wanderer x2)\" is the same start " +
-    "with 500,000 cats in the shared wallet and both characters levelled to 50 in every stat by the " +
-    "plugin. Data-only mod; requires the KenshiCoop plugin for co-op.")
+    "Play Kenshi together with up to 4 players. Each player controls their own squad in the " +
+    "host's world. Press F2 to host or join. Requires RE_Kenshi. Experimental: desyncs may occur.")
 {
     Dependencies = ["gamedata.base", "Newwworld.mod", "rebirth.mod", "Dialogue.mod"],
 };
