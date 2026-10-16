@@ -30,21 +30,21 @@
 > рассинхроны и вылеты. Два игрока — проверенный случай; три и четыре
 > реализованы, но в реальных сессиях не валидированы.
 
-> **Публичный v0.2.0 — протокол 80.** Steam и прямой IP используют
+> **Публичный v0.2.1 — протокол 82.** Steam и прямой IP используют
 > GameNetworkingSockets (GNS), без ENet и автоматического переключения транспорта.
-> Переход с 0.1.x требует ручной установки полного комплекта.
+> Переход с 0.1.x и v0.2.0 требует ручной установки полного комплекта.
 > Steam P2P между двумя реальными аккаунтами ещё не сертифицирован;
 > реальные сессии на 3–4 игроков и устранение всех рассинхронов не подтверждены.
 
-> **Локальная v0.2.1 ещё не опубликована:** UDP подключается только по IP:port,
-> без ключей и приглашений. Release — протокол **82**, Harness — **83**,
+> **UDP — только IP:port:** подключение без ключей, паролей, приглашений и allow-листов.
+> Release — протокол **82**, Harness — **83**,
 > native ABI3/UI API4. Переход с v0.2.0 — вручную полным комплектом на всех машинах;
 > старый updater не принимает новый ABI. Доступ к порту открыт без проверки личности.
 
 ## Разработка KenshiCoop4up
 
 - **Автообновление.** Все игроки обязаны использовать одну версию. После ручного
-  перехода на v0.2.0 мод проверяет манифест GitHub в отдельном потоке и обновляет
+  перехода на v0.2.1 мод проверяет манифест GitHub в отдельном потоке и обновляет
   все четыре DLL одной сборки, включая UI, для следующего запуска.
 - **Фикс вылета на луте.** Удаление предмета при открытом окне инвентаря
   освобождало память, на которую окно продолжало ссылаться, и игра падала на
@@ -78,7 +78,7 @@
 
 Потеря предметов при прямом обмене, разные товары торговцев, рассинхроны
 времени и координат, кровати на втором этаже и боевых анимаций не следует
-считать полностью устранёнными в v0.2.0. Также остаются проблемы окружения,
+считать полностью устранёнными в v0.2.1. Также остаются проблемы окружения,
 экипировки и NPC; исправление торговли не означает исправление всех рассинхронов.
 
 Направления разработки — устранение этих рассинхронов и потерь предметов,
@@ -94,7 +94,7 @@
 интерфейсы игры. Ручной список разрешённых SteamID не нужен. Реальный
 двухаккаунтный P2P ещё не сертифицирован; ошибка Steam не включает UDP автоматически.
 
-**Публичная установка v0.2.0 (протокол 80):** скачайте **`KenshiCoop-kit.zip`**
+**Публичная установка v0.2.1 (протокол 82):** скачайте **`KenshiCoop-kit.zip`**
 из [последнего релиза](https://github.com/kotetsyy/KenshiCoop4up/releases/latest).
 При закрытой игре распакуйте папку `KenshiCoop` в `<Kenshi>\mods\` с заменой файлов.
 Комплект содержит ровно шесть файлов для `<Kenshi>\mods\KenshiCoop\`:
@@ -102,7 +102,7 @@
 - `KenshiCoop.dll` — сам плагин
 - `KenshiCoopUI.dll` — нативное окно F2, шрифты и статус сессии
 - `KenshiCoopNetSteam.dll` — native Steamworks P2P, без скрытого UDP fallback
-- `KenshiCoopNetUDP.dll` — authenticated direct UDP, без Steam API/relay
+- `KenshiCoopNetUDP.dll` — encrypted direct UDP без проверки личности, Steam API и relay
 - `RE_Kenshi.json` — говорит RE_Kenshi загрузить эту DLL (без него мод не стартует)
 - `KenshiCoop.mod` — чтобы Kenshi показал мод в меню Mods
 
@@ -113,15 +113,15 @@
 инструкции сборки — в [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 
 
-**Первый переход с 0.1.x на v0.2.0 — только вручную:** установите полный
+**Переход с 0.1.x или v0.2.0 на v0.2.1 — только вручную:** установите полный
 шестифайловый комплект при закрытой игре, сохранив конфиг и сейвы. Старый updater
-не поддерживает новую схему. Затем новый updater обновляет все **четыре DLL
+не принимает новый ABI. Затем новый updater обновляет все **четыре DLL
 одной сборки**, включая `KenshiCoopUI.dll`, транзакционно для следующего запуска.
 `KenshiCoop.mod` и `RE_Kenshi.json` устанавливаются из полного комплекта.
 
-**У всех игроков должна быть одна версия.** v0.2.0 несовместим с 0.1.x.
-Публичный Release использует протокол **80**, отдельный приватный Harness —
-**81**, с отключённым автообновлением; эти сборки не соединяются друг с другом.
+**У всех игроков должна быть одна версия.** v0.2.1 несовместим с v0.2.0 и 0.1.x.
+Публичный Release использует протокол **82**, отдельный приватный Harness —
+**83**, с отключённым автообновлением; эти сборки не соединяются друг с другом.
 Хост держит симуляцию на паузе до загрузки мира всеми подключёнными клиентами:
 READY подтверждает текущий `LOAD_GO` и полное согласование проверяемых участков,
 а не просто окончание передачи файлов.
@@ -140,14 +140,14 @@ READY подтверждает текущий `LOAD_GO` и полное согл
 временную клиентскую копию. Передача рюкзака включает его содержимое.
 Загрузка уже лежащих в мире вещей больше не объявляется новым выбрасыванием.
 Товар торговца синхронизируется из полок его магазина, включая разные чертежи,
-а не только из инвентаря NPC. Для текущей версии всем нужен полный комплект v0.2.0.
+а не только из инвентаря NPC. Для текущей версии всем нужен полный комплект v0.2.1.
 
 ## Подключение в игре (F2)
 
 Панель работает и в **главном меню**, и в игре, так что подключающемуся не нужно
 ничего предварительно загружать.
 
-Ниже описана локальная v0.2.1. Опубликованный v0.2.0 ещё требует UDP-приглашения.
+Ниже описана v0.2.1; старые UDP-приглашения больше не используются.
 
 1. Нажмите **F2**.
 2. **Введите ник** в поле. Поддерживаются кириллица, выделение, редактирование
@@ -200,8 +200,7 @@ READY подтверждает текущий `LOAD_GO` и полное согл
 `scripts\build_plugin.cmd Harness` собирает согласованную пару
 `KenshiCoop.dll` и `KenshiCoopUI.dll`. Это оптимизированная сборка с
 `KENSHICOOP_NET_DIAG`, а не конфигурация VS Debug с отладочной CRT.
-Локальные исходники v0.2.1 используют Release **82** / Harness **83**;
-опубликованный v0.2.0 остаётся на протоколах **80** / **81**.
+Исходники v0.2.1 используют Release **82** / Harness **83**.
 Все участники должны использовать все четыре DLL из одной сборки;
 Release и Harness не соединяются друг с другом. Harness принудительно отключает
 публичный апдейтер, даже если в `coop_config.json` стоит `"updateEnabled": true`.
@@ -282,21 +281,21 @@ shared save, streamed to both machines automatically.
 > rough edges, desyncs, and crashes. Two players is the tested case; three
 > and four are implemented but not validated in real sessions.
 
-> **Public v0.2.0 — protocol 80.** Steam and direct IP use
+> **Public v0.2.1 — protocol 82.** Steam and direct IP use
 > GameNetworkingSockets (GNS), without ENet or automatic transport fallback.
-> Migrating from 0.1.x requires manual installation of the complete kit.
+> Migrating from 0.1.x or v0.2.0 requires manual installation of the complete kit.
 > Actual two-account Steam P2P is not yet certified; real 3–4-player sessions
 > and resolution of all desynchronization reports remain unverified.
 
-> **Local v0.2.1 is not published:** direct UDP uses only IP:port, without keys or
-> invitations. Release protocol **82**, Harness **83**, native ABI3/UI API4.
+> **UDP uses only IP:port:** no keys, passwords, invitations or allow-lists.
+> Release protocol **82**, Harness **83**, native ABI3/UI API4.
 > Install the full matching kit manually on every machine when migrating from
 > v0.2.0; its updater rejects the new ABI. Reachable peers are not authenticated.
 
 ## KenshiCoop4up development
 
 - **Self-update.** All players must use the same version. After the manual
-  v0.2.0 migration, the mod checks GitHub's manifest on a separate thread and
+  v0.2.1 migration, the mod checks GitHub's manifest on a separate thread and
   updates all four DLLs from one build, including the UI, for the next launch.
 - **Loot crash fix.** Destroying an item while an inventory panel had it open
   freed memory the open window still pointed at, and the game died on its render
@@ -330,7 +329,7 @@ shared save, streamed to both machines automatically.
 
 New reports of direct-trade item loss, differing merchant stock, time and position
 desynchronization, upstairs beds and combat animations should not be considered
-fully resolved in v0.2.0. Environment, outfit and NPC issues also remain;
+fully resolved in v0.2.1. Environment, outfit and NPC issues also remain;
 the merchant fix does not resolve every desynchronization.
 
 Development focuses on resolving these desyncs and item losses, improving
@@ -346,7 +345,7 @@ and — for Steam — online Steam on each machine and supported game interfaces
 No manual SteamID allow-list is required. Actual two-account P2P is not yet
 certified; Steam failures do not automatically select UDP.
 
-**Public v0.2.0 installation (protocol 80):** download **`KenshiCoop-kit.zip`**
+**Public v0.2.1 installation (protocol 82):** download **`KenshiCoop-kit.zip`**
 from the [latest release](https://github.com/kotetsyy/KenshiCoop4up/releases/latest).
 With the game closed, extract its `KenshiCoop` folder into `<Kenshi>\mods\`,
 replacing files. The kit contains exactly six files for `<Kenshi>\mods\KenshiCoop\`:
@@ -354,7 +353,7 @@ replacing files. The kit contains exactly six files for `<Kenshi>\mods\KenshiCoo
 - `KenshiCoop.dll` — the plugin
 - `KenshiCoopUI.dll` — the native F2 window, fonts and session status
 - `KenshiCoopNetSteam.dll` — native Steamworks P2P, no hidden UDP fallback
-- `KenshiCoopNetUDP.dll` — authenticated direct UDP, no Steam API/relay
+- `KenshiCoopNetUDP.dll` — encrypted direct UDP without identity authentication, Steam API or relay
 - `RE_Kenshi.json` — tells RE_Kenshi to load that DLL (without it the mod never starts)
 - `KenshiCoop.mod` — so Kenshi lists it in the Mods menu
 
@@ -365,14 +364,14 @@ Sources are available in this repository at the matching release tag;
 build instructions are in [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 
 
-**First migration from 0.1.x to v0.2.0 is manual only:** install the complete
-six-file kit with the game closed, preserving config and saves. Legacy updaters
-do not support the new manifest. Thereafter the new updater transactionally
+**Migration from 0.1.x or v0.2.0 to v0.2.1 is manual only:** install the complete
+six-file kit with the game closed, preserving config and saves. Previous updaters
+reject the new ABI. Thereafter the new updater transactionally
 replaces all **four DLLs from one build**, including `KenshiCoopUI.dll`, for the
 next launch. Install `KenshiCoop.mod` and `RE_Kenshi.json` from the complete kit.
 
-**All players must use the same version.** v0.2.0 is incompatible with 0.1.x.
-Public Release uses protocol **80**; the separate private Harness uses **81**
+**All players must use the same version.** v0.2.1 is incompatible with v0.2.0 and 0.1.x.
+Public Release uses protocol **82**; the separate private Harness uses **83**
 with updates disabled. Release and Harness cannot connect to each other.
 
 ## Connect in-game (F2)
@@ -380,7 +379,7 @@ with updates disabled. Release and Harness cannot connect to each other.
 The Co-op panel works at the **main menu** as well as in-game, so a joining
 player does not need to load anything first.
 
-These steps describe local v0.2.1; published v0.2.0 still requires UDP invitations.
+These steps describe v0.2.1; previous UDP invitations are no longer used.
 
 1. Press **F2**.
 2. **Type your nick** in the field. Cyrillic, selection, editing and **Ctrl+V**
@@ -431,8 +430,8 @@ some units into another squad tab in-game.
 The public sources include the Harness configuration:
 `scripts\build_plugin.cmd Harness` builds a matching `KenshiCoop.dll` and
 `KenshiCoopUI.dll` pair. It is an optimized build with `KENSHICOOP_NET_DIAG`,
-not VS Debug with the debug CRT. Public Release v0.2.0 uses protocol **80**;
-the private diagnostic Harness uses protocol **81**.
+not VS Debug with the debug CRT. Public Release v0.2.1 uses protocol **82**;
+the private diagnostic Harness uses protocol **83**.
 Every participant must use all four DLLs from the same build;
 Release and Harness cannot connect to each other. Harness forcibly
 disables the public updater even if `coop_config.json` has `"updateEnabled": true`.
@@ -453,7 +452,7 @@ acknowledged only for the quantity actually removed, and rejection rolls back
 the provisional client copy. Backpack transfers include their contents.
 Streaming an existing ground item no longer announces a fresh drop. Merchant
 stock comes from the actual shop furniture, including distinct blueprints,
-not just the NPC's character inventory. All peers now need the complete v0.2.0 kit.
+not just the NPC's character inventory. All peers now need the complete v0.2.1 kit.
 
 Local native transport rates appear in the separate movable **Diagnostics** window with
 its own scrolling and in **Copy report**. Harness logs `[net-diag]` lines once

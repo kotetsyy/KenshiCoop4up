@@ -1,12 +1,12 @@
 # Build setup
 
-## Scope: unpublished local native gameplay cutover
+## Scope: native gameplay transport
 
-This checkout targets unpublished **0.2.1**, Release protocol **82**, private
+This checkout targets **0.2.1**, Release protocol **82**, private
 Harness protocol **83**. The selected real native provider carries gameplay:
 Steamworks P2P or encrypted direct UDP, never ENet or an automatic fallback.
-The published v0.2.0 binaries, protocol80/81 and stable feed are unchanged.
-The user waived the two-account Steam pre-core gate for local integration;
+Migration from v0.2.0 requires manual installation of all six runtime files;
+its updater rejects ABI3. Publication does not certify two-account Steam:
 **real two-account Steam P2P remains unverified**.
 Provider tests/interface acquisition do not establish gameplay or Internet reachability.
 

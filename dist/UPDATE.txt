@@ -1,14 +1,14 @@
 # Schema 2: old updaters deliberately reject before download.
 schema=2
-transportAbi=2
-version=0.2.0
-proto=80
-coreSha256=547b2ab7550e49282b11445b41958b1a731d2dcef2342035652d646420a655bc
-coreUrl=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.0/KenshiCoop.dll
-uiSha256=d5d93cd8ac68ab6f69e770b3fdd5bd169d63cf6e8ae009efaf4fdb3e4533c94d
-uiUrl=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.0/KenshiCoopUI.dll
-steamSha256=65be13d37028a0dbc8ffcd023eb41a8f2c1b6cf67670606f69324aacf977bf65
-steamUrl=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.0/KenshiCoopNetSteam.dll
-udpSha256=ddb71d474bb90f5fae42dd028c8c0bbf4ad20b847bb88c248ad3d423720cf328
-udpUrl=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.0/KenshiCoopNetUDP.dll
-notes=Исправлена торговля перетаскиванием. GNS: первый переход полным комплектом.
+transportAbi=3
+version=0.2.1
+proto=82
+coreSha256=645c4366de364f1cdc2b8cef2b259d7cd25be9bcc6af8d11e4f0623fe21271fd
+coreUrl=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.1/KenshiCoop.dll
+uiSha256=fbc39c1f22bbb9d08b14b016d8d247829765c3e4d32f4ad668f095435d709e7c
+uiUrl=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.1/KenshiCoopUI.dll
+steamSha256=3ee27083b0a224077e623bd415d94c18c835e0201889bd5b1d5bf1d52ac67ca6
+steamUrl=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.1/KenshiCoopNetSteam.dll
+udpSha256=cb0dbf7f96557e5d7eff9f0f3e29a2e500305340cfc01145c3c2b47dcbb0ceb1
+udpUrl=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.1/KenshiCoopNetUDP.dll
+notes=UDP: только IP:port, без ключей и приглашений. Переход с v0.2.0 вручную полным комплектом.
