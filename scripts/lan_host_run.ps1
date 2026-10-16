@@ -1,98 +1,94 @@
 <#
 .SYNOPSIS
-  Remote-side host launcher for LAN validation runs. Lives in the drop dir on
-  the LAN machine (pushed by setup_lan_host.ps1) and is triggered via the
-  KenshiCoopHost scheduled task so the game launches in the INTERACTIVE session
-  (a plain SSH-spawned process cannot render on the desktop).
-
-.DESCRIPTION
-  Reads run_args.json (pushed per run by run_lan_test.ps1 on the dev machine):
-    runId       - results subfolder name (unique per run)
-    seconds     - hard-kill grace measured from gameplay start
-    anchor      - host log line to time the screenshot on ('' = none)
-    shotDelaySec- extra wait after the anchor before capturing
-    env         - flat map of every KENSHICOOP_* variable for the host role
-                  (built by the dev machine from the scenario manifest, so all
-                  role/scenario logic stays in one place)
-
-  Writes results\<runId>\host.log + host*.png + done.txt (status marker the dev
-  machine polls for, then collects via scp).
+  Interactive remote owner for a uniquely admitted LAN run. Staged files never
+  replace user runtime/saves until the owning snapshot is complete. done.json is
+  published only after cleanup/restoration and carries the exact request token.
 #>
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 $dropDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$argsFile = Join-Path $dropDir "run_args.json"
-
-if (-not (Test-Path $argsFile)) { throw "No run_args.json in $dropDir" }
-$runArgs = Get-Content $argsFile -Raw | ConvertFrom-Json
-
-$resultsDir = Join-Path $dropDir ("results\" + $runArgs.runId)
-New-Item -ItemType Directory -Force -Path $resultsDir | Out-Null
-$hostLog = Join-Path $resultsDir "host.log"
-$doneFile = Join-Path $resultsDir "done.txt"
-
-function Finish {
-    param([string]$Status, [string]$Detail = "")
-    Set-Content -Path $doneFile -Value ("{0}`n{1}" -f $Status, $Detail) -Encoding UTF8
-}
-
+. (Join-Path $dropDir 'kit_preflight.ps1')
+Import-Module (Join-Path $dropDir 'CoopHarness.psm1') -Force
+Import-Module (Join-Path $dropDir 'CoopOracles.psm1') -Force
+$runArgs = Get-Content -LiteralPath (Join-Path $dropDir 'run_args.json') -Raw | ConvertFrom-Json
+$runId = "$($runArgs.runId)"
+if ($runId -notmatch '^[a-fA-F0-9]{32}$') { throw 'Invalid LAN request token.' }
+$lockDir = Join-Path $dropDir 'owner.lock'
+if ((Get-Content -LiteralPath (Join-Path $lockDir 'token.txt') -Raw).Trim() -cne $runId) { throw 'This request does not own the remote admission lock.' }
+$resultsDir = Join-Path $dropDir "results\$runId"
+if (Test-Path -LiteralPath $resultsDir) { throw 'LAN request token has already been used.' }
+New-Item -ItemType Directory -Path $resultsDir | Out-Null
+$hostLog = Join-Path $resultsDir 'host.log'
+$runState = $null
+$failure = $null
 try {
-    # Clean slate: a stale instance holds the mod DLL lock and confuses PID discovery.
-    $stale = @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue)
-    if ($stale.Count -gt 0) { $stale | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
-
-    # Apply the env exactly as the dev machine built it, then pin the log path here.
-    foreach ($p in $runArgs.env.PSObject.Properties) {
-        Set-Item -Path ("Env:" + $p.Name) -Value ("" + $p.Value)
+    $kenshiDir = [IO.Path]::GetFullPath($runArgs.kenshiDir)
+    $save = "$($runArgs.env.KENSHICOOP_SAVE)"
+    Assert-CoopKit -KitDir $dropDir -Metadata $runArgs
+    Test-CoopPrereqs -KenshiDir $kenshiDir -UseSteam $false
+    if (-not (Test-Path -LiteralPath (Join-Path $dropDir "save\$save\quick.save"))) { throw 'Staged fixture is incomplete.' }
+    $runState = New-CoopRunState -GameDirs @($kenshiDir) -SaveNames @($save,'coopresume')
+    Clear-CoopRunEnvironment -State $runState
+    New-Item -ItemType Directory -Path (Join-Path $kenshiDir 'mods\KenshiCoop') -Force | Out-Null
+    foreach ($name in @('KenshiCoop.dll','KenshiCoopUI.dll','KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','KenshiCoop.mod','RE_Kenshi.json')) {
+        Copy-Item -LiteralPath (Join-Path "$dropDir\mod" $name) -Destination (Join-Path $kenshiDir 'mods\KenshiCoop') -Force
+    }
+    foreach ($root in @((Join-Path $env:LOCALAPPDATA 'kenshi\save'),(Join-Path $kenshiDir 'save'))) {
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $destination = Join-Path $root $save
+        if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Recurse -Force }
+        Copy-Item -LiteralPath (Join-Path $dropDir "save\$save") -Destination $destination -Recurse
+    }
+    # JSON null means removal. A present empty string is not a removal on PS7.5+.
+    [void](Set-CoopDiagEnv -Entry $null)
+    foreach ($property in $runArgs.env.PSObject.Properties) {
+        if ($property.Name -notlike 'KENSHICOOP_*') { throw 'Unexpected remote environment key.' }
+        $value = if ($null -eq $property.Value) { $null } else { [string]$property.Value }
+        [Environment]::SetEnvironmentVariable($property.Name,$value,'Process')
     }
     $env:KENSHICOOP_LOG = $hostLog
-
-    $kenshiDir = $runArgs.kenshiDir
-    $out = & (Join-Path $dropDir "start_kenshi.ps1") -ExePath (Join-Path $kenshiDir "kenshi_x64.exe") -WorkDir $kenshiDir -TimeoutSec 120 6>&1
-    $out | ForEach-Object { Add-Content -Path (Join-Path $resultsDir "launcher.log") -Value "$_" }
-    $gamePid = 0
-    $line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -First 1
-    if ($line -and ("$line" -match "GAMEPID=(\d+)")) { $gamePid = [int]$Matches[1] }
-    if ($gamePid -eq 0) { Finish "LAUNCH-FAIL" "no game pid"; exit 1 }
-
-    function Wait-ForLogLine {
-        param([string]$File, [string]$Pattern, [int]$TimeoutSec)
-        $deadline = (Get-Date).AddSeconds($TimeoutSec)
-        while ((Get-Date) -lt $deadline) {
-            if (Test-Path $File) {
-                $hit = Select-String -Path $File -Pattern $Pattern -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($null -ne $hit) { return $true }
-            }
-            Start-Sleep -Milliseconds 500
-        }
-        return $false
-    }
-
-    # Screenshot at the scenario anchor (best-effort; the log verdict is what gates).
-    if ($runArgs.anchor -ne "") {
-        if (Wait-ForLogLine -File $hostLog -Pattern $runArgs.anchor -TimeoutSec 180) {
+    Set-CoopPrivateCredentials -Mode host -UseSteam $false -GameDirs @($kenshiDir,$dropDir) -ProfilePath "$($runArgs.udpProfilePath)"
+    $out = Start-CoopOwnedGame -State $runState -ScriptDir $dropDir -ExePath (Join-Path $kenshiDir 'kenshi_x64.exe') -WorkDir $kenshiDir -TimeoutSec ([int]$runArgs.startTimeoutSec)
+    $out | ForEach-Object { Add-Content -LiteralPath (Join-Path $resultsDir 'launcher.log') -Value "$_" }
+    $line = $out | Where-Object { "$_" -match 'GAMEPID=(\d+)' } | Select-Object -First 1
+    if (-not $line -or "$line" -notmatch 'GAMEPID=(\d+)') { throw 'No final owned game process.' }
+    $game = $runState.Processes[[int]$Matches[1]]
+    $deadline = Get-CoopRunDeadline -Process $game -Seconds ([int]$runArgs.seconds) -StartTimeoutSec ([int]$runArgs.startTimeoutSec) -ArmTimeoutMs ([int]$runArgs.armTimeoutMs) -KillGraceSec ([int]$runArgs.killGraceSec)
+    @{ runToken=$runId; pid=$game.Id; startTicks=$game.StartTime.ToUniversalTime().Ticks; deadlineUtc=$deadline.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $resultsDir 'started.json') -Encoding UTF8
+    if ($runArgs.anchor -and (Wait-CoopOwnedLogLine -Process $game -Deadline $deadline -File $hostLog -Pattern $runArgs.anchor -TimeoutSec ([int]$runArgs.anchorTimeoutSec))) {
+        if ([DateTime]::UtcNow.AddSeconds([int]$runArgs.shotDelaySec) -lt $deadline -and -not $game.HasExited) {
             Start-Sleep -Seconds ([int]$runArgs.shotDelaySec)
             try {
-                & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dropDir "screenshot.ps1") `
-                    -ProcessId $gamePid -Out (Join-Path $resultsDir "host.png") -Frames 5 -IntervalMs 16
-            } catch {}
+                & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dropDir 'screenshot.ps1') -ProcessId $game.Id -ProcessStartTicks ($game.StartTime.ToUniversalTime().Ticks) -Out (Join-Path $resultsDir 'host.png') -Frames 5 -IntervalMs 16
+                if ($LASTEXITCODE -ne 0) { throw 'Screenshot helper failed.' }
+            } catch {
+                if ($runArgs.shotRequired) { throw }
+                Write-Warning "Screenshot evidence unavailable: $($_.Exception.Message)"
+            }
         }
     }
-
-    # Wait for scenario self-exit; hard-kill after gameplay + seconds + grace so an
-    # unattended run can never wedge the machine.
-    $started = Wait-ForLogLine -File $hostLog -Pattern "gameplay started" -TimeoutSec 240
-    $graceSec = [int]$runArgs.seconds + 120
-    try { Wait-Process -Id $gamePid -Timeout $graceSec -ErrorAction Stop }
-    catch {
-        if ($null -ne (Get-Process -Id $gamePid -ErrorAction SilentlyContinue)) {
-            Stop-Process -Id $gamePid -Force -ErrorAction SilentlyContinue
-            Finish "KILLED" "did not self-exit within ${graceSec}s (started=$started)"
-            exit 0
+    Wait-CoopOwnedExit -Process $game -Deadline $deadline
+    if (-not (Test-Path -LiteralPath $hostLog) -or -not (Select-String -LiteralPath $hostLog -Pattern 'gameplay started' -Quiet)) { throw 'No current-run gameplay evidence.' }
+    if ($runArgs.requireResult -and (Test-ScenarioResultPass -File $hostLog -Label host -Required $true -Scenario $runArgs.env.KENSHICOOP_SCENARIO) -ne 'PASS') { throw 'Scenario incomplete or failed; exit alone is not success.' }
+    if ($runArgs.shotRequired -and -not (Test-Path -LiteralPath (Join-Path $resultsDir 'host.png'))) { throw 'Required scenario capture is missing.' }
+} catch { $failure = $_ }
+finally {
+    try {
+        if ($runState) {
+            $engine = Join-Path $kenshiDir 'kenshi_info.log'
+            if (Test-Path -LiteralPath $engine) { Copy-Item -LiteralPath $engine -Destination (Join-Path $resultsDir 'host_engine.log') }
         }
+    } catch { if (-not $failure) { $failure = $_ } }
+    $restored = $false
+    try { Restore-CoopRunState $runState; $restored = $true } catch { $failure = $_ }
+    if ($restored) {
+        try {
+            if ((Get-Content -LiteralPath (Join-Path $lockDir 'token.txt') -Raw).Trim() -cne $runId) { throw 'Remote admission ownership changed unexpectedly.' }
+            Remove-Item -LiteralPath $lockDir -Recurse -Force
+        } catch { if (-not $failure) { $failure = $_ } }
     }
-    Finish "OK" "self-exited (started=$started)"
-    exit 0
-} catch {
-    Finish "ERROR" $_.Exception.Message
-    exit 1
+    $status = @{ runToken=$runId; success=($null -eq $failure); restored=$restored; error=$(if ($failure) { "$failure" } else { $null }) }
+    $done = Join-Path $resultsDir 'done.json'
+    $status | ConvertTo-Json | Set-Content -LiteralPath "$done.tmp" -Encoding UTF8
+    Move-Item -LiteralPath "$done.tmp" -Destination $done
 }
+if ($failure) { throw $failure }

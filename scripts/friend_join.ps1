@@ -9,8 +9,7 @@
 
   Steam P2P (no IPs, no port forwarding - the host tells you their SteamID):
     powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId <their steamid64>
-  You must ALSO tell the host YOUR SteamID (Steam > profile > Account details,
-  or steamid.io); they pass it as -PeerSteamId on their side.
+  The host does not need your SteamID in advance; no guest allowlist is required.
 
   Installs the bundled mod + save into the local Kenshi, launches the game as
   the JOIN client pointed at the host, lets the agreed scenario run to its own
@@ -49,6 +48,8 @@ param(
     # installing the kit's baked save. Defaults to free play (no scenario).
     [switch]$Resume,
     # Save name the coordinated-save flow writes (must match the host's).
+    [string[]]$OwnedPeerTokens = @(),
+    [string]$RunToken = [Guid]::NewGuid().ToString('N'),
     [string]$ResumeSave = "coopresume"
 )
 
@@ -84,12 +85,52 @@ if ($Resume) {
 }
 if ($Scenario -eq "") { $Scenario = $kit.scenario }
 if ($Scenario -eq "free") { $Scenario = "" }
+if ($Scenario -eq 'bootstrap_stream') { throw 'bootstrap_stream is runner-only; use stream_test.ps1 for its menu/bootstrap lifecycle.' }
 if ($Port -eq 0) { $Port = [int]$kit.port }
+if ($RunToken -notmatch '^[a-fA-F0-9]{32}$') { throw 'RunToken must be a GUID in N format.' }
+Import-Module (Join-Path $kitDir 'CoopHarness.psm1') -Force
+Import-Module (Join-Path $kitDir 'CoopOracles.psm1') -Force
+$manifest = Import-PowerShellDataFile (Join-Path $kitDir 'scenarios.psd1')
+$entry = $null
+if ($Scenario) {
+    if (-not $manifest.Scenarios.ContainsKey($Scenario)) { throw "Unknown scenario '$Scenario'." }
+    $entry = $manifest.Scenarios[$Scenario]
+    if ($Scenario -ne $kit.scenario -and $entry.Save -ne $save) { throw 'Scenario override requires a different fixture; assemble a matching kit.' }
+}
+$prof = $manifest.Profiles.remote
+$seconds = if (-not $Scenario) { $FreePlayMinutes * 60 } elseif ($entry.ContainsKey('Seconds')) { [int]$entry.Seconds } else { 150 }
+$killGraceSec = if ($entry -and $entry.ContainsKey('KillGraceSec')) { [int]$entry.KillGraceSec } else { [int]$prof.KillGraceSec }
+$shotAnchor = if ($entry -and $entry.ContainsKey('ShotAnchorJoin')) { $entry.ShotAnchorJoin } else { 'SCENARIO RECV' }
+$shotDelay = if ($entry -and $entry.ContainsKey('ShotDelaySec')) { [int]$entry.ShotDelaySec } else { 2 }
+$shotWait = if ($entry -and $entry.ContainsKey('ShotWaitSec')) { [int]$entry.ShotWaitSec } else { [int]$prof.JoinAnchorTimeoutSec }
+function Assert-CoopSharedFixture {
+    param([string]$KitSave, [string]$SharedSave)
+    foreach ($root in @($KitSave,$SharedSave)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw 'Parent-owned shared fixture is missing.' }
+        Assert-CoopOwnedPath -Path $root -Recurse
+        $items = @((Get-Item -LiteralPath $root -Force)) + @(Get-ChildItem -LiteralPath $root -Recurse -Force)
+        if (@($items | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) { throw 'Shared fixture identity must not traverse reparse points.' }
+    }
+    $expected = @(Get-ChildItem -LiteralPath $KitSave -Recurse -File -Force)
+    $actual = @(Get-ChildItem -LiteralPath $SharedSave -Recurse -File -Force)
+    if ($expected.Count -ne $actual.Count -or -not $expected.Count) { throw 'Parent-owned shared fixture file catalog differs from the kit.' }
+    foreach ($file in $expected) {
+        $relative = $file.FullName.Substring($KitSave.TrimEnd('\').Length).TrimStart('\')
+        $target = Join-Path $SharedSave $relative
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf) -or (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash) {
+            throw "Parent-owned shared fixture differs from the kit: $relative"
+        }
+    }
+}
+$shotRequired = $entry -and $entry.ContainsKey('ShotAnchorJoin')
+$requireResult = $null -ne $entry
 # The kit can pre-bake the Steam transport (kit.json: transport + hostSteamId).
 if ($HostSteamId -eq "" -and $kit.PSObject.Properties["hostSteamId"] -and "$($kit.hostSteamId)" -ne "" -and "$($kit.hostSteamId)" -ne "0") {
     $HostSteamId = "$($kit.hostSteamId)"
 }
 $useSteam = ($HostSteamId -ne "")
+if ("$($kit.transport)" -eq 'steam' -and -not $useSteam) { throw 'Steam kit requires an explicit host Steam ID; no UDP fallback.' }
+if ("$($kit.transport)" -eq 'udp' -and $useSteam) { throw 'UDP kit cannot switch to Steam.' }
 # Print YOUR friend code first (read from Steam) so the two of you can swap
 # codes right off this screen - the host needs YOURS as much as you need
 # theirs. Shown even if the launch then stops for a missing host id.
@@ -109,14 +150,29 @@ if ($KenshiDir -eq "") {
 if ($KenshiDir -eq "" -or -not (Test-Path (Join-Path $KenshiDir "kenshi_x64.exe"))) {
     throw "Kenshi not found. Pass -KenshiDir 'C:\path\to\Kenshi'."
 }
+$KenshiDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KenshiDir)
 Write-Host "Kenshi install: $KenshiDir"
 
 Test-CoopPrereqs -KenshiDir $KenshiDir -UseSteam $useSteam
 
+Assert-CoopKit -KitDir $kitDir -Metadata $kit
+if (-not $Resume -and -not (Test-Path -LiteralPath (Join-Path $kitDir "save\$save\quick.save"))) { throw 'Complete fixture save required before installation.' }
+$ownedSaveNames = if ($Scenario -ne '') { @($save,'coopresume') } elseif (-not $Resume) { @($save) } else { @() }
+$runState = $null
+$restored = $false
+$failure = $null
+$outDir = Join-Path $kitDir "results_$RunToken"
+$completionFile = Join-Path $kitDir "complete_$RunToken.json"
+if ((Test-Path -LiteralPath $outDir) -or (Test-Path -LiteralPath $completionFile)) { throw 'Run token has already been used.' }
+New-Item -ItemType Directory -Path $outDir | Out-Null
+try {
+$runState = New-CoopRunState -GameDirs @($KenshiDir) -SaveNames $ownedSaveNames -PreserveSaves:($Resume -and $Scenario -eq '') -AllowedPeerTokens $OwnedPeerTokens -PreserveUserSaveRoot:($OwnedPeerTokens.Count -gt 0)
+Clear-CoopRunEnvironment -State $runState -PreserveCredentials
+Set-CoopPrivateCredentials -Mode join -UseSteam $useSteam -GameDirs @($KenshiDir,$kitDir)
 # ---- Install mod + save ------------------------------------------------------------
 $modDst = Join-Path $KenshiDir "mods\KenshiCoop"
 New-Item -ItemType Directory -Force -Path $modDst | Out-Null
-Copy-Item -Force (Join-Path $kitDir "mod\*") $modDst
+foreach ($name in @('KenshiCoop.dll','KenshiCoopUI.dll','KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','KenshiCoop.mod','RE_Kenshi.json')) { Copy-Item -LiteralPath (Join-Path "$kitDir\mod" $name) -Destination $modDst -Force }
 Write-Host "Mod installed -> $modDst"
 
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
@@ -135,26 +191,31 @@ if ($Resume) {
     Write-Host "Resuming on transferred save '$save' (no kit save installed)."
 } else {
     $saveDst = Join-Path $saveRoot $save
-    if (Test-Path $saveDst) { Remove-Item -Recurse -Force $saveDst }
-    Copy-Item -Recurse (Join-Path $kitDir "save\$save") $saveDst
-    # Some installs read saves from <Kenshi>\save instead of %LOCALAPPDATA%; mirror
-    # to both so auto-load finds it either way.
-    $installSaveRoot = Join-Path $KenshiDir "save"
-    if (Test-Path $installSaveRoot) {
-        $dst2 = Join-Path $installSaveRoot $save
-        if (Test-Path $dst2) { Remove-Item -Recurse -Force $dst2 }
-        Copy-Item -Recurse (Join-Path $kitDir "save\$save") $dst2
+    $kitSave = Join-Path $kitDir "save\$save"
+    if ($OwnedPeerTokens.Count) {
+        # The outer owning rehearsal snapshots the shared root. Do not replace
+        # or restore it while the exempt host may still be using it.
+        Assert-CoopSharedFixture -KitSave $kitSave -SharedSave $saveDst
+    } else {
+        if (Test-Path -LiteralPath $saveDst) { Remove-Item -LiteralPath $saveDst -Recurse -Force }
+        Copy-Item -LiteralPath $kitSave -Destination $saveDst -Recurse
     }
+    $installSaveRoot = Join-Path $KenshiDir "save"
+    New-Item -ItemType Directory -Path $installSaveRoot -Force | Out-Null
+    $dst2 = Join-Path $installSaveRoot $save
+    if (Test-Path -LiteralPath $dst2) { Remove-Item -LiteralPath $dst2 -Recurse -Force }
+    Copy-Item -LiteralPath $kitSave -Destination $dst2 -Recurse
+    Set-CoopSaveLocation -GameDir $KenshiDir -UserLocation 0
     Write-Host "Save '$save' installed."
 }
 
 # ---- Output folder ------------------------------------------------------------------
-$stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$outDir = Join-Path $kitDir "results_$stamp"
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+$stamp = $RunToken
 $joinLog = Join-Path $outDir "join.log"
 
 # ---- Env + launch --------------------------------------------------------------------
+if ($entry) { [void](Set-CoopDiagEnv -Entry $entry) }
+$env:KENSHICOOP_AUTOCONNECT = '1'
 $env:KENSHICOOP_MODE         = "join"
 $env:KENSHICOOP_IP           = $HostIp
 $env:KENSHICOOP_PORT         = "$Port"
@@ -162,13 +223,11 @@ $env:KENSHICOOP_SAVE         = $save
 $env:KENSHICOOP_LOG          = $joinLog
 $env:KENSHICOOP_SCENARIO     = $Scenario
 $env:KENSHICOOP_SETUP        = ""
-$env:KENSHICOOP_TEST_SECONDS = if ($Scenario -ne "") { "600" }   # hard backstop
-                               elseif ($FreePlayMinutes -gt 0) { "$($FreePlayMinutes * 60)" }
-                               else { "0" }
+$env:KENSHICOOP_TEST_SECONDS = "$seconds"
 $env:KENSHICOOP_FAKE_CLOCK_SKEW_MS = "0"
 # Peer-ready arming: the scenario clock starts when the host's stream arrives;
 # generous fallback for a slow internet connect.
-$env:KENSHICOOP_ARM_TIMEOUT_MS = "240000"
+$env:KENSHICOOP_ARM_TIMEOUT_MS = "$($prof.ArmTimeoutMs)"
 if ($useSteam) {
     $hostId64 = ConvertTo-SteamId64 $HostSteamId
     $env:KENSHICOOP_TRANSPORT  = "steam"
@@ -177,6 +236,7 @@ if ($useSteam) {
     $env:KENSHICOOP_TRANSPORT  = "udp"
     $env:KENSHICOOP_STEAM_PEER = "0"
 }
+Set-CoopPrivateCredentials -Mode join -UseSteam $useSteam -GameDirs @($KenshiDir,$kitDir)
 
 $target = if ($useSteam) { "steam:$(ConvertTo-SteamId64 $HostSteamId)" } else { "${HostIp}:$Port" }
 Write-Host ""
@@ -185,7 +245,7 @@ if ($useSteam) {
     Write-Host "and that the host launched with YOUR SteamID as their peer."
 }
 Write-Host "Launching Kenshi as JOIN -> $target  (save '$save', scenario '$Scenario')"
-$out = & (Join-Path $kitDir "start_kenshi.ps1") -ExePath (Join-Path $KenshiDir "kenshi_x64.exe") -WorkDir $KenshiDir -TimeoutSec 240 6>&1
+$out = Start-CoopOwnedGame -State $runState -ScriptDir $kitDir -ExePath (Join-Path $KenshiDir 'kenshi_x64.exe') -WorkDir $KenshiDir -TimeoutSec $prof.StartTimeoutSec
 $out | ForEach-Object { Write-Host "    $_" }
 $gamePid = 0
 $line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -First 1
@@ -193,25 +253,12 @@ if ($line -and ("$line" -match "GAMEPID=(\d+)")) { $gamePid = [int]$Matches[1] }
 if ($gamePid -eq 0) { throw "Kenshi failed to get past the launcher." }
 Write-Host "Game PID: $gamePid"
 
-# Confirm RE_Kenshi actually loaded the plugin (its log appears immediately);
-# otherwise the game is running vanilla and waiting for a connection is moot.
-[void](Wait-PluginLoaded -LogPath $joinLog -KenshiDir $KenshiDir -TimeoutSec 120)
-
-function Wait-ForLogLine {
-    param([string]$File, [string]$Pattern, [int]$TimeoutSec)
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        if (Test-Path $File) {
-            $hit = Select-String -Path $File -Pattern $Pattern -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $hit) { return $true }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    return $false
-}
+$game = $runState.Processes[$gamePid]
+$runDeadline = if ($seconds -gt 0) { Get-CoopRunDeadline -Process $game -Seconds $seconds -StartTimeoutSec $prof.StartTimeoutSec -ArmTimeoutMs $prof.ArmTimeoutMs -KillGraceSec $killGraceSec } else { [DateTime]::MaxValue }
+if (-not (Wait-CoopOwnedLogLine -Process $game -Deadline $runDeadline -File $joinLog -Pattern '.' -TimeoutSec 120)) { throw 'Owned game did not load the plugin.' }
 
 # ---- Monitor: connection, gameplay, scenario anchor, screenshots ------------------------
-if (Wait-ForLogLine -File $joinLog -Pattern "peer connected" -TimeoutSec 120) {
+if (Wait-CoopOwnedLogLine -Process $game -Deadline $runDeadline -File $joinLog -Pattern "peer connected" -TimeoutSec 120) {
     Write-Host "CONNECTED to the host."
 } elseif ($useSteam) {
     Write-Warning "No connection after 120 s. Check that BOTH Steams are online and that"
@@ -220,30 +267,28 @@ if (Wait-ForLogLine -File $joinLog -Pattern "peer connected" -TimeoutSec 120) {
     Write-Warning "No connection after 120 s. Check the host's port forwarding / firewall."
     Write-Warning "Leaving the game up in case it connects late; results still collected."
 }
-if (Wait-ForLogLine -File $joinLog -Pattern "gameplay started" -TimeoutSec 240) {
+if (Wait-CoopOwnedLogLine -Process $game -Deadline $runDeadline -File $joinLog -Pattern "gameplay started" -TimeoutSec 240) {
     Write-Host "In-game."
 }
 if ($Scenario -ne "") {
-    if (Wait-ForLogLine -File $joinLog -Pattern "SCENARIO RECV" -TimeoutSec 180) {
-        Write-Host "Scenario streaming; capturing screenshots."
-        Start-Sleep -Seconds 2
+    if (Wait-CoopOwnedLogLine -Process $game -Deadline $runDeadline -File $joinLog -Pattern $shotAnchor -TimeoutSec $shotWait) {
+        Write-Host "Scenario anchor observed; capturing screenshots."
         try {
+            if ([DateTime]::UtcNow.AddSeconds($shotDelay) -ge $runDeadline -or $game.HasExited) { throw 'Game/deadline ended before capture.' }
+            Start-Sleep -Seconds $shotDelay
             & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $kitDir "screenshot.ps1") `
-                -ProcessId $gamePid -Out (Join-Path $outDir "join.png") -Frames 5 -IntervalMs 16
-        } catch { Write-Warning "screenshot failed: $($_.Exception.Message)" }
+                -ProcessId $gamePid -ProcessStartTicks ($game.StartTime.ToUniversalTime().Ticks) -Out (Join-Path $outDir "join.png") -Frames 5 -IntervalMs 16
+            if ($LASTEXITCODE -ne 0) { throw 'Screenshot helper failed.' }
+        } catch {
+            if ($shotRequired) { throw }
+            Write-Warning "Screenshot evidence unavailable: $($_.Exception.Message)"
+        }
     }
-    Write-Host "Waiting for the scenario to finish (self-exit; up to 10 min hard cap) ..."
-    try { Wait-Process -Id $gamePid -Timeout 660 -ErrorAction Stop }
-    catch {
-        Write-Warning "Game did not self-exit; closing it."
-        try { Stop-Process -Id $gamePid -Force -ErrorAction SilentlyContinue } catch {}
-    }
-} else {
-    Write-Host ""
-    Write-Host "FREE PLAY: play together; close the game window when the session ends."
-    Write-Host "(This script waits and collects the results when Kenshi exits.)"
-    Wait-Process -Id $gamePid -ErrorAction SilentlyContinue
 }
+Wait-CoopOwnedExit -Process $game -Deadline $runDeadline
+if (-not (Test-Path -LiteralPath $joinLog) -or -not (Select-String -LiteralPath $joinLog -Pattern 'gameplay started' -Quiet)) { throw 'No current-run gameplay evidence.' }
+if ($requireResult -and (Test-ScenarioResultPass -File $joinLog -Label join -Required $true -Scenario $Scenario) -ne 'PASS') { throw 'Scenario incomplete or failed; exit alone is not success.' }
+if ($shotRequired -and -not (Test-Path -LiteralPath (Join-Path $outDir 'join.png'))) { throw 'Required scenario capture is missing.' }
 
 # ---- Bundle results -----------------------------------------------------------------------
 @"
@@ -258,10 +303,22 @@ utc offset:    $((Get-TimeZone).BaseUtcOffset)
 run stamp:     $stamp
 "@ | Set-Content (Join-Path $outDir "session_info.txt") -Encoding UTF8
 
-$zip = Join-Path $kitDir "KenshiCoop-results-$stamp.zip"
-Compress-Archive -Path "$outDir\*" -DestinationPath $zip -Force
-Write-Host ""
-Write-Host "==================================================================="
-Write-Host " Results bundled: $zip"
-Write-Host " Send this file back to the host."
-Write-Host "==================================================================="
+} catch {
+    $failure = $_
+} finally {
+    try {
+        $engineLog = Join-Path $KenshiDir 'kenshi_info.log'
+        if (Test-Path -LiteralPath $engineLog) { Copy-Item -LiteralPath $engineLog -Destination (Join-Path $outDir 'join_engine.log') }
+    } catch { if (-not $failure) { $failure = $_ } }
+    try { Restore-CoopRunState $runState; $restored = $true } catch { $failure = $_ }
+}
+$zip = Join-Path $kitDir "KenshiCoop-results-$RunToken.zip"
+if (-not $failure) {
+    try { Compress-Archive -Path "$outDir\*" -DestinationPath $zip }
+    catch { $failure = $_ }
+}
+$status = @{ runToken=$RunToken; success=($null -eq $failure); restored=$restored; zip=$(if (-not $failure) { Split-Path -Leaf $zip } else { $null }); error=$(if ($failure) { "$failure" } else { $null }) }
+$status | ConvertTo-Json | Set-Content -LiteralPath "$completionFile.tmp" -Encoding UTF8
+Move-Item -LiteralPath "$completionFile.tmp" -Destination $completionFile
+if ($failure) { throw $failure }
+Write-Host "Results bundled after restoration: $zip"

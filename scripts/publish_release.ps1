@@ -1,190 +1,48 @@
-# publish_release.ps1 - stamp a built KenshiCoop.dll + KenshiCoopUI.dll pair as
-# a release and write the manifest the in-DLL updater reads.
-#
-# The updater compares COOP_BUILD_VERSION (baked into the DLL, src/netproto/Wire.h)
-# against `version=` in dist/UPDATE.txt on the release branch. Those two MUST agree
-# or every client re-downloads the same build forever, so this script reads the
-# version out of Wire.h rather than taking it as an argument.
-#
-# Usage (from the repo root, after scripts\build_plugin.cmd Release):
-#   powershell -ExecutionPolicy Bypass -File scripts\publish_release.ps1
-#   powershell ... -Owner you -Repo KenshiCoop        # first run, or to change it
-#   powershell ... -WhatIf                            # print, write nothing
-#
-# It does NOT push or create the GitHub release - it prints the two commands to
-# run, so nothing leaves the machine without you typing it.
-# Do not attach KenshiCoop-source.zip (or another dedicated source archive).
-# Keep each release tag at the exact source commit used for its DLLs. Source
-# access is documented in README.md; dependency fetch/build instructions live in
-# docs/BUILD_SETUP.md. GitHub's automatic source downloads need no asset upload.
-#
-# RELEASE NOTES FORMAT (dist/RELEASE_NOTES.md, passed as --notes-file):
-#   * Russian first, plain. English goes in a <details><summary> block at the
-#     bottom so it is one click away without pushing the Russian down the page.
-#   * Do NOT use in-page anchor links to switch language. GitHub strips heading
-#     ids from RELEASE BODIES (they work in README.md, not here), so "#english"
-#     renders as a link that goes nowhere - verified on the v0.1.0 page.
-#     <details> is the only toggle that actually works in a release body.
-#   * Do not repeat the original-project attribution or the protocol number in every
-#     release; that belongs in README.md. Mention the protocol only when it
-#     CHANGES, since that is the release where it decides who can still connect.
-#   * Do not repeat the release title as a heading inside its body.
-#   * Keep build/test reports and source-distribution explanations out of the
-#     player-facing notes; retain changes, compatibility and installation.
-#
-# -Amend: same version/tag, replace the assets on the EXISTING GitHub release
-# (window-size, label copy, tiny fixes). Use a new COOP_BUILD_VERSION / tag
-# only for a real feature or a protocol bump. Order is still: upload BOTH DLLs
-# first, then push dist/UPDATE.txt (new hashes, same version=). The updater
-# re-downloads the pair when either hash changes even if version= matches.
-#
-# The updater refuses a manifest without uiSha256/uiUrl, and installs the two
-# DLLs only together, so every release MUST carry KenshiCoopUI.dll as an asset.
-
+# Local manifest/command preparation only: never uploads, tags, pushes or mutates
+# the stable feed. -Local and -WhatIf are strictly read-only, including receipts.
 [CmdletBinding()]
-param(
-    [string]$Owner,
-    [string]$Repo,
-    [string]$Dll    = "src\plugin\x64\Release\KenshiCoop.dll",
-    [string]$UiDll  = "src\ui\x64\Release\KenshiCoopUI.dll",
-    [string]$Mod    = "dist\mods\KenshiCoop\KenshiCoop.mod",
-    [string]$Json   = "dist\mods\KenshiCoop\RE_Kenshi.json",
-    [string]$Kit    = "dist\KenshiCoop-kit.zip",
-    [string]$ReleaseNotes = "dist\RELEASE_NOTES.md",
-    [string]$Out    = "dist\UPDATE.txt",
-    [string]$Notes  = "",
-    [switch]$Amend,
-    [switch]$WhatIf
-)
-
-$ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
-Set-Location $root
-
-# --- version + protocol straight out of the header the DLL was built from -----
-$wire = Get-Content 'src\netproto\Wire.h' -Raw
-if ($wire -notmatch 'COOP_BUILD_VERSION\s*=\s*"([^"]+)"') {
-    throw "COOP_BUILD_VERSION not found in src/netproto/Wire.h"
-}
-$version = $Matches[1]
-# Release uses the public branch, last in Wire.h; the private NET_DIAG branch is first.
-$protocols = [regex]::Matches($wire, 'PROTOCOL_VERSION\s*=\s*(\d+)')
-if ($protocols.Count -eq 0) {
-    throw "PROTOCOL_VERSION not found in src/netproto/Wire.h"
-}
-$proto = $protocols[$protocols.Count - 1].Groups[1].Value
-
-if (-not (Test-Path $Dll)) { throw "No DLL at $Dll - run scripts\build_plugin.cmd Release first" }
-if (-not (Test-Path $UiDll)) { throw "No UI DLL at $UiDll - run scripts\build_plugin.cmd Release first" }
-if (-not (Test-Path $Mod)) { throw "No KenshiCoop.mod at $Mod" }
-if (-not (Test-Path $Json)) { throw "No RE_Kenshi.json at $Json" }
-$dllItem = Get-Item $Dll
-$uiDllItem = Get-Item $UiDll
-
-# A DLL older than the header means the version string in it is not $version.
-$wireItem = Get-Item 'src\netproto\Wire.h'
-if ($dllItem.LastWriteTime -lt $wireItem.LastWriteTime) {
-    throw "$Dll is older than Wire.h - rebuild before publishing, or the DLL carries a different COOP_BUILD_VERSION than this manifest claims"
-}
-# The UI and the core ship as one build pair; a UI left from an earlier build
-# (e.g. only the core was rebuilt) would be published as this version's UI.
-$apiItem = Get-Item 'src\ui\CoopUiApi.h'
-if ($uiDllItem.LastWriteTime -lt $apiItem.LastWriteTime) {
-    throw "$UiDll is older than CoopUiApi.h - rebuild both DLLs with scripts\build_plugin.cmd Release"
-}
-
-$sha = (Get-FileHash $Dll -Algorithm SHA256).Hash.ToLower()
-$uiSha = (Get-FileHash $UiDll -Algorithm SHA256).Hash.ToLower()
-
-# --- owner/repo: remembered in the manifest so repeat runs need no arguments ---
-if (-not $Owner -or -not $Repo) {
-    if (Test-Path $Out) {
-        $prev = Get-Content $Out -Raw
-        if ($prev -match '(?m)^\s*url\s*=\s*https://github\.com/([^/]+)/([^/]+)/') {
-            if (-not $Owner) { $Owner = $Matches[1] }
-            if (-not $Repo) { $Repo = $Matches[2] }
-        }
-    }
-}
-if (-not $Owner -or -not $Repo) {
-    throw "First run needs -Owner <github account> -Repo <repository> (they are remembered in $Out afterwards)"
-}
-
-$tag = "v$version"
-$url = "https://github.com/$Owner/$Repo/releases/download/$tag/KenshiCoop.dll"
-$uiUrl = "https://github.com/$Owner/$Repo/releases/download/$tag/KenshiCoopUI.dll"
-
-if (-not (Test-Path $Kit)) { throw "No kit at $Kit - run scripts\make_mod_kit.ps1 -Configuration Release first" }
-if (-not (Test-Path $ReleaseNotes)) { throw "No release notes at $ReleaseNotes" }
-
-# A publication command must not pair selected runtime files with an older ZIP.
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $Kit).Path)
-try {
-    $required = @("KenshiCoop/KenshiCoop.dll", "KenshiCoop/KenshiCoopUI.dll",
-                  "KenshiCoop/KenshiCoop.mod", "KenshiCoop/RE_Kenshi.json")
-    if ($archive.Entries.Count -ne 4 -or
-        (Compare-Object $required @($archive.Entries | ForEach-Object { $_.FullName }))) {
-        throw "$Kit must contain exactly the four KenshiCoop runtime files"
-    }
-    foreach ($pair in @(@("KenshiCoop.dll", $sha), @("KenshiCoopUI.dll", $uiSha),
-                       @("KenshiCoop.mod", (Get-FileHash $Mod -Algorithm SHA256).Hash.ToLower()),
-                       @("RE_Kenshi.json", (Get-FileHash $Json -Algorithm SHA256).Hash.ToLower()))) {
-        $stream = $archive.GetEntry("KenshiCoop/$($pair[0])").Open()
-        try { $kitHash = (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash.ToLower() }
-        finally { $stream.Dispose() }
-        if ($kitHash -ne $pair[1]) { throw "$Kit contains a stale $($pair[0]); rebuild the kit" }
-    }
-} finally { $archive.Dispose() }
-
-$manifest = @"
-# KenshiCoop update manifest - read by the in-DLL updater over HTTPS.
-# Generated by scripts/publish_release.ps1; do not hand-edit sha256/uiSha256.
-version=$version
-proto=$proto
-sha256=$sha
-url=$url
-uiSha256=$uiSha
-uiUrl=$uiUrl
-notes=$Notes
-"@
-
-Write-Host ""
-Write-Host "  version   $version   (proto $proto)"
-Write-Host "  dll       $($dllItem.Length) bytes, built $($dllItem.LastWriteTime)"
-Write-Host "  sha256    $sha"
-Write-Host "  url       $url"
-Write-Host "  ui dll    $($uiDllItem.Length) bytes, built $($uiDllItem.LastWriteTime)"
-Write-Host "  uiSha256  $uiSha"
-Write-Host "  uiUrl     $uiUrl"
-Write-Host "  extra     $Mod"
-Write-Host "            $Json"
-Write-Host "            (first-time install; the updater downloads only the DLL pair)"
-Write-Host "  sources   https://github.com/$Owner/$Repo/tree/$tag"
-Write-Host "            (release tag; do not upload a separate source ZIP)"
-Write-Host ""
-
-if ($WhatIf) {
-    Write-Host "-WhatIf: not writing $Out"
-    Write-Host $manifest
-} else {
-    New-Item -ItemType Directory -Force -Path (Split-Path $Out) | Out-Null
-    # LF endings keep the updater manifest independent of Git's newline conversion.
-    $manifestLf = ($manifest -replace "`r`n", "`n")
-    [IO.File]::WriteAllText((Join-Path $root $Out), $manifestLf)
-    Write-Host "wrote $Out"
-}
-Write-Host ""
-Write-Host "Next, in order (the manifest must not go live before the asset it names):"
-if ($Amend) {
-    Write-Host "  AMEND $tag (same version, replace assets):"
-    Write-Host "  1. gh release upload $tag `"$Kit`" `"$Dll`" `"$UiDll`" --repo `"$Owner/$Repo`" --clobber"
-    Write-Host "  2. git add $Out && git commit -m `"amend $tag`" && git push"
-} else {
-    Write-Host "  1. gh release create $tag `"$Kit`" `"$Dll`" `"$UiDll`" --repo `"$Owner/$Repo`" --verify-tag --title `"$tag`" --notes-file `"$ReleaseNotes`""
-    Write-Host "  2. git add $Out && git commit -m `"release $tag`" && git push"
-}
-Write-Host ""
-Write-Host "Order matters: clients read the manifest first and download the url it"
-Write-Host "names. Pushing the manifest before the release asset exists gives every"
-Write-Host "player a failed download until step 1 lands."
+param([string]$Owner='kotetsyy',[string]$Repo='KenshiCoop4up',[string]$NativeBin='',
+      [string]$Kit='dist\KenshiCoop-kit.zip',[string]$ReleaseNotes='dist\RELEASE_NOTES.md',
+      [string]$Out='',[string]$Notes='', [switch]$Amend,[switch]$WhatIf,[switch]$Local,[switch]$WriteManifest)
+$ErrorActionPreference='Stop'
+$root=Split-Path $PSScriptRoot -Parent
+if($Owner -cne 'kotetsyy' -or $Repo -cne 'KenshiCoop4up'){throw 'Publisher repository is fixed to kotetsyy/KenshiCoop4up.'}
+if($Notes -match '[\r\n\x00]'){throw 'Notes must be one line.'}
+. (Join-Path $PSScriptRoot 'RuntimeDistribution.ps1') -Configuration Release -NativeBin $NativeBin
+$files=Get-CoopRuntimeFiles -Configuration Release -NativeBin $NativeBin
+$wire=Get-Content -LiteralPath (Join-Path $root 'src\netproto\Wire.h') -Raw
+if($wire -notmatch 'COOP_BUILD_VERSION\s*=\s*"(\d+\.\d+\.\d+)"'){throw 'Exact build version missing.'}
+$version=$Matches[1]
+$releaseBranch=[regex]::Match($wire,'(?s)#ifdef\s+KENSHICOOP_NET_DIAG\b.*?#else\b(.*?)#endif\b')
+if(-not $releaseBranch.Success){throw 'Explicit public Release protocol branch missing.'}
+$protocols=[regex]::Matches($releaseBranch.Groups[1].Value,'PROTOCOL_VERSION\s*=\s*(\d+)')
+if($protocols.Count -ne 1){throw 'Ambiguous Release protocol.'};$proto=$protocols[0].Groups[1].Value
+$kitPath=if([IO.Path]::IsPathRooted($Kit)){$Kit}else{Join-Path $root $Kit}
+Assert-CoopRuntimeZip -Zip $kitPath -Files $files
+$runtimeHashes=Get-CoopRuntimeHashes $files
+$notesPath=if([IO.Path]::IsPathRooted($ReleaseNotes)){$ReleaseNotes}else{Join-Path $root $ReleaseNotes}
+if(-not(Test-Path -LiteralPath $notesPath -PathType Leaf)){throw 'Release notes missing.'}
+$tag="v$version";$lines=@('# Schema 2: old updaters deliberately reject before download.','schema=2','transportAbi=2',"version=$version","proto=$proto")
+$keys=@('core','ui','steam','udp');$names=@('KenshiCoop.dll','KenshiCoopUI.dll','KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll')
+for($i=0;$i -lt 4;++$i){$lines+="$($keys[$i])Sha256=$($runtimeHashes[$names[$i]])";$lines+="$($keys[$i])Url=https://github.com/$Owner/$Repo/releases/download/$tag/$($names[$i])"}
+$lines+="notes=$Notes";$manifest=($lines -join "`n")+"`n"
+$bytes=[Text.Encoding]::UTF8.GetBytes($manifest)
+if($bytes.Length -gt 65536){throw 'Manifest exceeds native updater 65536-byte UTF-8 limit.'}
+# Validate the exact local schema before any candidate write.
+$fields=@{}
+foreach($line in $lines){if($line.StartsWith('#')){continue};$pair=$line.Split([char[]]'=',2);if($pair.Count -ne 2 -or $fields.ContainsKey($pair[0])){throw 'Malformed/duplicate manifest field'};$fields[$pair[0]]=$pair[1]}
+$allowed=@('schema','transportAbi','version','proto','notes','coreSha256','coreUrl','uiSha256','uiUrl','steamSha256','steamUrl','udpSha256','udpUrl')
+if(Compare-Object $allowed @($fields.Keys) -CaseSensitive){throw 'Manifest schema mismatch'}
+foreach($key in $keys){if($fields["${key}Sha256"] -cnotmatch '^[0-9a-f]{64}$'){throw 'Invalid component hash'}}
+Write-Output $manifest
+if($WriteManifest -and -not $Local -and -not $WhatIf) {
+    if(-not $Out){throw 'Explicit non-stable -Out is required for -WriteManifest.'}
+    $outPath=[IO.Path]::GetFullPath($(if([IO.Path]::IsPathRooted($Out)){$Out}else{Join-Path $root $Out}))
+    if($outPath -ieq (Join-Path $root 'dist\UPDATE.txt') -or $outPath -ieq (Join-Path $root 'dist\RELEASE_NOTES.md')){throw 'Stable feed/notes mutation forbidden.'}
+    $stream=[IO.File]::Open($outPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}
+} else {Write-Host 'Read-only local/WhatIf preparation: no files, feeds or release assets changed.'}
+$assets='"'+$kitPath+'" '+(($names|ForEach-Object{'"'+$files[$_]+'"'}) -join ' ')
+if($Amend){Write-Host "UNEXECUTED: gh release upload $tag $assets --repo $Owner/$Repo --clobber"}
+else{Write-Host "UNEXECUTED: gh release create $tag $assets --repo $Owner/$Repo --verify-tag --title $tag --notes-file `"$notesPath`""}
+Write-Host 'LOCAL ONLY. Two-account Steam P2P is unverified; no stable publication is authorized.'

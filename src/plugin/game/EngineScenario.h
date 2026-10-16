@@ -22,8 +22,54 @@ class Faction;
 class Item;
 
 namespace coop {
+struct InvItemEntry;
 namespace engine {
 
+
+// Native physical witnesses: transport ids are read from existing replicator maps.
+struct ScenarioItemWitness {
+    unsigned int ownerId,eventId,itemHand[5],sourceHand[5],claimOwner;
+};
+struct ScenarioItemSample {
+    int bag,source,ground,location;
+    unsigned int itemHand[5],metadataHash;
+};
+inline bool sameScenarioItemSample(const ScenarioItemSample& a,const ScenarioItemSample& b) {
+    if (a.bag!=b.bag || a.source!=b.source || a.ground!=b.ground ||
+        a.location!=b.location || a.metadataHash!=b.metadataHash) return false;
+    for (int i=0;i<5;++i) if (a.itemHand[i]!=b.itemHand[i]) return false;
+    return true;
+}
+struct ScenarioItemStability {
+    ScenarioItemSample sample;
+    unsigned long sinceMs,lastMs,stableMs;
+    unsigned int sampleCount;
+    ScenarioItemStability() : sinceMs(0),lastMs(0),stableMs(0),sampleCount(0) {}
+    void observe(bool complete,const ScenarioItemSample& next,unsigned long now) {
+        if (!complete) { sampleCount=0; stableMs=0; return; }
+        if (!sampleCount || now-lastMs>1000 || !sameScenarioItemSample(sample,next)) {
+            sample=next; sinceMs=now; sampleCount=1; stableMs=0;
+        } else if (now-lastMs>=500) {
+            ++sampleCount; stableMs=now-sinceMs;
+        } else return;
+        lastMs=now;
+    }
+    bool stable() const { return sampleCount>=5 && stableMs>=2000; }
+};
+// Complete simultaneous root-owned quantities and exhaustive loaded-ground units.
+bool sampleScenarioItem(GameWorld*,const unsigned int bag[5],
+                        const unsigned int source[5],const char* sid,unsigned int type,
+                        const unsigned int itemHand[5],ScenarioItemSample* out);
+bool pickScenarioPhysicalItem(GameWorld*,const unsigned int owner[5],const char* sid,
+                              unsigned int type,unsigned int outHand[5],InvItemEntry* out);
+// Exact before/after binding recorded only at a successful native pickup boundary.
+bool readScenarioItemAfter(GameWorld*,const unsigned int before[5],unsigned int after[5]);
+inline bool scenarioProxyIdentityMatches(const void* mintedWorld,const void* world,
+                                         unsigned int generation,unsigned int currentGeneration,
+                                         const unsigned int hand[5],const void* minted,const void* resolved) {
+    return world && mintedWorld==world && generation==currentGeneration && minted &&
+        (hand[3] || hand[4]) && minted==resolved;
+}
 #ifdef KENSHICOOP_HARNESS
 // Native cursor lifetime: a real remove and later add, across separate game ticks.
 Item* holdInventoryBag(GameWorld* gw, const unsigned int source[5], const char* sid);
@@ -116,6 +162,17 @@ bool setupSquadScene(GameWorld* gw);
 bool claimJoinSquadTab(GameWorld* gw, unsigned int playerId, unsigned int nPlayers,
                        unsigned int wireHands[][5], unsigned int localHands[][5],
                        unsigned int* outN);
+bool seedGearIdentityVariant(GameWorld*, const unsigned int ownerHand[5],
+                             const InvItemEntry& identity, void** outItem);
+int dropPhysicalItemByHand(GameWorld*, const unsigned int itemHand[5],
+                           unsigned int outAfterItemHand[5]);
+int pickupPhysicalItemByHand(GameWorld*, const unsigned int ownerHand[5],
+                             const unsigned int itemHand[5],
+                             unsigned int outAfterItemHand[5]);
+bool equipPhysicalItemByHand(GameWorld*, const unsigned int ownerHand[5],
+                             const unsigned int itemHand[5]);
+bool physicalWeaponIsDrawn(GameWorld*, const unsigned int ownerHand[5],
+                            const unsigned int itemHand[5]);
 
 // split_far fixture bake: relocate every player-squad member that is NOT in the
 // LEADER's squad tab to (x,y,z) and halt it there, so the baked save opens with

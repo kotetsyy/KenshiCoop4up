@@ -11,6 +11,8 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../game/InventoryTransactionBridge.h"
+#include "LockAuthority.h"
 
 namespace coop {
 
@@ -60,7 +62,7 @@ Replicator::Replicator()
       camHintSendMs_(0), peerCamMs_(0),
       midCursor_(0), midSliceMs_(0), midFastPromoted_(0),
       censusParkDist_(0.0f), censusParks_(0),
-      censusPrevMs_(0), censusWalkDist_(0.0f), censusWalks_(0),
+      censusWalkDist_(0.0f), censusWalks_(0),
       censusFreezeAi_(true),
       attentionRadius_(0.0f),
       attnFlips_(0), attnWinMs_(0), attnBaseSupp_(0), attnBaseCull_(0),
@@ -71,7 +73,7 @@ Replicator::Replicator()
       speedCombatCap_(true),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedEffMult_(-1.0f), speedEffPaused_(false), speedLastReqOwner_(0),
-      speedSeqOut_(1), speedSeqSeen_(0),
+      speedSeqOut_(1),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
       speedDebounceUntilMs_(0), speedPendHave_(false),
       speedPendMult_(1.0f), speedPendPaused_(false), speedPendOwner_(0),
@@ -92,7 +94,7 @@ Replicator::Replicator()
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
-      fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
+      fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true), proceduralWorld_(0),
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeBrake_(true),
       timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
@@ -104,6 +106,10 @@ Replicator::Replicator()
     memset(peerNick_, 0, sizeof(peerNick_));
     memset(peerReadyLoadIds_, 0, sizeof(peerReadyLoadIds_));
     memset(nickHandSet_, 0, sizeof(nickHandSet_));
+    playerClaimPeers_=0;
+    pendingDropCursor_ = std::make_pair(0u, 0u);
+    pendingNpcDropCursor_.t = pendingNpcDropCursor_.c = pendingNpcDropCursor_.cs =
+        pendingNpcDropCursor_.i = pendingNpcDropCursor_.s = 0;
 }
 
 // ---- Phase 3: unified entity lifecycle ---------------------------------------
@@ -198,6 +204,7 @@ void Replicator::resetSession() {
     proxyByKey_.clear();
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
+    midPoseActors_.clear();
     midCursor_ = 0; midSliceMs_ = 0;
     life_.clear();             // Phase 3 lifecycle: the OLD world's journeys
     lifeSweepMs_ = 0;
@@ -217,9 +224,10 @@ void Replicator::resetSession() {
     // Protocol 36: the existence census describes the OLD world's hands; the
     // host re-publishes within a second of the new world going live.
     censusHands_.clear();
+    npcCensusLedger_.clear();
     censusPos_.clear();
     censusPrev_.clear();
-    censusPrevMs_ = 0;
+    censusSource_.clear();
     censusFix_.clear();
     parkMs_.clear();
     censusRecvMs_ = 0;
@@ -247,6 +255,9 @@ void Replicator::resetSession() {
     attnVetoMask_ = 0;
     furnPeerPend_.clear();
     ownFurnExit_.clear();
+    carryPlacements_.clear();
+    pendingFurnitureEvents_.clear();
+    furnitureEnterApplied_.clear();
     // Session maps + change-gate baselines (they describe the OLD world; the
     // reloaded save re-seeds them on first sample).
     ownBuilds_.clear();
@@ -261,6 +272,7 @@ void Replicator::resetSession() {
     invPub_.clear();
     invRecv_.clear();
     invPending_.clear();
+    invRevision_.clear();
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
     guiDefer_.clear();
@@ -270,6 +282,11 @@ void Replicator::resetSession() {
     worldSeeded_ = false; // re-baseline the reloaded world's save-native items
     weaponCensus_.clear();
     appliedDrops_.clear();
+    pendingDrops_.clear();
+    pendingNpcDrops_.clear();
+    pendingDropCursor_ = std::make_pair(0u, 0u);
+    pendingNpcDropCursor_.t = pendingNpcDropCursor_.c = pendingNpcDropCursor_.cs =
+        pendingNpcDropCursor_.i = pendingNpcDropCursor_.s = 0;
     appliedPickups_.clear();
     groundedWeapons_.clear();
     pendingPickups_.clear(); // the objects those intents named belong to the old world
@@ -278,9 +295,15 @@ void Replicator::resetSession() {
     xferOut_.clear();
     appliedXfers_.clear();
     pendingXfers_.clear();
+    transactionIntents_.clear();
+    inventoryResyncPeers_.clear();
+    inventoryResyncActors_.clear();
+    inventoryAwaitingActorAck_.clear();
+    inventoryCheckpointAcks_.clear();
     receivedXferAcks_.clear();
     deferredInvCommits_.clear();
     engine::clearItemTransfers();
+    engine::clearInventoryTransactionState();
     wdSuppress_.clear();
     medPub_.clear();
     medRecv_.clear();
@@ -297,6 +320,8 @@ void Replicator::resetSession() {
     stealthPub_.clear();
     pinOwned_.clear();
     pinPeer_.clear();
+    playerActorOwners_.clear();
+    announcedPlayerActors_.clear(); playerClaimPeers_=0;
     publishAsWire_.clear();
     peerTabAlias_.clear();
     moveEcho_.clear();
@@ -314,6 +339,7 @@ void Replicator::resetSession() {
     spawnInfoPend_.clear();
     unresolvedHands_.clear();
     forceReqHands_.clear();
+    actorHandoffs_.clear();
     spawnLogged_.clear();
     spawnReplyMs_.clear();
     censusScanMs_ = 0;
@@ -334,7 +360,7 @@ void Replicator::resetSession() {
     speedEffMult_     = -1.0f;
     speedEffPaused_   = false;
     speedLastReqOwner_ = 0;
-    speedSeqSeen_     = 0;
+    speedAdmission_.reset();
     speedLastSendMs_  = 0;
     speedCombatSampleMs_ = 0;
     speedCombatHoldMs_ = 0;
@@ -366,6 +392,8 @@ void Replicator::resetSession() {
     fixtureSampleMs_ = 0;
     fixtureOut_.clear();
     fixtureMap_.clear();
+    poseFixtureMap_.clear();
+    pendingPoseFixtures_.clear();
     contCensusMs_ = 0;
     authReassertMs_ = 0;
     // Config gates, ownRanks_ and every OUTBOUND seq counter are deliberately
@@ -408,7 +436,7 @@ void Replicator::clearPeerReplicationState(GameWorld* gw) {
     unsigned int wcleared = 0, wstale = 0;
     for (std::map<std::pair<u32, u32>, WorldProxy>::iterator wi = worldProxies_.begin();
          wi != worldProxies_.end(); ++wi) {
-        RootObject* live = gw ? liveWorldProxy(wi->second) : 0;
+        RootObject* live = gw ? liveWorldProxy(gw,wi->second) : 0;
         if (!live) { ++wstale; continue; }
         if (engine::removeWorldItemProxy(gw, live)) ++wcleared;
     }
@@ -417,6 +445,7 @@ void Replicator::clearPeerReplicationState(GameWorld* gw) {
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
     // Now drop every map (proxyByKey_ included) back to freshly-launched state.
+    engine::clearMaterializedPoseFixtures();
     resetSession();
 }
 
@@ -454,8 +483,13 @@ void Replicator::ingest(Inbound& in) {
             if ((long)(t - now) > 0) t = now;
         }
         Driven& d = targets_[keyOf(it->e)];
-        d.interp.push(it->e, t, now);
-        d.lastSeenMs = now;
+        if (d.interp.push(it->e, t, now)) {
+            d.lastSeenMs = now;
+            d.streamOwner = it->ownerId;
+            std::map<Key,ActorHandoff>::iterator handoff=actorHandoffs_.find(keyOf(it->e));
+            if (handoff!=actorHandoffs_.end() && handoff->second.destination==it->ownerId)
+                actorHandoffs_.erase(handoff);
+        }
     }
 }
 
@@ -477,19 +511,54 @@ void Replicator::ingestInv(Inbound& in) {
     }
     typedef std::pair<u32,Key> PendingKey;
     for (std::deque<InboundInv>::iterator it=got.begin();it!=got.end();++it) {
-        Key wire=keyForInvLocalHand(it->cKey);
-        invPending_[PendingKey(it->ownerId,wire)]=*it;
+        const Key wire=keyForInvLocalHand(it->cKey);
+        if (it->flags & INV_FLAG_CHECKPOINT_ACK) {
+            std::map<Key,std::pair<u32,u32> >::iterator awaited=inventoryAwaitingActorAck_.find(wire);
+            if (isHostRole() && it->ownerId>0 && awaited!=inventoryAwaitingActorAck_.end() &&
+                awaited->second.first==it->ownerId && awaited->second.second==it->revision)
+                inventoryAwaitingActorAck_.erase(awaited);
+            continue;
+        }
+        if ((it->flags & INV_FLAG_TRANSACTION) && (isHostRole() || it->ownerId!=0)) continue;
+        if (isHostRole() && it->ownerId>0 &&
+            (inventoryResyncPeers_.count(it->ownerId) || inventoryResyncActors_.count(wire) ||
+             inventoryAwaitingActorAck_.count(wire))) continue;
+        const PendingKey identity(it->ownerId,wire);
+        if (!invRevision_[identity].accept(it->revision,(it->flags & INV_FLAG_TRANSACTION)!=0)) {
+            unsigned int local[5];
+            if ((it->flags & INV_FLAG_CHECKPOINT) && resolveInvWireHand(wire,local)) {
+                std::map<Key,InvRecv>::const_iterator applied=invRecv_.find(keyForInvLocalHand(local));
+                if (applied!=invRecv_.end() && applied->second.ownerId==0 &&
+                    applied->second.revision==it->revision && applied->second.checkpoint &&
+                    !applied->second.dirty && !applied->second.truncated)
+                    inventoryCheckpointAcks_[wire]=it->revision;
+            }
+            continue;
+        }
+        InboundInv& pending=invPending_[identity];
+        pending.ownerId=it->ownerId; pending.keyKind=it->keyKind;
+        pending.flags=it->flags; pending.revision=it->revision;
+        memcpy(pending.cKey,it->cKey,sizeof(pending.cKey));
+        pending.items.swap(it->items);
     }
     for (std::map<PendingKey,InboundInv>::iterator it=invPending_.begin();it!=invPending_.end();) {
         unsigned int local[5];
         if (!resolveInvWireHand(it->first.second,local)) { ++it; continue; }
         Key k=keyForInvLocalHand(local);
-        // Ignore claims to our pockets or to the host's world; only its authority writes.
+        // Only a HOST-committed operation may reconcile our own pocket.
+        const bool transaction=it->second.ownerId==0 &&
+            (it->second.flags & INV_FLAG_TRANSACTION)!=0;
         bool own=ownHands_.count(k) || ownedContainers_.count(k);
-        if (!own && !(isHostRole() && ownerClassForHand(local)==0)) {
+        if ((!own || transaction) && !(isHostRole() && ownerClassForHand(local)==0)) {
             InvRecv& r=invRecv_[k];
-            r.ownerId=it->second.ownerId; r.items=it->second.items; r.dirty=true;
+            r.wireKey=it->first.second;
+            r.ownerId=it->second.ownerId; r.items.swap(it->second.items); r.dirty=true;
+            r.revision=it->second.revision; r.transaction=transaction;
+            r.checkpoint=(it->second.flags & INV_FLAG_CHECKPOINT)!=0;
             r.truncated=(it->second.flags & INV_FLAG_TRUNCATED)!=0;
+            // Ingest runs before the engine tick: close native extraction now,
+            // not after hooks could create a reservation that blocks this checkpoint.
+            if (own && transaction) engine::setInventoryCheckpointPending(local,true);
         }
         invPending_.erase(it++);
     }
@@ -563,6 +632,22 @@ bool Replicator::ownsTab(const std::pair<u32, u32>& key, unsigned int rank) cons
     // the historical rule, so this is never MORE permissive than before.
     return ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
 }
+u32 Replicator::playerActorOwner(const Key& actor) const {
+    std::map<Key,u32>::const_iterator explicitOwner=playerActorOwners_.find(actor);
+    if (explicitOwner!=playerActorOwners_.end()) return explicitOwner->second;
+    std::map<std::pair<u32,u32>,unsigned int>::const_iterator rank=
+        tabRank_.find(std::make_pair(actor.c,actor.cs));
+    return rank!=tabRank_.end() && rankIsShared(rank->second) && rank->second<MAX_PLAYERS
+        ? (u32)rank->second : OWNER_ID_ALL;
+}
+bool Replicator::validInitialPlayerClaim(GameWorld* gw,const Key& actor,u32 ownerId,
+                                       unsigned playerCount) const {
+    // Previously claimed actors cannot be stolen by another admitted peer.
+    std::map<Key,u32>::const_iterator claimed=playerActorOwners_.find(actor);
+    if (claimed!=playerActorOwners_.end() && claimed->second!=0) return false;
+    return engine::validateJoinSquadClaim(gw,resolveEventChar(actor),ownerId,playerCount);
+}
+
 
 unsigned int Replicator::tabRankFor(const std::pair<u32, u32>& key,
                                     const std::vector<std::pair<u32, u32> >& ctnrs) const {
@@ -717,5 +802,128 @@ void Replicator::logSmoothSummary() {
     }
 }
 
+
+bool Replicator::encodeEnvironmentActor(const unsigned int local[5],u32* owner,unsigned int wire[5]) const {
+    if (!local || !owner || !wire || localId_>=MAX_PLAYERS) return false;
+    Character* c=engine::resolveCharByHand(local[3],local[4],local[0],local[1],local[2]);
+    unsigned int actual[5];
+    if (!c || !engine::readObjectHand(reinterpret_cast<RootObject*>(c),actual) ||
+        memcmp(actual,local,sizeof(actual))) return false;
+    const Key native=keyForInvLocalHand(local);
+    Key canonical=ownedWireKey(native);
+    std::map<Character*,Key>::const_iterator binding=canonicalOf_.find(c);
+    if (binding!=canonicalOf_.end()) {
+        canonical=binding->second;
+        std::map<Key,Driven>::const_iterator driven=targets_.find(canonical);
+        if (driven==targets_.end() || !driven->second.lastSeenMs ||
+            driven->second.streamOwner>=MAX_PLAYERS) return false;
+        *owner=driven->second.streamOwner;
+    } else if (ownHands_.count(native) || pinOwned_.count(native)) {
+        std::map<Key,u32>::const_iterator claimed=playerActorOwners_.find(canonical);
+        if (claimed==playerActorOwners_.end() || claimed->second!=localId_) return false;
+        *owner=localId_;
+    } else {
+        // Only a body we actually publish can introduce a local actor anchor.
+        // A resolvable peer-native hand is not an authenticated binding.
+        if (playerActorOwners_.count(canonical) || !hostBody_.count(canonical)) return false;
+        *owner=localId_;
+    }
+    wire[0]=canonical.t;wire[1]=canonical.c;wire[2]=canonical.cs;
+    wire[3]=canonical.i;wire[4]=canonical.s;
+    return true;
+}
+bool Replicator::resolveEnvironmentActor(u32 owner,const unsigned int wire[5],unsigned int local[5]) const {
+    if (owner>=MAX_PLAYERS || !wire || !local) return false;
+    const Key key=keyForInvLocalHand(wire);
+    Character* c=resolveEventChar(key);
+    if (!c) return false;
+    if (owner!=localId_) {
+        std::map<Key,Driven>::const_iterator driven=targets_.find(key);
+        std::map<Character*,Key>::const_iterator binding=canonicalOf_.find(c);
+        if (driven==targets_.end() || driven->second.streamOwner!=owner ||
+            !driven->second.lastSeenMs || binding==canonicalOf_.end() ||
+            !(binding->second==key)) return false;
+    }
+    unsigned int encoded[5];u32 actualOwner=MAX_PLAYERS;
+    return engine::readObjectHand(reinterpret_cast<RootObject*>(c),local) &&
+        encodeEnvironmentActor(local,&actualOwner,encoded) && actualOwner==owner &&
+        !memcmp(encoded,wire,5*sizeof(unsigned int));
+}
+bool Replicator::queryClaimedActor(const unsigned int local[5],u32* owner,unsigned int canonical[5]) const {
+    u32 source=MAX_PLAYERS;
+    if (!owner || !encodeEnvironmentActor(local,&source,canonical)) return false;
+    std::map<Key,u32>::const_iterator claim=playerActorOwners_.find(keyForInvLocalHand(canonical));
+    if (claim==playerActorOwners_.end() || claim->second>=MAX_PLAYERS) return false;
+    *owner=claim->second;
+    return true;
+}
+namespace {
+template<class Rows> void retireOwnerRows(Rows& rows,u32 owner,bool all) {
+    for (typename Rows::iterator it=rows.begin();it!=rows.end();)
+        if (all || it->first.first==owner) rows.erase(it++);
+        else ++it;
+}
+}
+void Replicator::onPeerDisconnected(GameWorld* gw,u32 owner) {
+    const bool all=owner==OWNER_ID_ALL || (!isHostRole() && owner==0);
+    if (!all && owner>=MAX_PLAYERS) return;
+    announcedPlayerActors_.clear(); playerClaimPeers_=0;
+    if (all) {
+        for (u32 id=0;id<MAX_PLAYERS;++id) retireInventoryPeer(gw,id);
+        npcCensusLedger_.clear();
+    } else {
+        retireInventoryPeer(gw,owner);
+        npcCensusLedger_.retire(owner);
+    }
+    retireOwnerRows(censusPrev_,owner,all);
+    for (std::map<Key,u32>::iterator it=censusSource_.begin();it!=censusSource_.end();) {
+        if (all || it->second==owner) {
+            censusHands_.erase(it->first);
+            censusPos_.erase(it->first);
+            censusFix_.erase(it->first);
+            parkMs_.erase(it->first);
+            censusSource_.erase(it++);
+        } else ++it;
+    }
+    if (all) censusRecvMs_=0;
+    retireOwnerRows(invPending_,owner,all);
+    retireOwnerRows(invRevision_,owner,all);
+    retireOwnerRows(appliedXfers_,owner,all);
+    retireOwnerRows(pendingXfers_,owner,all);
+    retireOwnerRows(transactionIntents_,owner,all);
+    for (std::map<Key,InvRecv>::iterator it=invRecv_.begin();it!=invRecv_.end();)
+        if (all || it->second.ownerId==owner) invRecv_.erase(it++); else ++it;
+    for (std::map<Key,u32>::iterator it=inventoryResyncActors_.begin();it!=inventoryResyncActors_.end();)
+        if (all || it->second==owner) inventoryResyncActors_.erase(it++); else ++it;
+    for (std::map<Key,std::pair<u32,u32> >::iterator it=inventoryAwaitingActorAck_.begin();it!=inventoryAwaitingActorAck_.end();)
+        if (all || it->second.first==owner) inventoryAwaitingActorAck_.erase(it++); else ++it;
+    if (all) { inventoryResyncPeers_.clear();inventoryCheckpointAcks_.clear(); }
+    else inventoryResyncPeers_.erase(owner);
+    for (std::map<Key,CarryPlacement>::iterator it=carryPlacements_.begin();it!=carryPlacements_.end();)
+        if (all || it->second.owner==owner || playerActorOwner(it->first)==owner)
+            carryPlacements_.erase(it++); else ++it;
+    for (std::map<Key,EventPacket>::iterator it=pendingFurnitureEvents_.begin();it!=pendingFurnitureEvents_.end();)
+        if (all || it->second.ownerId==owner || playerActorOwner(it->first)==owner) {
+            furnitureEnterApplied_.erase(it->first);pendingFurnitureEvents_.erase(it++);
+        } else ++it;
+    if (all) furnitureEnterApplied_.clear();
+    for (std::map<PoseFixtureKey,PoseFixtureRow>::iterator it=poseFixtureMap_.begin();it!=poseFixtureMap_.end();)
+        if (all || it->first.first==owner) poseFixtureMap_.erase(it++); else ++it;
+    for (std::map<Key,FixtureRow>::iterator it=fixtureMap_.begin();it!=fixtureMap_.end();++it) {
+        if (all) memset(it->second.seqSeen,0,sizeof(it->second.seqSeen));
+        else it->second.seqSeen[owner]=0;
+    }
+    for (std::map<Key,DoorRow>::iterator it=doorRows_.begin();it!=doorRows_.end();++it)
+        sync::doorRetirePeerSequences(it->second.seqSeen,owner,all);
+    for (std::map<Character*,Key>::iterator it=canonicalOf_.begin();it!=canonicalOf_.end();) {
+        std::map<Key,Driven>::const_iterator driven=targets_.find(it->second);
+        if (all || (driven!=targets_.end() && driven->second.streamOwner==owner))
+            canonicalOf_.erase(it++); else ++it;
+    }
+    for (std::map<Key,Driven>::iterator it=targets_.begin();it!=targets_.end();++it)
+        if (all || it->second.streamOwner==owner) {
+            it->second.lastSeenMs=0;it->second.fresh=false;
+        }
+}
 
 } // namespace coop

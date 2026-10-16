@@ -17,16 +17,17 @@ typedef signed char    i8;
 typedef signed int     i32;
 typedef unsigned short u16;
 typedef unsigned int   u32;
+typedef unsigned __int64 u64;
 typedef float          f32;
 typedef double         f64;
 
 // Protocol version is checked at handshake; a mismatch is rejected (no back-compat).
-// Public 70 carries complete bag transfers and exact merchant stock/template state.
+// Public 80 adds inventory operation revisions and native door parent identity.
 #ifdef KENSHICOOP_NET_DIAG
-// Private 71 additionally carries bounded, reliable join-log chunks.
-const u16 PROTOCOL_VERSION = 71;
+// Private 81 additionally carries bounded, reliable join-log chunks.
+const u16 PROTOCOL_VERSION = 81;
 #else
-const u16 PROTOCOL_VERSION = 70;
+const u16 PROTOCOL_VERSION = 80;
 #endif
 
 // RELEASE id - a different axis from PROTOCOL_VERSION, and the two are routinely
@@ -47,7 +48,7 @@ const u16 PROTOCOL_VERSION = 70;
 // introduced ordering, which is the only moment it was free: those clients
 // install whatever the manifest names regardless of order, so they follow the
 // renumber, and every build after this one is ordered and monotonic.
-const char* const COOP_BUILD_VERSION = "0.1.31";
+const char* const COOP_BUILD_VERSION = "0.2.0";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;
@@ -104,6 +105,10 @@ enum PacketType {
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
     PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
     PKT_PLAYER_ROSTER    = 49, // RELIABLE display-name table (host -> all, protocol 56); RosterPacket
+    PKT_WORLD_READY      = 50, // join -> host, exact completed LOAD_GO
+    PKT_SESSION_ACK      = 51, // client confirms WELCOME before host publishes
+    PKT_PROCEDURAL       = 52, // reliable session-scoped procedural region reconciliation
+    PKT_ENVIRONMENT_ITEMS= 53, // reliable complete procedural environment item scopes
 #ifdef KENSHICOOP_NET_DIAG
     PKT_DEBUG_LOG_FILE   = 250 // private JOIN -> HOST local-log byte stream
 #endif
@@ -160,6 +165,38 @@ enum EventType {
 const u32 OWNER_ID_ALL = 0xFFFFFFFFu;
 
 #pragma pack(push, 1)
+
+enum ProceduralCategory { PROC_CATEGORY_CAMP_BED=1 };
+enum ProceduralObjectFlags { PROC_OWNER=1, PROC_TOWN=2, PROC_INSIDE=4, PROC_OUTSIDE=8 };
+enum ProceduralStateFlags { PROC_COMPLETE=1, PROC_PAUSED=2, PROC_DISMANTLED=4, PROC_NEST=8 };
+struct ProceduralObject {
+    u64 id;
+    u8 category,flags;
+    char sid[48];
+    f32 x,y,z,heading;
+    f32 rotationX,rotationY,rotationZ,rotationW;
+    i32 floor;
+    u32 buildingFunction,stateFlags;
+    f32 constructionProgress;
+    char ownerSid[48],townSid[48],insideSid[48];
+    f32 townX,townY,townZ,insideX,insideY,insideZ;
+};
+// JOIN controls share GAME_RELIABLE ordering: retire membership before scope commit.
+enum ProceduralOperation { PROC_REQUEST=1, PROC_BEGIN=2, PROC_ROW=3, PROC_END=4, PROC_ACK=5,
+    PROC_RETIRE=6, PROC_SCOPE_COMMIT=7 };
+const unsigned PROCEDURAL_OBJECTS_MAX=512;
+// Session framing permits reconciliation before READY; world/load remain fenced.
+struct ProceduralPacket {
+    u8 type;
+    u32 ownerId;
+    u64 worldToken;
+    u32 loadId;
+    i32 regionX,regionZ;
+    u32 epoch;
+    u8 operation;
+    u32 count,digest;
+    ProceduralObject object;
+};
 
 const unsigned HELLO_NAME_MAX = 63;
 
@@ -461,14 +498,7 @@ struct EntityBatchHeader {
 // is the HARD receive-side bound and the raw-UDP sender chunk size.
 const unsigned int ENTITY_BATCH_MAX = 17;
 
-// Steam sender chunk size: the Steam P2P transport clamps ENet's MTU to
-// 1200 B, and ENet sends an oversized UNRELIABLE packet as RELIABLE
-// fragments - retransmits and ordering stalls on the motion stream,
-// on exactly the transport real sessions use (architecture review
-// 2026-07-10). 14 * 79 B + 14 B header = 1120 B, inside 1200 with ENet's
-// per-packet overhead. Sender-side only - the receiver validates by
-// len >= need against the header count, so mixed caps interoperate.
-const unsigned int ENTITY_BATCH_MAX_STEAM = 14;
+
 
 // ---- Phase 4a: container-contents (inventory) snapshot ---------------------
 // World objects (items/buildings) carry the same save-stable `hand` as Characters,
@@ -508,7 +538,7 @@ struct InvItemEntry {
     // for the lock state; a peer's local lockpick must not desync it (see the
     // non-owner unlock guard in ReplicatorDrive). Cage occupancy (IN_PRISON) masks
     // the chained furniture kind, so this rides the inventory snapshot as an
-    // occupancy-independent lock signal. parentIdx (below) keeps `section` 2-byte aligned.
+    // occupancy-independent lock signal.
     u8   locked;
     // PARENT REFERENCE (protocol 48): 0 = this item sits directly in the container being
     // described; N > 0 = it is NESTED inside the item at index N-1 of this same entry array.
@@ -516,9 +546,8 @@ struct InvItemEntry {
     // (section 'backpack_content') that nothing in the wearer's own sections mentions, so a
     // bagged item was described by no snapshot at all and simply did not exist for the peer:
     // put something in a bag, drop the bag, and the other side picked up a bag without it.
-    // An index (rather than a sid) keeps two identical bags distinguishable and costs the byte
-    // that was already reserved here, so the entry size does not move.
-    u8   parentIdx;
+    // Wide enough for every parent in a complete staged inventory snapshot.
+    u16  parentIdx;
     u16  section;    // hash of the equip SECTION name (0 = loose / none). Distinguishes
                      // the two weapon slots ('hip' vs 'back'), which share AttachSlot
                      // ATTACH_WEAPON and so are identical in `slot`; lets the peer place
@@ -570,7 +599,7 @@ struct InvSnapshotHeader {
     // local hand; own key -> own hand) - the PKT_PROD identity approach.
     u8  keyKind;
     // Snapshot flags (protocol 46). INV_FLAG_TRUNCATED means the author's container
-    // did NOT fit in INV_ITEMS_MAX entries, so this list is an INCOMPLETE description:
+    // did NOT fit in INV_SNAPSHOT_ITEMS_MAX entries, so this list is INCOMPLETE:
     // the receiver must reconcile ADDITIVE-ONLY (fill shortfalls, destroy nothing),
     // because an absent entry means "unknown", not "gone". Before this flag existed a
     // truncated snapshot read as an authoritative delete and wiped every item past the
@@ -583,23 +612,21 @@ struct InvSnapshotHeader {
     u32 cContainerSerial;
     u32 cIndex;
     u32 cSerial;
-    u8  count;   // number of InvItemEntry that follow
+    u16 count;   // rows in this frame; queue API may accept a full snapshot
+    u32 revision; // authoritative per-container state version within this world/load
+    u32 offset, totalCount, digest; // staged full-set framing, COMPLETE closes it
 };
 
 // InvSnapshotHeader::flags bits.
 const u8 INV_FLAG_TRUNCATED = 0x01;
+const u8 INV_FLAG_TRANSACTION = 0x02; // HOST-only committed operation, including an owned pocket
+const u8 INV_FLAG_CHECKPOINT = 0x04; // HOST reconnect actor state, requires native apply ACK
+const u8 INV_FLAG_CHECKPOINT_ACK = 0x08; // JOIN confirms exact applied checkpoint revision
+const u8 INV_FLAG_COMPLETE = 0x10; // final snapshot frame, not an engine additive-only flag
 
-// A full snapshot ([header][InvItemEntry*count]) can now exceed one datagram (each entry
-// carries two 48-byte template ids), but inv snapshots ride the RELIABLE channel, which
-// ENet fragments + reassembles transparently. They are change-driven (rare), so the extra
-// bytes cost nothing in steady state.
-//
-// Raised 20 -> 64 in protocol 46 to match the receiver's own read depth (MAXC in
-// applyContainerContents). At 20 a backpacked character overflowed constantly, and every
-// overflow was an item-loss event; 64 covers a realistically loaded squad member so
-// INV_FLAG_TRUNCATED becomes the rare fallback (big storage chests) rather than the
-// routine case. Bounded by the u8 `count` field (255).
+// Frame/bag tails remain small; snapshots stage before exposing the complete set.
 const unsigned int INV_ITEMS_MAX = 64;
+const unsigned int INV_SNAPSHOT_ITEMS_MAX = 4096;
 
 // ---- Phase W1: world-item (ground drop) snapshot ---------------------------
 // Generalizes the Phase 4a content-snapshot/reconcile model from CONTAINERS to the open
@@ -697,9 +724,13 @@ struct WorldDropPacket {
     // item identity (the peer finds its own matching copy by these)
     char stringID[48];
     u32  itemType;   // GameData::type (WEAPON for now; generalizes later)
-    u16  quality;    // quality*100 (0 if n/a)
+    u16  quality;    // condition*100, NOT craft grade
     char manufacturer[48];
     char material[48];
+    u8   level;      // native craft grade, or GRADE_NA
+    u8   sourceEquipped;
+    u8   sourceSlot;
+    u16  sourceSection; // distinguishes identical hip/back weapon slots
     // mirrored ground position
     f32 x;
     f32 y;
@@ -774,6 +805,17 @@ struct InvXferPacket {
     char material[48];
     u8 contentsPresent; // complete bag inventory follows this header, including empty bags
     u8 contentsCount;
+    u8 operation;       // InventoryOperation
+    u32 sourceRevision; // source state on which the operation was requested
+    i32 quotedTotal;    // native total price; HOST revalidates before moving anything
+    u32 actorRevision;  // BUY/SELL causal actor publication before the frozen request
+};
+
+enum InventoryOperation {
+    INV_OP_TRANSFER = 0,
+    INV_OP_BUY = 1,
+    INV_OP_SELL = 2,
+    INV_OP_EXTRACT = 3
 };
 
 // An authority verdict rolls back only unaccepted units. A bag taken from a
@@ -789,6 +831,8 @@ struct InvXferAckPacket {
     u8  verdict;     // XFER_ACK_* below
     u8 contentsPresent;
     u8 contentsCount;
+    u8 operation;
+    i32 wallet; // canonical native wallet observation, -1 for non-commerce
 };
 
 enum XferAckVerdict {
@@ -945,22 +989,22 @@ struct CombatHitPacket {
 };
 
 // Last-write-wins game speed (pause / 1x / 2x / 5x / any multiplier). As
-// PKT_SPEED_REQ it carries one client's last click (level and/or pause) plus
-// an IN_COMBAT bit for diagnostics; as PKT_SPEED_SET it carries the host's
-// last accepted EFFECTIVE (multiplier + independent SPEED_PAUSED). Pause is
-// the PAUSED flag, not min() with 0; the speed field keeps the multiplier
-// even while paused (speed <= 0 is still accepted as pause for old packets).
-// seq is per-sender monotonic so a late retransmit never rolls back a newer
-// decision. Combat no longer caps the multiplier.
+// PKT_SPEED_REQ carries COMMAND only for newly captured local intent. Periodic
+// consensus/combat heartbeats omit it and MUST NOT change the host's effective.
+// PKT_SPEED_SET carries only the host's effective multiplier and independent
+// PAUSED flag; it never carries COMMAND. Pause preserves the multiplier.
+// seq is monotonic per sender: host guards each join REQ separately and joins
+// guard only host SET. Combat is diagnostic and does not cap the multiplier.
 enum SpeedFlags {
     SPEED_PAUSED    = 1,
-    SPEED_IN_COMBAT = 2
+    SPEED_IN_COMBAT = 2,
+    SPEED_COMMAND   = 4
 };
 struct SpeedPacket {
     u8  type;    // = PKT_SPEED_REQ or PKT_SPEED_SET
     u32 ownerId; // network player id of the sender
     u32 seq;     // monotonic per-sender (stale-packet guard)
-    f32 speed;   // requested/effective multiplier (0 = paused)
+    f32 speed;   // requested/effective positive multiplier, including while paused
     u8  flags;   // SPEED_* bits
 };
 
@@ -1104,6 +1148,8 @@ struct DoorPacket {
     u32 hand[5];
     u8  open;      // 1 = open/opening
     u8  locked;    // 1 = DoorLock engaged (only applied when the door has a lock)
+    u32 parentHand[5]; // authoritative parent fixture identity for a native door
+    i32 doorIndex;     // -1 = container lock; otherwise index in the parent's doors
 };
 
 // ---- Protocol 54: property-deed (building ownership) ------------------------
@@ -1217,14 +1263,14 @@ struct RosterPacket {
     u32 ownerId;   // always 0 - the host is the only author of the roster
     char name[MAX_PLAYERS][HELLO_NAME_MAX + 1]; // index = player id; empty = no nickname
 };
-// Optional byte after this unchanged prefix: accepted-member mask (bit id).
-// Distinguishes unnamed connected players from vacant slots. Old readers
-// consume the prefix; new readers use names only when the tail is absent.
+// Required native tail: accepted-member mask (bit id), then u64 incarnation
+// per player. Membership is independent of nick; relay origins are bound to
+// the current admitted incarnation, including reusable join slots.
 
 #ifdef KENSHICOOP_NET_DIAG
 // Private log mirror on the bulk channel, distinct from the live game-event
-// channel. The host derives the player id from the authenticated ENet peer.
-// A 960-byte payload plus this header and ENet framing fits Steam's 1200 B MTU.
+// channel. The host derives the player id from the authenticated native peer.
+// Native SAVE_BULK carries each bounded chunk independently of gameplay.
 enum { DEBUG_LOG_CHUNK_MAX = 960 };
 struct DebugLogFileHeader {
     u8 type;                 // = PKT_DEBUG_LOG_FILE
@@ -1233,6 +1279,11 @@ struct DebugLogFileHeader {
 };
 #endif
 
+enum PoseFixtureFlags {
+    POSE_FIXTURE_VALID = 1,
+    POSE_FIXTURE_OWNER_PRESENT = 2,
+    POSE_FIXTURE_OUTSIDE = 4
+};
 struct FixturePacket {
     u8  type;      // = PKT_FIXTURE
     u32 ownerId;   // network player id of the sender
@@ -1245,6 +1296,20 @@ struct FixturePacket {
     char sid[48];  // building template GameData stringID - the match guard, so a
                    // wrong-but-nearby building can never be paired
     u8  classType; // BuildingClassType, second match guard
+    // Only an accepted authoritative actor using this exact subject may
+    // materialize an inventoryless missing fixture. Ordinary census rows have
+    // poseFlags=0 and cannot create anything.
+    ObjectHand poseActor;
+    f32 heading;
+    i32 floor;
+    u8 poseFlags;
+    char ownerSid[48];
+    ObjectHand town;
+    char townSid[48];
+    f32 townX, townY, townZ;
+    ObjectHand inside;
+    char insideSid[48];
+    f32 insideX, insideY, insideZ;
 };
 
 // ---- Protocol 27: placed-building sync --------------------------------------
@@ -1373,6 +1438,7 @@ struct StealthPacket {
 struct SpawnReqPacket {
     u8  type;    // = PKT_SPAWN_REQ
     u32 ownerId; // network player id of the sender (the join)
+    u32 targetOwner; // actual stream/census author, not every admitted guest
     // the unresolvable streamed hand, verbatim from the entity batch
     u32 hType;
     u32 hContainer;
@@ -1391,6 +1457,7 @@ struct SpawnReqPacket {
 struct SpawnInfoPacket {
     u8  type;    // = PKT_SPAWN_INFO
     u32 ownerId; // network player id of the sender (the host)
+    u32 requestorId; // only this peer consumes the answer
     // the requested hand, echoed verbatim (the join's proxy-map key)
     u32 hType;
     u32 hContainer;
@@ -1431,14 +1498,13 @@ const u8 SPAWN_BODY_KO    = 2;
 // folder quiescence, then stream the whole save folder to the join. A save
 // initiated on the JOIN is suppressed locally (its engine never writes) and
 // forwarded to the host as PKT_SAVE_REQ instead - one authoritative save,
-// host-arbitrated. All five packets ride CH_RELIABLE (ENet fragments the
-// ~4 KB chunks transparently; ordered-reliable means FILE chunks can never
-// arrive before their BEGIN or after their DONE).
+// host-arbitrated. All five packets ride native SAVE_BULK; ordered-reliable
+// FILE chunks can never arrive before their BEGIN or after their DONE.
 
 // Save-name capacity on the wire (matches the SaveEdge capture buffer).
 const u8 SAVE_NAME_LEN = 48;
-// One PKT_SAVE_FILE payload cap. 4 KB = ~4 ENet fragments at the 1200 B
-// Steam MTU; small enough that pacing (chunks/pump) bounds burst bandwidth.
+// One PKT_SAVE_FILE payload cap; sender pacing also honors retained native
+// bulk backpressure without reading or advancing a blocked chunk.
 const u16 SAVE_CHUNK_MAX = 4096;
 // Relative-path capacity inside a save folder (e.g. "platoon\\x.platoon").
 const u16 SAVE_PATH_MAX = 260;
@@ -1525,6 +1591,7 @@ struct LoadGoPacket {
     u32  loadId;      // per-host monotonic load id (stale-NACK guard)
     u32  fingerprint; // folder fingerprint of the host's copy (0 = unknown)
     char name[48];    // save name ('\0'-padded)
+    u64  worldToken;  // host coordinated world, never a peer-local epoch
 };
 
 // Join -> host: "my player pressed load" (the join's local load was
@@ -1546,6 +1613,18 @@ struct LoadNackPacket {
     u32  loadId;      // the LOAD_GO being refused
     u32  fingerprint; // the join's local fingerprint (0 = missing folder)
     char name[48];    // save name ('\0'-padded)
+};
+
+struct WorldReadyPacket {
+    u8 type;
+    u32 ownerId;
+    u32 loadId;
+    u64 worldToken;
+};
+
+struct SessionAckPacket {
+    u8 type;
+    u32 ownerId;
 };
 
 // ---- Protocol 33: production machine sync ------------------------------------
@@ -1605,7 +1684,7 @@ struct ResearchPacket {
 // v38 adds the host position per row: existence AND whereabouts, so the join
 // can park a census-present local copy that wandered off the host's spot.
 // Layout: [NpcCensusHeader][u32 hand[5] * count][f32 pos[3] * count] -
-// 32 B per NPC, reliable (ENet fragments large lists), a few KB/s at worst.
+// 32 B per NPC, native reliable fragmentation, a few KB/s at worst.
 struct NpcCensusHeader {
     u8  type;    // = PKT_NPC_CENSUS
     u32 ownerId; // network player id of the sender (the host)

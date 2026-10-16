@@ -27,7 +27,7 @@
 
 .EXAMPLE
   # Same scenario through the WAN relay proxy ('bad' profile: 120ms +/-40ms, 5% loss
-  # both directions, below ENet) with 30s of injected join clock skew:
+  # both directions, below native GNS) with 30s of injected join clock skew:
   powershell -ExecutionPolicy Bypass -File scripts\run_test.ps1 -Scenario coop_presence -Wan bad -FakeClockSkewMs 30000
 #>
 [CmdletBinding()]
@@ -41,6 +41,10 @@ param(
     [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi",
     [string]$JoinDir = "$env:USERPROFILE\Kenshi-Join",
     [string]$OutDir = "",
+    [string]$NativeBin = "",
+    # Multi-stage caller owns the outer fixture transaction.
+    [switch]$PreserveFixtureOutput,
+    [switch]$UseSessionSave,
     [switch]$Sync,
     [switch]$NoKill,
     [int]$JoinDelaySec = 8,
@@ -51,10 +55,9 @@ param(
     # before the join's even opens (run 143805: 116 s stagger, 45 s timeout ->
     # host armed 69 s early and the oracle had zero overlapping samples).
     [int]$ArmTimeoutMs = -1,
-    # Hard-kill grace override (-1 = take the profile/manifest value). Raise it
-    # alongside -JoinDelaySec: the grace is measured from the early screenshot
-    # anchors, so a stagger pushes the join's window past a manifest grace sized
-    # for the un-staggered run and the games die before RESULT.
+    # Extra shutdown grace after the gameplay/scenario runtime budget.
+    # The deadline also includes bounded startup and peer-ready arming time;
+    # early screenshot anchors must not shorten a running scenario.
     [int]$KillGraceSec = -1,
     [int]$ShotLeadSec = 5,
     [int]$StartTimeoutSec = 90,
@@ -73,17 +76,17 @@ param(
     [int]$ScenarioWaitSec = 25,
     [switch]$Arrange,
     [switch]$NoArrange,
-    [ValidateSet("widest", "primary")]
-    [string]$ArrangeMonitor = "primary",
+    [ValidateSet("non-primary")]
+    [string]$ArrangeMonitor = "non-primary",
     [int]$ArrangeRepeatSec = 75,
-    # Legacy in-plugin WAN sim (inbound ENTITY batches only, above ENet). Kept for
+    # In-plugin sim (received ENTITY batches only, above native GNS). Retained for
     # targeted entity-only experiments; full-fidelity WAN testing should use -Wan.
     [int]$NetSimDelayMs = 0,
     [int]$NetSimJitterMs = 0,
     [int]$NetSimLossPct = 0,
     # WAN relay proxy profile (scenarios.psd1 WanProfiles: regional|bad|awful).
     # Launches dist\netsim.exe between the join and the host so delay/jitter/loss
-    # applies to ALL datagrams in BOTH directions BELOW ENet - reliable-channel
+    # applies to ALL datagrams in BOTH directions BELOW native GNS - reliable-channel
     # retransmission, handshake and all packet families are genuinely exercised.
     [string]$Wan = "",
     # Inject a fake wall-clock skew (ms) into the JOIN (KENSHICOOP_FAKE_CLOCK_SKEW_MS):
@@ -107,6 +110,9 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
+. (Join-Path $scriptDir 'kit_preflight.ps1')
+. (Join-Path $scriptDir 'NativeBuild.ps1')
+. (Join-Path $scriptDir 'PauseUiController.ps1')
 
 Import-Module (Join-Path $scriptDir "CoopOracles.psm1") -Force
 Import-Module (Join-Path $scriptDir "CoopHarness.psm1") -Force
@@ -184,22 +190,28 @@ if ($OutDir -eq "") {
     $stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
     $OutDir = Join-Path $repoRoot "tools\test-runs\$stamp"
 }
+if (Test-Path -LiteralPath $OutDir) {
+    if (@(Get-ChildItem -LiteralPath $OutDir -Force).Count) { throw "OutDir must be empty: $OutDir" }
+}
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+# The native processes run from separate game directories, not this shell's
+# working directory. Inject only an absolute path for their log/output files.
+$OutDir = (Resolve-Path -LiteralPath $OutDir).ProviderPath
 
 $hostExe = Join-Path $HostDir "kenshi_x64.exe"
 $joinExe = Join-Path $JoinDir "kenshi_x64.exe"
 if (-not (Test-Path $hostExe)) { throw "Host Kenshi not found: $hostExe" }
 if (-not (Test-Path $joinExe)) { throw "Join Kenshi not found: $joinExe (run scripts\setup_join_install.cmd)" }
 
-# The live save folder both clients auto-load from. The pristine copy is restored
-# from the repo fixture store just before launch (after the stale-Kenshi kill).
-$saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
-# Fail fast (before starting the WAN proxy) on a name that exists neither as a repo
-# fixture (restored later) nor already in AppData (debug saves not tracked in-repo).
-if (-not (Test-Path (Join-Path $repoRoot "fixtures\saves\$Save\quick.save")) -and `
-    -not (Test-Path (Join-Path $saveRoot $Save))) {
-    $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
-    throw "Save '$Save' not found as a repo fixture or in $saveRoot. Available saves: $avail"
+. (Join-Path $scriptDir 'capture_save.ps1')
+Assert-CoopSaveName -Name $Save
+$selectedSaveRoots = @(@($HostDir,$JoinDir) | ForEach-Object { Resolve-CoopSelectedSaveRoot -GameDir $_ } | Select-Object -Unique)
+$hostSaveRoot = Resolve-CoopSelectedSaveRoot -GameDir $HostDir
+$sourceFixture = Join-Path $repoRoot "fixtures\saves\$Save"
+Assert-CoopSavePath -Path $sourceFixture
+if (-not (Test-Path -LiteralPath (Join-Path $sourceFixture 'quick.save') -PathType Leaf) -and
+    -not (Test-Path -LiteralPath (Join-Path $hostSaveRoot "$Save\quick.save") -PathType Leaf)) {
+    throw "Save '$Save' has no quick.save in the fixture store or selected host root."
 }
 
 $hostLog = Join-Path $OutDir "host.log"
@@ -207,7 +219,21 @@ $joinLog = Join-Path $OutDir "join.log"
 $hostPng = Join-Path $OutDir "host.png"
 $joinPng = Join-Path $OutDir "join.png"
 
-# ---- WAN relay proxy (below-ENet delay/jitter/loss) -----------------------------
+$fixtureNames = @($Save)
+if (-not $PreserveFixtureOutput) { $fixtureNames += 'coopresume' }
+$runState = New-CoopRunState -GameDirs @($HostDir,$JoinDir) -SaveNames $fixtureNames
+$credentials = $null
+try {
+$preserve = if ($Scenario -eq 'spike') { @('KENSHICOOP_SPIKE') } else { @() }
+Clear-CoopRunEnvironment -State $runState -PreserveVariables $preserve
+if ($Scenario -eq 'spike') {
+    if (-not $env:KENSHICOOP_SPIKE) { $env:KENSHICOOP_SPIKE = '0' }
+    if ($env:KENSHICOOP_SPIKE -notin @('0','401','402','451')) { throw "Unsupported spike ID '$env:KENSHICOOP_SPIKE'." }
+}
+$native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
+Install-CoopHarnessRuntime -RepoRoot $repoRoot -GameDirs @($HostDir,$JoinDir) -NativeBin $native.Bin
+$credentials = New-CoopLocalCredentials -NativeBin $native.Bin -GameDirs @($HostDir,$JoinDir)
+# ---- WAN Winsock proxy (below-native-GNS delay/jitter/loss) ----------------------
 $wanProc = $null
 $wanSeed  = $null
 $joinIp   = $Ip
@@ -275,6 +301,7 @@ elseif ($FakeClockSkewMs -ne 0) { $variant = "skew" }
 $runJson = [ordered]@{
     timestamp     = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
     scenario      = $Scenario
+    spikeId       = $(if ($Scenario -eq 'spike') { $env:KENSHICOOP_SPIKE } else { $null })
     variant       = $variant
     save          = $Save
     setup         = $Setup
@@ -298,34 +325,26 @@ $runJson = [ordered]@{
 }
 $runJson | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $OutDir "run.json") -Encoding UTF8
 
-# Clear any leftover Kenshi instances from a previous (possibly crashed) run.
-if (-not $NoKill) {
-    $stale = @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue)
-    if ($stale.Count -gt 0) {
-        Write-Host "  killing $($stale.Count) stale Kenshi process(es) before starting ..."
-        $stale | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
+# Never terminate sessions that this invocation did not start.
+
+# Restore into every distinct native-selected root; resume stage 2 uses the
+# session's actual output unchanged rather than re-deploying a pristine fixture.
+if (-not $UseSessionSave) {
+    foreach ($selectedRoot in $selectedSaveRoots) {
+        Assert-CoopSavePath -Path (Join-Path $selectedRoot $Save)
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir 'deploy_saves.ps1') -Save $Save -SaveRoot $selectedRoot
+        if ($LASTEXITCODE -ne 0) { throw "deploy_saves.ps1 failed for '$Save' in '$selectedRoot' ($LASTEXITCODE)" }
     }
 }
 
-# Restore the pristine fixture from the repo (fixtures\saves\<Save>) over the live
-# AppData copy so a prior co-op run's connect-push / stream-commit can't drift the
-# validation save. Runs after the stale-Kenshi kill (the game must not be writing).
-# Debug saves with no repo fixture are left as-is. This is the single choke point
-# for the whole loopback matrix, since regress.ps1 invokes run_test.ps1 per scenario.
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "deploy_saves.ps1") -Save $Save
-if ($LASTEXITCODE -ne 0) { throw "deploy_saves.ps1 failed for '$Save' ($LASTEXITCODE)" }
-
-# Fail fast on a bad save name (auto-loading a non-existent save crashes the game).
-if (-not (Test-Path (Join-Path $saveRoot $Save))) {
-    $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
-    throw "Save '$Save' not found in $saveRoot (and no repo fixture to restore). Available saves: $avail"
+if ($Sync -and -not $UseSessionSave) {
+    Write-Host "Syncing only named fixture '$Save' host -> join ..."
+    Sync-CoopNamedSave -Save $Save -HostDir $HostDir -JoinDir $JoinDir
 }
-
-if ($Sync) {
-    Write-Host "Syncing saves host -> join ..."
-    & cmd /c "`"$scriptDir\sync_save.cmd`" `"$HostDir`" `"$JoinDir`""
-    if ($LASTEXITCODE -ne 0) { throw "sync_save.cmd failed ($LASTEXITCODE)" }
+foreach ($selectedRoot in $selectedSaveRoots) {
+    $selectedSave = Join-Path $selectedRoot $Save
+    Assert-CoopSavePath -Path $selectedSave
+    if (-not (Test-Path -LiteralPath (Join-Path $selectedSave 'quick.save') -PathType Leaf)) { throw "Missing selected save quick.save: $selectedSave" }
 }
 
 function Set-CoopEnv {
@@ -340,6 +359,7 @@ function Set-CoopEnv {
     # runner (run_lan_test.ps1) and are unaffected.
     $env:KENSHICOOP_TRANSPORT    = "udp"
     $env:KENSHICOOP_STEAM_PEER   = "0"
+    Set-CoopPrivateCredentials -Mode $Mode -UseSteam $false -GameDirs @($HostDir,$JoinDir) -ProfilePath $credentials.Profile -InviteFile $credentials.Invite
     # The join connects through the WAN proxy when one is active.
     $env:KENSHICOOP_PORT         = if ($Mode -eq "join") { "$joinPort" } else { "$Port" }
     $env:KENSHICOOP_IP           = if ($Mode -eq "join") { $joinIp } else { $Ip }
@@ -372,24 +392,37 @@ function Set-CoopEnv {
     $env:KENSHICOOP_ARM_TIMEOUT_MS = "$effArmTimeoutMs"
 }
 
-# Wait until a regex appears in a (growing) file, or timeout. Returns $true/$false.
+$killGrace = if ($Scenario -ne '') { 75 } else { $ShotLeadSec + 60 }
+if ($manifest.Profiles.ContainsKey($Profile)) { $killGrace = [Math]::Max($killGrace, $manifest.Profiles[$Profile].KillGraceSec) }
+if ($null -ne $manifestEntry -and $manifestEntry.ContainsKey('KillGraceSec')) { $killGrace = [Math]::Max($killGrace,$manifestEntry.KillGraceSec) }
+if ($KillGraceSec -ge 0) { $killGrace = $KillGraceSec }
+$deadlines = @{}
 function Wait-ForLogLine {
     param([string]$File, [string]$Pattern, [int]$TimeoutSec)
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        if (Test-Path $File) {
-            $hit = Select-String -Path $File -Pattern $Pattern -SimpleMatch:$false -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $hit) { return $true }
-        }
-        Start-Sleep -Milliseconds 500
+    $id = if ($File -eq $hostLog) { $hostPid } else { $joinPid }
+    return (Wait-CoopOwnedLogLine -Process $runState.Processes[$id] -Deadline $deadlines[$id] -File $File -Pattern $Pattern -TimeoutSec $TimeoutSec)
+}
+function Wait-RunDelay {
+    param([int]$ProcId,[double]$Seconds,[DateTime]$Since=[DateTime]::MinValue)
+    if ($Since -ne [DateTime]::MinValue) {
+        $elapsed = [Math]::Max(0,([DateTime]::UtcNow - $Since).TotalSeconds)
+        $Seconds = [Math]::Max(0,$Seconds - $elapsed)
     }
-    return $false
+    if ($Seconds -le 0) { return }
+    $remaining = ($deadlines[$ProcId] - [DateTime]::UtcNow).TotalSeconds
+    if ($remaining -le 0 -or $runState.Processes[$ProcId].HasExited) { return }
+    Start-Sleep -Milliseconds ([int]([Math]::Min($Seconds,$remaining) * 1000))
 }
 
 function Take-Shot {
     param([int]$ProcId, [string]$Out, [string]$Label)
     try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "screenshot.ps1") -ProcessId $ProcId -Out $Out -Frames $Frames -IntervalMs $FrameIntervalMs
+        $owned=$runState.Processes[$ProcId]
+        $args = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ProcessId {1} -ProcessStartTicks {2} -Out "{3}" -Frames {4} -IntervalMs {5}' -f (Join-Path $scriptDir 'screenshot.ps1'),$ProcId,$owned.StartTime.ToUniversalTime().Ticks,$Out,$Frames,$FrameIntervalMs
+        $capture = Start-Process powershell -ArgumentList $args -PassThru -WindowStyle Hidden
+        $captureDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        if ($deadlines[$ProcId] -lt $captureDeadline) { $captureDeadline = $deadlines[$ProcId] }
+        Wait-CoopOwnedExit -Process $capture -Deadline $captureDeadline
         Write-Host "  captured $Label ($Frames frame(s)) -> $Out"
     } catch {
         Write-Warning "screenshot ($Label) failed: $($_.Exception.Message)"
@@ -399,17 +432,15 @@ function Take-Shot {
 # Launch a Kenshi instance and get it past Kenshi's Win32 launcher.
 function Start-PastLauncher {
     param([string]$Exe, [string]$WorkDir)
-    $out = & (Join-Path $scriptDir "start_kenshi.ps1") -ExePath $Exe -WorkDir $WorkDir -TimeoutSec $StartTimeoutSec 6>&1
+    $out = Start-CoopOwnedGame -State $runState -ScriptDir $scriptDir -ExePath $Exe -WorkDir $WorkDir -TimeoutSec $StartTimeoutSec -NativeOutput $NativeBin
     $out | ForEach-Object { Write-Host "    $_" }
     $line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -First 1
     if ($line -and ("$line" -match "GAMEPID=(\d+)")) { return [int]$Matches[1] }
     return 0
 }
 
-# Automated layout: 1280x1024 pair on the PRIMARY (laptop) monitor - the
-# screenshot-stable baseline. Written every run because manual_session.ps1
-# resizes the same kenshi.cfg files for the ultrawide manual layout; this
-# guarantees automated runs always come back to the known-good geometry.
+# Automated display changes are temporary; owned hooks pin the non-primary
+# monitor and the encompassing finally restores exact original configuration.
 Write-Host "Window layout: automated (1280x1024 x2, $ArrangeMonitor monitor)"
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "set_video_mode.ps1") `
     -Width 1280 -Height 1024 -HostDir $HostDir -JoinDir $JoinDir
@@ -418,51 +449,57 @@ Write-Host "Launching HOST (and clicking through the launcher) ..."
 Set-CoopEnv -Mode "host" -Log $hostLog
 $hostPid = Start-PastLauncher -Exe $hostExe -WorkDir $HostDir
 if ($hostPid -eq 0) { throw "Host failed to get past the launcher." }
+$deadlines[$hostPid] = Get-CoopRunDeadline -Process $runState.Processes[$hostPid] -Seconds $Seconds -StartTimeoutSec $StartTimeoutSec -ArmTimeoutMs $effArmTimeoutMs -KillGraceSec $killGrace
 
 # Serialize the zone loads: two Kenshi instances loading the same save
 # concurrently can starve the (background, unfocused) host - measured run
 # 134544: the host's 12 s load took 2.4 min and only completed once the join
 # exited, so the windows never overlapped and the run burned for nothing.
-# Wait for the host to reach gameplay first (fall back to the old fixed
-# stagger if it never does - the analysis will flag health_host anyway).
+# Require host gameplay within its held deadline before spending a JOIN launch.
 Write-Host "Waiting for HOST to reach gameplay before launching JOIN (timeout ${StartTimeoutSec}s) ..."
 if (Wait-ForLogLine -File $hostLog -Pattern "gameplay started" -TimeoutSec $StartTimeoutSec) {
+    $hostGameplayReadyAt = [DateTime]::UtcNow
     Write-Host "Host in gameplay; launching JOIN after ${JoinDelaySec}s settle ..."
 } else {
-    Write-Warning "Host not in gameplay after ${StartTimeoutSec}s; launching JOIN anyway."
+    throw "Host did not reach gameplay within its owned startup budget."
 }
-Start-Sleep -Seconds $JoinDelaySec
+Wait-RunDelay -ProcId $hostPid -Seconds $JoinDelaySec
+if ($runState.Processes[$hostPid].HasExited) { throw 'Host exited before JOIN launch.' }
 
 Write-Host "Launching JOIN (and clicking through the launcher) ..."
 Set-CoopEnv -Mode "join" -Log $joinLog
 $joinPid = Start-PastLauncher -Exe $joinExe -WorkDir $JoinDir
-if ($joinPid -eq 0) { Write-Warning "Join failed to get past the launcher; continuing with host only." }
+if ($joinPid -eq 0) { throw "Join failed to get past the launcher." }
+$deadlines[$joinPid] = Get-CoopRunDeadline -Process $runState.Processes[$joinPid] -Seconds $Seconds -StartTimeoutSec $StartTimeoutSec -ArmTimeoutMs $effArmTimeoutMs -KillGraceSec $killGrace
 
 Write-Host "Host game PID=$hostPid  Join game PID=$joinPid"
-
-# Auto-arrange the windows side by side (background, re-pinned through load).
-if (-not $NoArrange -and $hostPid -ne 0) {
-    $arrangeScript = Join-Path $scriptDir "arrange_windows.ps1"
-    Write-Host "Arranging windows side by side ($ArrangeMonitor monitor, host left / join right; re-pinning ${ArrangeRepeatSec}s) ..."
-    Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$arrangeScript`"",
-        "-HostPid", "$hostPid", "-JoinPid", "$joinPid",
-        "-Monitor", $ArrangeMonitor, "-TimeoutSec", "90", "-RepeatSec", "$ArrangeRepeatSec"
-    ) | Out-Null
+foreach ($ownedPid in @($hostPid,$joinPid)) {
+    $ownedProcess = $runState.Processes[$ownedPid]
+    if ($null -eq $ownedProcess) { throw "Owned game PID=$ownedPid is missing from this run." }
+    $ownedProcess.Refresh()
+    if ($ownedProcess.HasExited) {
+        throw "Owned game PID=$ownedPid exited during paired startup (exit=$($ownedProcess.ExitCode)); inspect host.log and join.log."
+    }
 }
+$runJson.ownedProcesses = @(
+    [ordered]@{ role='host'; pid=$hostPid; processStartUtcTicks=$runState.Processes[$hostPid].StartTime.ToUniversalTime().Ticks; windowId=$runState.Processes[$hostPid].MainWindowHandle.ToInt64().ToString() },
+    [ordered]@{ role='join'; pid=$joinPid; processStartUtcTicks=$runState.Processes[$joinPid].StartTime.ToUniversalTime().Ticks; windowId=$runState.Processes[$joinPid].MainWindowHandle.ToInt64().ToString() }
+)
+$runJson | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $OutDir "run.json") -Encoding UTF8
 
-# Anchor the screenshot to when the HOST reaches gameplay.
-$started = Wait-ForLogLine -File $hostLog -Pattern "gameplay started" -TimeoutSec $StartTimeoutSec
-if ($started) {
-    Write-Host "Host reached gameplay; waiting before screenshot ..."
-} else {
-    Write-Warning "Did not see 'gameplay started' in host log within $StartTimeoutSec s; capturing on a best-effort basis."
-}
+# Owned launcher/game hooks place both windows on the non-primary monitor.
 
-function Test-Alive { param([int]$ProcId) return ($ProcId -ne 0 -and $null -ne (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) }
+# The HOST gameplay anchor was observed before launching JOIN. Do not restart
+# its screenshot delay after the staggered launcher and JOIN load.
+
+function Test-Alive { param([int]$ProcId) return ($ProcId -gt 0 -and $runState.Processes.ContainsKey($ProcId) -and -not $runState.Processes[$ProcId].HasExited) }
 
 $shotsTaken = $false
-if ($Scenario -ne "") {
+if ($Scenario -eq 'speed_pause_ui') {
+    Invoke-CoopPauseUi -State $runState -HostPid $hostPid -JoinPid $joinPid `
+        -HostLog $hostLog -JoinLog $joinLog -OutDir $OutDir -TimeoutSec $StartTimeoutSec -Deadlines $deadlines
+    $shotsTaken = $true
+} elseif ($Scenario -ne "") {
     # Capture each client at ITS OWN anchor so BOTH screenshots show in-game,
     # mid-action state despite the launch stagger.
     #
@@ -497,7 +534,7 @@ if ($Scenario -ne "") {
     }
     if (Wait-ForLogLine -File $hostLog -Pattern $hostAnchor -TimeoutSec $hostShotWait) {
         Write-Host "Saw host '$hostAnchor'; capturing host shortly after."
-        Start-Sleep -Seconds $hostShotDelay
+        Wait-RunDelay -ProcId $hostPid -Seconds $hostShotDelay
     } else {
         Write-Warning "No host '$hostAnchor' within $hostShotWait s; capturing host best-effort."
     }
@@ -507,7 +544,7 @@ if ($Scenario -ne "") {
     if ($joinPid -ne 0) {
         if (Wait-ForLogLine -File $joinLog -Pattern $joinAnchor -TimeoutSec $joinShotWait) {
             Write-Host "Saw join '$joinAnchor'; capturing join shortly after."
-            Start-Sleep -Seconds $joinShotDelay
+            Wait-RunDelay -ProcId $joinPid -Seconds $joinShotDelay
         } else {
             Write-Warning "No join '$joinAnchor' within $joinShotWait s; capturing join best-effort."
         }
@@ -518,7 +555,7 @@ if ($Scenario -ne "") {
 } else {
     $lead = $Seconds - $ShotLeadSec
     if ($lead -lt 0) { $lead = 0 }
-    Start-Sleep -Seconds $lead
+    Wait-RunDelay -ProcId $hostPid -Seconds $lead -Since $hostGameplayReadyAt
 }
 
 if (-not $shotsTaken) {
@@ -529,31 +566,22 @@ if (-not $shotsTaken) {
 }
 
 # Wait for self-exit, with a hard-timeout kill so unattended runs never hang.
-$killGrace = if ($Scenario -ne "") { 75 } else { $ShotLeadSec + 60 }
-if ($manifest.Profiles.ContainsKey($Profile)) { $killGrace = [Math]::Max($killGrace, $manifest.Profiles[$Profile].KillGraceSec) }
-# Long scenarios: the kill grace runs from the (early) screenshot anchors, so a
-# scenario window longer than ~KillGraceSec gets killed before RESULT unless
-# the manifest entry raises it.
-if ($null -ne $manifestEntry -and $manifestEntry.ContainsKey("KillGraceSec")) {
-    $killGrace = [Math]::Max($killGrace, $manifestEntry.KillGraceSec)
-}
-if ($KillGraceSec -ge 0) { $killGrace = $KillGraceSec }
-$killDeadline = (Get-Date).AddSeconds($killGrace)
+$ownedExitFailures=@()
 foreach ($p in @($hostPid, $joinPid)) {
     if ($p -eq 0) { continue }
-    $remain = [int]([Math]::Max(1, ($killDeadline - (Get-Date)).TotalSeconds))
-    try { Wait-Process -Id $p -Timeout $remain -ErrorAction Stop }
+    $owned=$runState.Processes[$p]
+    try { Wait-CoopOwnedExit -Process $owned -Deadline $deadlines[$p] }
     catch {
-        if (Test-Alive $p) {
-            Write-Warning "PID $p did not self-exit; killing."
-            try { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } catch {}
-        }
+        $ownedExitFailures+="PID ${p}: $($_.Exception.Message)"
+        Write-Warning "Owned game exit failed: $($_.Exception.Message)"
     }
 }
+$runJson.ownedExitFailures = @($ownedExitFailures)
+$runJson | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutDir 'run.json') -Encoding UTF8
 
 # Tear down the WAN proxy.
 if ($null -ne $wanProc -and -not $wanProc.HasExited) {
-    try { Stop-Process -Id $wanProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+    try { $wanProc.Kill(); $wanProc.WaitForExit() } catch {}
 }
 
 # Archive the ENGINE's own log next to ours. kenshi_info.log is where Kenshi
@@ -582,12 +610,36 @@ if ($Frames -gt 1) {
     Write-Host "  join png: $joinPng"
 }
 
+} catch {
+    if ($null -ne $runJson) {
+        $runJson.failure = [ordered]@{
+            message = $_.Exception.Message
+            errorId = $_.FullyQualifiedErrorId
+            position = $_.InvocationInfo.PositionMessage
+            stack = $_.ScriptStackTrace
+        }
+        $runJson | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutDir 'run.json') -Encoding UTF8
+    }
+    throw
+} finally {
+    try { Restore-CoopHarnessSession -State $runState -CredentialRoot $(if ($credentials) { $credentials.Root } else { '' }) -Proxy $wanProc }
+    catch {
+        $ownedExitFailures += "Restoration failed: $($_.Exception.Message)"
+        if ($null -ne $runJson) {
+            $runJson.ownedExitFailures = @($ownedExitFailures)
+            $runJson | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutDir 'run.json') -Encoding UTF8
+        }
+        Write-Warning $_.Exception.Message
+    }
+}
+
 # ---- Judge the run with the shared oracle library --------------------------------
 Write-Host ""
 if ($Scenario -ne "") { Write-Host "== Scenario checks: $Scenario ==" }
 
 $runInfo = @{
     save          = $Save
+    spikeId       = $runJson.spikeId
     setup         = $Setup
     profile       = $Profile
     wan           = $Wan
@@ -596,14 +648,19 @@ $runInfo = @{
     netSimJitterMs= $NetSimJitterMs
     netSimLossPct = $NetSimLossPct
     outDir        = $OutDir
+    ownedExitFailures = $ownedExitFailures
 }
 $expectedSkew = if ($FakeClockSkewMs -ne 0) { $FakeClockSkewMs } else { $null }
 $verdict = Invoke-RunAnalysis -HostLog $hostLog -JoinLog $joinLog -Scenario $Scenario `
-              -Tolerance $Tolerance -JoinExpected ($joinPid -ne 0) `
+              -Tolerance $Tolerance -JoinExpected $true `
               -RunInfo $runInfo -ExpectedSkewMs $expectedSkew `
               -WanActive ($Wan -ne "") `
               -OutJson (Join-Path $OutDir "verdict.json")
 
 Write-Host ""
+if ($verdict.diagnostic) {
+    Write-Host ("RESULT: DIAGNOSTIC " + $(if ($verdict.captureOk) { 'CAPTURE-OK' } else { 'CAPTURE-INCOMPLETE' }))
+    if ($verdict.captureOk) { exit 0 } else { exit 1 }
+}
 Write-Host ("RESULT: " + $(if ($verdict.pass) { "PASS" } else { "FAIL" }))
 if ($verdict.pass) { exit 0 } else { exit 1 }

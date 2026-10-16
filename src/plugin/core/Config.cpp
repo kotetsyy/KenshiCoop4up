@@ -2,7 +2,6 @@
 
 #include "Config.h"
 #include "OwnRanks.h"
-#include "SteamId.h"
 #include "PlayerNick.h"
 #include <cstdlib>
 #include <cstdio>
@@ -10,6 +9,9 @@
 #include <fstream>
 #include <iterator>
 #include <windows.h>
+#include <aclapi.h>
+#include <cstring>
+#pragma comment(lib, "advapi32.lib")
 
 namespace coop {
 namespace {
@@ -177,6 +179,107 @@ bool writeConfigText(const std::string& text) {
 
 } // namespace
 
+bool validSteamPeerId(unsigned long long id) {
+    return (id >> 56) == 1 && ((id >> 52) & 15) == 1 &&
+           ((id >> 32) & 0xfffff) == 1 && (unsigned int)id != 0;
+}
+
+
+namespace {
+bool utf8Path(const char* path, std::wstring& out) {
+    if (!path || !path[0] || strlen(path) > 32700) return false;
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, 0, 0);
+    if (!n) return false;
+    out.resize(n);
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, &out[0], n)) return false;
+    out.resize(n - 1); return true;
+}
+void readSteamSettings(Config& c, const std::string& peer) {
+    c.steamPeer = 0;
+    const size_t first = peer.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return;
+    const size_t last = peer.find_last_not_of(" \t\r\n");
+    const std::string token = peer.substr(first, last - first + 1);
+    if (token.size() != 17 || token.find_first_not_of("0123456789") != std::string::npos) return;
+    const unsigned long long id = _strtoui64(token.c_str(), 0, 10);
+    if (!validSteamPeerId(id)) return;
+    c.steamPeer = id;
+}
+}
+
+bool readUdpJoinInviteFile(std::string& invite) {
+    invite.clear();
+    std::wstring path;
+    if (!utf8Path(getenv("KENSHICOOP_UDP_INVITE_FILE"), path)) return false;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | READ_CONTROL, FILE_SHARE_READ,
+                             0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, 0);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info;
+    LARGE_INTEGER size;
+    bool ok = GetFileInformationByHandle(file, &info) && GetFileSizeEx(file, &size) &&
+              !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+              size.QuadPart > 0 && size.QuadPart < 4096;
+    HANDLE token = 0;
+    DWORD needed = 0;
+    std::vector<unsigned char> user;
+    PACL dacl = 0;
+    PSECURITY_DESCRIPTOR sd = 0;
+    unsigned char systemSid[SECURITY_MAX_SID_SIZE];
+    DWORD systemSize = sizeof(systemSid);
+    ok = ok && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) != FALSE;
+    if (ok) {
+        GetTokenInformation(token, TokenUser, 0, 0, &needed);
+        user.resize(needed);
+        ok = needed && GetTokenInformation(token, TokenUser, &user[0], needed, &needed) &&
+             CreateWellKnownSid(WinLocalSystemSid, 0, systemSid, &systemSize) &&
+             GetSecurityInfo(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, 0, 0, &dacl, 0, &sd) == ERROR_SUCCESS &&
+             dacl != 0;
+    }
+    for (DWORD i = 0; ok && i < dacl->AceCount; ++i) {
+        void* ace = 0;
+        ok = GetAce(dacl, i, &ace) != FALSE;
+        if (!ok) break;
+        ACE_HEADER* header = (ACE_HEADER*)ace;
+        if (header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) { ok = false; break; }
+        PSID sid = (PSID)&((ACCESS_ALLOWED_ACE*)ace)->SidStart;
+        ok = EqualSid(sid, ((TOKEN_USER*)&user[0])->User.Sid) || EqualSid(sid, systemSid);
+    }
+    if (ok) {
+        char bytes[4096] = {0};
+        DWORD got = 0;
+        ok = ReadFile(file, bytes, (DWORD)size.QuadPart, &got, 0) && got == (DWORD)size.QuadPart;
+        if (ok) {
+            while (got && (bytes[got-1] == '\r' || bytes[got-1] == '\n')) --got;
+            ok = got && memchr(bytes, 0, got) == 0;
+            if (ok) invite.assign(bytes, got);
+        }
+        SecureZeroMemory(bytes, sizeof(bytes));
+    }
+    if (sd) LocalFree(sd);
+    if (token) CloseHandle(token);
+    CloseHandle(file);
+    return ok;
+}
+
+std::string udpHostProfilePath() {
+    const char* explicitPath = getenv("KENSHICOOP_UDP_PROFILE_PATH");
+    if (explicitPath && explicitPath[0]) return explicitPath;
+    wchar_t path[32768];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", path, 32768);
+    if (!n || n >= 32768) return std::string();
+    std::wstring directory(path, n);
+    directory += L"\\KenshiCoop";
+    if (!CreateDirectoryW(directory.c_str(), 0) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return std::string();
+    directory += L"\\udp-host.private";
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, directory.c_str(), -1, 0, 0, 0, 0);
+    if (!bytes) return std::string();
+    std::string out(bytes, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, directory.c_str(), -1, &out[0], bytes, 0, 0);
+    out.resize(bytes - 1); return out;
+}
+
 void loadConfig(Config& c) {
     // coop_config.json (next to the DLL) supplies the interactive-install
     // defaults; env vars still override every one of them (test harness).
@@ -327,26 +430,8 @@ void loadConfig(Config& c) {
     // shipped plugin - the manifest (scripts/scenarios.psd1) is the single source
     // of truth for per-scenario channel A/B; see Contract.Tests's DiagEnv guard.
 
-    // Transport: "udp" (default) keeps the stock ENet/UDP path (the whole local
-    // harness runs on it); "steam" tunnels ENet over Steam P2P by SteamID (no
-    // port forwarding / CGNAT-immune). steamPeer is the OTHER player's steamid64
-    // (two-code exchange); steamPing arms the channel-1 reachability spike.
     c.transport = envOr("KENSHICOOP_TRANSPORT", fileOr(f, "transport", "udp").c_str());
-    {
-        std::string raw = envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str());
-        c.steamPeer = 0;
-        c.steamPeers.clear();
-        unsigned long long ids[4];
-        int n = parseSteamId64List(raw, ids, 4);
-        if (n == 0) {
-            // Numeric-only config (test harness / non-community ids).
-            c.steamPeer = (unsigned long long)_strtoui64(raw.c_str(), 0, 10);
-        } else {
-            c.steamPeer = ids[0];
-            for (int i = 1; i < n; ++i) c.steamPeers.push_back(ids[i]);
-        }
-    }
-    c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
+    readSteamSettings(c, envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str()));
     {
         std::string raw = envOr("KENSHICOOP_PLAYER_NAME", fileOr(f, "playerName", "").c_str());
         std::string nick;
@@ -599,18 +684,7 @@ void reloadPeerFromFile(Config& c) {
     // toggles at Connect time and are left untouched here.
     std::map<std::string, std::string> f = readConfigFile();
     std::map<std::string, std::string>::const_iterator it;
-    it = f.find("steamPeer");
-    if (it != f.end() && !it->second.empty()) {
-        unsigned long long ids[4];
-        int n = parseSteamId64List(it->second, ids, 4);
-        c.steamPeers.clear();
-        if (n == 0) {
-            c.steamPeer = (unsigned long long)_strtoui64(it->second.c_str(), 0, 10);
-        } else {
-            c.steamPeer = ids[0];
-            for (int i = 1; i < n; ++i) c.steamPeers.push_back(ids[i]);
-        }
-    }
+    readSteamSettings(c, envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str()));
     it = f.find("ip");
     if (it != f.end() && !it->second.empty()) {
         c.ip = it->second;
@@ -634,21 +708,10 @@ void saveConnectMemory(const Config& c) {
     upsertJsonValue(text, "role", jsonQuote(c.isHost ? "host" : "join"));
     std::string trans = c.transport.empty() ? std::string("udp") : c.transport;
     upsertJsonValue(text, "transport", jsonQuote(trans));
-    if (c.steamPeer != 0) {
-        char idbuf[32];
-        _snprintf(idbuf, sizeof(idbuf) - 1, "%llu", (unsigned long long)c.steamPeer);
-        idbuf[sizeof(idbuf) - 1] = '\0';
-        std::string ids = idbuf;
-        for (size_t i = 0; i < c.steamPeers.size(); ++i) {
-            if (c.steamPeers[i] == 0) continue;
-            _snprintf(idbuf, sizeof(idbuf) - 1, "%llu",
-                      (unsigned long long)c.steamPeers[i]);
-            idbuf[sizeof(idbuf) - 1] = '\0';
-            ids += ",";
-            ids += idbuf;
-        }
-        upsertJsonValue(text, "steamPeer", jsonQuote(ids));
-    }
+    char idbuf[32];
+    _snprintf(idbuf, sizeof(idbuf) - 1, "%llu", c.steamPeer);
+    idbuf[sizeof(idbuf) - 1] = '\0';
+    upsertJsonValue(text, "steamPeer", jsonQuote(idbuf));
     if (!c.ip.empty()) upsertJsonValue(text, "ip", jsonQuote(c.ip));
     if (c.port > 0 && c.port <= 65535) {
         char pbuf[16];

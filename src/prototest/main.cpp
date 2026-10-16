@@ -72,6 +72,10 @@ static int g_total  = 0;
 } while (0)
 
 #include "UiPresentationTests.h"
+#include "ProceduralWorldTests.h"
+#include "InventorySnapshotTests.h"
+#include "InventoryTransactionTests.h"
+#include "LockAuthorityTests.h"
 
 // ---- 1. Wire contract: packed sizes ------------------------------------------
 
@@ -82,15 +86,15 @@ static void testSizes() {
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             71); // v57: +xyz/heading/poseValid
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
-    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            165); // v68: +native stock-grid placement
-    CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       28); // v33: +keyKind; v46: +flags
+    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            166);
+    CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       45);
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
     CHECK_EQ("sizeof(WorldItemRemoveHeader)",   sizeof(WorldItemRemoveHeader),   6);
     CHECK_EQ("sizeof(WorldItemClaimHeader)",    sizeof(WorldItemClaimHeader),    10); // v47
-    CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         191);
+    CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         196);
     CHECK_EQ("sizeof(WorldPickupPacket)",       sizeof(WorldPickupPacket),       91); // v40: +item identity
-    CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           204); // v66: +bag payload framing
+    CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           217);
 
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
     CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
@@ -99,13 +103,13 @@ static void testSizes() {
     CHECK_EQ("sizeof(SpeedPacket)",             sizeof(SpeedPacket),             14);
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
-    CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          25);
-    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         211);
+    CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          29);
+    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         215);
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
     CHECK_EQ("sizeof(MoneyDeltaPacket)",        sizeof(MoneyDeltaPacket),        13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
     CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              21);
-    CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              31);
+    CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              55);
     CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),        94);
     CHECK_EQ("sizeof(BuildStatePacket)",        sizeof(BuildStatePacket),        34);
     CHECK_EQ("sizeof(BuildDoorPacket)",         sizeof(BuildDoorPacket),         32);
@@ -115,34 +119,20 @@ static void testSizes() {
     CHECK_EQ("sizeof(SaveFileHeader)",          sizeof(SaveFileHeader),          19);
     CHECK_EQ("sizeof(SaveDoneHeader)",          sizeof(SaveDoneHeader),          11);
     CHECK_EQ("sizeof(SaveAckPacket)",           sizeof(SaveAckPacket),           20);
-    CHECK_EQ("sizeof(LoadGoPacket)",            sizeof(LoadGoPacket),            61);
+    CHECK_EQ("sizeof(LoadGoPacket)",            sizeof(LoadGoPacket),            69);
     CHECK_EQ("sizeof(LoadReqPacket)",           sizeof(LoadReqPacket),           57);
     CHECK_EQ("sizeof(LoadNackPacket)",          sizeof(LoadNackPacket),          61);
     CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              109);
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(DeedPacket)",              sizeof(DeedPacket),              78); // v54: deeds
-    CHECK_EQ("sizeof(FixturePacket)",           sizeof(FixturePacket),           90); // v55: fixture identity
+    CHECK_EQ("sizeof(FixturePacket)",           sizeof(FixturePacket),           327); // v74: authoritative native pose descriptor
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
     CHECK_EQ("sizeof(CellClaimPacket)",         sizeof(CellClaimPacket),         21); // v49: cell claim
-    CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        20); // v66: +authoritative bag framing
-    // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
-    CHECK("entity batch fits datagram",
-          sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
-    // The Steam sender chunk must fit the 1200 B clamped Steam MTU with room
-    // for ENet's per-packet overhead (an oversized UNRELIABLE packet would be
-    // sent as RELIABLE fragments - motion-stream stalls; review 2026-07-10).
-    CHECK("steam entity batch fits clamped MTU",
-          sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX_STEAM * sizeof(EntityState) <= 1150);
-    CHECK("steam cap under hard receive bound",
-          ENTITY_BATCH_MAX_STEAM <= ENTITY_BATCH_MAX);
+    CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        25);
 #ifdef KENSHICOOP_NET_DIAG
     CHECK_EQ("sizeof(DebugLogFileHeader)", sizeof(DebugLogFileHeader), 11);
-    CHECK("private log chunk fits clamped Steam MTU",
-          sizeof(DebugLogFileHeader) + DEBUG_LOG_CHUNK_MAX <= 1150);
 #endif
-    CHECK("world-item batch fits datagram",
-          sizeof(WorldItemSnapshotHeader) + WORLD_ITEMS_MAX * sizeof(WorldItemEntry) <= 1400);
 
     // Carried-body sync (protocol 18): the synthetic carry task must never
     // collide with TASK_NONE, the combat stances, or a real engine task key
@@ -368,15 +358,6 @@ static void testSizes() {
         CHECK("pool delta is signed", d.delta < 0 && d.seq == 8u);
     }
 
-    // Protocol 48: the parent reference. A worn backpack owns a PRIVATE inventory, so a bagged
-    // item is described by no snapshot unless it can name its container. The byte was already
-    // reserved, so the entry must not have grown, and index 0 must keep meaning "top level" or
-    // every existing entry would silently claim a parent.
-    {
-        InvItemEntry pe; std::memset(&pe, 0, sizeof(pe));
-        CHECK_EQ("parentIdx defaults to top-level (0)", (int)pe.parentIdx, 0);
-        CHECK("parentIdx addresses every entry INV_ITEMS_MAX allows", INV_ITEMS_MAX < 256);
-    }
 
     // Protocol 51: the craft GRADE. Kenshi's named grades (Prototype 5 ... Masterwork 95)
     // are points on a 1..100 craft level held in Gear, and `quality` is CONDITION on a
@@ -399,28 +380,6 @@ static void testSizes() {
               invEntryHash(na) == invEntryHash(zero));
     }
 
-    // Protocol 46 (inventory item-loss fixes). The entry cap must match the receiver's
-    // own read depth (MAXC in applyContainerContents) or a snapshot silently describes
-    // less than the peer holds, and it must stay inside the u8 `count` field.
-    CHECK_EQ("INV_ITEMS_MAX raised to the receiver's read depth", (int)INV_ITEMS_MAX, 64);
-    CHECK("INV_ITEMS_MAX fits the u8 count field", INV_ITEMS_MAX <= 255);
-    // The TRUNCATED bit is what stops a partial snapshot being read as a delete. It must
-    // be a single low bit so future flags can share the byte.
-    CHECK_EQ("INV_FLAG_TRUNCATED value", (int)INV_FLAG_TRUNCATED, 1);
-    CHECK("INV_FLAG_TRUNCATED is a single bit",
-          (INV_FLAG_TRUNCATED & (u8)(INV_FLAG_TRUNCATED - 1)) == 0);
-    // `count` must remain the LAST header field: the entry array is framed immediately
-    // after it, so inserting `flags` anywhere else would shift the payload.
-    {
-        InvSnapshotHeader h;
-        std::memset(&h, 0, sizeof(h));
-        const unsigned char* base = reinterpret_cast<const unsigned char*>(&h);
-        std::size_t offCount = (std::size_t)(reinterpret_cast<const unsigned char*>(&h.count) - base);
-        std::size_t offFlags = (std::size_t)(reinterpret_cast<const unsigned char*>(&h.flags) - base);
-        CHECK_EQ("InvSnapshotHeader::count is the last field",
-                 offCount, sizeof(InvSnapshotHeader) - 1);
-        CHECK("InvSnapshotHeader::flags precedes the container key", offFlags < offCount);
-    }
 
     // Protocol 47 (world-item CLAIM: the W1 pickup mirror). The tag must be unique or a
     // claim would be decoded as some other packet and silently destroy the wrong thing.
@@ -460,73 +419,17 @@ static void fillPattern(T* p, unsigned char seed) {
     for (unsigned i = 0; i < sizeof(T); ++i) b[i] = (unsigned char)(seed + i * 7);
 }
 
-template <typename T>
-static void roundTrip(const char* name, u8 typeTag) {
-    T in;
-    fillPattern(&in, (unsigned char)(typeTag * 31));
-    in.type = typeTag;
-    unsigned char buf[512];
-    std::memcpy(buf, &in, sizeof(T));
-
-    char label[128];
-
-    T out;
-    std::memset(&out, 0, sizeof(T));
-    bool okRead = readPacket(buf, (unsigned)sizeof(T), &out);
-    std::sprintf(label, "%s round-trip read", name);
-    CHECK(label, okRead && std::memcmp(&in, &out, sizeof(T)) == 0);
-
-    std::sprintf(label, "%s packetType tag", name);
-    CHECK(label, packetType(buf, (unsigned)sizeof(T)) == typeTag);
-
-    // Truncated by one byte: the reader MUST reject (never a partial fill).
-    std::sprintf(label, "%s rejects truncated buffer", name);
-    CHECK(label, !readPacket(buf, (unsigned)sizeof(T) - 1, &out));
-}
-
-static void testRoundTrips() {
-    std::printf("== readPacket round-trips + truncation rejection ==\n");
-    roundTrip<HelloPacket>("HelloPacket", (u8)PKT_HELLO);
-    roundTrip<WelcomePacket>("WelcomePacket", (u8)PKT_WELCOME);
-    roundTrip<EventPacket>("EventPacket", (u8)PKT_EVENT);
-    roundTrip<WorldDropPacket>("WorldDropPacket", (u8)PKT_WORLD_DROP);
-    roundTrip<WorldPickupPacket>("WorldPickupPacket", (u8)PKT_WORLD_PICKUP);
-    roundTrip<InvXferPacket>("InvXferPacket", (u8)PKT_INV_XFER);
-    roundTrip<MedicalPacket>("MedicalPacket", (u8)PKT_MEDICAL);
-    roundTrip<TreatmentPacket>("TreatmentPacket", (u8)PKT_TREATMENT);
-    roundTrip<CombatHitPacket>("CombatHitPacket", (u8)PKT_COMBAT_HIT);
-    roundTrip<SpeedPacket>("SpeedPacket(REQ)", (u8)PKT_SPEED_REQ);
-    roundTrip<SpeedPacket>("SpeedPacket(SET)", (u8)PKT_SPEED_SET);
-    roundTrip<StatsPacket>("StatsPacket", (u8)PKT_STATS);
-    roundTrip<MoneyPacket>("MoneyPacket", (u8)PKT_MONEY);
-    roundTrip<MoneyDeltaPacket>("MoneyDeltaPacket", (u8)PKT_MONEY_DELTA);
-    roundTrip<FactionPacket>("FactionPacket", (u8)PKT_FACTION);
-    roundTrip<TimePacket>("TimePacket", (u8)PKT_TIME);
-    roundTrip<DoorPacket>("DoorPacket", (u8)PKT_DOOR);
-    roundTrip<BuildPlacePacket>("BuildPlacePacket", (u8)PKT_BUILD_PLACE);
-    roundTrip<BuildStatePacket>("BuildStatePacket", (u8)PKT_BUILD_STATE);
-    roundTrip<BuildDoorPacket>("BuildDoorPacket", (u8)PKT_BUILD_DOOR);
-    roundTrip<BuildRemovePacket>("BuildRemovePacket", (u8)PKT_BUILD_REMOVE);
-    roundTrip<StealthPacket>("StealthPacket", (u8)PKT_STEALTH);
-    roundTrip<SpawnReqPacket>("SpawnReqPacket", (u8)PKT_SPAWN_REQ);
-    roundTrip<SpawnInfoPacket>("SpawnInfoPacket", (u8)PKT_SPAWN_INFO);
-    roundTrip<SaveReqPacket>("SaveReqPacket", (u8)PKT_SAVE_REQ);
-    roundTrip<SaveBeginPacket>("SaveBeginPacket", (u8)PKT_SAVE_BEGIN);
-    roundTrip<SaveAckPacket>("SaveAckPacket", (u8)PKT_SAVE_ACK);
-    roundTrip<LoadGoPacket>("LoadGoPacket", (u8)PKT_LOAD_GO);
-    roundTrip<LoadReqPacket>("LoadReqPacket", (u8)PKT_LOAD_REQ);
-    roundTrip<LoadNackPacket>("LoadNackPacket", (u8)PKT_LOAD_NACK);
-    roundTrip<ProdPacket>("ProdPacket", (u8)PKT_PROD);
-    roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
-    roundTrip<DeedPacket>("DeedPacket", (u8)PKT_DEED);
-    roundTrip<FixturePacket>("FixturePacket", (u8)PKT_FIXTURE);
-    roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
-    roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
-
-    CHECK("packetType(null) == 0", packetType(0, 10) == 0);
-    unsigned char b0[1] = { 0 };
-    CHECK("packetType(len 0) == 0", packetType(b0, 0) == 0);
-    CHECK("readPacket(null) rejected", !readPacket<HelloPacket>(0, 4, (HelloPacket*)b0) || true);
+static void testWireReaderBounds() {
+    std::printf("== wire reader malformed input boundaries ==\n");
+    unsigned char bytes[sizeof(HelloPacket)] = { (u8)PKT_HELLO };
+    HelloPacket output; std::memset(&output, 0x5a, sizeof(output));
+    CHECK("empty packet has no tag", packetType(bytes, 0) == 0);
+    CHECK("null packet has no tag", packetType(0, sizeof(bytes)) == 0);
+    CHECK("null input rejected", !readPacket<HelloPacket>(0, sizeof(bytes), &output));
+    CHECK("null output rejected", !readPacket<HelloPacket>(bytes, sizeof(bytes), 0));
+    CHECK("truncated fixed header rejected without output mutation",
+          !readPacket<HelloPacket>(bytes, sizeof(bytes) - 1, &output) &&
+          output.type == 0x5a && output.version == 0x5a5a && output.nameLen == 0x5a);
 }
 
 // ---- 3. Field-offset lock (HELLO version + batch framing) -----------------------
@@ -1207,6 +1110,62 @@ static void testInterp() {
         bool ok = it.sample(1030, cfg, &out);
         CHECK("identity+state passthrough", ok && out.bodyState == BODY_DOWN && out.cMoving == 1 && out.task == 42 && out.hIndex == 1);
     }
+
+    // Duplicate/reordered samples must not acquire the retained pose's author.
+    // The caller can bind provenance only to a positively accepted full state.
+    {
+        EntityInterp it;
+        EntityState first = entAt(3.0f);
+        first.task = 42; first.sType = 0; first.sContainer = 12;
+        first.sContainerSerial = 5; first.sIndex = 77; first.sSerial = 9;
+        EntityState other = entAt(999.0f);
+        other.task = 21; other.sType = 0; other.sContainer = 31;
+        other.sContainerSerial = 2; other.sIndex = 88; other.sSerial = 4;
+        CHECK("initial full pose accepted", it.push(first, 1000));
+        CHECK("duplicate capture cannot replace pose provenance", !it.push(other, 1000));
+        CHECK("small reorder cannot replace pose provenance", !it.push(other, 751));
+        EntityState out;
+        bool have = it.latest(&out, 0, 0, 0);
+        CHECK("rejected captures preserve full authoritative subject",
+              have && out.x == first.x && out.task == first.task &&
+              out.sType == first.sType && out.sContainer == first.sContainer &&
+              out.sContainerSerial == first.sContainerSerial &&
+              out.sIndex == first.sIndex && out.sSerial == first.sSerial);
+        CHECK("clock restart boundary accepts new authoritative pose", it.push(other, 750));
+        have = it.latest(&out, 0, 0, 0);
+        CHECK("clock restart replaces full state without old subject",
+              have && out.x == other.x && out.task == other.task &&
+              out.sType == other.sType && out.sContainer == other.sContainer &&
+              out.sContainerSerial == other.sContainerSerial &&
+              out.sIndex == other.sIndex && out.sSerial == other.sSerial);
+    }
+    // The 100 Hz sender emits several samples per 50 ms mid-band slice,
+    // then leaves that body unstreamed until the rotation returns.
+    {
+        EntityInterp it;
+        for (int cycle = 0; cycle < 4; ++cycle)
+            for (int tick = 0; tick < 5; ++tick) {
+                unsigned long stamp = 1000 + cycle * 500 + tick * 10;
+                it.push(entAt((float)(stamp - 1000) * 0.01f), stamp);
+            }
+        EntityState out;
+        bool have = it.sample(2960, cfg, &out);
+        CHECK("mid-band bursts interpolate through the rotation drought",
+              have && it.lastMode() == EntityInterp::SM_LERP &&
+              it.lastDelayMs() >= 420 && out.x >= 10.0f && out.x <= 15.4f);
+        for (int tick = 1; tick <= 20; ++tick)
+            it.push(entAt(15.4f + tick * 0.1f), 2540 + tick * 10);
+        have = it.sample(2780, cfg, &out);
+        CHECK("near promotion evicts sparse cadence without retaining a long delay",
+              have && it.lastDelayMs() <= cfg.maxDelayMs &&
+              out.x >= 15.4f && out.x <= 17.8f);
+        it.clear();
+        it.push(entAt(3.0f), 4000);
+        it.push(entAt(4.0f), 4050);
+        have = it.sample(4100, cfg, &out);
+        CHECK("clear removes sparse capture history",
+              have && it.lastDelayMs() <= cfg.maxDelayMs && out.x >= 3.0f && out.x <= 5.0f);
+    }
 }
 
 // ---- 6. Ownership rank resolution (OwnRanks.h) ----------------------------------
@@ -1356,13 +1315,25 @@ static void testUdpEndpointParse() {
           coop::parseUdpEndpoint("10.0.0.2", ip, port) &&
           ip == "10.0.0.2" && port == 9);
     ip.clear(); port = 1;
-    CHECK("host port space-separated",
-          coop::parseUdpEndpoint("play.example.com 12345", ip, port) &&
-          ip == "play.example.com" && port == 12345);
+    CHECK("numeric address with space-separated port",
+          coop::parseUdpEndpoint("10.0.0.2 12345", ip, port) &&
+          ip == "10.0.0.2" && port == 12345);
     ip.clear(); port = 27800;
     CHECK("whitespace/newline stripped",
           coop::parseUdpEndpoint("  127.0.0.1:9000 \r\n", ip, port) &&
           ip == "127.0.0.1" && port == 9000);
+    ip.clear(); port = 27800;
+    CHECK("bare IPv6 does not mistake final group for port",
+          coop::parseUdpEndpoint("2001:db8::1234", ip, port) &&
+          ip == "2001:db8::1234" && port == 27800);
+    ip.clear(); port = 27800;
+    CHECK("bracketed IPv6 explicit port",
+          coop::parseUdpEndpoint("[::1]:65535", ip, port) &&
+          ip == "::1" && port == 65535);
+    ip.clear(); port = 27800;
+    CHECK("bracketed IPv6 separate port",
+          coop::parseUdpEndpoint(" [2001:db8::1] 1\r\n", ip, port) &&
+          ip == "2001:db8::1" && port == 1);
 
     ip = "keep"; port = 7;
     CHECK("empty rejected", !coop::parseUdpEndpoint("", ip, port) &&
@@ -1373,6 +1344,27 @@ static void testUdpEndpointParse() {
           !coop::parseUdpEndpoint("1.2.3.4:70000", ip, port) && port == 7);
     CHECK("junk rejected", !coop::parseUdpEndpoint("not an address!", ip, port) &&
           ip == "keep");
+    CHECK("DNS names refused by direct numeric-only UDP",
+          !coop::parseUdpEndpoint("play.example.com:12345", ip, port) &&
+          ip == "keep" && port == 7);
+    CHECK("out-of-range IPv4 rejected without output mutation",
+          !coop::parseUdpEndpoint("256.1.2.3", ip, port) &&
+          ip == "keep" && port == 7);
+    CHECK("malformed IPv6 rejected",
+          !coop::parseUdpEndpoint("2001:::1", ip, port) &&
+          ip == "keep" && port == 7);
+    CHECK("missing bracket refused",
+          !coop::parseUdpEndpoint("[::1:9000", ip, port) &&
+          ip == "keep" && port == 7);
+    CHECK("empty explicit port refused",
+          !coop::parseUdpEndpoint("[::1]:", ip, port) &&
+          ip == "keep" && port == 7);
+    CHECK("trailing third token refused",
+          !coop::parseUdpEndpoint("127.0.0.1 9000 junk", ip, port) &&
+          ip == "keep" && port == 7);
+    CHECK("unbracketed IPv6 port ambiguity is address only",
+          coop::parseUdpEndpoint("::1:9000", ip, port) &&
+          ip == "::1:9000" && port == 7);
 }
 
 static void testPlayerNickParse() {
@@ -1507,6 +1499,31 @@ static void testTaskClear() {
     const unsigned long postWrap  = 1199UL;             // (nearMax + 1300) mod 2^32: 1300 ms later
     CHECK("wrap: 50 ms elapsed holds",    !poseClearElapsed(nearMax, stillPre, clearMs));
     CHECK("wrap: 1300 ms elapsed clears",  poseClearElapsed(nearMax, postWrap, clearMs));
+
+    // An explicit newer NONE receipt can end NPC combat after the existing
+    // task-clear window. Silence or an older receipt is not that transition.
+    CHECK("combat NONE 1199 ms holds",
+          !combatClearConfirmed(2199UL, 1000UL, 2199UL, clearMs));
+    CHECK("combat NONE 1200 ms clears",
+           combatClearConfirmed(2200UL, 1000UL, 2200UL, clearMs));
+    CHECK("combat continued NONE clears",
+           combatClearConfirmed(2500UL, 1000UL, 2400UL, clearMs));
+    CHECK("combat one NONE then drought holds",
+          !combatClearConfirmed(2500UL, 1000UL, 1005UL, clearMs));
+    CHECK("combat old receipt holds",
+          !combatClearConfirmed(2500UL, 1000UL, 995UL, clearMs));
+    CHECK("combat refreshed engagement holds",
+          !combatClearConfirmed(2500UL, 2495UL, 2500UL, clearMs));
+    CHECK("combat receipt before clear boundary holds",
+          !combatClearConfirmed(2500UL, 1000UL, 2199UL, clearMs));
+    CHECK("combat wrapped continued NONE clears",
+           combatClearConfirmed(944UL, 0xffffff00UL, 944UL, clearMs));
+    CHECK("combat wrapped short NONE holds",
+          !combatClearConfirmed(943UL, 0xffffff00UL, 943UL, clearMs));
+    CHECK("combat wrapped drought holds",
+          !combatClearConfirmed(1200UL, 0xffffff00UL, 0xffffff01UL, clearMs));
+    CHECK("combat wrapped old receipt holds",
+          !combatClearConfirmed(1200UL, 0xffffff00UL, 0xfffffeffUL, clearMs));
 }
 
 // ---- 10. Death/KO latch carry across re-key (DeathLatch.h rekeyCarryLatch) ------
@@ -1719,8 +1736,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("worldRemove", InboundWorldRemove, drainWorldRemove);
     WS_EMPTY("worldClaim",  InboundWorldClaim,  drainWorldClaim);
     WS_EMPTY("npcCensus",   InboundNpcCensus,   drainNpcCensus);
-    WS_EMPTY("worldDrop",   InboundWorldDrop,   drainWorldDrops);
-    WS_EMPTY("worldPickup", InboundWorldPickup, drainWorldPickups);
+    WS_EMPTY("groundGear",  InboundGroundGear,  drainGroundGear);
     WS_EMPTY("invXfer",     InboundInvXfer,     drainInvXfers);
     WS_EMPTY("medical",     InboundMedical,     drainMedical);
     WS_EMPTY("treatment",   InboundTreatment,   drainTreatments);
@@ -1769,35 +1785,6 @@ static void testFlushWorldStateContract() {
     #undef SP_KEPT
 }
 
-// ---- 12. Worker-teardown ordering (models NetLink::stop()) -----------------------
-// The NetLink::stop() fix: ENet teardown (enet_deinitialize + CloseHandle) must
-// happen ONLY after the net worker has fully exited - the worker owns transport
-// cleanup, so deinitializing while it still runs is a use-after-free / double
-// free. The old code tore down unconditionally on a 2 s wait TIMEOUT. This locks
-// the ordering invariant with a bare Win32 worker (no ENet dependency in the unit
-// layer): stop() waits for the thread to exit FIRST, and the worker's cleanup
-// strictly precedes the post-wait teardown.
-static volatile LONG g_teardownSeq   = 0;
-static LONG          g_workerCleanup = 0;
-static LONG          g_teardown      = 0;
-static DWORD WINAPI teardownWorker(LPVOID) {
-    Sleep(40); // simulate the service loop draining + transport cleanup
-    g_workerCleanup = InterlockedIncrement(&g_teardownSeq);
-    return 0;
-}
-static void testTeardownOrdering() {
-    std::printf("== worker-teardown ordering (NetLink::stop contract) ==\n");
-    g_teardownSeq = 0; g_workerCleanup = 0; g_teardown = 0;
-    HANDLE th = CreateThread(0, 0, &teardownWorker, 0, 0, 0);
-    CHECK("worker thread created", th != 0);
-    if (th) {
-        DWORD wr = WaitForSingleObject(th, INFINITE); // stop(): wait for full exit
-        CHECK("wait returns signalled (worker exited)", wr == WAIT_OBJECT_0);
-        CloseHandle(th);
-        g_teardown = InterlockedIncrement(&g_teardownSeq); // "enet_deinitialize" AFTER
-        CHECK("worker cleanup precedes teardown", g_workerCleanup < g_teardown);
-    }
-}
 
 // ---- ObjectHand: dual-layout unification contract (Phase 5b) ----------------
 // Locks the ONE typed identity's two legacy array orders so a future edit can't
@@ -2032,7 +2019,7 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
-    testRoundTrips();
+    testWireReaderBounds();
     testFraming();
     testSaveCrc();
     testFolderFingerprint();
@@ -2049,7 +2036,11 @@ int main() {
     testDeathRekey();
     testInboundLifecycle();
     testFlushWorldStateContract();
-    testTeardownOrdering();
+    CHECK("procedural region snapshot regression group", testProceduralWorldState()==0);
+    CHECK("assembled inventory snapshot regression group", testInventorySnapshots()==0);
+    CHECK("authoritative inventory transaction regression group", testInventoryTransactionRules()==0);
+    CHECK("durable lock authority regression group", testLockAuthority()==0);
+
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

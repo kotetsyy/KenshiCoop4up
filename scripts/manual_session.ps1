@@ -1,8 +1,7 @@
 <#
 .SYNOPSIS
-  Launch a HOST + JOIN co-op session for MANUAL validation (you drive, no
-  self-exit, no screenshots). The host auto-spawns a few distinct-hand squad
-  members so you can move them and watch the join render/follow them live.
+  Launch a HOST + JOIN co-op session for manual validation (you drive, no
+  self-exit or automated screenshots). Host owns squad tab 0; join owns tab 1.
 
 .DESCRIPTION
   Unlike run_test.ps1 (timed/scenario runs that self-exit and screenshot), this
@@ -10,10 +9,6 @@
     KENSHICOOP_SAVE         - save both clients auto-load
     KENSHICOOP_TEST_SECONDS - forced 0 here (NO self-exit; you close the windows)
     KENSHICOOP_SCENARIO     - forced empty (normal co-op tick, no scenario)
-    KENSHICOOP_AUTOSPAWN    - host only: spawn N distinct squad members once
-  Those spawned units get fresh hands (not in the join's own squad), so the join
-  renders them as proxies - exercising the cross-client squad-render path on a
-  single shared save, no second save needed.
 
   Host runs from the Steam install; join from the Kenshi-Join install. With
   -Sync the host save is mirrored into the join install first.
@@ -27,12 +22,12 @@
   powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -TitleScreen
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -Save "c" -AutoSpawn 5 -SkipBuild -Sync
+  powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -Save "c" -SkipBuild -Sync
 
 .EXAMPLE
   # Long-run visual pop/snap inspection: 'zoom' save (outside town, camera far
   # out) + colored authority markers on the join (green DRV / red HID / yellow LOC).
-  powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -Save "zoom" -Inhabit -DebugMarkers -Tile
+  powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -Save "zoom" -DebugMarkers
 #>
 [CmdletBinding()]
 param(
@@ -42,35 +37,28 @@ param(
     # Title-screen free play: launch BOTH clients to the Kenshi main menu with
     # NO auto-load and NO auto-connect (KENSHICOOP_SAVE empty, AUTOCONNECT=0 on
     # both). You then load a save and go ONLINE via the in-game F2 panel - the
-    # real remote-play flow. Skips save validation, -Sync, and inhabit ownership.
+    # manual connection flow. Skips save validation and -Sync.
     [switch]$TitleScreen,
-    # Save the JOIN client loads. Defaults to $Save (shared-save mode). Pass a
-    # DIFFERENT save (with its own characters) so the two squads have distinct
-    # hands and fully render each other - including the player-controlled leaders.
+    # Must match the host save; accepted explicitly for paired launch callers.
     [string]$JoinSave = "",
-    [int]$AutoSpawn = 3,
     # Host-only recruit helper (KENSHICOOP_AUTORECRUIT=N seconds): N s after
     # gameplay settles, the host ONCE programmatically recruits the nearest
     # non-player world NPC via the same PlayerInterface::recruit the dialog
     # "join me" hits. Use to validate recruit sync on a populated save that has
     # no dialog-hireable NPC (camp/squad1). 0 = off.
     [int]$AutoRecruit = 0,
-    # Inhabit mode: both clients load the SAME save (so NPC sync works) but each
-    # OWNS a different subset of the shared squad. Default split: host owns the
-    # leader (index 0), join inhabits everyone else (~0). Overridable via
-    # -HostOwn/-JoinOwn (KENSHICOOP_OWN_INDICES: "0", "~0", "1,2", ""=own all).
-    # Forces shared save + no autospawn.
-    [switch]$Inhabit,
-    [string]$HostOwn = "0",
-    [string]$JoinOwn = "~0",
+    # Supported ownership is a CSV of squad-tab ranks, not character indices.
+    [ValidatePattern('^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$')]
+    [string]$HostSquads = "0",
+    [ValidatePattern('^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$')]
+    [string]$JoinSquads = "1",
     # Push-save-on-connect test: launch the JOIN with NO save so it sits at the
     # main menu (Continue / New Game / ...). The host loads $Save and, on the
     # join's connect, bakes + announces its live world (LOAD_GO); the join loads
     # it straight from the menu. On a single machine both installs share the save
     # folder, so the join fingerprint MATCHES and it loads from disk (the connect
     # trigger + title-screen load pump); the folder-transfer half only engages
-    # when the join genuinely lacks the save (a real second machine). Implies
-    # -Inhabit ownership so each side drives a distinct squad subset.
+    # when the join genuinely lacks the save (a real second machine).
     [switch]$JoinFromMenu,
     [int]$Port = 27800,
     [string]$Ip = "127.0.0.1",
@@ -165,33 +153,21 @@ param(
     # observing side (a diagnostic divergence, NOT a real desync). Do NOT use for
     # parity/visual A-B; use plain -JailProbe for that.
     [switch]$JailObserve,
-    # Manual sessions tile the two game windows side-by-side BY DEFAULT (host left,
-    # join right; scripts\arrange_windows.ps1, re-pinned through the load screen) on
-    # the ULTRAWIDE (widest monitor, 3440x1440): each client window is sized to half
-    # the ultrawide via kenshi.cfg Video Mode (set_video_mode.ps1) so visual A/B
-    # validation FILLS the screen. -NoTile skips both the resize and the tiling.
-    # (-Tile is legacy/accepted; tiling is on unless -NoTile.)
-    [switch]$Tile,
-    [switch]$NoTile,
-    [ValidateSet("widest", "primary")]
-    [string]$TileMonitor = "widest",
-    # Client (render area) size per window for the manual layout: 1720x1440 fills the
-    # 3440x1440 ultrawide edge-to-edge (2x1720 = 3440 wide, full 1440 height). This is
-    # the MANUAL-only resolution; automated runs (run_test.ps1) keep the smaller
-    # 1280x1024 primary-monitor layout, so the two harnesses never fight over the cfg.
-    [int]$WindowW = 1720,
-    [int]$WindowH = 1440,
-    # How long to keep re-pinning. Must outlast host launch + join delay + both load
-    # screens (Kenshi re-centers on gameplay entry), matching run_test.ps1's default.
-    [int]$TileRepeatSec = 75
+    # The owning helper always sizes/pins windows on a live non-primary monitor.
+    [string]$NativeBin = ""
 )
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir 'kit_preflight.ps1')
+. (Join-Path $scriptDir 'NativeBuild.ps1')
 
-# Tiling is the manual-session default; -NoTile opts out (-Tile kept for compat).
-$doTile = -not $NoTile
 
+$HostDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($HostDir)
+$JoinDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($JoinDir)
+$HostSquads = (@($HostSquads.Split(',') | ForEach-Object { [uint32]$_ } | Sort-Object -Unique) -join ',')
+$JoinSquads = (@($JoinSquads.Split(',') | ForEach-Object { [uint32]$_ } | Sort-Object -Unique) -join ',')
+if (@($HostSquads.Split(',') | Where-Object { $JoinSquads.Split(',') -contains $_ }).Count -and -not $NoJoin) { throw 'Host and join squad-tab ownership must not overlap.' }
 $hostExe = Join-Path $HostDir "kenshi_x64.exe"
 $joinExe = Join-Path $JoinDir "kenshi_x64.exe"
 if (-not (Test-Path $hostExe)) { throw "Host Kenshi not found: $hostExe" }
@@ -203,10 +179,7 @@ if ($JailObserve -and -not $JailProbe) {
 
 if ($JoinSave -eq "") { $JoinSave = $Save }
 
-if ($Inhabit -or $JoinFromMenu) {
-    $JoinSave  = $Save   # shared save: NPC resolve-by-hand needs identical hands
-    $AutoSpawn = 0       # inhabit drives EXISTING squad members, not spawned ones
-}
+if ($JoinFromMenu) { $JoinSave = $Save }
 
 # Title-screen mode boots both clients to the main menu (no auto-load), so no
 # save is required or validated. Every other mode auto-loads and needs a save.
@@ -214,19 +187,18 @@ if (-not $TitleScreen -and $Save -eq "") {
     throw "Provide -Save <name>, or pass -TitleScreen to boot both clients to the main menu."
 }
 
-# Validate the saves exist (auto-loading a missing save crashes the game). Both
-# installs read named saves from the same per-user folder, so a save created in
-# either client is visible to both - no copy/sync needed.
-$saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
+# Check the native save location selected by each install, not an assumed global
+# folder. A join about to receive the explicit sync is validated after copying.
 if (-not $TitleScreen) {
-    # JoinFromMenu launches the join with no save (it sits at the menu), so only
-    # the host's save must exist up front.
-    $savesToCheck = if ($JoinFromMenu) { @($Save) } else { @($Save, $JoinSave) }
-    foreach ($s in $savesToCheck | Select-Object -Unique) {
-        if (-not (Test-Path (Join-Path $saveRoot $s))) {
-            $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
-            throw "Save '$s' not found in $saveRoot. Available saves: $avail"
-        }
+    $clients = @(@{Dir=$HostDir;Save=$Save})
+    if (-not $NoJoin -and -not $JoinFromMenu -and -not ($Sync -and $Save -eq $JoinSave)) { $clients += @{Dir=$JoinDir;Save=$JoinSave} }
+    foreach ($client in $clients) {
+        if (-not $client.Save -or $client.Save -match '[\\/:]' -or $client.Save -in @('.','..')) { throw 'One named save is required.' }
+        $settings = Join-Path $client.Dir 'settings.cfg'
+        $location = @(Get-Content -LiteralPath $settings | Where-Object { $_ -match '^\s*User save location\s*=\s*[01]\s*$' })
+        if ($location.Count -ne 1) { throw "Native save location cannot be established in $settings." }
+        $saveRoot = if ($location[0] -match '=\s*1\s*$') { Join-Path $env:LOCALAPPDATA 'kenshi\save' } else { Join-Path $client.Dir 'save' }
+        if (-not (Test-Path -LiteralPath (Join-Path $saveRoot "$($client.Save)\quick.save") -PathType Leaf)) { throw "Complete save '$($client.Save)' not found in $saveRoot." }
     }
 }
 
@@ -238,37 +210,21 @@ if ($TitleScreen) {
     Write-Host "  host save:  $Save"
     Write-Host "  join save:  $JoinSave"
 }
-Write-Host "  autospawn:  $AutoSpawn (host only)"
 Write-Host "  self-exit:  OFF (close the windows yourself when done)"
 if ($TitleScreen) {
     Write-Host "  NOTE: pick the SAME save on both clients (NPC sync is resolve-by-hand)."
-} elseif ($Inhabit) {
-    Write-Host "  mode:       INHABIT (shared save, partitioned squad ownership)"
-    Write-Host "  host owns:  $HostOwn   join owns:  $JoinOwn  (squad-member rank: 0 = leader)"
-} elseif ($Save -ne $JoinSave) {
-    # Distinct-save is a v1 dead-end: NPC identity is resolve-by-hand, which needs
-    # IDENTICAL saves on both clients. Two different saves mint different hands, so
-    # NPCs (and squads) fail to resolve and desync. Kept only for experiments.
-    Write-Warning "DISTINCT-SAVE MODE IS UNSUPPORTED FOR v1."
-    Write-Warning "  Host loads '$Save' but join loads '$JoinSave'. NPC sync is resolve-by-hand and"
-    Write-Warning "  REQUIRES the same save on both clients - expect NPC/squad desync. Use -Inhabit"
-    Write-Warning "  (shared save + partitioned ownership) for the supported two-player path."
 } else {
-    Write-Host "  NOTE: shared save in OWN-ALL mode - both clients claim the same squad, so the"
-    Write-Host "        leaders share a hand and won't render cross-client. Pass -Inhabit to"
-    Write-Host "        partition ownership so each player's character renders + drives on the other."
+    if (-not $NoJoin -and $Save -ne $JoinSave) { throw 'Both clients must load the same save for full entity identity.' }
+    Write-Host "  ownership: host squad tabs {$HostSquads}; join squad tabs {$JoinSquads}"
 }
 
-# Clean slate so build/deploy aren't blocked by a loaded DLL / running game.
-$stale = @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue)
-if ($stale.Count -gt 0) {
-    Write-Host "  killing $($stale.Count) stale Kenshi process(es) ..."
-    $stale | Stop-Process -Force -ErrorAction SilentlyContinue
-    for ($i = 0; $i -lt 20; $i++) {
-        if (@(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue).Count -eq 0) { break }
-        Start-Sleep -Milliseconds 500
-    }
-}
+$ownedDirs = @(Get-CoopManualGameDirs -HostDir $HostDir -JoinDir $JoinDir -NoJoin ([bool]$NoJoin))
+$runState = New-CoopRunState -GameDirs $ownedDirs -PreserveSaves
+$credentials = $null
+$repoRoot = Split-Path -Parent $scriptDir
+$dest = Join-Path $repoRoot ('tools\manual-sessions\' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
+try {
+New-Item -ItemType Directory -Path $dest | Out-Null
 
 # Build and deploy are INDEPENDENT steps. -SkipBuild reuses the existing built
 # DLL but STILL DEPLOYS it (the old behavior skipped deploy too, which silently
@@ -283,8 +239,7 @@ if (-not $SkipBuild) {
 if (-not $SkipDeploy) {
     Write-Host ""
     Write-Host "=== deploy ==="
-    & cmd /c "`"$scriptDir\deploy.cmd`""
-    if ($LASTEXITCODE -ne 0) { throw "deploy.cmd failed ($LASTEXITCODE)" }
+    Install-CoopHarnessRuntime -RepoRoot (Split-Path -Parent $scriptDir) -GameDirs $ownedDirs -NativeBin $NativeBin
     # Surface exactly which DLL is now deployed so we never validate a stale build.
     $deployed = Join-Path $HostDir "mods\KenshiCoop\KenshiCoop.dll"
     if (Test-Path $deployed) {
@@ -296,31 +251,27 @@ if (-not $SkipDeploy) {
     Write-Host "=== deploy SKIPPED (-SkipDeploy): installs keep their current DLL ==="
 }
 
-# Size both clients for the manual layout BEFORE launch (Kenshi reads kenshi.cfg
-# Video Mode at startup; the tiler only moves). run_test.ps1 writes the automated
-# layout back on its next run, so the two harnesses never fight over the cfg.
-if ($doTile) {
-    Write-Host ""
-    Write-Host "=== window layout: manual (${WindowW}x${WindowH} x2, $TileMonitor monitor) ==="
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "set_video_mode.ps1") `
-        -Width $WindowW -Height $WindowH -HostDir $HostDir -JoinDir $JoinDir
-}
+$native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
+$credentials = New-CoopLocalCredentials -NativeBin $native.Bin -GameDirs $ownedDirs
 
-if ($Sync -and $TitleScreen) {
+if ($Sync -and $NoJoin) {
+    Write-Host 'Skipping -Sync: no join game is owned in host-only mode.'
+} elseif ($Sync -and $TitleScreen) {
     Write-Host ""
     Write-Host "Skipping -Sync: title-screen mode auto-loads nothing (load a save by hand)."
 } elseif ($Sync -and ($Save -eq $JoinSave)) {
     Write-Host ""
-    Write-Host "Syncing saves host -> join ..."
-    & cmd /c "`"$scriptDir\sync_save.cmd`" `"$HostDir`" `"$JoinDir`""
-    if ($LASTEXITCODE -ne 0) { throw "sync_save.cmd failed ($LASTEXITCODE)" }
+    Write-Host "Syncing only named save '$Save' host -> join ..."
+    Add-CoopRunBackup -State $runState -Path (Join-Path $JoinDir "save\$Save")
+    Sync-CoopNamedSave -Save $Save -HostDir $HostDir -JoinDir $JoinDir
 } elseif ($Sync) {
     Write-Host ""
     Write-Host "Skipping -Sync: host and join load different saves (distinct-save mode)."
 }
 
 function Set-CoopEnv {
-    param([string]$Mode, [string]$SaveName, [int]$Spawn, [string]$Own = "")
+    param([string]$Mode, [string]$SaveName, [string]$Own)
+    Clear-CoopRunEnvironment -State $runState
     $env:KENSHICOOP_MODE         = $Mode
     # Manual sessions run BOTH clients on this one machine (same Steam account), so
     # they must use direct-UDP loopback: a same-machine Steam P2P session can't
@@ -330,6 +281,7 @@ function Set-CoopEnv {
     # the file. For a real two-machine Steam test, use the in-game F2 panel instead.
     $env:KENSHICOOP_TRANSPORT    = "udp"
     $env:KENSHICOOP_STEAM_PEER   = "0"
+    Set-CoopPrivateCredentials -Mode $Mode -UseSteam $false -GameDirs $ownedDirs -ProfilePath $credentials.Profile -InviteFile $credentials.Invite
     # Auto-connect at load using the env role/transport above. EXCEPTION: with
     # -JoinFromMenu the JOIN must WAIT at the main menu so the user can bring up
     # the F2 panel and go ONLINE by hand (the whole point of that mode - the join
@@ -342,22 +294,20 @@ function Set-CoopEnv {
     $env:KENSHICOOP_SAVE         = $SaveName
     $env:KENSHICOOP_TEST_SECONDS = "0"     # manual: never self-exit
     $env:KENSHICOOP_SCENARIO     = ""      # manual: no scenario
-    $env:KENSHICOOP_AUTOSPAWN    = "$Spawn"
-    $env:KENSHICOOP_OWN_INDICES  = $Own    # inhabit partition ("" = own all)
+    $env:KENSHICOOP_OWN_SQUAD    = $Own
     # Host-only one-shot world spawn for baking a deterministic test scene.
     $env:KENSHICOOP_SETUP        = if ($Mode -eq "join") { "" } else { $SetupScene }
     # Host-only auto-recruit (N s after gameplay): recruit nearest world NPC.
-    $env:KENSHICOOP_AUTORECRUIT  = if ($Mode -eq "join") { "" } else { "$AutoRecruit" }
-    $env:KENSHICOOP_PROBE_RECRUIT = if ($Mode -eq "join" -and $ProbeRecruit) { "1" } else { "" }
-    $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
+    $env:KENSHICOOP_AUTORECRUIT  = if ($Mode -eq "join") { "0" } else { "$AutoRecruit" }
+    $env:KENSHICOOP_PROBE_RECRUIT = if ($Mode -eq "join" -and $ProbeRecruit) { "1" } else { "0" }
+    $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "0" }
     # Inventory sync is bidirectional, so enable it on BOTH clients.
-    $env:KENSHICOOP_INV_SYNC     = if ($InvSync) { "1" } else { "" }
+    if ($InvSync) { $env:KENSHICOOP_INV_SYNC = "1" }
     # World-item sync is host-authored + join-observed, but the gate is read on both
     # clients (host publishes, join applies), so enable it on BOTH.
-    $env:KENSHICOOP_WORLD_SYNC   = if ($WorldSync) { "1" } else { "" }
-    $env:KENSHICOOP_INV_DUMP     = if ($InvDump) { "1" } else { "" }
-    # Authority markers render on the DRIVEN side; harmless on both, so set both.
-    $env:KENSHICOOP_DEBUG_MARKERS = if ($DebugMarkers) { "1" } else { "" }
+    if ($WorldSync) { $env:KENSHICOOP_WORLD_SYNC = "1" }
+    $env:KENSHICOOP_INV_DUMP     = if ($InvDump) { "1" } else { "0" }
+    $env:KENSHICOOP_DEBUG_MARKERS = if ($DebugMarkers) { "1" } else { "0" }
     # Presence authority MUST match on both clients: each side publishes claims and
     # reads the peer's, so one side alone would author its cells while the other
     # went on enforcing host authority over the same bodies. Pinned explicitly in
@@ -371,25 +321,24 @@ function Set-CoopEnv {
     $env:KENSHICOOP_CELL_COLLAPSE = if ($NoCollapse) { "0" } else { "1" }
     # Track on BOTH: each client can only see its own tabs' true positions, and
     # the interesting comparison is what the two logs say about the same walk.
-    $env:KENSHICOOP_TRACK_MOVE   = if ($TrackMove) { "1" } else { "" }
+    $env:KENSHICOOP_TRACK_MOVE   = if ($TrackMove) { "1" } else { "0" }
     # Phase 6 shackle trace on both clients (see -DebugShackle).
-    $env:KENSHICOOP_DEBUG_SHACKLE = if ($DebugShackle) { "1" } else { "" }
+    $env:KENSHICOOP_DEBUG_SHACKLE = if ($DebugShackle) { "1" } else { "0" }
     # Jail long-play probes on BOTH clients (spike 58, see -JailProbe): STATE/SNAP
     # + task-selection traces + auditRows (auditRows keys off KENSHICOOP_JAIL_PROBE
     # in Plugin.cpp when no scenario name is set). NOTE: JAIL_OBSERVE is NOT armed
     # by -JailProbe - observe disables the captive self-heal (captives exit
     # furniture + walk off on the observing side), which is a diagnostic
     # divergence, not real behavior. It is opt-in via -JailObserve.
-    $env:KENSHICOOP_JAIL_PROBE   = if ($JailProbe) { "1" } else { "" }
-    $env:KENSHICOOP_TASK_SPIKE   = if ($JailProbe) { "1" } else { "" }
-    $env:KENSHICOOP_JAIL_OBSERVE = if ($JailObserve) { "1" } else { "" }
-    # Per-mode log next to the install so host/join don't clobber each other.
-    $env:KENSHICOOP_LOG          = if ($Mode -eq "join") { "KenshiCoop_join.log" } else { "KenshiCoop_host.log" }
+    $env:KENSHICOOP_JAIL_PROBE   = if ($JailProbe) { "1" } else { "0" }
+    $env:KENSHICOOP_TASK_SPIKE   = if ($JailProbe) { "1" } else { "0" }
+    $env:KENSHICOOP_JAIL_OBSERVE = if ($JailObserve) { "1" } else { "0" }
+    $env:KENSHICOOP_LOG          = Join-Path $dest "$Mode.log"
 }
 
 function Start-PastLauncher {
     param([string]$Exe, [string]$WorkDir)
-    $out = & (Join-Path $scriptDir "start_kenshi.ps1") -ExePath $Exe -WorkDir $WorkDir -TimeoutSec $StartTimeoutSec 6>&1
+    $out = Start-CoopOwnedGame -State $runState -ScriptDir $scriptDir -ExePath $Exe -WorkDir $WorkDir -TimeoutSec $StartTimeoutSec -NativeOutput $NativeBin
     $out | ForEach-Object { Write-Host "    $_" }
     $line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -First 1
     if ($line -and ("$line" -match "GAMEPID=(\d+)")) { return [int]$Matches[1] }
@@ -398,12 +347,12 @@ function Start-PastLauncher {
 
 $joinPid = 0
 Write-Host ""
-$hostOwnEnv = if ($Inhabit -or $JoinFromMenu) { $HostOwn } else { "" }
-$joinOwnEnv = if ($Inhabit -or $JoinFromMenu) { $JoinOwn } else { "" }
+$hostOwnEnv = $HostSquads
+$joinOwnEnv = $JoinSquads
 
 $hostSaveName = if ($TitleScreen) { "" } else { $Save }
-Write-Host "Launching HOST ($(if ($TitleScreen) { '<main menu - no save>' } else { "save $Save" }), autospawn $AutoSpawn) ..."
-Set-CoopEnv -Mode "host" -SaveName $hostSaveName -Spawn $AutoSpawn -Own $hostOwnEnv
+Write-Host "Launching HOST ($(if ($TitleScreen) { '<main menu - no save>' } else { "save $Save" })) ..."
+Set-CoopEnv -Mode "host" -SaveName $hostSaveName -Own $hostOwnEnv
 $hostPid = Start-PastLauncher -Exe $hostExe -WorkDir $HostDir
 if ($hostPid -eq 0) { throw "Host failed to get past the launcher." }
 
@@ -414,9 +363,9 @@ if (-not $NoJoin) {
     # host's push-on-connect pulls it into the world.
     $joinSaveName = if ($JoinFromMenu -or $TitleScreen) { "" } else { $JoinSave }
     Write-Host "Launching JOIN (save $(if ($JoinFromMenu -or $TitleScreen) { '<main menu - no save>' } else { $JoinSave })) ..."
-    Set-CoopEnv -Mode "join" -SaveName $joinSaveName -Spawn 0 -Own $joinOwnEnv
+    Set-CoopEnv -Mode "join" -SaveName $joinSaveName -Own $joinOwnEnv
     $joinPid = Start-PastLauncher -Exe $joinExe -WorkDir $JoinDir
-    if ($joinPid -eq 0) { Write-Warning "Join failed to get past the launcher; host is up alone." }
+    if ($joinPid -eq 0) { throw "Join failed to get past the launcher." }
 }
 
 Write-Host ""
@@ -434,102 +383,30 @@ if ($TitleScreen) {
     Write-Host "  preset for loopback). The host then pushes its world and the join loads in"
     Write-Host "  straight from the menu - no save needed on the join. Close windows when done."
 } else {
-    Write-Host "  The host spawns $AutoSpawn squad members a few seconds after gameplay starts."
-    Write-Host "  Select them on the HOST and move them around; watch the JOIN render and"
-    Write-Host "  follow them. Close both windows when you're done (no auto-exit)."
+    Write-Host "  Move characters in your owned squad tabs; inspect both clients."
+    Write-Host "  Close both windows when done (no auto-exit)."
 }
 
-if ($doTile -and $hostPid -ne 0) {
-    # Same mechanism the automated tests use (scripts\arrange_windows.ps1): place the
-    # two windows side by side (host left / join right) and RE-PIN through the load
-    # screen, because Kenshi re-centers its window on the load->gameplay switch. Runs in
-    # the background so this launcher returns immediately. Requires windowed mode
-    # (kenshi.cfg Full Screen=No); it MOVES only, preserving each window's native size.
-    $arrangeScript = Join-Path $scriptDir "arrange_windows.ps1"
-    Write-Host ""
-    Write-Host "Arranging windows side by side ($TileMonitor monitor, host left / join right; re-pinning ${TileRepeatSec}s) ..."
-    # -ClientW/-ClientH: enforce the manual layout size at placement time too.
-    # Kenshi is system-DPI-aware, so when the primary (laptop) monitor runs a
-    # different DPI scale than the ultrawide, Windows RESCALES the window as the
-    # tiler moves it across - a move-only pin lands it the wrong size.
-    Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$arrangeScript`"",
-        "-HostPid", "$hostPid", "-JoinPid", "$joinPid",
-        "-Monitor", $TileMonitor, "-TimeoutSec", "90", "-RepeatSec", "$TileRepeatSec",
-        "-ClientW", "$WindowW", "-ClientH", "$WindowH"
-    ) | Out-Null
-}
-
-# Auto-collect the evidence when the session ends. The launcher returns
-# immediately (manual play), so a hidden background waiter blocks on the two game
-# PIDs and copies the logs into a stamped dir the moment you close the windows -
-# no manual copy step, no clobbered evidence.
-#
-# This used to run only under -JailProbe, which meant an ordinary session - the
-# kind that reproduces travel bugs - kept nothing. Both installs OVERWRITE their
-# logs on next launch, so the evidence for a crash survived only until whichever
-# run came next. kenshi_info.log comes along too: it is where the ENGINE reports
-# damage to its own bookkeeping ("was not removed from any zones", "alredy has
-# destroy reason <ours>"), which is how the 2026-08-03 stale-proxy crash was
-# eventually identified - from a copy that happened to still be sitting there.
-if ($hostPid -ne 0) {
-    $repoRoot   = Split-Path -Parent $scriptDir
-    $stamp      = Get-Date -Format "yyyyMMdd_HHmmss"
-    $prefix     = if ($JailProbe) { "jail_" } else { "" }
-    $dest       = Join-Path $repoRoot ("tools\manual-sessions\{0}{1}_{2}" -f $prefix, $Save.Replace(' ', '_'), $stamp)
-    $hostLogSrc = Join-Path $HostDir "KenshiCoop_host.log"
-    $joinLogSrc = Join-Path $JoinDir "KenshiCoop_join.log"
-    $hostEngSrc = Join-Path $HostDir "kenshi_info.log"
-    $joinEngSrc = Join-Path $JoinDir "kenshi_info.log"
-    $pidCsv     = if ($joinPid -ne 0) { "$hostPid,$joinPid" } else { "$hostPid" }
-    $waiterPs   = Join-Path $env:TEMP ("kc_session_waiter_{0}.ps1" -f $stamp)
-    @"
-`$ErrorActionPreference = 'SilentlyContinue'
-Wait-Process -Id $pidCsv
-New-Item -ItemType Directory -Force -Path '$dest' | Out-Null
-Copy-Item '$hostLogSrc' (Join-Path '$dest' 'KenshiCoop_host.log')
-Copy-Item '$joinLogSrc' (Join-Path '$dest' 'KenshiCoop_join.log')
-Copy-Item '$hostEngSrc' (Join-Path '$dest' 'host_engine.log')
-Copy-Item '$joinEngSrc' (Join-Path '$dest' 'join_engine.log')
-"@ | Set-Content -Path $waiterPs -Encoding UTF8
-    Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$waiterPs`""
-    ) | Out-Null
-    Write-Host ""
-    Write-Host "  on exit: plugin + engine logs (both clients) -> $dest"
-    if ($JailProbe) {
-        if ($JailObserve) {
-            Write-Host "  [jail] probes ARMED on both clients: STATE/SNAP + [spike] SELECT + auditRows + OBSERVE."
-            Write-Host "  [jail] WARNING: -JailObserve disables the captive self-heal - captives WILL exit"
-            Write-Host "  [jail]          furniture + walk off on the observing side (diagnostic, NOT a real desync)."
-        } else {
-            Write-Host "  [jail] probes ARMED on both clients: STATE/SNAP + [spike] SELECT + auditRows (self-heal ON)."
-        }
+# Check the unique current-run logs while the held processes are live. An old
+# install-root log can never satisfy these checks.
+foreach ($client in @(@{ Pid=$hostPid; Role='host'; Own=$HostSquads }, @{ Pid=$joinPid; Role='join'; Own=$JoinSquads })) {
+    if ($client.Pid -le 0) { continue }
+    $game = $runState.Processes[$client.Pid]
+    $log = Join-Path $dest "$($client.Role).log"
+    $pattern = 'ownership ranks = \{' + [regex]::Escape($client.Own) + '\}'
+    if (-not (Wait-CoopOwnedLogLine -Process $game -Deadline ([DateTime]::MaxValue) -File $log -Pattern $pattern -TimeoutSec $StartTimeoutSec)) {
+        throw "Current $($client.Role) plugin did not confirm requested squad ownership {$($client.Own)}."
     }
 }
-
-# Build-freshness guard: confirm the running plugin is the one we expect. In
-# -Inhabit mode the plugin logs "inhabit ownership = ..." once at load; if that
-# line never appears, the installs are running a stale DLL (the deploy-skip trap)
-# and any validation would be meaningless. Surface it loudly instead of silently
-# validating the wrong build.
-if (($Inhabit -or $JoinFromMenu) -and -not $TitleScreen) {
-    $hostLog = Join-Path $HostDir "KenshiCoop_host.log"
-    Write-Host ""
-    Write-Host "Confirming the deployed build is the inhabit build (watching host log) ..."
-    $deadline = (Get-Date).AddSeconds($StartTimeoutSec)
-    $seen = $false
-    while ((Get-Date) -lt $deadline) {
-        if (Test-Path $hostLog) {
-            # The plugin's load line reads "ownership ranks = {..}" (older builds
-            # said "inhabit ownership = ..." - the grep must match the current one).
-            $hit = Select-String -Path $hostLog -Pattern "ownership ranks = " -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $hit) { $seen = $true; Write-Host "  OK: $($hit.Line.Trim())"; break }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    if (-not $seen) {
-        Write-Warning "Did NOT see 'inhabit ownership' in the host log within $StartTimeoutSec s."
-        Write-Warning "The installs may be running a STALE DLL - re-run without -SkipDeploy."
-    }
+foreach ($game in @($hostPid,$joinPid) | Where-Object { $_ -gt 0 } | ForEach-Object { $runState.Processes[$_] }) {
+    Wait-CoopOwnedExit -Process $game -Deadline ([DateTime]::MaxValue)
+}
+foreach ($client in @(@{Dir=$HostDir;Role='host'},@{Dir=$JoinDir;Role='join'})) {
+    if ($client.Role -eq 'join' -and $NoJoin) { continue }
+    $source = Join-Path $client.Dir 'kenshi_info.log'
+    if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $dest "$($client.Role)_engine.log") }
+}
+Write-Host "Manual session artifacts: $dest"
+} finally {
+    Restore-CoopHarnessSession -State $runState -CredentialRoot $(if ($credentials) { $credentials.Root } else { '' })
 }

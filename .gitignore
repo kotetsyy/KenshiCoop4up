@@ -26,8 +26,11 @@ dist/KenshiCoop-remote-kit-*.zip
 tools/manual-sessions/
 
 # Vendored dependency source (fetched via clone/git-LFS, not committed; ~500MB)
-third_party/enet/enet/
 third_party/KenshiLib_deps/
+dist/build-receipts/
+dist/updater_tests.exe
+dist/core_native_tests.exe
+dist/native_frame_tests.exe
 
 # Test-run artifacts (logs, screenshots, verdicts, history)
 tools/test-runs/

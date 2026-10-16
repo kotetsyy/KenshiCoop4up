@@ -1,8 +1,8 @@
-// Updater.cpp - manifest fetch, payload download, SHA-256 verify, on-disk swap
-// of the KenshiCoop.dll + KenshiCoopUI.dll pair. See Updater.h for the design
-// and the trust model.
+// Schema-2 fixed-repository updater: all four native-runtime images or none.
 
 #include "Updater.h"
+#include "UpdatePackage.h"
+#include "RuntimeImages.h"
 #include "../CoopLog.h"
 #include "../core/Config.h"
 #include "../core/SemVer.h" // version ordering (unit-tested in prototest)
@@ -25,14 +25,13 @@ namespace updater {
 namespace {
 
 // ---- process-wide state -----------------------------------------------------
-// Written by the worker thread, read by the game thread (the F2 panel). Only
-// two producers exist and neither read is used for control flow beyond display,
-// so a mutex around the status buffer is enough; the flags are plain aligned
-// bools whose torn-read risk on x86-64 is nil.
+// Status is written by the download worker and displayed by MAIN. Runtime image
+// replacement additionally owns the shared companion/session lifecycle barrier.
 CRITICAL_SECTION g_lock;
 bool          g_lockInit    = false;
 char          g_status[256] = "update: idle";
 volatile bool g_restart     = false;
+bool          g_recoverySafe = true;
 HANDLE        g_thread      = 0;
 Settings      g_settings;
 std::string   g_buildVersion;
@@ -68,42 +67,7 @@ std::string selfDllPath() {
     return std::string(buf, n);
 }
 
-// The UI companion always sits beside the core; the core loads it from there.
-std::string uiDllPath(const std::string& dllPath) {
-    size_t slash = dllPath.find_last_of("\\/");
-    if (slash == std::string::npos) return std::string();
-    return dllPath.substr(0, slash + 1) + "KenshiCoopUI.dll";
-}
 
-// ---- tiny manifest parser ---------------------------------------------------
-// key=value per line; '#' starts a comment; surrounding whitespace trimmed.
-// Deliberately dumb: this parses attacker-reachable input, so it has no state
-// machine to get wrong and cannot allocate unboundedly (the caller caps size).
-
-std::string trim(const std::string& s) {
-    size_t a = 0, b = s.size();
-    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) ++a;
-    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n')) --b;
-    return s.substr(a, b - a);
-}
-
-std::map<std::string, std::string> parseManifest(const std::string& text) {
-    std::map<std::string, std::string> m;
-    size_t i = 0;
-    while (i < text.size()) {
-        size_t nl = text.find('\n', i);
-        std::string line = text.substr(i, nl == std::string::npos ? std::string::npos : nl - i);
-        i = (nl == std::string::npos) ? text.size() : nl + 1;
-        size_t h = line.find('#');
-        if (h != std::string::npos) line = line.substr(0, h);
-        size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        std::string k = trim(line.substr(0, eq));
-        std::string v = trim(line.substr(eq + 1));
-        if (!k.empty()) m[k] = v;
-    }
-    return m;
-}
 
 // ---- HTTPS ------------------------------------------------------------------
 
@@ -147,13 +111,16 @@ bool httpGet(const std::string& url, std::string* out, size_t maxBytes,
     URL_COMPONENTS uc;
     memset(&uc, 0, sizeof(uc));
     uc.dwStructSize = sizeof(uc);
-    wchar_t host[256], path[2048];
+    uc.dwUserNameLength = (DWORD)-1; uc.dwPasswordLength = (DWORD)-1;
+    wchar_t host[256], path[2048], extra[4096];
     uc.lpszHostName = host; uc.dwHostNameLength = 256;
     uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
+    uc.lpszExtraInfo = extra; uc.dwExtraInfoLength = 4096;
     if (!WinHttpCrackUrl(wurl.c_str(), (DWORD)wurl.size(), 0, &uc)) {
         *err = "malformed url"; return false;
     }
-    if (uc.nScheme != INTERNET_SCHEME_HTTPS) { *err = "refused: not https"; return false; }
+    if (uc.nScheme != INTERNET_SCHEME_HTTPS || uc.nPort != 443 ||
+        uc.dwUserNameLength || uc.dwPasswordLength) { *err = "refused: unsafe HTTPS URL"; return false; }
     std::wstring hostName(host, uc.dwHostNameLength);
     if (!hostAllowed(hostName)) { *err = "refused: host not on the allow list"; return false; }
 
@@ -162,19 +129,25 @@ bool httpGet(const std::string& url, std::string* out, size_t maxBytes,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!ses) { *err = "WinHttpOpen failed"; return false; }
     // Don't let a stalled connection keep the thread (and shutdown) waiting.
-    WinHttpSetTimeouts(ses, 10000, 10000, 20000, 20000);
+    if (!WinHttpSetTimeouts(ses, 10000, 10000, 20000, 20000)) {
+        WinHttpCloseHandle(ses); *err = "cannot set bounded HTTP timeouts"; return false;
+    }
 
     bool ok = false;
     std::string redirect;
     HINTERNET con = WinHttpConnect(ses, hostName.c_str(), uc.nPort, 0);
+    std::wstring requestPath = std::wstring(path, uc.dwUrlPathLength) + std::wstring(extra, uc.dwExtraInfoLength);
     if (con) {
         HINTERNET req = WinHttpOpenRequest(
-            con, L"GET", std::wstring(path, uc.dwUrlPathLength).c_str(),
+            con, L"GET", requestPath.c_str(),
             0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
             WINHTTP_FLAG_SECURE | WINHTTP_FLAG_REFRESH);
         if (req) {
             DWORD noRedirect = WINHTTP_DISABLE_REDIRECTS;
-            WinHttpSetOption(req, WINHTTP_OPTION_DISABLE_FEATURE, &noRedirect, sizeof(noRedirect));
+            if (!WinHttpSetOption(req, WINHTTP_OPTION_DISABLE_FEATURE, &noRedirect, sizeof(noRedirect))) {
+                WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+                *err = "cannot disable automatic redirects"; return false;
+            }
             WinHttpAddRequestHeaders(req,
                 L"Cache-Control: no-cache\r\nPragma: no-cache",
                 (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
@@ -195,6 +168,7 @@ bool httpGet(const std::string& url, std::string* out, size_t maxBytes,
                             WideCharToMultiByte(CP_UTF8, 0, loc, (int)(ll / sizeof(wchar_t)),
                                                 &b[0], n, 0, 0);
                             redirect.assign(&b[0], (size_t)n);
+                            while (!redirect.empty() && redirect[redirect.size() - 1] == '\0') redirect.erase(redirect.size() - 1);
                         }
                     }
                     if (redirect.empty()) *err = "redirect without a location";
@@ -228,125 +202,6 @@ bool httpGet(const std::string& url, std::string* out, size_t maxBytes,
     return ok;
 }
 
-// ---- SHA-256 ----------------------------------------------------------------
-
-std::string sha256Hex(const void* data, size_t n) {
-    std::string out;
-    HCRYPTPROV prov = 0;
-    HCRYPTHASH hash = 0;
-    if (!CryptAcquireContextA(&prov, 0, 0, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return out;
-    if (CryptCreateHash(prov, CALG_SHA_256, 0, 0, &hash)) {
-        if (CryptHashData(hash, (const BYTE*)data, (DWORD)n, 0)) {
-            BYTE dig[32]; DWORD dl = sizeof(dig);
-            if (CryptGetHashParam(hash, HP_HASHVAL, dig, &dl, 0) && dl == 32) {
-                char hex[65];
-                for (int i = 0; i < 32; ++i) _snprintf(hex + i * 2, 3, "%02x", dig[i]);
-                hex[64] = '\0';
-                out = hex;
-            }
-        }
-        CryptDestroyHash(hash);
-    }
-    CryptReleaseContext(prov, 0);
-    return out;
-}
-
-// Hash the on-disk DLL. FILE_SHARE_* so this works while the image is mapped.
-std::string sha256File(const std::string& path) {
-    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-    if (f == INVALID_HANDLE_VALUE) return std::string();
-    DWORD sz = GetFileSize(f, 0);
-    if (sz == INVALID_FILE_SIZE || sz == 0 || sz > 32 * 1024 * 1024) {
-        CloseHandle(f);
-        return std::string();
-    }
-    std::string buf;
-    buf.resize((size_t)sz);
-    DWORD got = 0;
-    BOOL ok = ReadFile(f, &buf[0], sz, &got, 0);
-    CloseHandle(f);
-    if (!ok || got != sz) return std::string();
-    return sha256Hex(buf.data(), buf.size());
-}
-
-std::string lower(const std::string& s) {
-    std::string o = s;
-    for (size_t i = 0; i < o.size(); ++i)
-        if (o[i] >= 'A' && o[i] <= 'Z') o[i] = (char)(o[i] - 'A' + 'a');
-    return o;
-}
-
-// ---- the swap ---------------------------------------------------------------
-
-// Write `bytes` to `path`, flushed. Removes the partial file on failure.
-bool writeStage(const std::string& path, const std::string& bytes) {
-    HANDLE f = CreateFileA(path.c_str(), GENERIC_WRITE, 0, 0,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    DWORD wrote = 0;
-    BOOL wok = WriteFile(f, bytes.data(), (DWORD)bytes.size(), &wrote, 0);
-    // Force it to disk before we start renaming, so a power cut cannot leave a
-    // half-written image in place of a live one.
-    FlushFileBuffers(f);
-    CloseHandle(f);
-    if (!wok || wrote != bytes.size()) {
-        DeleteFileA(path.c_str());
-        return false;
-    }
-    return true;
-}
-
-// Put both payloads on disk AS the live pair. Windows refuses to overwrite or
-// delete a mapped image but DOES allow renaming one, so: write both payloads
-// beside the DLLs, move each running file out of the way, move its payload in.
-// Any failure undoes every step already taken, so the install is either the
-// complete new pair or the untouched old pair - never a new core with an old
-// UI. The UI may be absent (an install that predates the split); then there is
-// nothing to move aside for it. The old images cannot be deleted until they are
-// unmapped - sweepOldImage does that on the next launch.
-bool swapPair(const std::string& dllPath, const std::string& bytes,
-              const std::string& uiPath, const std::string& uiBytes, std::string* err) {
-    std::string stage   = dllPath + ".new";
-    std::string old     = dllPath + ".old";
-    std::string uiStage = uiPath + ".new";
-    std::string uiOld   = uiPath + ".old";
-
-    if (!writeStage(stage, bytes)) { *err = "cannot stage the DLL next to it"; return false; }
-    if (!writeStage(uiStage, uiBytes)) {
-        DeleteFileA(stage.c_str());
-        *err = "cannot stage the UI DLL next to it";
-        return false;
-    }
-
-    // Leftovers from an earlier swap, if they unmapped.
-    DeleteFileA(old.c_str());
-    DeleteFileA(uiOld.c_str());
-    bool uiExisted = GetFileAttributesA(uiPath.c_str()) != INVALID_FILE_ATTRIBUTES;
-
-    // Every failure below restores what was already moved, in reverse. The new
-    // files overwritten by a rollback are not mapped, so REPLACE_EXISTING works.
-    const char* fail = 0;
-    if (!MoveFileExA(dllPath.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        fail = "cannot move the running DLL aside (read-only install?)";
-    } else if (!MoveFileExA(stage.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        MoveFileExA(old.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING);
-        fail = "cannot move the update into place";
-    } else if (uiExisted && !MoveFileExA(uiPath.c_str(), uiOld.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        MoveFileExA(old.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING);
-        fail = "cannot move the running UI DLL aside";
-    } else if (!MoveFileExA(uiStage.c_str(), uiPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        if (uiExisted) MoveFileExA(uiOld.c_str(), uiPath.c_str(), MOVEFILE_REPLACE_EXISTING);
-        MoveFileExA(old.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING);
-        fail = "cannot move the UI update into place";
-    }
-    if (!fail) return true;
-    DeleteFileA(stage.c_str());
-    DeleteFileA(uiStage.c_str());
-    *err = fail;
-    return false;
-}
 
 // ---- worker -----------------------------------------------------------------
 
@@ -365,7 +220,7 @@ bool fetchVerified(const std::string& url, const std::string& sha, const char* w
         setStatus("%s download rejected: not a PE image", what);
         return false;
     }
-    std::string got = sha256Hex(payload->data(), payload->size());
+    std::string got = packageHash(payload->data(), payload->size());
     if (got.empty()) { setStatus("cannot hash the download (CryptoAPI unavailable)"); return false; }
     if (got != sha) {
         setStatus("%s download REJECTED: sha256 mismatch (got %.12s..., want %.12s...)",
@@ -384,81 +239,47 @@ DWORD WINAPI threadEntry(LPVOID) {
         setStatus("check failed: %s", err.c_str());
         return 0;
     }
-    std::map<std::string, std::string> m = parseManifest(body);
-    std::string ver   = m["version"];
-    std::string sha   = lower(m["sha256"]);
-    std::string url   = m["url"];
-    std::string uiSha = lower(m["uiSha256"]);
-    std::string uiUrl = m["uiUrl"];
-    std::string proto = m["proto"];
-    std::string notes = m["notes"];
-    // The core and its UI companion only ever move together: a manifest that
-    // does not name BOTH is not installable, whatever else it says.
-    if (ver.empty() || sha.size() != 64 || url.empty() || uiSha.size() != 64 || uiUrl.empty()) {
-        setStatus("manifest incomplete (need version, sha256, url, uiSha256, uiUrl)");
-        return 0;
+    PackageManifest manifest;
+    if (!parsePackageManifest(body, &manifest, &err)) {
+        setStatus("manifest rejected: %s", err.c_str()); return 0;
     }
-    // Refuse to go BACKWARDS unless the manifest says to. A deliberate rollback
-    // stays possible (allowDowngrade=1); an accidental one - a manifest built
-    // from a stale checkout - no longer drags every player back with it. When
-    // either side will not parse we cannot order them, so the old behaviour
-    // stands: different means install. That keeps a mangled version string
-    // recoverable by publishing a good one, instead of wedging every client.
-    {
-        coop::Ver mine = coop::parseVer(g_buildVersion);
-        coop::Ver theirs = coop::parseVer(ver);
-        bool allowDown = (m["allowDowngrade"] == "1" || m["allowDowngrade"] == "true");
-        if (mine.ok && theirs.ok && !allowDown && coop::cmpVer(theirs, mine) < 0) {
-            setStatus("published %s is OLDER than this build %s - ignoring "
-                      "(set allowDowngrade=1 in the manifest to force it)",
-                      ver.c_str(), g_buildVersion.c_str());
-            return 0;
-        }
+    coop::Ver mine = coop::parseVer(g_buildVersion);
+    coop::Ver theirs = coop::parseVer(manifest.version);
+    if (!mine.ok || !theirs.ok) { setStatus("invalid installed/published version"); return 0; }
+    if (!manifest.allowDowngrade && coop::cmpVer(theirs, mine) < 0) {
+        setStatus("published %s is older; ignoring", manifest.version.c_str()); return 0;
     }
-    if (ver == g_buildVersion) {
-        // Same release id, but a GitHub asset may have been replaced in place
-        // (a tiny fix that did not deserve a new tag), or the UI companion is
-        // missing/stale (an older updater that swapped only the core). If both
-        // on-disk hashes match the manifest we really are current; otherwise
-        // fall through and install this version's pair.
-        std::string dll = selfDllPath();
-        std::string local = sha256File(dll);
-        if (local.empty()) {
-            setStatus("up to date (%s, proto %u)", g_buildVersion.c_str(), g_proto);
-            return 0;
-        }
-        if (local == sha && sha256File(uiDllPath(dll)) == uiSha) {
-            setStatus("up to date (%s, proto %u)", g_buildVersion.c_str(), g_proto);
-            return 0;
-        }
-        setStatus(local == sha ? "UI companion missing or stale, reinstalling the pair ..."
-                               : "same version, newer file on GitHub ...");
+    std::string dll = selfDllPath();
+    size_t slash = dll.find_last_of("\\/");
+    if (dll.empty() || slash == std::string::npos) { setStatus("cannot locate installed images"); return 0; }
+    std::string directory = dll.substr(0, slash + 1);
+    if (manifest.version == g_buildVersion) {
+        bool matches = true;
+        for (int i = 0; i < 4; ++i)
+            if (packageFileHash(directory + kComponentNames[i]) != manifest.hash[i]) matches = false;
+        if (matches) { setStatus("up to date (%s, proto %u)", g_buildVersion.c_str(), g_proto); return 0; }
     }
     if (!g_settings.autoApply) {
-        setStatus("update available: %s%s%s - autoApply off, install by hand",
-                  ver.c_str(), proto.empty() ? "" : " proto ", proto.c_str());
+        setStatus("update available: %s - autoApply off", manifest.version.c_str()); return 0;
+    }
+    setStatus("downloading complete runtime %s ...", manifest.version.c_str());
+    std::string payloads[4];
+    for (int i = 0; i < 4; ++i)
+        if (!fetchVerified(manifest.url[i], manifest.hash[i], kComponentNames[i], &payloads[i])) return 0;
+    RuntimeImageApplyGuard apply;
+    if (!apply.ready()) {
+        setStatus("install deferred: cannot acquire runtime image lifecycle"); return 0;
+    }
+    if (!installPackage(directory, manifest, payloads, &err)) {
+        if (!packageRecoveryPending(directory)) apply.allowLoadsAfterRollback();
+        else g_restart = true;
+        setStatus("install failed: %s%s", err.c_str(),
+                  runtimeImagesRestartOnly() ? " - RESTART Kenshi; preserve recovery files" : "");
         return 0;
     }
-
-    // Both payloads are downloaded and verified BEFORE anything on disk moves;
-    // either one failing leaves the installed pair untouched.
-    setStatus("downloading %s ...", ver.c_str());
-    std::string payload, uiPayload;
-    if (!fetchVerified(url, sha, "DLL", &payload)) return 0;
-    if (!fetchVerified(uiUrl, uiSha, "UI DLL", &uiPayload)) return 0;
-
-    std::string dll = selfDllPath();
-    std::string ui = uiDllPath(dll);
-    if (dll.empty() || ui.empty()) { setStatus("cannot locate the loaded DLL; not swapping"); return 0; }
-    if (!swapPair(dll, payload, ui, uiPayload, &err)) {
-        setStatus("install failed: %s", err.c_str());
-        return 0;
-    }
-
     g_restart = true;
-    setStatus("updated to %s%s%s - RESTART Kenshi to use it%s%s",
-              ver.c_str(), proto.empty() ? "" : " (proto ", proto.c_str(),
-              notes.empty() ? "" : " | ", notes.c_str());
+    setStatus("updated to %s - RESTART Kenshi%s%s", manifest.version.c_str(),
+              manifest.notes.empty() ? "" : " | ", manifest.notes.c_str());
     return 0;
 }
 
@@ -467,14 +288,8 @@ DWORD WINAPI threadEntry(LPVOID) {
 // ---- public -----------------------------------------------------------------
 
 // ---- BUILT-IN RELEASE SOURCE ------------------------------------------------
-// Fill these in with the repository that publishes releases, then rebuild. They
-// are compile-time on purpose: coop_config.json ships only in the mod-kit, so a
-// config-only setting would leave every plain install silently un-updatable -
-// which is exactly the population the feature exists for. Except in private
-// diagnostics builds, coop_config.json overrides all of it (updateOwner /
-// updateRepo / updateEnabled / ...), so a player can point at a fork or turn
-// the whole thing off without a rebuild.
-// Empty owner or repo = updates off, no logging, no network.
+// The owner/repository/feed are fixed. Config may disable checking/application,
+// but cannot redirect this binary's trust root to an arbitrary fork.
 const char* const kDefaultOwner   = "kotetsyy";
 const char* const kDefaultRepo    = "KenshiCoop4up";
 const bool        kDefaultEnabled = true;
@@ -488,7 +303,7 @@ Settings settingsFromConfig() {
     s.path      = "dist/UPDATE.txt";
     s.autoApply = true;
     coop::readUpdateSettings(&s.enabled, &s.owner, &s.repo, &s.branch, &s.path, &s.autoApply);
-#ifdef KENSHICOOP_NET_DIAG
+#if defined(KENSHICOOP_HARNESS) || defined(KENSHICOOP_NET_DIAG) || defined(_DEBUG)
     // The private protocol must never be replaced by a public release, even
     // when a tester still has updateEnabled=true in their local config.
     s.enabled = false;
@@ -502,17 +317,22 @@ Settings settingsFromConfig() {
 
 bool start(const Settings& s, const char* buildVersion, unsigned int protoVersion) {
     if (!g_lockInit) { InitializeCriticalSection(&g_lock); g_lockInit = true; }
+    if (!g_recoverySafe || g_restart) return false;
+#if defined(KENSHICOOP_HARNESS) || defined(KENSHICOOP_NET_DIAG) || defined(_DEBUG)
+    setStatus("off (private Harness/Debug build)");
+    return false;
+#endif
+    if (s.owner != kDefaultOwner || s.repo != kDefaultRepo ||
+        s.branch != "main" || s.path != "dist/UPDATE.txt") {
+        setStatus("off (update source must match the fixed release repository)");
+        return false;
+    }
     if (g_thread != 0) return false;
     g_settings     = s;
     g_buildVersion = buildVersion ? buildVersion : "";
     g_proto        = protoVersion;
     if (!s.enabled) {
-#ifdef KENSHICOOP_NET_DIAG
-        setStatus("off (private network diagnostics build)");
-#else
-        setStatus("off (no release repo: set updateOwner/updateRepo in "
-                  "coop_config.json, or kDefaultOwner/kDefaultRepo at build time)");
-#endif
+        setStatus("off (updates disabled)");
         return false;
     }
     g_thread = CreateThread(0, 0, &threadEntry, 0, 0, 0);
@@ -521,18 +341,45 @@ bool start(const Settings& s, const char* buildVersion, unsigned int protoVersio
 }
 
 const char* status() { return g_status; }
-bool restartRequired() { return g_restart; }
+bool restartRequired() { return runtimeImagesRestartOnly() || g_restart; }
 
-void sweepOldImage() {
+bool sweepOldImage() {
     std::string dll = selfDllPath();
-    if (dll.empty()) return;
-    const std::string olds[2] = { dll + ".old", uiDllPath(dll) + ".old" };
-    for (int i = 0; i < 2; ++i) {
-        if (GetFileAttributesA(olds[i].c_str()) == INVALID_FILE_ATTRIBUTES) continue;
-        if (DeleteFileA(olds[i].c_str()))
-            coop::logLine(i == 0 ? "[update] removed the previous DLL left by an earlier update"
-                                 : "[update] removed the previous UI DLL left by an earlier update");
+    size_t slash = dll.find_last_of("\\/");
+    if (dll.empty() || slash == std::string::npos) {
+        g_recoverySafe = false; setStatus("recovery blocked: cannot locate core"); return false;
     }
+    const std::string deployMarker = dll.substr(0, slash + 1) + ".kenshicoop-deploy.pending";
+    if (GetFileAttributesA(deployMarker.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        g_recoverySafe = false;
+        setStatus("deployment recovery pending; initialization blocked, preserve backups");
+        return false;
+    }
+    const DWORD markerError = GetLastError();
+    if (markerError != ERROR_FILE_NOT_FOUND && markerError != ERROR_PATH_NOT_FOUND) {
+        g_recoverySafe = false;
+        setStatus("cannot verify deployment recovery marker; initialization blocked");
+        return false;
+    }
+#if defined(KENSHICOOP_HARNESS) || defined(KENSHICOOP_NET_DIAG) || defined(_DEBUG)
+    // Private test runtimes must never recover/delete a public updater's files.
+    std::string root = dll.substr(0, slash + 1);
+    bool pending = packageRecoveryPending(root);
+    if (pending) {
+        g_recoverySafe = false; setStatus("private runtime preserves public recovery files; inspect/restart");
+        return false;
+    }
+    return true;
+#endif
+    const std::string before = packageFileHash(dll);
+    std::string error; bool restart = false;
+    if (!recoverPackageForStartup(dll.substr(0, slash + 1), before, &restart, &error)) {
+        g_recoverySafe = false;
+        if (restart) { g_restart = true; setStatus("%s", error.c_str()); }
+        else setStatus("recovery blocked: %s", error.c_str());
+        return false;
+    }
+    return true;
 }
 
 } // namespace updater

@@ -8,14 +8,13 @@
 # Design:
 #   * DiagEnv is MODE-AGNOSTIC (host and join get the same knobs) - every entry
 #     here is a channel toggle or a trace flag, never an endpoint/role value.
-#   * The applier is HERMETIC: it clears the whole managed keyset to "" first,
-#     then applies the scenario's DiagEnv, so no knob leaks from a previous
-#     scenario when several run in one process.
-#   * Clearing a channel key to "" means the plugin's Config default applies
-#     (envOr("...","1")!="0" for the always-on channels; the scenario==""/setup
-#     auto rules for invSync/worldSync). DiagEnv only carries the DELTAS from
-#     those defaults (a probe forcing a channel OFF, or a scenario forcing
-#     invSync/worldSync ON), exactly the set Config.cpp used to name.
+#   * The applier is HERMETIC: it removes the whole managed keyset first,
+#     then applies the scenario's DiagEnv, so no knob leaks between scenarios.
+#   * Removed channel keys use Config's defaults. Do not assign an empty value:
+#     PowerShell 7.5+ preserves it, and native booleans using != "0" turn ON.
+#     Config's scenario/setup rules still select invSync/worldSync.
+#     DiagEnv carries only explicit deltas: a probe forcing a channel OFF or a
+#     scenario forcing invSync/worldSync ON.
 
 Set-StrictMode -Version Latest
 
@@ -46,10 +45,13 @@ $script:CoopDiagEnvKeys = @(
     'KENSHICOOP_STORE_SYNC'
     'KENSHICOOP_SQUAD_SYNC'
     'KENSHICOOP_LATEJOIN_SYNC'
+    'KENSHICOOP_ENVIRONMENT_ITEMS' # Harness opt-in; cleared before every scenario/free-play run
     # --- log-only diagnostic traces (read outside Config; never gate behavior) ---
     'KENSHICOOP_INV_DUMP'
+    'KENSHICOOP_WEAPON_FAB' # explicit native fixture seeding, not DROP recovery
     'KENSHICOOP_DEBUG_SPEED'
     'KENSHICOOP_DEBUG_SHACKLE'
+    'KENSHICOOP_NPC_PAIR_TRACE' # full native/stream identities, pose and task authority
     # On-screen authority labels (Replicator::debugMark): green DRV/HI, red
     # CULLED, yellow PARKED, gray MID, pinned over each judged body. Purely
     # visual - nothing is logged per body - so this earns its place in the
@@ -75,6 +77,8 @@ $script:CoopDiagEnvKeys = @(
     # Forces the join to NACK a MATCHing LOAD_GO so the real folder-transfer path
     # runs on one machine (bootstrap_stream / stream_test.ps1).
     'KENSHICOOP_FORCE_STREAM'
+    # Unique local readiness barrier for the native two-process extraction race.
+    'KENSHICOOP_NATIVE_TAKE_BARRIER'
     # --- test-only W2 fault injection (read in ReplicatorItems, not Config) ------
     # Refuses the FIRST conservation re-home so inv_regear_refuse can exercise the
     # retry + verify-then-destroy recovery. A real refusal depends on the receiving
@@ -145,19 +149,17 @@ function Set-CoopDiagEnv {
     .DESCRIPTION
       Clears the whole managed keyset first (hermetic), then applies the given
       manifest entry's DiagEnv hashtable. Returns the applied map (for logging /
-      run.json provenance). Pass $null / an entry without DiagEnv to just clear.
+      run.json provenance). Pass $null to restore free-play native defaults.
     #>
     param($Entry)
 
-    foreach ($k in $script:CoopDiagEnvKeys) { Set-Item -Path "env:$k" -Value "" }
+    foreach ($k in $script:CoopDiagEnvKeys) {
+        [Environment]::SetEnvironmentVariable($k, [NullString]::Value, 'Process')
+    }
 
-    # Presence authority ships ON (Config.cpp, v0.47), and clearing an env var on
-    # Windows DELETES it, so a cleared keyset would hand every scenario the SHIPPED
-    # default and quietly turn the whole tier into a co-test of that flag. Pin it
-    # clear as the harness baseline instead: the tier's job is to prove the feature
-    # is additive, which it can only do from the isHost branch. DiagEnv still wins,
-    # which is how split_far2 and run_apart ask for it.
-    Set-Item -Path "env:KENSHICOOP_CELL_AUTH" -Value "0"
+    # Only actual scripted entries use the authority A/B baseline. Free play
+    # leaves the key absent so native defaults remain authoritative.
+    if ($null -ne $Entry) { [Environment]::SetEnvironmentVariable('KENSHICOOP_CELL_AUTH','0','Process') }
 
     $applied = @{}
     if ($null -ne $Entry -and ($Entry -is [hashtable]) -and $Entry.ContainsKey('DiagEnv')) {
@@ -174,18 +176,5 @@ function Set-CoopDiagEnv {
     return $applied
 }
 
-function Stop-CoopKenshi {
-    <#
-    .SYNOPSIS
-      Kill any stale Kenshi game processes from a previous (possibly crashed) run.
-    #>
-    param([int]$SettleSec = 2)
-    $stale = @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue)
-    if ($stale.Count -gt 0) {
-        $stale | Stop-Process -Force -ErrorAction SilentlyContinue
-        if ($SettleSec -gt 0) { Start-Sleep -Seconds $SettleSec }
-    }
-    return $stale.Count
-}
 
-Export-ModuleMember -Function Get-CoopDiagEnvKeys, Set-CoopDiagEnv, Stop-CoopKenshi
+Export-ModuleMember -Function Get-CoopDiagEnvKeys, Set-CoopDiagEnv

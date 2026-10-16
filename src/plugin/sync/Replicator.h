@@ -28,6 +28,9 @@
 #include "../net/NetLink.h"
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
+#include "SpeedAdmission.h"
+#include "NpcCensusLedger.h"
+#include "../core/InventorySnapshotRevision.h"
 
 class GameWorld;
 class Character;
@@ -35,10 +38,17 @@ class RootObject;
 class Item;
 
 namespace coop {
+namespace engine { struct ItemDropEdge; struct ScenarioItemWitness; }
+class ProceduralWorldSync;
 
 class Replicator {
 public:
     Replicator();
+    bool queryScenarioItemWitness(GameWorld*,unsigned int channel,const char* sid,
+                                  unsigned int type,const unsigned int sourceHand[5],
+                                  engine::ScenarioItemWitness* out) const;
+    // Native witness: round-tripped root; JOIN also proves the complete applied HOST contents.
+    bool queryScenarioInventoryRoot(GameWorld* gw,const unsigned int local[5],unsigned int canonical[5]) const;
 
     // Stage 1/2 stream only the squad leader; later stages stream the whole squad.
     void setLeaderOnly(bool v) { leaderOnly_ = v; }
@@ -218,7 +228,7 @@ public:
     // BEFORE engine (join side): drain reliable transition events and latch them
     // onto the matching tracked body (death = held down permanently; revive clears).
     // gw is needed by the EVT_RECRUIT re-key (restoring a suppressed local body).
-    void applyEvents(GameWorld* gw, Inbound& in);
+    void applyEvents(GameWorld* gw, Inbound& in, u32 ownerId);
 
     // BEFORE engine: capture the locally-owned squad and publish it (host side).
     // Also detects per-entity bodyState transitions (KO/death/revive) and queues the
@@ -265,29 +275,12 @@ public:
     // handle per sid so the conservation channel can re-home the exact object on pickup.
     void detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ownerId);
 
-    // AFTER engine (Phase W2): drain received DROP intents and relocate THIS client's own
-    // copy of the weapon to the ground (Inventory::dropItem, no fabrication). Idempotent by
-    // (ownerId,dropId); never acts on a character we own (we already dropped it locally).
-    // Runs BEFORE applyInventories so the relocation beats the debounced removal reconcile.
-    // Tracks the relocated Item* so a later pickup can re-home that exact object.
-    void applyWeaponDrops(GameWorld* gw, Inbound& in);
+    // AFTER engine, BEFORE inventory reconciliation: consume reliable native
+    // DROP/PICKUP in arrival order, relocating only exact existing objects.
+    void applyGroundGear(GameWorld* gw, Inbound& in);
 
-    // AFTER engine (Phase W3): drain received PICKUP intents and re-home THIS client's tracked
-    // ground copy of the weapon back into the picking character's bag (no fabrication, no
-    // spatial re-query - uses the remembered Item* handle). Idempotent by (ownerId,pickupId);
-    // never acts on a character we own (we already picked it up locally). Runs BEFORE
-    // applyInventories so the re-home beats the inventory reconcile.
-    void applyWeaponPickups(GameWorld* gw, Inbound& in);
-
-    // BEFORE engine, every tick (Phase W3 convergence): keep groundedWeapons_ honest.
-    // Nothing used to prune it, so a cached ground Item* survived the object's despawn and
-    // a later re-home handed a dead pointer to the engine. Two jobs:
-    //   1) PRUNE tracks whose object no longer resolves as a free ground item. Nothing is
-    //      left on the ground, so there is nothing to duplicate.
-    //   2) RETRY a re-home that failed (bag refused the object) and, once past
-    //      WD_REHOME_MAX_MS, resolve the split - but ONLY after reading the item in the
-    //      target container, so the ground copy is destroyed strictly as a duplicate and
-    //      never as the last instance.
+    // Retry unresolved exact physical pickups. Unloading is not destruction;
+    // a refused destination never authorizes timeout deletion or fabrication.
     void reconcileGroundGear(GameWorld* gw);
 
     // BEFORE engine, after publishInventories (protocol 37, BOTH clients): detect a
@@ -406,7 +399,7 @@ public:
     void publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId);
     void announceSquadClaim(NetLink& net, u32 ownerId,
                             const unsigned int wire[][5],
-                            const unsigned int local[][5], unsigned n);
+                            const unsigned int local[][5], unsigned n, unsigned playerCount);
 
     // Display nick for a network player (HELLO/WELCOME). Applied onto the
     // first claimed / owned squad body so F2 nicks show on nametags.
@@ -583,6 +576,7 @@ public:
 
     // Runtime-fixture sync master enable (KENSHICOOP_FIXTURE_SYNC).
     void setFixtureSync(bool v) { fixtureSync_ = v; }
+    void setProceduralWorld(ProceduralWorldSync* world) { proceduralWorld_=world; }
 
     // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
     // buildings, placed-building doors, production, research) from one
@@ -617,6 +611,12 @@ public:
     // baseline is not traffic. Edge-only caches (weaponCensus_, hostBody_)
     // are deliberately untouched: re-seeding would author phantom edges.
     void onPeerConnected(NetLink& net, u32 ownerId);
+    void onPeerDisconnected(GameWorld*,u32 ownerId);
+    void retireInventoryPeer(GameWorld*,u32 ownerId);
+    void resyncInventoryPeer(GameWorld*,NetLink&,u32 ownerId);
+    bool encodeEnvironmentActor(const unsigned int local[5],u32* owner,unsigned int wire[5]) const;
+    bool resolveEnvironmentActor(u32 owner,const unsigned int wire[5],unsigned int local[5]) const;
+    bool queryClaimedActor(const unsigned int local[5],u32* owner,unsigned int canonical[5]) const;
 
     // AFTER publishOwned (protocol 20, HOST only - the world-detection
     // authority): for every DRIVEN copy currently in stealth mode, read its
@@ -847,13 +847,17 @@ private:
         unsigned int walkStallF;     // consecutive frames the ordered body advanced ~nothing
         bool         suppressed;     // NPC pulled off the local AI update list
         unsigned long lastSeenMs;    // last ingest for this hand (stale-entry pruning)
+        u32          streamOwner;     // authenticated sender of the latest actor stream
         // Stage 5 rest-pose reproduction.
         u16          issuedTask;     // task we last committed (TASK_NONE = none)
+        Key          issuedPoseSubject; // full subject of the committed pose, not task alone
+        u32          issuedPoseOwner; // subject hands are scoped to accepted stream author
         bool         taskApplied;    // a fixture-resolved pose is currently held
         bool         taskBad;        // task not reproducible here (fixture missing/drift)
         unsigned long taskTick;      // when the task was issued (drift grace timer)
         unsigned int taskRetries;    // far-fixture (r=3) attempts (interp-lag retry)
         bool         fixtureXlateLogged; // one [pose] fixture-xlate line per body
+        unsigned long poseObserveTick;
         unsigned long taskNoneTick;  // first tick of the current sustained host->NONE
                                      //   streak (0 = not in one); after TASK_CLEAR_MS
                                      //   of continuous NONE the held pose is released
@@ -908,6 +912,10 @@ private:
         unsigned long carryNoSeeTick; // first tick a locally-carrying copy's stream
                                       //   stopped reporting TASK_CARRY_BODY (the
                                       //   debounced host-side-drop detector)
+        // A reliable DROP supersedes delayed carry samples for this exact body.
+        // Only a later reliable PICKUP can start that carry lifecycle again.
+        u32 carryReleaseOwner;
+        unsigned int carryReleasedBody[5];
         // Furniture occupancy sync (protocol 19):
         unsigned long furnHealTick;   // last self-heal enter attempt (throttle)
         unsigned long furnNoSeeTick;  // first tick a locally-occupying copy's stream
@@ -980,9 +988,9 @@ private:
         unsigned long midSeenMs;
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0), walkHalted(false), walkStallF(0),
-                   suppressed(false), lastSeenMs(0),
-                   issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
-                   taskTick(0), taskRetries(0), fixtureXlateLogged(false),
+                   suppressed(false), lastSeenMs(0), streamOwner(OWNER_ID_ALL),
+                   issuedTask(TASK_NONE), issuedPoseOwner(OWNER_ID_ALL), taskApplied(false), taskBad(false),
+                   taskTick(0), taskRetries(0), fixtureXlateLogged(false), poseObserveTick(0),
                    taskNoneTick(0), detached(false), downApplied(false),
                    visFollowMs(0),
                    koLatched(false), deathLatched(false), carriedDown(false),
@@ -992,7 +1000,7 @@ private:
                    combatOverTick(0), npcSnapTick(0), hadCarry(false),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
-                   carryHealTick(0), carryNoSeeTick(0),
+                   carryHealTick(0), carryNoSeeTick(0), carryReleaseOwner(OWNER_ID_ALL),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
                    haveChainOwner(false), chainHealTick(0),
                    sneakTick(0), proneTick(0), crawlDrive(false),
@@ -1003,6 +1011,9 @@ private:
                    prevInterpMode(-1), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
             lastCarried[0] = lastCarried[1] = lastCarried[2] = lastCarried[3] = lastCarried[4] = 0;
+            memset(carryReleasedBody, 0, sizeof(carryReleasedBody));
+            issuedPoseSubject.t = issuedPoseSubject.c = issuedPoseSubject.cs =
+                issuedPoseSubject.i = issuedPoseSubject.s = 0;
         }
     };
 
@@ -1137,6 +1148,7 @@ private:
     float                     peerCam_[3];    // host: latest peer camera center
     unsigned long             peerCamMs_;     // host: its arrival time (0 = none)
     std::set<Key>             censusHands_;   // join: latest existence set
+    NpcCensusLedger<InboundNpcCensus> npcCensusLedger_;
     // Whose claim censusHands_ is. Under presence authority a census only
     // speaks for the cells its sender owns, so enforcement has to know who
     // sent it. Defaults to the host, which is who it always was.
@@ -1192,6 +1204,9 @@ private:
         bool operator<(const MidBandEntry& o) const { return dist < o.dist; }
     };
     std::vector<MidBandEntry> midBand_;
+    // Current mid-band actors that have emitted a real pose. Keep native NONE
+    // on the same quota stream until band exit; bounded by MID_BAND_MAX.
+    std::set<Key>              midPoseActors_;
     unsigned int              midCursor_;  // start of the CURRENT slice
     unsigned long             midSliceMs_; // last slice advance; 50 ms selection budget
     unsigned int              midFastPromoted_; // mid bodies streamed at the full
@@ -1210,13 +1225,11 @@ private:
     float                     censusParkDist_;
     unsigned long             censusParks_;   // join: divergence-park count
     std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
-    // The census rows from the PREVIOUS packet, and when they arrived. Two
-    // consecutive rows are the only measure of the host copy's pace the join
-    // has for a body outside the stream bubble - the census carries position
-    // and nothing else - and the walk-converge band needs it to pick a speed
-    // that out-paces what it is chasing.
-    std::map<Key, CensusPos>  censusPrev_;
-    unsigned long             censusPrevMs_;
+    // Previous rows stay in their actual author's namespace. The merged
+    // position selects a source author; only that author's clock measures pace.
+    typedef std::pair<u32, Key> CensusSourceKey;
+    std::map<CensusSourceKey, CensusPos> censusPrev_;
+    std::map<Key, u32> censusSource_;
     // Per-key state for the two ways a census row can correct its local body:
     // the walk that converges it, and the teleport of last resort.
     //
@@ -1390,6 +1403,19 @@ private:
     // (5 s re-author window) PEER-ENTER must not re-jail a body its owner
     // just freed - the exit-vs-reauthor race guard.
     std::map<Key, unsigned long> ownFurnExit_;
+    struct CarryPlacement {
+        u32 owner;
+        bool local, released, pending;
+        unsigned int furn[5];
+        CarryPlacement() : owner(MAX_PLAYERS), local(false), released(false), pending(false) {
+            memset(furn, 0, sizeof(furn));
+        }
+    };
+    std::map<Key, CarryPlacement> carryPlacements_;
+    std::map<Key,EventPacket> pendingFurnitureEvents_;
+    std::map<Key,u32> furnitureEnterApplied_;
+    bool resolveFurnitureEventHand(const EventPacket&,unsigned int out[5]) const;
+    int applyFurnitureEvent(const EventPacket&);
     InterpConfig          cfg_;
     float                 catchupK_;  // walk-drive gap-proportional speed gain
     float                 snapDist_;  // moving-body hard-snap distance floor (u)
@@ -1446,14 +1472,22 @@ private:
     //   a removal and silently took the fast path - which is what let a bag snapshot beat
     //   the debounced W2 drop intent and lose the dropped item. Unit totals also catch a
     //   partial-stack removal (drop 5 of 10), which never changed the entry count at all.
-    struct InvPub { u32 hash; unsigned long lastSendMs; u32 pendingHash; unsigned long pendingSince; unsigned int lastSentN; unsigned int lastSentUnits; };
+    struct InvPub { u32 hash; unsigned long lastSendMs; u32 pendingHash; unsigned long pendingSince; unsigned int lastSentN; unsigned int lastSentUnits; u32 revision; };
     // truncated (protocol 46): the author's container did not fit in INV_ITEMS_MAX, so
     // `items` is an INCOMPLETE description - reconcile additive-only, never delete.
-    struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated; };
+    struct InvRecv {
+        u32 ownerId, revision;
+        Key wireKey; // authenticated snapshot identity, independent of NPC movement ownership
+        std::vector<InvItemEntry> items;
+        bool dirty, truncated, transaction, checkpoint;
+        InvRecv() : ownerId(MAX_PLAYERS), revision(0), wireKey(), dirty(false),
+                    truncated(false), transaction(false), checkpoint(false) {}
+    };
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
     std::map<std::pair<u32,Key>,InboundInv> invPending_;
+    std::map<std::pair<u32,Key>,InventorySnapshotRevision> invRevision_;
     // Protocol 34: the host's ~1 Hz container census (STORAGE/machine buildings
     // plus down/dead world-NPC inventories). Folded into the authored set each
     // publishInventories pass while storeSync_ is on. Refreshed wholesale each
@@ -1496,15 +1530,17 @@ private:
     // unloads - which is what travelling far DOES - the item is destroyed and `obj`
     // becomes freed memory we still hold. Every use goes through liveWorldProxy(),
     // which re-resolves the hand and hands back only a pointer the engine still
-    // owns. An all-zero hand means the round-trip failed at mint; those fall back
-    // to the raw pointer, because dropping them instead would leak the proxy.
-    struct WorldProxy { RootObject* obj; unsigned int hand[5]; float x, y, z; u32 hash; };
+    // owns. A failed mint registration never licenses a raw-pointer fallback.
+    struct WorldProxy {
+        RootObject* obj; GameWorld* world; unsigned int generation,hand[5],sourceHand[5];
+        float x,y,z; u32 hash;
+    };
     // The one gate between a stored proxy pointer and the engine. Returns 0 once
     // the object is gone (hand no longer resolves, or its table slot was recycled
     // by a different object), in which case the caller must drop its mapping and
     // touch nothing: the engine already destroyed the item, and destroying,
     // moving or even READING it a second time is a use-after-free.
-    RootObject* liveWorldProxy(const WorldProxy& wp);
+    RootObject* liveWorldProxy(GameWorld* gw,const WorldProxy& wp) const;
     std::map<Key, WorldTrack> worldTrack_;
     // Spawned proxies for PEER-authored ground items, keyed by (ownerId, netId):
     // W1 is bidirectional (each client streams the free ground items it authors),
@@ -1517,6 +1553,8 @@ private:
     // world (which may now contain previously-dropped-then-baked items) re-baselines
     // rather than re-streaming - closing the per-reload duplicate layering.
     bool                       worldSeeded_;
+    bool publishPendingGearDrop(GameWorld*, NetLink&, const Key& item, WorldDropPacket& packet);
+    bool publishNativeGearPickup(GameWorld*, NetLink&, u32 localId, const engine::ItemDropEdge& edge);
 
     // Phase W2 conservation-drop state.
     // weaponCensus_: per OWNED character hand, the last-tick set of WEAPON copies it held,
@@ -1535,13 +1573,6 @@ private:
     struct WCensus {
         WCensus() : seeded(false), zeroReads(0) {}
         std::map<std::string, WCensusItem> items;
-        std::map<std::string, int>         retries; // per-sid ground-correlation retry budget
-        // Wall-clock ms at which each sid's retry budget was FIRST armed. The budget is
-        // frame-denominated and xferPendingLoss re-arms it, so it can cycle for as long as
-        // the transfer detector holds an unresolved loss (observed: 29->1->29 repeatedly).
-        // That is fine for the drop verdict itself, but wdPendingDrop gates the whole
-        // inventory snapshot on it, so the hold needs an absolute ceiling - see WD_HOLD_MAX_MS.
-        std::map<std::string, unsigned long> retryArmMs;
         std::map<std::string, std::deque<void*> > ptrs;        // current weapon Item* per sid
         bool seeded;
         // Consecutive ZERO-ROW reads of this container. A zero-row read carries no
@@ -1553,6 +1584,12 @@ private:
     std::map<Key, WCensus>            weaponCensus_;
     u32                               nextDropId_;
     std::set<std::pair<u32, u32> >    appliedDrops_;
+    // Failed physical relocations remain pending until the real owner/item loads.
+    std::map<std::pair<u32, u32>, WorldDropPacket> pendingDrops_;
+    std::pair<u32, u32> pendingDropCursor_;
+    // Query-free authoritative NPC drops must precede their bag snapshots.
+    std::map<Key, WorldDropPacket> pendingNpcDrops_;
+    Key pendingNpcDropCursor_;
 
     // Phase W3 conservation-pickup state.
     // groundedWeapons_: the REAL ground Item* handles THIS client is tracking per sid (from
@@ -1563,53 +1600,19 @@ private:
     //   re-home. This disambiguates two same-sid weapons on the ground (one dropped by each
     //   client): FIFO-by-sid would otherwise re-home the wrong copy on the peer.
     // nextPickupId_ hands out per-sender monotonic ids; appliedPickups_ dedupes received ones.
-    // A cached ground Item* goes STALE (the engine despawns/streams the object out) and
-    // nothing used to prune this list, so a later re-home handed addItemPtrToInventory a
-    // dead pointer. `hand` is the object's save-stable engine hand, so the re-home can
-    // RE-RESOLVE the object and test its liveness instead of trusting `item`.
-    //
-    // pending*: a re-home that FAILED (the object is alive but the bag refused it - an
-    // occupied equip slot, no room, a container still resolving). The entry is retried by
-    // reconcileGroundGear until pendingSinceMs + WD_REHOME_MAX_MS, and only then may the
-    // author destroy its ground copy - and ONLY after it has SEEN the item in the target
-    // container. Destroying on faith would lose the item outright wherever the reconcile
-    // cannot recreate it (a truncated read, KENSHICOOP_WEAPON_FAB=0, or a backpack, which
-    // must never be fabricated because the copy would be empty).
     struct GroundWeapon {
         u32           dropOwnerId;
         u32           dropId;
         void*         item;
         unsigned int  hand[5];
-        unsigned int  pendingHand[5];   // re-home target container (all-zero = none pending)
-        unsigned int  pendingType;      // itemType of the pending re-home
-        unsigned long pendingSinceMs;   // when the first re-home attempt failed
-        // Consecutive ticks this object failed to read as a live free ground item. A track is
-        // only dropped once that REPEATS: discarding it on a single bad read is how the author
-        // ended up with no answer for a real pickup, and the cost of being wrong is asymmetric
-        // (a forgotten track means a permanent duplicate, whereas keeping a dead one costs a
-        // pointer until the next read).
-        unsigned int  deadReads;
-        // ...and WHEN the current dead streak began, because the tick count alone is a ~25 ms
-        // tolerance at engine tick rate - far too short to distinguish "gone" from "streamed out
-        // for a moment". Zero while the last read was live. createdMs/everLive bound the case
-        // where the object never resolved even once, which has no ground copy to protect.
-        unsigned long firstDeadMs;
-        unsigned long createdMs;
-        bool          everLive;
+        unsigned int  sourceHand[5]; // actual DROP character wire owner
     };
     std::map<std::string, std::deque<GroundWeapon> > groundedWeapons_;
     u32                               nextPickupId_;
     std::set<std::pair<u32, u32> >    appliedPickups_;
 
-    // An IDENTIFIED pickup intent we could not satisfy the moment it arrived, because the named
-    // track had just been retired or we never held it. Concluding from that single attempt is
-    // not neutral: a real object left the ground over there, so our own copy is now a duplicate
-    // for the rest of the session. The only fallback is a site-anchored spatial scan, and that
-    // is the query that fails in towns - which is precisely where the player hit this. So park
-    // the intent instead and retry it from reconcileGroundGear: by the named track if it
-    // resolves again (a streamed-out object usually does), by the site scan otherwise, until
-    // WD_REHOME_MAX_MS. Only identified intents are ever parked; an identity-less one still
-    // gets nothing, because we cannot know which object it took.
+    // An identified pickup waits for its exact tracked item and destination.
+    // No same-template spatial substitute or expiry can authorize a mutation.
     struct PendingPickup {
         unsigned int  targetHand[5];
         std::string   sid;
@@ -1620,14 +1623,9 @@ private:
     };
     std::deque<PendingPickup> pendingPickups_;
 
-    // Start tracking a just-grounded conservation item: records the drop identity both
-    // clients share, the raw Item*, AND the object's engine hand (so a later re-home
-    // re-resolves rather than trusting the pointer), with the pending re-home state clear.
-    // `authored` distinguishes a drop WE detected locally from one we mirrored for a peer;
-    // only the test forget-lever reads it (it must blind the author without blinding the
-    // picker, or no identified pickup is ever sent at all).
-    void trackGroundGear(const std::string& sid, u32 dropOwnerId, u32 dropId, void* item,
-                         bool authored);
+    // Track the agreed drop identity and full physical hand. The pointer is
+    // checked against a fresh hand resolution before any native mutation.
+    void trackGroundGear(const std::string& sid, u32 dropOwnerId, u32 dropId, void* item);
 
     // Park an identified pickup we could not satisfy on arrival (see PendingPickup), and the
     // per-tick retry that drains it. Idempotent in (refOwnerId, refDropId) so a reliable resend
@@ -1635,20 +1633,27 @@ private:
     void parkPendingPickup(const unsigned int targetHand[5], const char* sid,
                            unsigned int itemType, u32 refOwnerId, u32 refDropId);
     void retryPendingPickups(GameWorld* gw);
+    bool tryApplyWeaponDrop(GameWorld* gw, const WorldDropPacket& packet);
+    void applyWeaponPickup(GameWorld* gw, const WorldPickupPacket& packet);
 
     // Exact native cross-owner moves. A peer snapshot is held as a whole until
     // its owner has incorporated the move; nested bag entries stay intact.
     // wdSuppress_: (character key, sid) -> expiry; a gear transfer must not be read by
     //   the W2 weapon census as a ground drop / pickup of that sid on those characters.
     typedef std::pair<std::string, u32> XKey; // (stringID, itemType)
-    struct XferLatch { int delta; unsigned long deadlineMs; };
+    struct XferLatch { int delta; };
     std::map<Key, std::map<XKey, XferLatch> > xferLatch_;
     u32                                       nextXferId_;
     std::map<std::pair<u32, u32>, InboundInvXferAck> appliedXfers_;
     std::map<std::pair<u32, u32>, InboundInvXfer> pendingXfers_;
+    std::map<std::pair<u32,u32>,InvXferPacket> transactionIntents_;
     std::deque<InboundInvXferAck> receivedXferAcks_;
     // Canonical wire inventories awaiting a full snapshot after an additive verdict.
     std::set<Key> deferredInvCommits_;
+    std::set<u32> inventoryResyncPeers_;
+    std::map<Key,u32> inventoryResyncActors_;
+    std::map<Key,std::pair<u32,u32> > inventoryAwaitingActorAck_;
+    std::map<Key,u32> inventoryCheckpointAcks_;
     void queueXferVerdict(GameWorld* gw, NetLink& net, const InvXferPacket& intent,
                           const InboundInvXferAck& result);
     // Locally completed moves awaiting the other endpoint's authority verdict.
@@ -1662,6 +1667,8 @@ private:
         bool          dstPeer;
         unsigned long sentMs;
         u32           peerId;
+        u8            operation;
+        bool          retired;
         int           rollbackQty;
         int           appliedQty;
         bool          answered;
@@ -2010,9 +2017,13 @@ private:
         int knownOpen; int knownLocked; unsigned long lastSendMs;
         u32 seqSeen[MAX_PLAYERS]; u32 pendingSeq;
         bool seeded; bool pending;
+        unsigned int parentHand[5];
+        int doorIndex, observedOpen;
         DoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                    pendingSeq(0), seeded(false), pending(false) {
+                    pendingSeq(0), seeded(false), pending(false),
+                    doorIndex(-1), observedOpen(-1) {
             memset(seqSeen, 0, sizeof(seqSeen));
+            memset(parentHand, 0, sizeof(parentHand));
         }
     };
     std::map<Key, DoorRow> doorRows_;
@@ -2155,29 +2166,51 @@ private:
     //   fixtureOut_  - PUBLISH bookkeeping: which of OUR fixtures we have
     //     announced and when, so the channel is first-sight + safety resend
     //     rather than a per-sample broadcast.
-    //   fixtureMap_  - APPLY result: the PEER's key -> the hand that fixture has
-    //     HERE. Read through localHandForFixtureKey by the pose inject and by
-    //     the prod/container channels. Absent or unresolved means "no pairing
-    //     known", and every caller then falls back to the raw wire hand, which
-    //     is still correct for a save-baked machine.
+    //   fixtureMap_ - canonical inventory/container pairing.
+    //   poseFixtureMap_ - (author, full wire hand) pose pairing. A pending
+    //     descriptor blocks raw-hand fallback; hands from different processes
+    //     are not globally unique.
     struct FixOut {
-        unsigned long lastSendMs; bool sent;
-        FixOut() : lastSendMs(0), sent(false) {}
+        unsigned long lastSendMs, lastPoseSendMs;
+        u64 poseCandidateRound;
+        Key poseActor, poseCandidateActor;
+        bool sent, poseSent;
+        FixOut() : lastSendMs(0), lastPoseSendMs(0), poseCandidateRound(0), sent(false), poseSent(false) {
+            poseActor.t=poseActor.c=poseActor.cs=poseActor.i=poseActor.s=0;
+            poseCandidateActor=poseActor;
+        }
     };
     struct FixtureRow {
-        unsigned int hand[5]; bool resolved; u32 seqSeen; unsigned long lastMissMs;
-        FixtureRow() : resolved(false), seqSeen(0), lastMissMs(0) {
-            hand[0] = hand[1] = hand[2] = hand[3] = hand[4] = 0;
+        unsigned int hand[5]; bool resolved; u32 seqSeen[MAX_PLAYERS]; unsigned long lastMissMs;
+        u64 proceduralId;
+        FixtureRow() : resolved(false), lastMissMs(0), proceduralId(0) {
+            memset(seqSeen, 0, sizeof(seqSeen));
+            memset(hand, 0, sizeof(hand));
+        }
+    };
+    typedef std::pair<u32, Key> PoseFixtureKey;
+    struct PoseFixtureRow {
+        unsigned int hand[5]; u32 seqSeen;
+        bool resolved, posePendingQueued;
+        FixturePacket poseDescriptor;
+        PoseFixtureRow() : seqSeen(0), resolved(false), posePendingQueued(false) {
+            memset(hand, 0, sizeof(hand));
         }
     };
     std::map<Key, FixOut>     fixtureOut_;
     std::map<Key, FixtureRow> fixtureMap_;
+    std::map<PoseFixtureKey, PoseFixtureRow> poseFixtureMap_;
+    std::deque<PoseFixtureKey> pendingPoseFixtures_;
     u32           fixtureSeqOut_;
     unsigned long fixtureSampleMs_;
     bool          fixtureSync_;
+    ProceduralWorldSync* proceduralWorld_;
     // Translate a peer fixture key to the local hand for the same object.
     // False when we have no pairing (yet) - the caller keeps the raw hand.
     bool localHandForFixtureKey(const Key& wire, unsigned int out[5]) const;
+    // 1: translated, 0: no descriptor, -1: known descriptor not resolved yet.
+    int localHandForPoseFixtureKey(const Key& wire, u32 author, unsigned int out[5],
+                                  bool allowBuildFallback=true) const;
     // Release the taskBad park on driven bodies after a new pairing lands, so a
     // pose that failed while the fixture was unpaired gets one more chance.
     void unparkForNewFixture();
@@ -2234,6 +2267,11 @@ private:
     // (mid-session) tab inherits its authoring side's ownership.
     std::set<Key> pinOwned_;
     std::set<Key> pinPeer_;
+    std::map<Key,u32> playerActorOwners_; // admitted squad claim / local partition, not actor streams
+    std::set<Key> announcedPlayerActors_;
+    u32 playerClaimPeers_;
+    u32 playerActorOwner(const Key& actor) const;
+    bool validInitialPlayerClaim(GameWorld*, const Key& actor, u32 ownerId, unsigned playerCount) const;
     char          peerNick_[MAX_PLAYERS][64];
     Key           nickHand_[MAX_PLAYERS];
     unsigned char nickHandSet_[MAX_PLAYERS];
@@ -2641,7 +2679,7 @@ private:
     bool          speedEffPaused_;     // last LWW pause
     u32           speedLastReqOwner_;  // ownerId of last accepted LWW command
     u32           speedSeqOut_;        // per-sender monotonic seq for REQ/SET we send
-    u32           speedSeqSeen_;       // newest seq accepted from the peer (stale guard)
+    sync::SpeedAdmission speedAdmission_; // independent join REQ + host SET sequence scopes
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
     unsigned long speedCombatHoldMs_;  // last TRUE own-squad combat (hint hysteresis)
@@ -2738,8 +2776,9 @@ private:
         // hands). Without this the runtime recruit defers forever behind a
         // same-template twin (recruit_sync run 094401).
         bool forceReq;
+        u32 targetOwner;
         SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0), farMs(0),
-                          fromCensus(false), firstMissMs(0), forceReq(false) {}
+                          fromCensus(false), firstMissMs(0), forceReq(false), targetOwner(OWNER_ID_ALL) {}
     };
     std::map<Key, SpawnReqState> spawnReq_;
     // Spawn INFO replies waiting on the per-tick mint budget. Drain keeps
@@ -2765,6 +2804,14 @@ private:
     // Entries retain the destination ownership verdict until a real body binds.
     // Never pin an unresolved owned hand: that would veto its own spawn request.
     std::map<Key, bool> forceReqHands_;
+    struct ActorHandoff {
+        u32 source, destination;
+        unsigned int localHand[5]; // giver's exact native hand, never a cached pointer
+        ActorHandoff() : source(OWNER_ID_ALL), destination(OWNER_ID_ALL) {
+            memset(localHand,0,sizeof(localHand));
+        }
+    };
+    std::map<Key,ActorHandoff> actorHandoffs_;
     // JOIN: census-mint reach (see setSpawnMintRadius) + the census-missing
     // scan throttle (the resolve sweep over censusHands_ runs at ~0.5 Hz, not
     // per tick).
@@ -2779,7 +2826,7 @@ private:
     std::set<Key> spawnLogged_;
     // HOST: per-hand reply throttle (a re-request within the window is a
     // duplicate in flight, not a new question).
-    std::map<Key, unsigned long> spawnReplyMs_;
+    std::map<std::pair<u32,Key>, unsigned long> spawnReplyMs_;
     // JOIN: last "SCENARIO PROXY ..." telemetry emit (~2 Hz while proxies live).
     unsigned long spawnPosLogMs_;
 

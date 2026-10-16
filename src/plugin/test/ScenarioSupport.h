@@ -80,6 +80,8 @@ Scenario* makeWorldItemScenario(const std::string& name); // ScenarioWorldItems.
 Scenario* makeCharStateScenario(const std::string& name); // ScenarioCharState.cpp
 Scenario* makeProbeScenario(const std::string& name);     // ScenarioProbes.cpp
 Scenario* makeBuildingScenario(const std::string& name);  // ScenarioBuildings.cpp
+Scenario* makeProceduralScenario(const std::string& name); // ScenarioProcedural.cpp
+Scenario* makeEnvironmentItemsScenario(const std::string& name); // ScenarioEnvironmentItems.cpp
 Scenario* makeSessionScenario(const std::string& name);   // ScenarioSession.cpp
 
 } // namespace coop

@@ -11,6 +11,9 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "ProceduralWorldSync.h"
+#include "LockAuthority.h"
+#include "../game/InventoryTransactionBridge.h"
 
 namespace coop {
 
@@ -946,26 +949,53 @@ void Replicator::publishDoors(const SyncContext& ctx) {
         std::map<Key, Key>::const_iterator minted = mintByLocal_.find(local);
         if (minted != mintByLocal_.end()) k = minted->second;
         else if (!ctx.isHost) k = invWireKeyForLocal(local);
-        DoorRow& dr = doorRows_[k];
-        if (dr.pending) continue; // do not echo an unapplied remote state
-        bool changed = (r.open != dr.knownOpen) || (r.locked != dr.knownLocked);
-        if (!dr.seeded) {
-            dr.seeded = true; dr.knownOpen = r.open; dr.knownLocked = r.locked;
-            if (!ctx.isHost) continue; // only the host authors the initial snapshot
-            changed = true;
+        if (!ctx.isHost && r.doorIndex >= 0) {
+            Key parent = invWireKeyForLocal(keyForInvLocalHand(r.parentHand));
+            bool matched = false;
+            for (std::map<Key, DoorRow>::const_iterator d = doorRows_.begin();
+                 d != doorRows_.end(); ++d) {
+                if (!d->second.seeded || d->second.doorIndex != r.doorIndex) continue;
+                Key expected = keyForInvLocalHand(d->second.parentHand);
+                if (!(parent < expected) && !(expected < parent)) {
+                    k = d->first; matched = true; break;
+                }
+            }
+            if (!matched) continue; // no HOST identity, no interaction request
         }
-        // Reliable changes need no heartbeat. A stale resend from either
-        // writer can undo the other writer's newer native lock operation.
-        // Zero lastSendMs requests the host's initial/reconnect snapshot.
-        if (!changed && !(ctx.isHost && dr.lastSendMs == 0)) continue;
-        dr.knownOpen = r.open; dr.knownLocked = r.locked; dr.lastSendMs = now;
+        DoorRow& dr = doorRows_[k];
+        bool changed = (r.open != dr.knownOpen) || (r.locked != dr.knownLocked);
+        if (!ctx.isHost) {
+            // Locks are not commands: a client's stale save/AI must never
+            // relock a successfully picked HOST lock. Preserve local OPEN
+            // clicks as requests, independently of the accepted lock baseline.
+            if (!dr.seeded || dr.pending || r.state < 0) continue;
+            bool clicked = dr.observedOpen >= 0 && r.open != dr.observedOpen;
+            dr.observedOpen = r.open;
+            if (!clicked) continue;
+        } else {
+            if (!dr.seeded) { dr.seeded = true; changed = true; }
+            if (!changed && dr.lastSendMs != 0) continue;
+            dr.knownOpen = r.open; dr.knownLocked = r.locked;
+            dr.doorIndex = r.doorIndex;
+            memcpy(dr.parentHand, r.parentHand, sizeof(dr.parentHand));
+        }
+        dr.lastSendMs = now;
         DoorPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_DOOR;
         pkt.ownerId = ownerId;
+        if (!doorSeqOut_) ++doorSeqOut_;
         pkt.seq     = doorSeqOut_++;
         pkt.hand[0] = k.t; pkt.hand[1] = k.c; pkt.hand[2] = k.cs;
         pkt.hand[3] = k.i; pkt.hand[4] = k.s;
+        pkt.doorIndex = r.doorIndex;
+        if (r.doorIndex >= 0) {
+            Key parent = keyForInvLocalHand(r.parentHand);
+            if (!ctx.isHost) parent = invWireKeyForLocal(parent);
+            pkt.parentHand[0] = parent.t; pkt.parentHand[1] = parent.c;
+            pkt.parentHand[2] = parent.cs; pkt.parentHand[3] = parent.i;
+            pkt.parentHand[4] = parent.s;
+        }
         pkt.open    = (u8)(r.open ? 1 : 0);
         pkt.locked  = (u8)(r.locked ? 1 : 0);
         net.queueDoor(pkt);
@@ -987,21 +1017,48 @@ void Replicator::applyDoors(const SyncContext& ctx) {
     if (!doorSync_) return;
     for (std::deque<InboundDoor>::iterator it = got.begin(); it != got.end(); ++it) {
         const DoorPacket& p = it->pkt;
-        if (p.ownerId >= MAX_PLAYERS) continue;
+        if (p.ownerId >= MAX_PLAYERS || p.open > 1 || p.locked > 1 ||
+            p.doorIndex < -1 || p.doorIndex > 255 || p.seq == 0) continue;
+        if (ctx.isHost ? p.ownerId == 0 : p.ownerId != 0) continue;
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         DoorRow& dr = doorRows_[k];
-        if (!sync::gateSeqAccept(dr.seqSeen[p.ownerId], p.seq)) continue;
-        dr.seqSeen[p.ownerId] = p.seq;
+        if (ctx.isHost) {
+            if (!sync::gateSeqAccept(dr.seqSeen[p.ownerId], p.seq)) continue;
+            dr.seqSeen[p.ownerId] = p.seq;
+            // Requests are ephemeral and only name an already known HOST
+            // door. They cannot invent a lock target or change a lock value.
+            if (!dr.seeded || dr.doorIndex < 0) continue;
+            engine::DoorRead before, after;
+            unsigned int target[5] = { k.t, k.c, k.cs, k.i, k.s };
+            if (!engine::readDoorByHand(target, &before) || before.state < 0) continue;
+            if (p.open && before.locked) { dr.lastSendMs = 0; continue; }
+            if (engine::writeDoorByHand(target, p.open, -1, &after))
+                dr.lastSendMs = 0; // resulting native state is the response
+            continue;
+        }
+        if (!sync::doorAcceptHostState(false, p.ownerId, dr.seqSeen[0], p.seq)) continue;
+        dr.seqSeen[0] = p.seq;
         dr.knownOpen = (int)p.open; dr.knownLocked = (int)p.locked;
+        memcpy(dr.parentHand, p.parentHand, sizeof(dr.parentHand));
+        dr.doorIndex = p.doorIndex;
         dr.pendingSeq = p.seq; dr.seeded = true; dr.pending = true;
     }
+    if (ctx.isHost) return;
     for (std::map<Key, DoorRow>::iterator it = doorRows_.begin(); it != doorRows_.end(); ++it) {
         DoorRow& dr = it->second;
-        if (!dr.pending) continue;
+        if (!dr.seeded || dr.seqSeen[0] == 0) continue;
         const Key& k = it->first;
         unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
-        if (!localHandForFixtureKey(k, hand)) {
+        if (dr.doorIndex >= 0) {
+            Key parent = keyForInvLocalHand(dr.parentHand);
+            unsigned int ph[5]; memcpy(ph, dr.parentHand, sizeof(ph));
+            if (fixtureMap_.count(parent) && !localHandForFixtureKey(parent, ph)) continue;
+            engine::DoorRead door;
+            if (!engine::readDoorOfBuilding(ph, (unsigned int)dr.doorIndex, &door)) continue;
+            memcpy(hand, door.hand, sizeof(hand));
+        } else if (!localHandForFixtureKey(k, hand)) {
+            if (fixtureMap_.count(k)) continue; // known but unloaded is NOT a raw hand
             std::map<Key, OwnBuild>::const_iterator own = ownBuilds_.find(k);
             std::map<Key, PeerBuild>::const_iterator peer = peerBuilds_.find(k);
             if (own != ownBuilds_.end()) {
@@ -1011,22 +1068,25 @@ void Replicator::applyDoors(const SyncContext& ctx) {
                 if (peer->second.removed) { dr.pending = false; continue; }
                 if (peer->second.minted != 1) continue;
                 memcpy(hand, peer->second.localHand, sizeof(hand));
-            }
+            } else continue; // await HOST fixture census; raw runtime hands can collide
         }
         engine::DoorRead cur;
         if (!engine::readDoorByHand(hand, &cur)) continue; // retained until streamed in
-        bool openMoves = cur.state >= 0 && cur.open != dr.knownOpen;
-        bool lockMoves = cur.hasLock && cur.locked != dr.knownLocked;
+        bool openMoves = dr.pending && cur.state >= 0 && cur.open != dr.knownOpen;
+        bool lockMoves = sync::doorNeedsLockApply(cur.hasLock != 0, cur.locked, dr.knownLocked);
         if (!openMoves && !lockMoves) {
+            if (dr.pending) dr.observedOpen = cur.open;
             dr.pending = false;
             continue;
         }
         engine::DoorRead after;
-        bool ok = engine::writeDoorByHand(hand, cur.state >= 0 ? dr.knownOpen : -1,
+        bool ok = engine::writeDoorByHand(hand, openMoves ? dr.knownOpen : -1,
                                           cur.hasLock ? dr.knownLocked : -1, &after);
-        if (ok && (after.state < 0 || after.open == dr.knownOpen) &&
-            (!after.hasLock || after.locked == dr.knownLocked))
+        if (ok && (!openMoves || after.open == dr.knownOpen) &&
+            (!after.hasLock || after.locked == dr.knownLocked)) {
+            if (dr.pending) dr.observedOpen = after.open;
             dr.pending = false;
+        }
         char b[176];
         _snprintf(b, sizeof(b) - 1,
                   "[door] RECV hand=%u.%u.%u.%u.%u open=%u locked=%u was=%d/%d ok=%d seq=%u",
@@ -1140,19 +1200,24 @@ void Replicator::applyProd(const SyncContext& ctx) {
         Key wk; wk.t = p.key[0]; wk.c = p.key[1]; wk.cs = p.key[2];
         wk.i = p.key[3]; wk.s = p.key[4];
         ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wk)];
+#ifdef KENSHICOOP_HARNESS
+        const bool firstNativeRow=pr.seqSeen==0;
+#endif
         if (!sync::gateSeqAccept(pr.seqSeen, p.seq)) continue; // stale/dup row
         pr.seqSeen = p.seq;
         // Resolve the wire key to OUR machine's hand: baked hands resolve
         // directly; a placer key is either a building WE placed (our own
         // hand) or one we MINTED for the host's placement (translation map).
         unsigned int hand[5];
+        bool pairedFixture=false;
         if (p.keyKind == 0) {
             // A baked hand resolves directly, but a MINE's does not: it is a
             // per-client instance for a terrain node, so the host's key names
             // nothing here and every buffer row for it used to be dropped -
             // the "mine inventory does not sync" half of the report. Prefer the
             // protocol-55 pairing, fall back to the raw hand.
-            if (!localHandForFixtureKey(wk, hand))
+            pairedFixture=localHandForFixtureKey(wk,hand);
+            if (!pairedFixture)
                 for (unsigned int h = 0; h < 5; ++h) hand[h] = p.key[h];
         } else {
             std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(wk);
@@ -1168,18 +1233,37 @@ void Replicator::applyProd(const SyncContext& ctx) {
             }
         }
         engine::ProdRead cur;
-        if (!engine::readMachineByHand(hand, &cur))
-            continue; // out-of-interest / not resolvable here - accepted edge
+        const bool readable=engine::readMachineByHand(hand,&cur);
+#ifdef KENSHICOOP_HARNESS
+        if (firstNativeRow) {
+            engine::DeedRead deed;
+            const bool ownerReadable=readable && engine::readDeedByHand(ctx.gw,hand,&deed);
+            char line[320];_snprintf(line,sizeof(line)-1,
+                "[prod] NATIVE-ROW key=%u,%u,%u,%u,%u local=%u,%u,%u,%u,%u "
+                "paired=%d readable=%d complete=%d class=%d ownerReadable=%d playerOwned=%d owner=%s",
+                p.key[0],p.key[1],p.key[2],p.key[3],p.key[4],
+                hand[0],hand[1],hand[2],hand[3],hand[4],
+                pairedFixture?1:0,readable?1:0,readable?cur.complete:0,
+                readable?cur.classType:-1,ownerReadable?1:0,
+                ownerReadable?deed.owned:-1,ownerReadable?deed.ownerSid:"unresolved");
+            line[sizeof(line)-1]=0;coop::logLine(line);
+        }
+#endif
+        if (!readable) continue;
         if (!cur.complete)
             continue; // still a construction site here; protocol 27 will finish it
+        const bool guardedOutput=pairedFixture && !isHostRole() && p.ownerId==0 &&
+            p.classType==cur.classType && !strcmp(p.outSid,cur.outSid) &&
+            engine::noteHostProductionReplica(hand);
+        // Native output updates also run outside operate() (automatic/inlined
+        // work paths). Only HOST's inventory channel may materialize stock;
+        // this scalar is the non-materializing progress of admitted replicas.
+        const bool needOut=guardedOutput && p.outAmount>=0.0f && p.outAmount<1.0f &&
+            p.outAmount!=cur.outAmount;
         // Apply only what actually diverged, through the engine's own levers.
         int wantPower = -1;
         if (p.powerOn >= 0 && cur.powerOn >= 0 && (int)p.powerOn != cur.powerOn)
             wantPower = (int)p.powerOn;
-        float outWant = -1.0f;
-        if (p.outAmount >= 0.0f &&
-            qProd(p.outAmount) != qProd(cur.outAmount >= 0.0f ? cur.outAmount : 0.0f))
-            outWant = p.outAmount;
         float inWant[2] = { -1.0f, -1.0f };
         for (unsigned int k = 0; k < 2; ++k)
             if (p.inAmount[k] >= 0.0f && (int)k < cur.nInputs &&
@@ -1197,18 +1281,14 @@ void Replicator::applyProd(const SyncContext& ctx) {
         bool needIn   = (inWant[0] >= 0.0f) || (inWant[1] >= 0.0f);
         bool needFarm = farmWant[0] >= 0.0f || farmWant[1] >= 0.0f ||
                         farmWant[2] >= 0.0f || farmWant[3] >= 0.0f;
-        if (wantPower < 0 && outWant < 0.0f && !needIn && !needFarm)
+        if (wantPower < 0 && !needIn && !needFarm && !needOut)
             continue; // already converged (resend or settled row)
-        // A still-null output buffer can't take the direct amount write -
-        // materialize it FIRST via the native setProductionItem (the probe-
-        // proven materializing lever), then land the exact amount directly
-        // (setProductionItem splits stack into inventory; the direct write
-        // is what makes the buffer byte-match the host's).
-        if (outWant >= 0.0f && cur.outAmount < 0.0f)
-            engine::writeMachineByHand(hand, -1, outWant, /*useSetItem*/true,
-                                       0, 0, 0);
+        // Actual output stock belongs exclusively to the versioned inventory
+        // channel. ConsumptionItem::amount is native production progress, not an
+        // inventory checkpoint: a delayed scalar must never refill extracted
+        // stock or materialize a new output item through setProductionItem.
         engine::ProdRead after;
-        bool ok = engine::writeMachineByHand(hand, wantPower, outWant,
+        bool ok = engine::writeMachineByHand(hand, wantPower, needOut?p.outAmount:-1.0f,
                                              /*useSetItem*/false,
                                              needIn ? inWant : 0,
                                              needFarm ? farmWant : 0, &after);
@@ -1478,9 +1558,8 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
 // this channel (the same mine carrying hand 50.2399902464 on the host and
 // 104.1377319296 on the join, at an identical world position).
 
-// Publish identities for the complete container census used by inventory sync.
-// A narrower radius left shop stock authored but unresolvable on the peer.
-// Inventory-less seats and beds remain outside the census.
+// Publish the complete container and usable-fixture census. Inventoryless work
+// nodes still carry native pose subjects and need the same identity pairing.
 static const float FIXTURE_CENSUS_RADIUS = 400.0f;
 static const unsigned int FIXTURE_MAX_ROWS = 96;
 
@@ -1497,7 +1576,7 @@ void Replicator::publishFixtures(const SyncContext& ctx) {
     fixtureSampleMs_ = now;
 
     static engine::ContRead rows[FIXTURE_MAX_ROWS]; // main-thread only
-    unsigned int n = engine::enumContainersNear(gw, FIXTURE_CENSUS_RADIUS, rows,
+    unsigned int n = engine::enumFixturesNear(gw, FIXTURE_CENSUS_RADIUS, rows,
                                                 FIXTURE_MAX_ROWS);
     for (unsigned int i = 0; i < n; ++i) {
         const engine::ContRead& r = rows[i];
@@ -1534,59 +1613,198 @@ void Replicator::applyFixtures(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
     std::deque<InboundFixture> got;
     in.drainFixture(got);
-    if (got.empty()) return;
     if (!fixtureSync_) return;
-    unsigned long now = nowMs();
+    const unsigned long now = nowMs();
     for (std::deque<InboundFixture>::iterator it = got.begin(); it != got.end(); ++it) {
         const FixturePacket& p = it->pkt;
+        if (it->ownerId >= MAX_PLAYERS) continue;
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
-        FixtureRow& fr = fixtureMap_[k];
-        if (!sync::gateSeqAccept(fr.seqSeen, p.seq)) continue; // stale/dup row
-        fr.seqSeen = p.seq;
-        if (fr.resolved) continue; // identity is permanent; resends are no-ops
-
-        // Save-baked machines DO cross by hand, and those rows are the majority
-        // in a town. Take the sender's hand as-is when it resolves here to the
-        // same template at the same place - the position/sid agreement is what
-        // makes it a proven pairing rather than a coincidental resolve.
-        engine::ContRead cur;
-        if (engine::readContainerByHand(p.hand, &cur) &&
-            strcmp(cur.sid, p.sid) == 0 &&
-            (cur.x - p.x) * (cur.x - p.x) + (cur.z - p.z) * (cur.z - p.z) <= 25.0f) {
-            memcpy(fr.hand, p.hand, sizeof(unsigned int) * 5);
-            fr.resolved = true;
-            continue; // identity pairing: consumers keep using the wire hand
-        }
-
-        unsigned int lh[5];
-        if (!engine::findFixtureByPosSid(gw, p.x, p.y, p.z, p.sid,
-                                         (int)p.classType, lh)) {
-            // Not loaded here yet. Record nothing and let the safety resend
-            // retry; consumers meanwhile fall back to the raw hand.
-            if (fr.lastMissMs == 0 || (now - fr.lastMissMs) >= 10000) {
-                fr.lastMissMs = now;
-                char b[208];
-                _snprintf(b, sizeof(b) - 1,
-                          "[fixture] RECV unmatched wire=%u.%u.%u.%u.%u cls=%u "
-                          "pos=%.1f,%.1f sid='%s' seq=%u",
-                          p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
-                          (unsigned)p.classType, p.x, p.z, p.sid, p.seq);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (p.poseActor.index || p.poseActor.serial) {
+            const PoseFixtureKey scoped(it->ownerId,k);
+            PoseFixtureRow& fr=poseFixtureMap_[scoped];
+            if (!sync::gateSeqAccept(fr.seqSeen,p.seq)) continue;
+            fr.seqSeen=p.seq;
+            fr.poseDescriptor = p;
+            if (!fr.posePendingQueued) {
+                pendingPoseFixtures_.push_back(scoped);
+                fr.posePendingQueued=true;
             }
             continue;
         }
-        memcpy(fr.hand, lh, sizeof(unsigned int) * 5);
-        fr.resolved = true;
-        char b[240];
-        _snprintf(b, sizeof(b) - 1,
-                  "[fixture] RECV pair wire=%u.%u.%u.%u.%u -> local=%u.%u.%u.%u.%u "
-                  "cls=%u pos=%.1f,%.1f sid='%s' seq=%u",
-                  p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
-                  lh[0], lh[1], lh[2], lh[3], lh[4], (unsigned)p.classType,
-                  p.x, p.z, p.sid, p.seq);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        unparkForNewFixture();
+        // Ordinary census rows pair inventory identities but never authorize creation.
+        FixtureRow& fr=fixtureMap_[k];
+        if (!sync::gateSeqAccept(fr.seqSeen[it->ownerId],p.seq)) continue;
+        fr.seqSeen[it->ownerId]=p.seq;
+        unsigned int proceduralHand[5]; u64 proceduralId=0;
+        int proceduralMatch=proceduralWorld_ ? proceduralWorld_->resolveFixture(p,proceduralHand,&proceduralId) : 0;
+        if (proceduralMatch<0 && localHandForBuildKey(k,proceduralHand)) proceduralMatch=1;
+        if (proceduralMatch!=0) {
+            fr.resolved=proceduralMatch==1;
+            fr.proceduralId=proceduralId;
+            if (fr.resolved) { memcpy(fr.hand,proceduralHand,sizeof(fr.hand)); unparkForNewFixture(); }
+            continue;
+        }
+        if (fr.resolved) continue;
+        engine::ContRead cur;
+        if (engine::readContainerByHand(p.hand, &cur) && cur.classType == (int)p.classType &&
+            strcmp(cur.sid, p.sid) == 0 &&
+            (cur.x-p.x)*(cur.x-p.x)+(cur.y-p.y)*(cur.y-p.y)+(cur.z-p.z)*(cur.z-p.z) <= 25.0f) {
+            memcpy(fr.hand, p.hand, sizeof(fr.hand)); fr.resolved = true;
+            unparkForNewFixture();
+            continue;
+        }
+        unsigned int local[5];
+        if (!engine::findFixtureByPosSid(gw, p.x, p.y, p.z, p.sid, (int)p.classType, local)) {
+            if (!fr.lastMissMs || now-fr.lastMissMs >= 10000) {
+                fr.lastMissMs = now;
+                char b[208]; _snprintf(b,sizeof(b)-1,
+                    "[fixture] RECV unmatched wire=%u.%u.%u.%u.%u cls=%u pos=%.1f,%.1f sid='%s' seq=%u",
+                    p.hand[0],p.hand[1],p.hand[2],p.hand[3],p.hand[4],(unsigned)p.classType,p.x,p.z,p.sid,p.seq);
+                b[sizeof(b)-1]=0; coop::logLine(b);
+            }
+            continue;
+        }
+        memcpy(fr.hand, local, sizeof(fr.hand)); fr.resolved = true;
+        char b[240]; _snprintf(b,sizeof(b)-1,
+            "[fixture] RECV pair wire=%u.%u.%u.%u.%u -> local=%u.%u.%u.%u.%u cls=%u pos=%.1f,%.1f sid='%s' seq=%u",
+            p.hand[0],p.hand[1],p.hand[2],p.hand[3],p.hand[4],local[0],local[1],local[2],local[3],local[4],
+            (unsigned)p.classType,p.x,p.z,p.sid,p.seq);
+        b[sizeof(b)-1]=0; coop::logLine(b); unparkForNewFixture();
+    }
+
+    // Reliable descriptors can precede the actor's unreliable sample or its
+    // zone. Retry fairly; packet identity alone never authorizes world mutation.
+    unsigned int tries = (unsigned int)pendingPoseFixtures_.size();
+    if (tries > 16) tries = 16;
+    while (tries--) {
+        const PoseFixtureKey scoped=pendingPoseFixtures_.front(); pendingPoseFixtures_.pop_front();
+        const Key& fixture=scoped.second;
+        std::map<PoseFixtureKey,PoseFixtureRow>::iterator row=poseFixtureMap_.find(scoped);
+        if (row==poseFixtureMap_.end()) continue;
+        PoseFixtureRow& fr=row->second; fr.posePendingQueued=false;
+        const FixturePacket& p=fr.poseDescriptor;
+        Key actor; actor.t=p.poseActor.type; actor.c=p.poseActor.container;
+        actor.cs=p.poseActor.containerSerial; actor.i=p.poseActor.index; actor.s=p.poseActor.serial;
+        std::map<Key,Driven>::iterator driven = targets_.find(actor);
+        EntityState latest;
+        bool occupancyDescriptor=false;
+        bool allowed = driven != targets_.end() &&
+            driven->second.streamOwner == p.ownerId && peerStreamFresh(actor,now) &&
+            ownHands_.count(actor) == 0 && driven->second.interp.latest(&latest,0,0,0);
+        if (allowed) {
+            const bool taskSubject=latest.sType==fixture.t && latest.sContainer==fixture.c &&
+                latest.sContainerSerial==fixture.cs && latest.sIndex==fixture.i &&
+                latest.sSerial==fixture.s && latest.task!=TASK_NONE && !taskIsCombat(latest.task);
+            // Occupancy edges carry the exact author-native inWhat even when
+            // an unconscious passenger has no task subject.
+            std::map<Key,EventPacket>::const_iterator enter=pendingFurnitureEvents_.find(actor);
+            const bool occupancy=bodyInFurniture(latest.bodyState) &&
+                enter!=pendingFurnitureEvents_.end() && enter->second.ownerId==p.ownerId &&
+                actorKeyOf(enter->second)==fixture &&
+                ((enter->second.arg==1 && (latest.bodyState&BODY_IN_BED)) ||
+                 (enter->second.arg==2 && (latest.bodyState&BODY_IN_CAGE)));
+            occupancyDescriptor=occupancy && !taskSubject;
+            allowed=taskSubject || occupancy;
+            Character* body = allowed ? resolveEventChar(actor) : 0;
+            allowed = body && (engine::isLocalPlayerChar(gw,body)
+                ? playerActorOwner(actor)==p.ownerId
+                : authorityFor(gw,latest.x,latest.z)==p.ownerId);
+        }
+        bool carryDescriptor=false;
+        if (!allowed) {
+            std::map<Key,CarryPlacement>::const_iterator carry=carryPlacements_.find(actor);
+            std::map<Key,EventPacket>::const_iterator enter=pendingFurnitureEvents_.find(actor);
+            carryDescriptor=carry!=carryPlacements_.end() && !carry->second.local &&
+                carry->second.owner==p.ownerId && carry->second.released &&
+                enter!=pendingFurnitureEvents_.end() && enter->second.ownerId==p.ownerId &&
+                actorKeyOf(enter->second)==fixture &&
+                (enter->second.arg==1 || enter->second.arg==2);
+            allowed=carryDescriptor;
+        }
+        if (!allowed && p.ownerId==0 && playerActorOwner(actor)==localId_) {
+            // HOST can place a downed peer body through native NPC actions,
+            // without a player carry token. Require its exact pending ENTER
+            // and a currently downed local body before resolving its fixture.
+            std::map<Key,EventPacket>::const_iterator enter=pendingFurnitureEvents_.find(actor);
+            Character* body=resolveEventChar(actor);
+            allowed=enter!=pendingFurnitureEvents_.end() &&
+                enter->second.ownerId==0 && actorKeyOf(enter->second)==fixture &&
+                (enter->second.arg==1 || enter->second.arg==2) && body &&
+                coop::bodyDownNotCrawling(engine::readBodyState(body));
+            occupancyDescriptor=allowed;
+        }
+        bool done = false;
+        if (allowed) {
+            const bool wasResolved=fr.resolved;
+            unsigned int previous[5]; memcpy(previous,fr.hand,sizeof(previous));
+            const bool mintDescriptor=(p.poseFlags&POSE_FIXTURE_VALID)!=0;
+            engine::PoseFixtureRead d; memset(&d,0,sizeof(d));
+            memcpy(d.fixture.hand,p.hand,sizeof(d.fixture.hand));
+            d.sourceOwner=p.ownerId; d.fixture.x=p.x; d.fixture.y=p.y; d.fixture.z=p.z;
+            d.fixture.classType=p.classType; d.fixture.complete=1;
+            memcpy(d.fixture.sid,p.sid,sizeof(d.fixture.sid));
+            d.heading=p.heading; d.floor=p.floor;
+            d.ownerPresent=(p.poseFlags&POSE_FIXTURE_OWNER_PRESENT)!=0;
+            d.outsideFurniture=(p.poseFlags&POSE_FIXTURE_OUTSIDE)!=0;
+            memcpy(d.ownerSid,p.ownerSid,sizeof(d.ownerSid));
+            p.town.toObjOrder(d.town); p.inside.toObjOrder(d.inside);
+            memcpy(d.townSid,p.townSid,sizeof(d.townSid)); memcpy(d.insideSid,p.insideSid,sizeof(d.insideSid));
+            d.townX=p.townX; d.townY=p.townY; d.townZ=p.townZ;
+            d.insideX=p.insideX; d.insideY=p.insideY; d.insideZ=p.insideZ;
+            unsigned int local[5];
+            int match;
+            int proceduralMatch=proceduralWorld_ ? proceduralWorld_->resolveFixture(p,local) : 0;
+            if (proceduralMatch<0 && !carryDescriptor && !occupancyDescriptor &&
+                localHandForBuildKey(fixture,local)) proceduralMatch=1;
+            if (proceduralMatch!=0) {
+                match=proceduralMatch;
+            } else if (!mintDescriptor) {
+                match=engine::findFixtureByPosSid(gw,p.x,p.y,p.z,p.sid,(int)p.classType,local) ? 1 : -1;
+            } else if (fr.resolved && engine::poseFixtureMatches(fr.hand,d)) {
+                memcpy(local,fr.hand,sizeof(local)); match=1;
+            } else {
+                fr.resolved=false;
+                match=engine::findPoseFixtureByDescriptor(gw,d,local);
+            }
+            if (match==1) {
+                // Different subjects from one author are different physical
+                // fixtures. Other authors may describe the same shared node.
+                for (std::map<PoseFixtureKey,PoseFixtureRow>::const_iterator other=poseFixtureMap_.begin();other!=poseFixtureMap_.end();++other)
+                    if (other->first.first==p.ownerId && !(other->first.second==fixture) &&
+                        other->second.resolved &&
+                        memcmp(other->second.hand,local,sizeof(local))==0) { match=-1; break; }
+            }
+            if (match!=1) fr.resolved=false;
+            if (match==0 && mintDescriptor && !carryDescriptor && !occupancyDescriptor) {
+                unsigned int inside[5]; const unsigned int* preferred=0;
+                Key parent; parent.t=p.inside.type; parent.c=p.inside.container;
+                parent.cs=p.inside.containerSerial; parent.i=p.inside.index; parent.s=p.inside.serial;
+                std::map<PoseFixtureKey,PoseFixtureRow>::const_iterator pairing=poseFixtureMap_.find(PoseFixtureKey(p.ownerId,parent));
+                bool parentPending=pairing!=poseFixtureMap_.end() && !pairing->second.resolved;
+                if (pairing!=poseFixtureMap_.end() && pairing->second.resolved) {
+                    memcpy(inside,pairing->second.hand,sizeof(inside)); preferred=inside;
+                } else if (localHandForBuildKey(parent,inside)) preferred=inside;
+                if (!parentPending && engine::materializePoseFixture(gw,d,preferred,local)==1) match=1;
+            }
+            if (match==1) {
+                const bool changed=!wasResolved || memcmp(previous,local,sizeof(previous))!=0;
+                memcpy(fr.hand,local,sizeof(fr.hand)); fr.resolved=true; done=true;
+                if (!changed) continue;
+                for (std::map<Key,Driven>::iterator target=targets_.begin();target!=targets_.end();++target) {
+                    Driven& drivenPose=target->second;
+                    if (drivenPose.streamOwner!=p.ownerId || !(drivenPose.issuedPoseSubject==fixture)) continue;
+                    drivenPose.taskApplied=false; drivenPose.taskBad=false; drivenPose.taskRetries=0;
+                    drivenPose.fixtureXlateLogged=false;
+                }
+                char b[256]; _snprintf(b,sizeof(b)-1,
+                    "[posefixture] pair author=%u actor=%u.%u.%u.%u.%u wire=%u.%u.%u.%u.%u local=%u.%u.%u.%u.%u",
+                    p.ownerId,actor.t,actor.c,actor.cs,actor.i,actor.s,fixture.t,fixture.c,fixture.cs,fixture.i,fixture.s,
+                    local[0],local[1],local[2],local[3],local[4]);
+                b[sizeof(b)-1]=0; coop::logLine(b);
+            }
+        }
+        if (!done) { pendingPoseFixtures_.push_back(scoped); fr.posePendingQueued=true; }
     }
 }
 
@@ -1622,8 +1840,25 @@ bool Replicator::localHandForFixtureKey(const Key& wire, unsigned int out[5]) co
     if (!out) return false;
     std::map<Key, FixtureRow>::const_iterator it = fixtureMap_.find(wire);
     if (it == fixtureMap_.end() || !it->second.resolved) return false;
+    if (it->second.proceduralId)
+        return proceduralWorld_ && proceduralWorld_->localHand(it->second.proceduralId,out);
     memcpy(out, it->second.hand, sizeof(unsigned int) * 5);
     return true;
+}
+
+int Replicator::localHandForPoseFixtureKey(const Key& wire,u32 author,unsigned int out[5],bool allowBuildFallback) const {
+    std::map<PoseFixtureKey,PoseFixtureRow>::const_iterator it=poseFixtureMap_.find(PoseFixtureKey(author,wire));
+    if (it!=poseFixtureMap_.end()) {
+        if (proceduralWorld_) {
+            const int managed=proceduralWorld_->resolveFixture(it->second.poseDescriptor,out);
+            if (allowBuildFallback && managed<0 && localHandForBuildKey(wire,out)) return 1;
+            if (managed!=0) return managed;
+        }
+        if (!it->second.resolved) return -1;
+        memcpy(out,it->second.hand,sizeof(unsigned int)*5);
+        return 1;
+    }
+    return wire.t==0 && (wire.i || wire.s) ? -1 : 0;
 }
 
 // Build-site pose subject translation. A construction site is created at RUNTIME,
@@ -1979,7 +2214,6 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nFac; }
     for (std::map<Key, DoorRow>::iterator it = doorRows_.begin();
          it != doorRows_.end(); ++it) {
-        memset(it->second.seqSeen, 0, sizeof(it->second.seqSeen));
         it->second.lastSendMs = 0; ++nDoor; // host replays current locks on next sample
     }
     for (std::map<std::pair<Key, int>, BdoorRow>::iterator it = bdoorRows_.begin();
@@ -2308,6 +2542,14 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
                 if (moved) canonicalOf_[moved] = wireNew;
                 if (moved && (wireNew.c != nk.c || wireNew.cs != nk.cs))
                     proxyByKey_[wireNew] = moved;
+                const u32 destination=playerActorOwner(wireNew);
+                if (destination<MAX_PLAYERS && destination!=ownerId) {
+                    ActorHandoff& handoff=actorHandoffs_[wireNew];
+                    handoff.source=ownerId; handoff.destination=destination;
+                    handoff.localHand[0]=nk.t; handoff.localHand[1]=nk.c; handoff.localHand[2]=nk.cs;
+                    handoff.localHand[3]=nk.i; handoff.localHand[4]=nk.s;
+                    playerActorOwners_[wireNew]=destination;
+                }
             } else {
                 pinOwned_.insert(nk);
                 pinPeer_.erase(nk);
@@ -2341,7 +2583,7 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
 
 void Replicator::announceSquadClaim(NetLink& net, u32 ownerId,
                                     const unsigned int wire[][5],
-                                    const unsigned int local[][5], unsigned n) {
+                                    const unsigned int local[][5], unsigned n, unsigned playerCount) {
     for (unsigned int i = 0; i < n; ++i) {
         Key lk; lk.t = local[i][0]; lk.c = local[i][1]; lk.cs = local[i][2];
         lk.i = local[i][3]; lk.s = local[i][4];
@@ -2349,6 +2591,7 @@ void Replicator::announceSquadClaim(NetLink& net, u32 ownerId,
         wk.i = wire[i][3]; wk.s = wire[i][4];
         pinOwned_.insert(lk);
         pinOwned_.insert(wk);
+        playerActorOwners_[lk]=ownerId; playerActorOwners_[wk]=ownerId;
         publishAsWire_[lk] = wk;
         if (i == 0) noteNickHand(ownerId, local[i]);
         EventPacket ev;
@@ -2356,6 +2599,7 @@ void Replicator::announceSquadClaim(NetLink& net, u32 ownerId,
         ev.type    = (u8)PKT_EVENT;
         ev.event   = EVT_SQUAD_MOVE;
         ev.ownerId = ownerId;
+        ev.arg=(float)playerCount;
         ev.eventId = nextEventId_++;
         ev.sType = wk.t; ev.sContainer = wk.c; ev.sContainerSerial = wk.cs;
         ev.sIndex = wk.i; ev.sSerial = wk.s;
@@ -2653,7 +2897,8 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // Drain peer speed packets. seq guard drops a stale retransmit.
+    // Admission distinguishes fresh commands from heartbeats, with REQ seq
+    // scoped per authenticated sender and SET seq scoped only to the host.
     std::deque<InboundSpeed> got;
     in.drainSpeed(got);
     bool gotPeerCmd = false;
@@ -2662,37 +2907,35 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     u32   peerOwner = 0;
     for (std::deque<InboundSpeed>::iterator it = got.begin(); it != got.end(); ++it) {
         const SpeedPacket& p = it->pkt;
-        if (p.seq != 0 && speedSeqSeen_ != 0 && (long)(p.seq - speedSeqSeen_) <= 0)
-            continue;
-        speedSeqSeen_ = p.seq;
+        const sync::SpeedAdmission::Kind accepted =
+            speedAdmission_.accept(p, it->ownerId, isHost);
+        if (accepted == sync::SpeedAdmission::DROP) continue;
         bool pkPaused = (p.flags & SPEED_PAUSED) != 0 || p.speed <= EPS;
-        if (p.type == (u8)PKT_SPEED_REQ && isHost) {
+        if (isHost) {
             float req = (p.speed > EPS) ? p.speed : 0.0f;
             bool  cmb = (p.flags & SPEED_IN_COMBAT) != 0;
             if (speedPeerReq_ < 0.0f ||
                 (req > EPS && fabs(req - speedPeerReq_) > EPS) ||
                 pkPaused != speedEffPaused_ ||
                 cmb != speedPeerCombat_) {
-                char b[112]; _snprintf(b, sizeof(b) - 1,
-                    "[speed] REQ RECV owner=%u mult=%.2f paused=%d combat=%d",
-                    (unsigned)it->ownerId, req > EPS ? req : speedEffMult_,
-                    pkPaused ? 1 : 0, cmb ? 1 : 0);
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[speed] REQ RECV owner=%u seq=%u command=%d mult=%.2f paused=%d combat=%d",
+                    (unsigned)it->ownerId, (unsigned)p.seq,
+                    accepted == sync::SpeedAdmission::COMMAND ? 1 : 0,
+                    req > EPS ? req : speedEffMult_, pkPaused ? 1 : 0, cmb ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
             if (req > EPS) speedPeerReq_ = req;
             speedPeerCombat_ = cmb;
-            // Combat-only / safety echo of the current effective is not a click.
-            bool pauseChg = pkPaused != speedEffPaused_;
-            bool unpause  = !pkPaused && speedEffPaused_;
-            bool multChg  = !pkPaused && req > EPS &&
-                            (speedEffMult_ < 0.0f || fabs(req - speedEffMult_) > EPS);
-            if (pauseChg || unpause || multChg) {
+            // Equality to current effective cannot identify an echo: a delayed
+            // heartbeat may legitimately carry the PREVIOUS pause/speed state.
+            if (accepted == sync::SpeedAdmission::COMMAND) {
                 gotPeerCmd = true;
                 peerPaused = pkPaused;
                 peerMult   = (req > EPS) ? req : speedEffMult_;
                 peerOwner  = it->ownerId;
             }
-        } else if (p.type == (u8)PKT_SPEED_SET && !isHost) {
+        } else {
             // QUIET apply: sim follows host effective; UI buttons keep the vote.
             if (p.speed > EPS) speedEffMult_ = p.speed;
             speedEffPaused_ = pkPaused;
@@ -2801,7 +3044,8 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
             pkt.seq     = speedSeqOut_++;
             pkt.speed   = sendMult;
             pkt.flags   = (sendPaused ? SPEED_PAUSED : 0) |
-                          (speedMyCombat_ ? SPEED_IN_COMBAT : 0);
+                          (speedMyCombat_ ? SPEED_IN_COMBAT : 0) |
+                          (userActed ? SPEED_COMMAND : 0);
             net.queueSpeed(pkt);
             speedLastSendMs_ = now;
         }

@@ -7,6 +7,9 @@
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
 #include "ScenarioSupport.h"
+#include "../game/InventoryTransactionBridge.h"
+#include <algorithm>
+#include <cstdlib>
 
 namespace coop {
 namespace {
@@ -1683,158 +1686,90 @@ const float INVDF_RADIUS = 18.0f;
 // own the leader - must still end up with the gear OFF its leader and ON the ground, i.e.
 // conserved. The oracle additionally reads the [wd] APPLY lines for moved>0 and asserts no
 // APPLY-LOST appears. INVDF log contract.
+static bool selectScenarioGear(GameWorld* gw,const unsigned int owner[5],
+                               unsigned int item[5],InvItemEntry* descriptor) {
+    InvItemEntry rows[INV_ITEMS_MAX]; bool truncated=false;
+    if (!engine::containerInventoryAvailable(owner)) return false;
+    unsigned int n=engine::captureContainerContents(gw,owner,rows,INV_ITEMS_MAX,0,&truncated,true);
+    if (truncated || n>=INV_ITEMS_MAX) return false;
+    for (unsigned int pass=0;pass<2;++pass)
+        for (unsigned int type=2;type<=3;++type)
+            for (unsigned int i=0;i<n;++i) {
+                if (rows[i].itemType!=type || (pass==0 && !rows[i].equipped)) continue;
+                return engine::pickScenarioPhysicalItem(gw,owner,rows[i].stringID,type,item,descriptor);
+            }
+    return false;
+}
+
 class InventoryDropFullScenario : public Scenario {
 public:
-    InventoryDropFullScenario()
-        : passed_(false), have_(false), isHost_(false), gearType_(0), step_(0),
-          lastChurnMs_(0), churns_(0), invBase_(0), invAfter_(-1), grndAfter_(-1),
-          invMin_(9999), grndMax_(0) {
-        for (int i = 0; i < 5; ++i) hand_[i] = 0;
-        gearSid_[0] = '\0';
+    InventoryDropFullScenario() : passed_(false),have_(false),complete_(false),dropped_(0),
+        lastChurn_(0),lastSample_(0),churns_(0),actualChurn_(0),bagBase_(0),groundBase_(0) {
+        memset(owner_,0,sizeof(owner_)); memset(item_,0,sizeof(item_));
+        memset(&descriptor_,0,sizeof(descriptor_)); memset(&witness_,0,sizeof(witness_));
+        memset(&final_,0,sizeof(final_));
     }
     virtual const char* name() const { return "inv_dropfull"; }
-
-    virtual void onStart(const ScenarioContext& ctx) {
-        isHost_ = ctx.isHost;
-        // Target the host-owned tab-0 member, deterministic on both clients (same save):
-        // the host owns it and drops, the join mirrors by conservation.
-        have_ = ovlRankContainer(ctx.gw, 0u, hand_);
-        if (have_) have_ = pickGear(ctx.gw);
-        if (have_) {
-            invBase_ = gearCount(ctx.gw);
-            invMin_  = invBase_;
-            grndMax_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, gearSid_, gearType_,
-                                                        INVDF_RADIUS);
-        }
-        char b[240];
-        _snprintf(b, sizeof(b) - 1,
-            "SCENARIO INVDF start role=%s have=%d sid='%s' type=%u invBase=%d "
-            "hand=%u,%u,%u,%u,%u",
-            isHost_ ? "host" : "join", have_ ? 1 : 0,
-            gearSid_[0] ? gearSid_ : "(none)", gearType_, invBase_,
-            hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-    }
-
-    virtual bool onTick(const ScenarioContext& ctx) {
-        if (!have_ || !gearSid_[0]) {
-            if (ctx.elapsedMs >= 6000) { passed_ = false; return true; }
-            return false;
-        }
-
-        if (isHost_) {
-            // CHURN: keep the inventory snapshot channel busy on the SAME container across
-            // the whole drop window, so the drop intent has to compete with it.
-            if (ctx.elapsedMs >= CHURN_FROM_MS && ctx.elapsedMs < CHURN_TO_MS &&
-                (ctx.elapsedMs - lastChurnMs_ >= CHURN_EVERY_MS)) {
-                lastChurnMs_ = ctx.elapsedMs;
-                char sid[48]; sid[0] = '\0';
-                int n;
-                if ((churns_ & 1) == 0) n = engine::addTestItemsToContainer(ctx.gw, hand_, 1,
-                                                                           sid, sizeof(sid));
-                else                    n = engine::removeTestItemsFromContainer(ctx.gw, hand_, 1);
-                ++churns_;
-                char b[180]; _snprintf(b, sizeof(b) - 1,
-                    "SCENARIO INVDF churn i=%u op=%s n=%d",
-                    churns_, ((churns_ & 1) == 1) ? "add" : "remove", n);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            }
-            // DROP (@11s): mid-churn, unequip-to-loose then drop, the real player action.
-            if (step_ == 0 && ctx.elapsedMs >= DROP_MS) {
-                step_ = 1;
-                int dr = engine::dropItemFromInventory(ctx.gw, hand_, gearSid_, gearType_, 1);
-                if (dr == 0) {
-                    int un = engine::unequipItemToLoose(ctx.gw, hand_, gearSid_, gearType_, 1);
-                    if (un > 0) dr = engine::dropItemFromInventory(ctx.gw, hand_, gearSid_,
-                                                                   gearType_, 1);
-                }
-                invAfter_  = gearCount(ctx.gw);
-                grndAfter_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, gearSid_,
-                                                              gearType_, INVDF_RADIUS);
-                char b[200]; _snprintf(b, sizeof(b) - 1,
-                    "SCENARIO INVDF host-dropped n=%d inv=%d ground=%d churns=%u",
-                    dr, invAfter_, grndAfter_, churns_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            }
-        } else {
-            // OBSERVER: the conservation signature is bag LOSES it and ground GAINS it.
-            int inv  = gearCount(ctx.gw);
-            int grnd = engine::countFreeGroundItemsNear(ctx.gw, hand_, gearSid_, gearType_,
-                                                        INVDF_RADIUS);
-            if (inv  < invMin_)  invMin_  = inv;
-            if (grnd > grndMax_) grndMax_ = grnd;
-        }
-
-        if (ctx.elapsedMs >= DURATION_MS) {
-            if (isHost_) {
-                bool dropped = (invAfter_ >= 0) && (invAfter_ <= invBase_ - 1);
-                passed_ = have_ && (invBase_ >= 1) && dropped && (churns_ > 0);
-                char b[240]; _snprintf(b, sizeof(b) - 1,
-                    "SCENARIO INVDF verdict role=host pass=%d sid='%s' invBase=%d "
-                    "invAfter=%d grndAfter=%d churns=%u",
-                    passed_ ? 1 : 0, gearSid_, invBase_, invAfter_, grndAfter_, churns_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            } else {
-                bool leftBag  = (invMin_ <= invBase_ - 1);
-                bool onGround = (grndMax_ >= 1);
-                passed_ = have_ && (invBase_ >= 1) && leftBag && onGround;
-                char b[240]; _snprintf(b, sizeof(b) - 1,
-                    "SCENARIO INVDF verdict role=join pass=%d sid='%s' invBase=%d "
-                    "invMin=%d grndMax=%d conserved=%d",
-                    passed_ ? 1 : 0, gearSid_, invBase_, invMin_, grndMax_,
-                    (leftBag && onGround) ? 1 : 0);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            }
-            return true;
-        }
-        return false;
-    }
     virtual bool passed() const { return passed_; }
-
+    virtual void onStart(const ScenarioContext& ctx) {
+        engine::ScenarioItemSample s;
+        have_=ovlRankContainer(ctx.gw,0u,owner_) &&
+            selectScenarioGear(ctx.gw,owner_,item_,&descriptor_) &&
+            engine::sampleScenarioItem(ctx.gw,owner_,0,descriptor_.stringID,descriptor_.itemType,item_,&s);
+        if (have_) { bagBase_=s.bag; groundBase_=s.ground; }
+        char b[320]; _snprintf(b,sizeof(b)-1,
+            "SCENARIO INVDF start role=%s have=%d sid='%s' type=%u invBase=%d hand=%u,%u,%u,%u,%u",
+            ctx.isHost ? "host" : "join",have_ ? 1 : 0,descriptor_.stringID,descriptor_.itemType,bagBase_,
+            owner_[0],owner_[1],owner_[2],owner_[3],owner_[4]);
+        b[sizeof(b)-1]='\0'; coop::logLine(b);
+    }
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.isHost && have_) {
+            if (ctx.elapsedMs>=7000 && ctx.elapsedMs<18000 && ctx.elapsedMs-lastChurn_>=700) {
+                lastChurn_=ctx.elapsedMs;
+                char sid[48]; bool add=(churns_&1)==0;
+                int n=add ? engine::addTestItemsToContainer(ctx.gw,owner_,1,sid,sizeof(sid)) :
+                    engine::removeTestItemsFromContainer(ctx.gw,owner_,1);
+                ++churns_; if (n>0) ++actualChurn_;
+                char b[160]; _snprintf(b,sizeof(b)-1,"SCENARIO INVDF churn i=%u op=%s n=%d actualchurn=%u",
+                    churns_,add ? "add" : "remove",n,actualChurn_);
+                b[sizeof(b)-1]='\0'; coop::logLine(b);
+            }
+            if (!dropped_ && ctx.elapsedMs>=11000)
+                dropped_=engine::dropPhysicalItemByHand(ctx.gw,item_,item_);
+        }
+        if (have_ && !witness_.eventId && ctx.queryItemWitness)
+            ctx.queryItemWitness(ctx.gw,2,descriptor_.stringID,descriptor_.itemType,
+                item_,&witness_);
+        if (witness_.eventId) memcpy(item_,witness_.itemHand,sizeof(item_));
+        if (!lastSample_ || ctx.elapsedMs-lastSample_>=500 || ctx.elapsedMs>=26000) {
+            lastSample_=ctx.elapsedMs;
+            complete_=have_ && engine::sampleScenarioItem(ctx.gw,owner_,0,descriptor_.stringID,
+                descriptor_.itemType,item_,&final_);
+            stability_.observe(complete_,final_,ctx.elapsedMs);
+        }
+        if (ctx.elapsedMs<26000) return false;
+        passed_=have_ && witness_.eventId && complete_ && stability_.stable() &&
+            final_.bag==bagBase_-1 && final_.ground==groundBase_+1 && final_.location==1 &&
+            (!ctx.isHost || (dropped_==1 && actualChurn_>=10));
+        char b[640]; _snprintf(b,sizeof(b)-1,
+            "SCENARIO INVDF verdict role=%s pass=%d sid='%s' invBase=%d invAfter=%d grndAfter=%d "
+            "churns=%u actualchurn=%u type=%u bagBase=%d bagFinal=%d groundBase=%d groundFinal=%d "
+            "stable=%d complete=%d stableMs=%lu sampleCount=%u itemHand=%u,%u,%u,%u,%u "
+            "sourceHand=%u,%u,%u,%u,%u dropOwner=%u dropId=%u",
+            ctx.isHost ? "host" : "join",passed_ ? 1 : 0,descriptor_.stringID,bagBase_,final_.bag,final_.ground,
+            actualChurn_,actualChurn_,descriptor_.itemType,bagBase_,final_.bag,groundBase_,final_.ground,
+            stability_.stable() ? 1 : 0,complete_ ? 1 : 0,stability_.stableMs,stability_.sampleCount,
+            item_[0],item_[1],item_[2],item_[3],item_[4],witness_.sourceHand[0],witness_.sourceHand[1],
+            witness_.sourceHand[2],witness_.sourceHand[3],witness_.sourceHand[4],witness_.ownerId,witness_.eventId);
+        b[sizeof(b)-1]='\0'; coop::logLine(b);
+        return true;
+    }
 private:
-    static const unsigned long CHURN_FROM_MS  = 7000;
-    static const unsigned long CHURN_TO_MS    = 18000;
-    static const unsigned long CHURN_EVERY_MS = 700;
-    static const unsigned long DROP_MS        = 11000;
-    static const unsigned long DURATION_MS    = 26000;
-
-    int gearCount(GameWorld* gw) {
-        InvItemEntry it[INV_ITEMS_MAX];
-        unsigned int n = engine::captureContainerContents(gw, hand_, it, INV_ITEMS_MAX, 0);
-        int c = 0;
-        for (unsigned int i = 0; i < n; ++i)
-            if (it[i].itemType == gearType_ && strcmp(it[i].stringID, gearSid_) == 0) ++c;
-        return c;
-    }
-    // First GEAR piece (WEAPON=2 preferred, else ARMOUR=3), preferring an EQUIPPED one -
-    // equipped gear is the case the reconcile could not refabricate, so it is the one the
-    // race actually destroyed. Deterministic across clients (same save).
-    bool pickGear(GameWorld* gw) {
-        InvItemEntry it[INV_ITEMS_MAX];
-        unsigned int n = engine::captureContainerContents(gw, hand_, it, INV_ITEMS_MAX, 0);
-        const unsigned int cats[2] = { 2u, 3u }; // WEAPON, ARMOUR
-        for (unsigned int pass = 0; pass < 2; ++pass)
-            for (unsigned int c = 0; c < 2; ++c)
-                for (unsigned int i = 0; i < n; ++i) {
-                    if (it[i].itemType != cats[c]) continue;
-                    if (pass == 0 && !it[i].equipped) continue;
-                    strncpy(gearSid_, it[i].stringID, sizeof(gearSid_) - 1);
-                    gearSid_[sizeof(gearSid_) - 1] = '\0';
-                    gearType_ = it[i].itemType;
-                    return true;
-                }
-        return false;
-    }
-
-    bool          passed_, have_, isHost_;
-    unsigned int  hand_[5];
-    char          gearSid_[48];
-    unsigned int  gearType_;
-    int           step_;
-    unsigned long lastChurnMs_;
-    unsigned int  churns_;
-    int           invBase_, invAfter_, grndAfter_;
-    int           invMin_, grndMax_;
+    bool passed_,have_,complete_; int dropped_,bagBase_,groundBase_;
+    unsigned long lastChurn_,lastSample_; unsigned int churns_,actualChurn_,owner_[5],item_[5];
+    InvItemEntry descriptor_; engine::ScenarioItemSample final_;
+    engine::ScenarioItemWitness witness_; engine::ScenarioItemStability stability_;
 };
 
 // inv_regear (protocol 47 regression): the ONE-INSTANCE invariant across a full W2
@@ -1855,164 +1790,75 @@ private:
 // WGRP log contract; judged by Test-GearRepickup.
 class InventoryRegearScenario : public Scenario {
 public:
-    explicit InventoryRegearScenario(const char* scenarioName)
-        : passed_(false), have_(false), isHost_(false), gearType_(0), step_(0),
-          dropped_(0), pickedUp_(0), lastTryMs_(0), tries_(0), lastLogMs_(0),
-          grndPeak_(0), grndFinal_(-1), bagFinal_(-1), bagBase_(0),
-          scenarioName_(scenarioName) {
-        for (int i = 0; i < 5; ++i) { r0_[i] = 0; r1_[i] = 0; }
-        gearSid_[0] = '\0';
+    explicit InventoryRegearScenario(const char* scenarioName) : scenarioName_(scenarioName),
+        passed_(false),have_(false),complete_(false),dropped_(0),pickedUp_(0),lastSample_(0),
+        bagBase_(0),sourceBase_(0),groundBase_(0),peak_(0) {
+        memset(r0_,0,sizeof(r0_)); memset(r1_,0,sizeof(r1_)); memset(item_,0,sizeof(item_));
+        memset(after_,0,sizeof(after_)); memset(&descriptor_,0,sizeof(descriptor_));
+        memset(&witness_,0,sizeof(witness_)); memset(&final_,0,sizeof(final_));
     }
     virtual const char* name() const { return scenarioName_; }
-
-    virtual void onStart(const ScenarioContext& ctx) {
-        isHost_ = ctx.isHost;
-        // Both tabs on BOTH clients: the host drops from tab 0 and must later read tab 1's
-        // bag (the container it does NOT own) to prove the item landed there.
-        have_ = ovlRankContainer(ctx.gw, 0u, r0_) && ovlRankContainer(ctx.gw, 1u, r1_);
-        if (have_) have_ = pickGear(ctx.gw);
-        // Tab 1 may already carry the same template (squad members share starting kit), so
-        // the invariant is measured as a DELTA of exactly +1 - "at least one" would accept a
-        // second copy appearing inside the bag.
-        if (have_) bagBase_ = gearCount(ctx.gw, r1_);
-        char b[260]; _snprintf(b, sizeof(b) - 1,
-            "WGRP start role=%s have=%d sid='%s' type=%u bagBase=%d r0=%u,%u,%u,%u,%u r1=%u,%u,%u,%u,%u",
-            isHost_ ? "host" : "join", have_ ? 1 : 0, gearSid_[0] ? gearSid_ : "(none)",
-            gearType_, bagBase_, r0_[0], r0_[1], r0_[2], r0_[3], r0_[4],
-            r1_[0], r1_[1], r1_[2], r1_[3], r1_[4]);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-    }
-
-    virtual bool onTick(const ScenarioContext& ctx) {
-        if (!have_ || !gearSid_[0]) {
-            if (ctx.elapsedMs >= 6000) { passed_ = false; return true; }
-            return false;
-        }
-
-        if (isHost_ && step_ == 0 && ctx.elapsedMs >= DROP_MS) {
-            step_ = 1;
-            dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_, gearType_, 1);
-            if (dropped_ == 0) {
-                int un = engine::unequipItemToLoose(ctx.gw, r0_, gearSid_, gearType_, 1);
-                if (un > 0) dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_,
-                                                                    gearType_, 1);
-                if (dropped_ == 0)
-                    dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_, gearType_,
-                                                             1, 0, /*allowEquipped*/ true);
-            }
-            char b[180]; _snprintf(b, sizeof(b) - 1,
-                "WGRP host-dropped n=%d ground=%d", dropped_,
-                engine::countFreeGroundItemsNear(ctx.gw, r0_, gearSid_, gearType_, RADIUS));
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
-
-        // JOIN picks the relocated item up into the member it OWNS. Retried: the peer's
-        // conservation relocation has to land first, and it is debounced.
-        if (!isHost_ && pickedUp_ == 0 && ctx.elapsedMs >= PICKUP_MS &&
-            tries_ < MAX_TRIES && (ctx.elapsedMs - lastTryMs_ >= TRY_EVERY_MS)) {
-            lastTryMs_ = ctx.elapsedMs;
-            ++tries_;
-            pickedUp_ = engine::pickupWorldItemIntoInventory(ctx.gw, r1_, gearSid_,
-                                                             gearType_, RADIUS);
-            char b[180]; _snprintf(b, sizeof(b) - 1,
-                "WGRP join-pickup try=%u got=%d ground=%d", tries_, pickedUp_,
-                engine::countFreeGroundItemsNear(ctx.gw, r1_, gearSid_, gearType_, RADIUS));
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
-
-        // The AUTHOR's series is the evidence: its ground count must rise on the drop and
-        // come back to zero once the peer's pickup is honoured.
-        if (isHost_ && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
-            lastLogMs_ = ctx.elapsedMs;
-            int grnd = engine::countFreeGroundItemsNear(ctx.gw, r0_, gearSid_, gearType_, RADIUS);
-            if (grnd > grndPeak_) grndPeak_ = grnd;
-            char b[180]; _snprintf(b, sizeof(b) - 1,
-                "WGRP host t=%lu ground=%d peak=%d bagR1=%d",
-                (unsigned long)ctx.elapsedMs, grnd, grndPeak_, gearCount(ctx.gw, r1_));
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
-
-        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
-        if (ctx.elapsedMs >= dur) {
-            bagFinal_ = gearCount(ctx.gw, r1_);
-            if (isHost_) {
-                grndFinal_ = engine::countFreeGroundItemsNear(ctx.gw, r0_, gearSid_,
-                                                              gearType_, RADIUS);
-                passed_ = (dropped_ > 0) && (grndPeak_ >= 1) && (grndFinal_ == 0) &&
-                          (bagFinal_ == bagBase_ + 1);
-                char b[260]; _snprintf(b, sizeof(b) - 1,
-                    "WGRP verdict role=host pass=%d sid='%s' dropped=%d grndPeak=%d "
-                    "grndFinal=%d bagR1=%d bagBase=%d",
-                    passed_ ? 1 : 0, gearSid_, dropped_, grndPeak_, grndFinal_, bagFinal_,
-                    bagBase_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            } else {
-                passed_ = (pickedUp_ > 0) && (bagFinal_ == bagBase_ + 1);
-                char b[240]; _snprintf(b, sizeof(b) - 1,
-                    "WGRP verdict role=join pass=%d sid='%s' pickedUp=%d tries=%u bagR1=%d bagBase=%d",
-                    passed_ ? 1 : 0, gearSid_, pickedUp_, tries_, bagFinal_, bagBase_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            }
-            return true;
-        }
-        return false;
-    }
     virtual bool passed() const { return passed_; }
-
+    virtual void onStart(const ScenarioContext& ctx) {
+        engine::ScenarioItemSample s;
+        have_=ovlRankContainer(ctx.gw,0u,r0_) && ovlRankContainer(ctx.gw,1u,r1_) &&
+            selectScenarioGear(ctx.gw,r0_,item_,&descriptor_) &&
+            engine::sampleScenarioItem(ctx.gw,r1_,r0_,descriptor_.stringID,descriptor_.itemType,item_,&s);
+        if (have_) { bagBase_=s.bag; sourceBase_=s.source; groundBase_=s.ground; }
+        char b[384]; _snprintf(b,sizeof(b)-1,
+            "WGRP start role=%s have=%d sid='%s' type=%u bagBase=%d r0=%u,%u,%u,%u,%u r1=%u,%u,%u,%u,%u",
+            ctx.isHost ? "host" : "join",have_ ? 1 : 0,descriptor_.stringID,descriptor_.itemType,bagBase_,
+            r0_[0],r0_[1],r0_[2],r0_[3],r0_[4],r1_[0],r1_[1],r1_[2],r1_[3],r1_[4]);
+        b[sizeof(b)-1]='\0'; coop::logLine(b);
+    }
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (have_ && ctx.isHost && !dropped_ && ctx.elapsedMs>=8000)
+            dropped_=engine::dropPhysicalItemByHand(ctx.gw,item_,item_);
+        if (have_ && !witness_.eventId && ctx.queryItemWitness) {
+            if (ctx.queryItemWitness(ctx.gw,2,descriptor_.stringID,descriptor_.itemType,
+                    item_,&witness_))
+                memcpy(item_,witness_.itemHand,sizeof(item_));
+        }
+        if (!ctx.isHost && witness_.eventId && !pickedUp_ && ctx.elapsedMs>=16000)
+            pickedUp_=engine::pickupPhysicalItemByHand(ctx.gw,r1_,item_,after_);
+        if (!lastSample_ || ctx.elapsedMs-lastSample_>=500 || ctx.elapsedMs>=(ctx.isHost ? 40000u : 30000u)) {
+            lastSample_=ctx.elapsedMs;
+            // Only a recorded successful native before/after transition licenses re-keying.
+            if (ctx.isHost && witness_.eventId)
+                engine::readScenarioItemAfter(ctx.gw,item_,after_);
+            const unsigned int* current=(after_[3] || after_[4]) ? after_ : item_;
+            complete_=have_ && engine::sampleScenarioItem(ctx.gw,r1_,r0_,descriptor_.stringID,
+                descriptor_.itemType,current,&final_);
+            if (complete_ && final_.ground>peak_) peak_=final_.ground;
+            stability_.observe(complete_,final_,ctx.elapsedMs);
+        }
+        if (ctx.elapsedMs<(ctx.isHost ? 40000u : 30000u)) return false;
+        passed_=have_ && complete_ && stability_.stable() && witness_.eventId &&
+            final_.bag==bagBase_+1 && final_.source==sourceBase_-1 && final_.ground==groundBase_ &&
+            final_.location==2 && (ctx.isHost ? dropped_==1 : pickedUp_==1);
+        char b[768]; _snprintf(b,sizeof(b)-1,
+            "WGRP verdict role=%s pass=%d sid='%s' dropped=%d grndPeak=%d grndFinal=%d "
+            "bagR1=%d bagBase=%d pickedUp=%d type=%u bagFinal=%d sourceBase=%d sourceFinal=%d "
+            "groundBase=%d groundFinal=%d stable=%d complete=%d stableMs=%lu sampleCount=%u "
+            "sourceHand=%u,%u,%u,%u,%u itemHand=%u,%u,%u,%u,%u dropOwner=%u dropId=%u "
+            "afterItemHand=%u,%u,%u,%u,%u",
+            ctx.isHost ? "host" : "join",passed_ ? 1 : 0,descriptor_.stringID,dropped_,peak_,final_.ground,
+            final_.bag,bagBase_,pickedUp_,descriptor_.itemType,final_.bag,sourceBase_,final_.source,
+            groundBase_,final_.ground,stability_.stable() ? 1 : 0,complete_ ? 1 : 0,
+            stability_.stableMs,stability_.sampleCount,witness_.sourceHand[0],witness_.sourceHand[1],
+            witness_.sourceHand[2],witness_.sourceHand[3],witness_.sourceHand[4],
+            item_[0],item_[1],item_[2],item_[3],item_[4],witness_.ownerId,witness_.eventId,
+            after_[0],after_[1],after_[2],after_[3],after_[4]);
+        b[sizeof(b)-1]='\0'; coop::logLine(b); return true;
+    }
 private:
-    static const unsigned long DROP_MS          = 8000;
-    static const unsigned long PICKUP_MS        = 16000;
-    static const unsigned long TRY_EVERY_MS     = 1500;
-    static const unsigned int  MAX_TRIES        = 5;
-    static const unsigned long JOIN_DURATION_MS = 30000;
-    // Outlive the join by the author's full re-home window (WD_REHOME_MAX_MS) plus slack:
-    // a refused re-home is retried for that long, and only then may the author retire its
-    // ground copy against the bag it can now read.
-    static const unsigned long HOST_DURATION_MS = 40000;
-    static const float         RADIUS;
-
-    int gearCount(GameWorld* gw, const unsigned int cHand[5]) {
-        InvItemEntry it[INV_ITEMS_MAX];
-        unsigned int n = engine::captureContainerContents(gw, cHand, it, INV_ITEMS_MAX, 0);
-        int c = 0;
-        for (unsigned int i = 0; i < n; ++i)
-            if (it[i].itemType == gearType_ && strcmp(it[i].stringID, gearSid_) == 0) ++c;
-        return c;
-    }
-    // Tab 0's first WEAPON or ARMOUR piece, equipped preferred - deliberately NOT a
-    // container: a backpack is unfabricable by design, so a refused re-home of one has no
-    // convergent end state to assert (the author keeps its ground copy rather than risk
-    // destroying the only instance).
-    bool pickGear(GameWorld* gw) {
-        InvItemEntry it[INV_ITEMS_MAX];
-        unsigned int n = engine::captureContainerContents(gw, r0_, it, INV_ITEMS_MAX, 0);
-        const unsigned int cats[2] = { 2u, 3u };
-        for (unsigned int pass = 0; pass < 2; ++pass)
-            for (unsigned int c = 0; c < 2; ++c)
-                for (unsigned int i = 0; i < n; ++i) {
-                    if (it[i].itemType != cats[c]) continue;
-                    if (pass == 0 && !it[i].equipped) continue;
-                    strncpy(gearSid_, it[i].stringID, sizeof(gearSid_) - 1);
-                    gearSid_[sizeof(gearSid_) - 1] = '\0';
-                    gearType_ = it[i].itemType;
-                    return true;
-                }
-        return false;
-    }
-
-    bool          passed_, have_, isHost_;
-    unsigned int  r0_[5], r1_[5];
-    char          gearSid_[48];
-    unsigned int  gearType_;
-    int           step_;
-    int           dropped_, pickedUp_;
-    unsigned long lastTryMs_;
-    unsigned int  tries_;
-    unsigned long lastLogMs_;
-    int           grndPeak_, grndFinal_, bagFinal_, bagBase_;
-    const char*   scenarioName_;
+    const char* scenarioName_; bool passed_,have_,complete_;
+    int dropped_,pickedUp_; unsigned long lastSample_;
+    int bagBase_,sourceBase_,groundBase_,peak_;
+    unsigned int r0_[5],r1_[5],item_[5],after_[5];
+    InvItemEntry descriptor_; engine::ScenarioItemSample final_;
+    engine::ScenarioItemWitness witness_; engine::ScenarioItemStability stability_;
 };
-const float InventoryRegearScenario::RADIUS = 60.0f;
 
 // inv_nested_bag (protocol 48): items placed INSIDE worn containers must land inside the PEER's
 // copy of the RIGHT container. A worn bag owns a private Inventory that no section of the
@@ -3172,7 +3018,366 @@ private:
     bool moved_, passed_;
 };
 
+// Drives real native shop/cursor entrypoints with hooks enabled. A source-only
+// decrease is not proof: require the same physical commodity at the owned actor,
+// conserved endpoint units, and native wallet effects. No seeding or packet echo.
+class NativeTransactionWatchScenario : public Scenario {
+public:
+    explicit NativeTransactionWatchScenario(bool extraction,bool stacked=false,bool race=false) :
+        extraction_(extraction),stacked_(stacked),race_(race),have_(false),invoked_(false),passed_(false),
+        attempted_(false),baselineReady_(false),step_(0),lastMs_(0),selectedAt_(0),boughtObservedAt_(0),
+        samples_(0),stockBefore_(0),actorBefore_(0),peerBefore_(0),walletBefore_(-1),
+        boughtWallet_(-1),miningOrdered_(false),miningStopped_(false),takeAt_(0),raceReady_(false) {
+        memset(hand_,0,sizeof(hand_)); memset(actor_,0,sizeof(actor_));
+        memset(&item_,0,sizeof(item_));
+        memset(barrier_,0,sizeof(barrier_));
+        if (race_) {
+            const DWORD length=GetEnvironmentVariableW(L"KENSHICOOP_NATIVE_TAKE_BARRIER",barrier_,_countof(barrier_));
+            if (!length || length>=_countof(barrier_)-32) barrier_[0]=0;
+        }
+    }
+    virtual const char* name() const {
+        return extraction_ ? (race_?"native_extraction_race_watch":"native_extraction_watch") :
+            (stacked_ ? "native_trade_stack_watch" : "native_trade_watch");
+    }
+    virtual void onStart(const ScenarioContext& ctx) {
+        if (!ctx.worldToken || !ctx.loadId) {
+            coop::logLine("NATIVE_TX WATCH waiting for admitted world/load"); return;
+        }
+        have_=selectClaimedActors(ctx);
+        if (!have_) return;
+        unsigned int candidates[64][5]; unsigned int count=0;
+        if (extraction_) {
+            engine::ProdRead machines[48];
+            unsigned int n=engine::enumMachinesNear(ctx.gw,100.0f,machines,48);
+            for (unsigned int i=0;i<n;++i)
+                if (machines[i].complete && machines[i].outSid[0])
+                    memcpy(candidates[count++],machines[i].hand,sizeof(hand_));
+            // Produce through the real admitted owner and native mining goal.
+            // An empty mine save is not a stock fixture, and adding test ore
+            // would bypass the production/removal path under investigation.
+            if (ctx.isHost && !miningOrdered_ && count==1) {
+                unsigned int worker[5];int task=0;
+                if (engine::pickMineWorker(ctx.gw,worker,&task))
+                    miningOrdered_=engine::orderMineWorker(ctx.gw,actor_,task);
+                char line[192];_snprintf(line,sizeof(line)-1,
+                    "NATIVE_TX PRODUCTION order=%d actor=%u,%u,%u,%u,%u",
+                    miningOrdered_?1:0,actor_[0],actor_[1],actor_[2],actor_[3],actor_[4]);
+                line[sizeof(line)-1]=0;coop::logLine(line);
+            }
+        } else {
+            count=engine::enumMerchantInventoryHands(ctx.gw,candidates,64);
+            if (!count && ctx.isHost) {
+                engine::ContRead traders[64];
+                unsigned int n=engine::enumLootInventoriesNear(ctx.gw,400.0f,traders,64,false);
+                for (unsigned int i=0;i<n;++i) {
+                    if (!traders[i].isTrader) continue;
+                    unsigned int hash=0,quantity=0;
+                    bool opened=engine::probeTraderWindow(traders[i].hand,&hash,&quantity,true);
+                    char view[224];_snprintf(view,sizeof(view)-1,
+                        "NATIVE_TX SHOP_VIEW trader=%u,%u,%u,%u,%u open=%d qty=%u hash=%u census=%u",
+                        traders[i].hand[0],traders[i].hand[1],traders[i].hand[2],
+                        traders[i].hand[3],traders[i].hand[4],opened?1:0,quantity,hash,count);
+                    view[sizeof(view)-1]=0;coop::logLine(view);
+                    if (opened && quantity) break;
+                }
+            }
+        }
+        if (!count) coop::logLine("NATIVE_TX WATCH WAIT actors=admitted sourceCandidates=0");
+        have_=false;
+        static InvItemEntry rows[INV_SNAPSHOT_ITEMS_MAX];
+        for (unsigned int c=0;c<count && !have_;++c) {
+            bool truncated=false;
+            unsigned int n=engine::captureContainerContents(ctx.gw,candidates[c],rows,
+                INV_SNAPSHOT_ITEMS_MAX,0,&truncated,true);
+            if (!n || truncated) {
+                char wait[224]; _snprintf(wait,sizeof(wait)-1,
+                    "NATIVE_TX WATCH WAIT source=%u,%u,%u,%u,%u entries=%u truncated=%d",
+                    candidates[c][0],candidates[c][1],candidates[c][2],candidates[c][3],candidates[c][4],
+                    n,truncated ? 1 : 0);
+                wait[sizeof(wait)-1]=0; coop::logLine(wait);
+            }
+            if (truncated) continue;
+            for (unsigned int i=0;i<n;++i) {
+                if (rows[i].parentIdx || rows[i].equipped || !rows[i].quantity ||
+                    engine::isContainerItemType(rows[i].itemType)) continue;
+                if (stacked_ && rows[i].quantity<2) continue;
+                item_=rows[i];
+                if (!extraction_) item_.quantity=1; // actual native right-click unit
+                memcpy(hand_,candidates[c],sizeof(hand_)); have_=true; break;
+            }
+        }
+        if (have_ && extraction_ && ctx.isHost && miningOrdered_ && !miningStopped_) {
+            Character* miner=engine::resolveCharByHand(actor_[3],actor_[4],actor_[0],actor_[1],actor_[2]);
+            float x=0,y=0,z=0;
+            if (miner && engine::readPos(miner,&x,&y,&z)) {
+                engine::clearGoals(miner);engine::endAction(miner);
+                miningStopped_=engine::orderMoveTo(miner,x,y,z);
+            }
+            // Keep production out of the subsequent conservation interval.
+            have_=miningStopped_;
+            coop::logLine(miningStopped_?"NATIVE_TX PRODUCTION stopped after actual output":
+                "NATIVE_TX PRODUCTION stop refused; no extraction attempted");
+        }
+        if (have_ && !extraction_) {
+            unsigned int hash=0,quantity=0;
+            have_=engine::probePreparePlayerTrade(ctx.gw,hand_,actor_) &&
+                engine::probeTraderWindow(hand_,&hash,&quantity,true);
+            char view[192];_snprintf(view,sizeof(view)-1,
+                "NATIVE_TX SHOP_VIEW selected=1 open=%d qty=%u hash=%u",
+                have_?1:0,quantity,hash);
+            view[sizeof(view)-1]=0;coop::logLine(view);
+        }
+        if (have_) {
+            selectedAt_=ctx.elapsedMs;
+            coop::logLine("NATIVE_TX WATCH real native subject selected");
+        }
+        world_=ctx.worldToken; load_=ctx.loadId;
+    }
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const u64 now=GetTickCount64();
+        if (race_ && (!barrier_[0] || (takeAt_ && !attempted_ && now>takeAt_+250))) {
+            passed_=false;coop::logLine("NATIVE_TX WATCH FAIL missing barrier or missed shared contention deadline");
+            return true;
+        }
+        if (!have_) {
+            // Peer-ready precedes the first admitted actor batch/claim. Resolve
+            // real ownership and stock before starting, never infer squad ranks.
+            // At native 1x the actual mine produces its first unit after about
+            // 100 seconds. This wait is preparation, not the conservation leg.
+            const unsigned long prepareLimit=extraction_?150000u:30000u;
+            if (ctx.elapsedMs>=prepareLimit) {
+                coop::logLine("NATIVE_TX WATCH FAIL native actor/stock preparation timed out");
+                return true;
+            }
+            if (lastMs_ && ctx.elapsedMs-lastMs_<500) return false;
+            lastMs_=ctx.elapsedMs;
+            onStart(ctx);
+            return false;
+        }
+        if (ctx.worldToken!=world_ || ctx.loadId!=load_) {
+            passed_=false; coop::logLine("NATIVE_TX WATCH FAIL world/load changed"); return true;
+        }
+        if (samples_ && ctx.elapsedMs-lastMs_<500 &&
+            !(race_ && takeAt_ && !attempted_ && now>=takeAt_)) return false;
+        lastMs_=ctx.elapsedMs; ++samples_;
+        const unsigned long observedMs=ctx.elapsedMs-selectedAt_;
+        bool complete=true;
+        u32 actorOwner=MAX_PLAYERS,peerOwner=MAX_PLAYERS;
+        unsigned int canonical[5]={0},peerCanonical[5]={0},sourceCanonical[5]={0};
+        const bool sourceKnown=ctx.queryInventoryRoot && ctx.queryInventoryRoot(hand_,sourceCanonical);
+        const bool actorKnown=ctx.queryClaimedActor && ctx.queryClaimedActor(actor_,&actorOwner,canonical);
+        const bool peerKnown=ctx.queryClaimedActor && ctx.queryClaimedActor(peerActor_,&peerOwner,peerCanonical);
+        complete=sourceKnown && actorKnown && peerKnown &&
+            actorOwner==ctx.localId && peerOwner!=ctx.localId && peerOwner<MAX_PLAYERS;
+        u32 hash=0,actorHash=0,peerHash=0;
+        unsigned int stock=units(ctx.gw,hand_,complete,hash),actor=units(ctx.gw,actor_,complete,actorHash);
+        unsigned int peerUnits=units(ctx.gw,peerActor_,complete,peerHash);
+        int wallet=-1; complete=engine::readPlayerWallet(ctx.gw,&wallet) && complete;
+        engine::ProdRead machine; float output=-1.0f;
+        if (extraction_ && engine::readMachineByHand(hand_,&machine)) output=machine.outAmount;
+        if (race_ && !takeAt_) {
+            if (observedMs>=30000 || (complete && stock!=item_.quantity)) {
+                passed_=false;coop::logLine("NATIVE_TX WATCH FAIL full native baseline barrier timed out or stock changed");
+                return true;
+            }
+            if (!complete) return false;
+            if (!coordinateRace(ctx)) {
+                passed_=false;coop::logLine("NATIVE_TX WATCH FAIL native baseline barrier IO failed");
+                return true;
+            }
+            if (!takeAt_) return false;
+        }
+        char line[1280]; _snprintf(line,sizeof(line)-1,
+            "NATIVE_TX WATCH world=%I64u load=%u role=%s extraction=%d race=%d takeAt=%I64u t=%lu sampleMs=%I64u preparedAt=%lu step=%u attempted=%d invoked=%d "
+            "hand=%u,%u,%u,%u,%u sourceCanonical=%u,%u,%u,%u,%u actor=%u,%u,%u,%u,%u sid=%s qty=%u "
+            "peerActor=%u,%u,%u,%u,%u peerUnits=%u peerHash=%u "
+            "actorOwner=%u actorCanonical=%u,%u,%u,%u,%u peerOwner=%u peerCanonical=%u,%u,%u,%u,%u "
+            "revision=%u hash=%u actorHash=%u stock=%u actorUnits=%u wallet=%d output=%.3f complete=%d",
+            ctx.worldToken,ctx.loadId,ctx.isHost ? "HOST" : "JOIN",extraction_ ? 1 : 0,race_?1:0,takeAt_,
+            ctx.elapsedMs,GetTickCount64(),selectedAt_,step_,attempted_?1:0,invoked_ ? 1 : 0,
+            hand_[0],hand_[1],hand_[2],hand_[3],hand_[4],
+            sourceCanonical[0],sourceCanonical[1],sourceCanonical[2],sourceCanonical[3],sourceCanonical[4],
+            actor_[0],actor_[1],actor_[2],actor_[3],actor_[4],item_.stringID,(unsigned)item_.quantity,
+            peerActor_[0],peerActor_[1],peerActor_[2],peerActor_[3],peerActor_[4],peerUnits,peerHash,
+            actorOwner,canonical[0],canonical[1],canonical[2],canonical[3],canonical[4],
+            peerOwner,peerCanonical[0],peerCanonical[1],peerCanonical[2],peerCanonical[3],peerCanonical[4],
+            engine::inventoryRevision(hand_),hash,actorHash,stock,actor,wallet,
+            output,complete ? 1 : 0);
+        line[sizeof(line)-1]=0; coop::logLine(line);
+        if (!complete) { passed_=false;return observedMs>=90000; }
+        if (extraction_) {
+            // One actual native stack: sequential stale retry or two real
+            // contenders at the same boot-clock deadline. Never seed ore.
+            if (!baselineReady_) {
+                if (stock!=item_.quantity) {
+                    coop::logLine("NATIVE_TX WATCH FAIL extraction fixture is not one complete physical stack");
+                    return true;
+                }
+                stockBefore_=stock;actorBefore_=actor;peerBefore_=peerUnits;
+                walletBefore_=wallet;baselineReady_=true;
+            }
+            const bool due=race_ ? now>=takeAt_ : observedMs>=(ctx.isHost?10000u:30000u);
+            if (!attempted_ && due) {
+                attempted_=true;
+                const u64 actionMs=GetTickCount64();
+                invoked_=engine::exerciseNativeTransaction(ctx.gw,hand_,actor_,item_,false);
+                char action[192];_snprintf(action,sizeof(action)-1,
+                    "NATIVE_TX ACTION host=%d attempted=1 returned=%d stock=%u actor=%u peer=%u sampleMs=%I64u",
+                    ctx.isHost?1:0,invoked_?1:0,stock,actor,peerUnits,actionMs);
+                action[sizeof(action)-1]=0;coop::logLine(action);
+                if (ctx.isHost && !invoked_ && !race_) {
+                    coop::logLine("NATIVE_TX WATCH FAIL native HOST extraction refused");
+                    return true;
+                }
+                step_=1;
+            } else if (attempted_) {
+                const bool selfWon=actor==actorBefore_+item_.quantity && peerUnits==peerBefore_;
+                const bool peerWon=peerUnits==peerBefore_+item_.quantity && actor==actorBefore_;
+                const bool conserved=stock+item_.quantity==stockBefore_ && wallet==walletBefore_ &&
+                    (race_ ? (selfWon || peerWon) : (ctx.isHost?selfWon:peerWon));
+                if (step_==3 && !conserved) {
+                    passed_=false;coop::logLine("NATIVE_TX WATCH FAIL extraction conservation regressed");
+                    return true;
+                }
+                if (conserved) { passed_=true;step_=3; }
+            }
+            return observedMs>=90000;
+        }
+        if (!attempted_ && observedMs>=(ctx.isHost ? 10000u : 30000u)) {
+            stockBefore_=stock; actorBefore_=actor; walletBefore_=wallet;attempted_=true;
+            invoked_=engine::exerciseNativeTransaction(ctx.gw,hand_,actor_,item_,true);
+            if (!invoked_) {
+                coop::logLine("NATIVE_TX WATCH FAIL real native entrypoint refused/unavailable");
+                return true;
+            }
+            step_=1;
+        } else if (step_==1 && stock+item_.quantity==stockBefore_ &&
+                   actor==actorBefore_+item_.quantity &&
+                   wallet<walletBefore_) {
+            // Keep the real purchase long enough to cross the normal snapshot
+            // settle window. The paired oracle still requires actual peer
+            // stock, receiver contents and payment before accepting the sale.
+            if (!boughtObservedAt_) boughtObservedAt_=observedMs;
+            if (observedMs-boughtObservedAt_<5000) return false;
+            // Sell the actual purchased commodity through the same native body.
+            // A pending checkpoint or unavailable physical stack is not success.
+            if (!engine::inventoryCheckpointReady(engine::transactionInventory(actor_))) return false;
+            boughtWallet_=wallet;
+            if (!engine::exerciseNativeTransaction(ctx.gw,actor_,hand_,item_,true)) {
+                coop::logLine("NATIVE_TX WATCH FAIL native sale refused/unavailable"); return true;
+            }
+            step_=2;
+        } else if (step_==2 && stock==stockBefore_ && actor==actorBefore_ &&
+                   wallet>boughtWallet_) { passed_=true; step_=3; }
+        return observedMs>=90000;
+    }
+    virtual bool passed() const { return passed_; }
+private:
+    static const unsigned int MAX_SQUAD=32;
+    bool selectClaimedActors(const ScenarioContext& ctx) {
+        if (!ctx.queryClaimedActor) return false;
+        EntityState squad[MAX_SQUAD];
+        const unsigned n=engine::captureSquad(ctx.gw,false,squad,MAX_SQUAD);
+        if (!n || n>=MAX_SQUAD) return false;
+        const u32 owners[2]={ctx.localId,ctx.isHost?1u:0u};
+        unsigned int canonical[2][5]={{0},{0}};
+        bool found[2]={false,false};
+        for (unsigned i=0;i<n;++i) {
+            const EntityState& s=squad[i];
+            unsigned int local[5]={s.hType,s.hContainer,s.hContainerSerial,s.hIndex,s.hSerial};
+            unsigned int key[5];u32 owner=MAX_PLAYERS;
+            if (!ctx.queryClaimedActor(local,&owner,key)) {
+                char wait[192]; _snprintf(wait,sizeof(wait)-1,
+                    "NATIVE_TX WATCH WAIT actorClaim=unresolved hand=%u,%u,%u,%u,%u",
+                    local[0],local[1],local[2],local[3],local[4]);
+                wait[sizeof(wait)-1]=0; coop::logLine(wait);
+                continue;
+            }
+            for (unsigned side=0;side<2;++side) {
+                if (owner!=owners[side] || (found[side] &&
+                    !std::lexicographical_compare(key,key+5,canonical[side],canonical[side]+5))) continue;
+                memcpy(side?peerActor_:actor_,local,sizeof(local));
+                memcpy(canonical[side],key,sizeof(key));found[side]=true;
+            }
+        }
+        if (!found[0] || !found[1]) {
+            char wait[160]; _snprintf(wait,sizeof(wait)-1,
+                "NATIVE_TX WATCH WAIT roster=%u ownAdmitted=%d peerAdmitted=%d",
+                n,found[0] ? 1 : 0,found[1] ? 1 : 0);
+            wait[sizeof(wait)-1]=0; coop::logLine(wait);
+        }
+        return found[0] && found[1];
+    }
+    bool coordinateRace(const ScenarioContext& ctx) {
+        wchar_t own[1100]={0},peer[1100]={0},deadline[1100]={0};
+        _snwprintf(own,_countof(own)-1,L"%s.%s.ready",barrier_,ctx.isHost?L"host":L"join");
+        _snwprintf(peer,_countof(peer)-1,L"%s.%s.ready",barrier_,ctx.isHost?L"join":L"host");
+        _snwprintf(deadline,_countof(deadline)-1,L"%s.deadline",barrier_);
+        // Scheduling only: markers are emitted after real complete stock/actor
+        // baselines. The paired oracle independently verifies both native calls.
+        if (!raceReady_) {
+            HANDLE ready=CreateFileW(own,GENERIC_WRITE,0,0,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,0);
+            if (ready==INVALID_HANDLE_VALUE) return false;
+            if (!CloseHandle(ready)) return false;
+            raceReady_=true;
+            coop::logLine(ctx.isHost?"NATIVE_TX RACE_READY role=HOST":"NATIVE_TX RACE_READY role=JOIN");
+        }
+        if (GetFileAttributesW(peer)==INVALID_FILE_ATTRIBUTES) {
+            return GetLastError()==ERROR_FILE_NOT_FOUND;
+        }
+        if (ctx.isHost) {
+            HANDLE file=CreateFileW(deadline,GENERIC_WRITE,0,0,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,0);
+            if (file!=INVALID_HANDLE_VALUE) {
+                char text[32]={0}; DWORD written=0;
+                const int length=_snprintf(text,sizeof(text)-1,"%I64u",GetTickCount64()+5000);
+                const bool ok=length>0 && WriteFile(file,text,length,&written,0) && written==(DWORD)length;
+                const bool closed=CloseHandle(file)!=0;
+                if (!ok || !closed) return false;
+            } else if (GetLastError()!=ERROR_FILE_EXISTS) return false;
+        }
+        HANDLE file=CreateFileW(deadline,GENERIC_READ,FILE_SHARE_READ,0,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,0);
+        if (file==INVALID_HANDLE_VALUE) {
+            const DWORD error=GetLastError();
+            return error==ERROR_FILE_NOT_FOUND || error==ERROR_SHARING_VIOLATION;
+        }
+        char text[32]={0}; DWORD read=0;
+        const bool ok=ReadFile(file,text,sizeof(text)-1,&read,0)!=0;
+        const bool closed=CloseHandle(file)!=0;
+        if (!ok || !closed || !read) return false;
+        char* end=0; const u64 value=_strtoui64(text,&end,10);
+        if (!value || !end || *end || value>0x7fffffffffffffffULL) return false;
+        takeAt_=value;
+        return true;
+    }
+    unsigned int units(GameWorld* gw,const unsigned int hand[5],bool& complete,u32& hash) {
+        static InvItemEntry rows[INV_SNAPSHOT_ITEMS_MAX]; bool truncated=false;
+        unsigned int n=engine::captureContainerContents(gw,hand,rows,INV_SNAPSHOT_ITEMS_MAX,&hash,&truncated,true);
+        if (truncated || !engine::transactionInventory(hand)) complete=false;
+        unsigned int result=0;
+        for (unsigned int i=0;i<n;++i)
+            if (rows[i].itemType==item_.itemType && rows[i].quality==item_.quality &&
+                rows[i].level==item_.level && !strcmp(rows[i].stringID,item_.stringID) &&
+                !strcmp(rows[i].manufacturer,item_.manufacturer) &&
+                !strcmp(rows[i].material,item_.material)) result+=rows[i].quantity;
+        return result;
+    }
+    bool extraction_,stacked_,race_,have_,invoked_,passed_,attempted_,baselineReady_;
+    unsigned int step_; unsigned long lastMs_,selectedAt_,boughtObservedAt_;
+    unsigned int hand_[5],actor_[5],peerActor_[5],samples_,stockBefore_,actorBefore_,peerBefore_,load_;
+    u64 world_;
+    int walletBefore_,boughtWallet_; InvItemEntry item_;
+    bool miningOrdered_,miningStopped_;
+    u64 takeAt_;
+    bool raceReady_;
+    wchar_t barrier_[1024];
+};
+
 Scenario* makeInventoryScenario(const std::string& name) {
+    if (name == "native_trade_watch") return new NativeTransactionWatchScenario(false);
+    if (name == "native_trade_stack_watch") return new NativeTransactionWatchScenario(false,true);
+    if (name == "native_extraction_watch") return new NativeTransactionWatchScenario(true);
+    if (name == "native_extraction_race_watch") return new NativeTransactionWatchScenario(true,false,true);
     if (name == "inv_snapshot_cursor") return new SnapshotCursorScenario();
     if (name == "critical_stock") return new CriticalStockScenario();
     if (name == "critical_ground") return new CriticalGroundScenario();

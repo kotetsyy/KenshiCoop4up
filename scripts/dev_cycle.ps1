@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   One-shot autonomous iteration cycle for KenshiCoop:
-  kill stale Kenshi -> build the plugin -> deploy to both installs ->
+  reject existing user games -> build the plugin -> deploy to explicit installs ->
   run the host+join functional test -> exit with PASS/FAIL.
 
 .DESCRIPTION
@@ -25,6 +25,9 @@ param(
     [switch]$Sync,
     [switch]$SkipBuild,
     [int]$Port = 27800,
+    [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi",
+    [string]$JoinDir = "$env:USERPROFILE\Kenshi-Join",
+    [string]$NativeBin = "",
     # Optional compiled scenario to run (KENSHICOOP_SCENARIO); passthrough to run_test.ps1.
     [string]$Scenario = "",
     [double]$Tolerance = 3.0,
@@ -37,6 +40,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir 'kit_preflight.ps1')
+$runState = New-CoopRunState -GameDirs @($HostDir,$JoinDir)
+try {
 
 function Invoke-Step {
     param([string]$Name, [scriptblock]$Action)
@@ -46,31 +52,10 @@ function Invoke-Step {
     if ($LASTEXITCODE -ne 0) { Write-Host "RESULT: FAIL ($Name failed, exit $LASTEXITCODE)"; exit $LASTEXITCODE }
 }
 
-# 1. Clean slate so build/deploy aren't blocked by a loaded DLL / running game.
-#    Kill, then WAIT for the processes to actually disappear and for the mod DLL
-#    to become writable. A Kenshi instance that self-exited via the old ExitProcess
-#    path could hang (non-responding zombie) and keep the DLL file-locked; if we
-#    don't catch that here, deploy silently runs the STALE DLL. Abort loudly.
-Write-Host "=== kill stale Kenshi ==="
-$stale = @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue)
-if ($stale.Count -gt 0) { $stale | Stop-Process -Force -ErrorAction SilentlyContinue }
-Write-Host "  killed $($stale.Count) process(es)"
-
-$gone = $false
-for ($i = 0; $i -lt 20; $i++) {
-    if (@(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue).Count -eq 0) { $gone = $true; break }
-    Start-Sleep -Milliseconds 500
-}
-if (-not $gone) {
-    $zids = (Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) -join ", "
-    Write-Host "RESULT: FAIL (Kenshi process(es) would not terminate: PID $zids)"
-    Write-Host "  A hung/zombie instance is holding the mod DLL lock. End it via Task"
-    Write-Host "  Manager (or reboot if it is non-responding), then re-run."
-    exit 1
-}
+# The owning preflight rejects existing user sessions rather than killing them.
 
 # Confirm the deployed DLL is actually unlocked before we bother building.
-$deployedDll = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\KenshiCoop\KenshiCoop.dll"
+$deployedDll = Join-Path $HostDir "mods\KenshiCoop\KenshiCoop.dll"
 if (Test-Path $deployedDll) {
     $unlocked = $false
     for ($i = 0; $i -lt 10; $i++) {
@@ -87,17 +72,21 @@ if (Test-Path $deployedDll) {
 # 2/3. Build + deploy (skippable when only the test changed).
 if (-not $SkipBuild) {
     Invoke-Step "build plugin" { & cmd /c "`"$scriptDir\build_plugin.cmd`"" }
-    Invoke-Step "deploy"       { & cmd /c "`"$scriptDir\deploy.cmd`"" }
+    Install-CoopHarnessRuntime -RepoRoot (Split-Path -Parent $scriptDir) -GameDirs @($HostDir,$JoinDir) -NativeBin $NativeBin
 }
 
 # 4. Run the functional test; its exit code is the verdict.
 Write-Host ""
 Write-Host "=== run test ==="
 $testArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $scriptDir "run_test.ps1"),
-              "-Save", $Save, "-Seconds", "$Seconds", "-Port", "$Port")
+              "-Save", $Save, "-Seconds", "$Seconds", "-Port", "$Port", "-HostDir", $HostDir, "-JoinDir", $JoinDir)
+if ($NativeBin) { $testArgs += @("-NativeBin", $NativeBin) }
 if ($Sync) { $testArgs += "-Sync" }
 if ($Scenario -ne "") { $testArgs += @("-Scenario", $Scenario, "-Tolerance", "$Tolerance") }
 if ($Setup -ne "") { $testArgs += @("-Setup", $Setup) }
 if ($ProbeAiSuspend) { $testArgs += "-ProbeAiSuspend" }
 & powershell @testArgs
 exit $LASTEXITCODE
+} finally {
+    Restore-CoopRunState $runState
+}

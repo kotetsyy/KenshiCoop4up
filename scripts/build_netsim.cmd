@@ -1,7 +1,7 @@
 @echo off
 REM Build dist\netsim.exe - the WAN-conditions UDP relay proxy (src\netsim).
-REM Applies delay/jitter/loss to ALL datagrams in BOTH directions BELOW ENet,
-REM so WAN-variant test runs exercise real retransmission behaviour.
+REM Applies delay/jitter/loss below native GNS to whole Winsock UDP datagrams,
+REM exercising genuine UDP provider retransmission. Single client, not Steam.
 REM Uses the same v100 (VC++ 2010) x64 toolchain as the plugin.
 setlocal
 

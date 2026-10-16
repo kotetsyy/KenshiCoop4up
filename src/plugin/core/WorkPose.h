@@ -96,6 +96,17 @@ inline bool poseClearElapsed(unsigned long noneTick, unsigned long now,
     return (now - noneTick) >= clearMs;
 }
 
+// Called only while the newest task is NONE. combatSeenTick is the last local
+// render/application tick that sampled combat; latestArrivalTick is local receive
+// time, NOT sender capture time. Render time passing cannot confirm removal:
+// a later NONE receipt must span the clear window too. Compare ages so an arrival
+// older than the last combat draw cannot underflow into a false confirmation.
+inline bool combatClearConfirmed(unsigned long now, unsigned long combatSeenTick,
+                                  unsigned long latestArrivalTick, unsigned long clearMs) {
+    const unsigned long elapsed = now - combatSeenTick;
+    return elapsed >= clearMs && (now - latestArrivalTick) <= elapsed - clearMs;
+}
+
 } // namespace coop
 
 #endif // COOP_WORK_POSE_H

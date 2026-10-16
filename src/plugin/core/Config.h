@@ -560,19 +560,9 @@ struct Config {
     // "0" is the A/B escape hatch.
     bool          latejoinSync;
 
-    // Transport selection (KENSHICOOP_TRANSPORT): "udp" (default) or "steam".
-    // "steam" tunnels the unchanged ENet protocol over Steam P2P (legacy
-    // ISteamNetworking in the game's own steam_api64.dll): connections are
-    // made BY STEAMID with automatic NAT punching and Valve-relay fallback -
-    // no port forwarding, no public IPs, immune to CGNAT. Requires
-    // steamPeer below; falls back to UDP (loudly) when Steam is unavailable.
-    std::string   transport;
-
-    // The co-op partner's steamid64 (KENSHICOOP_STEAM_PEER). Host may list
-    // several (comma-separated) for 3-4 player Steam; join lists the host.
-    // Extra ids beyond steamPeer live in steamPeers.
-    unsigned long long steamPeer;
-    std::vector<unsigned long long> steamPeers;
+    // Exactly one native provider is selected for the complete session.
+    std::string transport; // KENSHICOOP_TRANSPORT: udp or steam; never fallback
+    unsigned long long steamPeer; // JOIN target only: KENSHICOOP_STEAM_PEER
 
     // F2-panel display nick (KENSHICOOP_PLAYER_NAME / coop_config.json
     // "playerName"). Pasted from the clipboard - the panel has no text field.
@@ -581,10 +571,6 @@ struct Config {
     // character's original name.
     std::string playerName;
 
-    // Steam reachability spike (KENSHICOOP_STEAM_PING=<steamid64>): ping/echo
-    // that peer on P2P channel 1 every 2 s and log RTT + punch-vs-relay,
-    // independent of the transport in use. 0 = off.
-    unsigned long long steamPing;
 
     // In-game co-op panel session control (2026-07-13). When the mod is driven
     // by the F2 panel instead of the env launchers, networking is DEFERRED at
@@ -602,15 +588,20 @@ struct Config {
 // env var > config file > hard-coded default.
 void loadConfig(Config& out);
 
-// Re-read only the connection target (steamPeer / ip / port) from
-// coop_config.json into 'c'. Called on the panel's Connect so a friend-code edit
-// applies without restarting the game. No-op for keys absent from the file.
+// Strict ordinary configuration/admission parsing (no clipboard digit extraction).
+bool validSteamPeerId(unsigned long long id);
+// Private runtime inputs only; never persisted to coop_config.json or logged.
+bool readUdpJoinInviteFile(std::string& invite);
+std::string udpHostProfilePath();
+
+// Re-read join target, explicit host allowlist and endpoint before Connect.
+// Env overrides still win; missing/empty allowlist means deny-all, never hidden grants.
 void reloadPeerFromFile(Config& c);
 
-// Write the last join/host connection (role, transport, steamPeer list, UDP
-// ip/port, playerName) into coop_config.json next to the DLL so a relaunch
-// pre-fills F2 instead of requiring another clipboard paste. Merges into the
-// existing file (other keys kept). No-op if the path cannot be written.
+// Remember ordinary role/transport, JOIN Steam target, UDP ip/port and nick.
+// An empty JOIN Steam target explicitly clears its persisted value.
+// Private invitations/profile paths are never written here. Other keys are kept.
+// No-op if the path cannot be written.
 void saveConnectMemory(const Config& c);
 
 // Read the self-update keys out of coop_config.json. Kept OUT of struct Config

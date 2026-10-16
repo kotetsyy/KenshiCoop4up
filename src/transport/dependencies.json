@@ -1,0 +1,16 @@
+{
+  "gns": {
+    "version": "1.6.1",
+    "commit": "d534c19aa760df3fb75fd20db13ba1932b8a5463",
+    "url": "https://codeload.github.com/ValveSoftware/GameNetworkingSockets/tar.gz/d534c19aa760df3fb75fd20db13ba1932b8a5463",
+    "sha256": "099d4b0ff1837f0f27c83d4ce05869ec1d32136866f69a3336cc137e951189ab",
+    "patch": "patches/gns-authenticated-ip.patch",
+    "patchSha256": "03f1df288dc04e64c00f64055a3af288144a075fe2a0c4937d377a753d402f11"
+  },
+  "protobuf": {
+    "version": "21.12",
+    "commit": "f0dc78d7e6e331b8c6bb2d5283e06aa26883ca7c",
+    "url": "https://codeload.github.com/protocolbuffers/protobuf/tar.gz/f0dc78d7e6e331b8c6bb2d5283e06aa26883ca7c",
+    "sha256": "d594b561fb41bf243233d8f411c7f2b7d913e5c9c1be4ca439baf7e48384c893"
+  }
+}

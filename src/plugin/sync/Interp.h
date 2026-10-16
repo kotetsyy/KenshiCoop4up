@@ -60,7 +60,8 @@ public:
     // time; the positive gap (arrivalMs - nowMs) is the packet's queueing lag,
     // tracked peak-hold so renderDelay still covers path jitter even though the
     // interval stats no longer contain it.
-    void push(const EntityState& e, unsigned long nowMs, unsigned long arrivalMs = 0);
+    // True only when this sample becomes latest; bind its authenticated author then.
+    bool push(const EntityState& e, unsigned long nowMs, unsigned long arrivalMs = 0);
 
     // Produce the render-time pose at 'nowMs' into 'out' (identity + locomotion
     // copied from the latest snapshot, transform interpolated). Returns false if
@@ -89,6 +90,9 @@ public:
         unsigned long dt = at(count_ - 1).t - at(count_ - 2).t;
         return dt;
     }
+    // Largest capture gap still retained in the ring. Sparse mid-band bursts
+    // contain 10 ms segments but return only once per rotation.
+    unsigned long maxSegMs() const { return maxIntervalMs_; }
 
     // LOCAL arrival time of the newest snapshot (0 = nothing received yet). The
     // ring times above are the SENDER's clock; this is the only thing that says
@@ -124,6 +128,7 @@ private:
     int           count_;
     int           head_;             // index of the next write slot
     unsigned long lastArrival_;
+    unsigned long maxIntervalMs_;    // cached maximum retained capture gap
     float         avgIntervalMs_;
     float         jitterMs_;
     float         lagMs_;            // peak-decayed queueing lag (arrival - ring time)

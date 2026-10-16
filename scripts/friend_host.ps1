@@ -10,9 +10,9 @@
     powershell -ExecutionPolicy Bypass -File friend_host.ps1
 
   Steam P2P (no port forwarding / router setup at all):
-    powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <joining player's steamid64>
-  Your own SteamID is printed once the game is up - read it to the joining
-  player (they pass it as -HostSteamId). The kit may pre-bake -PeerSteamId.
+    powershell -ExecutionPolicy Bypass -File friend_host.ps1
+  Transport comes from kit.json. Give your own SteamID to the joining player
+  (they pass it as -HostSteamId); no guest allowlist is required.
 
   Installs the bundled mod + save into the local Kenshi, adds the Windows
   Firewall rule, asks the router to forward the UDP port automatically via
@@ -23,8 +23,8 @@
   host.log + screenshots into KenshiCoop-results-<stamp>.zip to send back
   for offline judging (analyze_run.ps1).
 
-  Run with -CheckOnly the day before a scheduled session to verify the
-  firewall + router setup without installing or launching anything.
+  -CheckOnly provisions/verifies the permanent firewall admission and tests an
+  owned transient router mapping; it installs no runtime and launches no game.
 
   Scenario timing note: the host's scripted actions ARM only when the joining
   player's stream arrives (peer-ready), so nothing happens before both are
@@ -43,37 +43,21 @@ param(
     [switch]$NoPrompt,
     # Skip the automatic UPnP router mapping (manual port forward only).
     [switch]$NoUpnp,
-    # Preflight only: firewall rule + UPnP + public-IP check, then exit.
-    # Installs nothing, launches nothing. Run this the day before a scheduled
-    # session so router problems surface off the clock.
+    # Connectivity preflight: permanently provision/verify the firewall rule,
+    # test/release an owned transient UPnP mapping, and inspect the public IP.
     [switch]$CheckOnly,
-    # Steam P2P transport: the JOINING player's steamid64 (or short friend code).
-    # When set, Steam brokers the connection - the firewall / UPnP / public-IP
-    # checklist is skipped entirely. The kit may pre-bake this (kit.json).
-    [string]$PeerSteamId = "",
     # Resume the previous session: load the 'coopresume' save the coordinated
     # save (protocol 31) wrote last session instead of installing the kit's
     # baked save. BOTH sides must resume. Defaults to free play (no scenario).
     [switch]$Resume,
     # Save name the coordinated-save flow writes (must match the join's).
+    [string]$UdpProfilePath = $env:KENSHICOOP_UDP_PROFILE_PATH,
+    [string]$RunToken = [Guid]::NewGuid().ToString('N'),
     [string]$ResumeSave = "coopresume"
 )
 
 $ErrorActionPreference = "Stop"
 $kitDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-# Short Steam friend codes are steamid64 minus the account-universe base.
-function ConvertTo-SteamId64([string]$id) {
-    $id = "$id".Trim()
-    if ($id -notmatch '^\d{1,17}$') {
-        throw ("'$id' is not a Steam ID. Use the other player's friend code (Steam > " +
-               "Friends > Add a Friend - the number at the top) or their 17-digit " +
-               "SteamID64 (steamid.io converts profile URLs).")
-    }
-    $v = [uint64]$id
-    if ($v -lt 76561197960265728) { $v += 76561197960265728 }
-    return $v
-}
 
 # Preflight helpers (RE_Kenshi / Steam / Mark-of-the-Web / windowed checks).
 . (Join-Path $kitDir "kit_preflight.ps1")
@@ -91,14 +75,28 @@ if ($Resume) {
 }
 if ($Scenario -eq "") { $Scenario = $kit.scenario }
 if ($Scenario -eq "free") { $Scenario = "" }
+if ($Scenario -eq 'bootstrap_stream') { throw 'bootstrap_stream is runner-only; use stream_test.ps1 for its menu/bootstrap lifecycle.' }
 if ($Port -eq 0) { $Port = [int]$kit.port }
-# The kit can pre-bake the Steam transport (kit.json: transport + peerSteamId).
-if ($PeerSteamId -eq "" -and $kit.PSObject.Properties["peerSteamId"] -and "$($kit.peerSteamId)" -ne "" -and "$($kit.peerSteamId)" -ne "0") {
-    $PeerSteamId = "$($kit.peerSteamId)"
+if ($RunToken -notmatch '^[a-fA-F0-9]{32}$') { throw 'RunToken must be a GUID in N format.' }
+Import-Module (Join-Path $kitDir 'CoopHarness.psm1') -Force
+Import-Module (Join-Path $kitDir 'CoopOracles.psm1') -Force
+$manifest = Import-PowerShellDataFile (Join-Path $kitDir 'scenarios.psd1')
+$entry = $null
+if ($Scenario) {
+    if (-not $manifest.Scenarios.ContainsKey($Scenario)) { throw "Unknown scenario '$Scenario'." }
+    $entry = $manifest.Scenarios[$Scenario]
+    if ($Scenario -ne $kit.scenario -and $entry.Save -ne $save) { throw 'Scenario override requires a different fixture; assemble a matching kit.' }
 }
-$useSteam = ($PeerSteamId -ne "")
-# Validate the ID up front (clear error now beats a dead session later).
-if ($useSteam) { [void](ConvertTo-SteamId64 $PeerSteamId) }
+$prof = $manifest.Profiles.remote
+$seconds = if (-not $Scenario) { $FreePlayMinutes * 60 } elseif ($entry.ContainsKey('Seconds')) { [int]$entry.Seconds } else { 150 }
+$killGraceSec = if ($entry -and $entry.ContainsKey('KillGraceSec')) { [int]$entry.KillGraceSec } else { [int]$prof.KillGraceSec }
+$shotAnchor = if ($entry -and $entry.ContainsKey('ShotAnchorHost')) { $entry.ShotAnchorHost } else { 'SCENARIO MEMBER' }
+$shotDelay = if ($entry -and $entry.ContainsKey('ShotDelaySec')) { [int]$entry.ShotDelaySec } else { 2 }
+$shotWait = if ($entry -and $entry.ContainsKey('ShotWaitSec')) { [int]$entry.ShotWaitSec } else { [int]$prof.JoinAnchorTimeoutSec }
+$shotRequired = $entry -and $entry.ContainsKey('ShotAnchorHost')
+$requireResult = $null -ne $entry
+# The runtime kit selects the transport; HOST does not select guests by ID.
+$useSteam = ("$($kit.transport)" -eq 'steam')
 # Print YOUR friend code first (read from Steam) so the two of you can swap
 # codes right off this screen - no profile-page spelunking.
 if ($useSteam -or "$($kit.transport)" -eq "steam") { Show-MySteamId }
@@ -109,21 +107,26 @@ if ($useSteam -or "$($kit.transport)" -eq "steam") { Show-MySteamId }
 function Ensure-CoopFirewallRule {
     param([int]$RulePort)
     try {
-        $rule = & netsh advfirewall firewall show rule name=KenshiCoop 2>&1
-        if ("$rule" -notmatch "KenshiCoop") {
-            & netsh advfirewall firewall add rule name=KenshiCoop dir=in action=allow protocol=UDP localport=$RulePort | Out-Null
-            Write-Host "Firewall: inbound UDP $RulePort allowed (rule added)."
-        } else {
-            Write-Host "Firewall: KenshiCoop rule already present."
+        $rules = @(Get-NetFirewallRule -DisplayName KenshiCoop -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' })
+        foreach ($rule in $rules) {
+            foreach ($filter in @($rule | Get-NetFirewallPortFilter)) {
+                if ("$($filter.Protocol)" -in @('UDP','17') -and "$($filter.LocalPort)" -eq "$RulePort") { return $true }
+            }
         }
-        return $true
+        & netsh advfirewall firewall add rule name=KenshiCoop dir=in action=allow protocol=UDP localport=$RulePort | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Firewall rule creation failed.' }
+        $rules = @(Get-NetFirewallRule -DisplayName KenshiCoop -ErrorAction Stop | Where-Object { $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' })
+        foreach ($rule in $rules) {
+            foreach ($filter in @($rule | Get-NetFirewallPortFilter)) {
+                if ("$($filter.Protocol)" -in @('UDP','17') -and "$($filter.LocalPort)" -eq "$RulePort") { return $true }
+            }
+        }
+        throw 'Required enabled inbound UDP firewall rule could not be verified.'
     } catch {
-        Write-Warning "Could not add the firewall rule automatically (needs admin PowerShell)."
-        Write-Warning "Run once as admin: netsh advfirewall firewall add rule name=KenshiCoop dir=in action=allow protocol=UDP localport=$RulePort"
+        Write-Warning "Firewall readiness failed: $($_.Exception.Message)"
         return $false
     }
 }
-
 function Get-PublicIp {
     try { return (Invoke-WebRequest -Uri "https://api.ipify.org" -UseBasicParsing -TimeoutSec 5).Content.Trim() }
     catch { return "" }
@@ -142,32 +145,38 @@ if ($CheckOnly -and $useSteam) {
 }
 if ($CheckOnly) {
     Write-Host ""
-    Write-Host "=== PRE-SESSION CONNECTIVITY CHECK (installs nothing, launches nothing) ==="
+    Write-Host "=== CONNECTIVITY CHECK (firewall provisioning is permanent; no game/runtime install) ==="
     $fwOk = Ensure-CoopFirewallRule $Port
     $publicIp = Get-PublicIp
     if ($publicIp -ne "") { Write-Host "Public IP: $publicIp" }
     else                  { Write-Host "Public IP: (could not detect - use whatismyip.com)" }
 
-    Write-Host "Asking the router to forward UDP $Port automatically (UPnP) ..."
-    $upnp = Add-UpnpMapping -Port $Port
+    $upnp = $null
+    if (-not $NoUpnp) {
+        Write-Host "Asking the router to forward UDP $Port automatically (UPnP) ..."
+        $upnp = Add-UpnpMapping -Port $Port
+    } else {
+        Write-Host 'UPnP skipped (-NoUpnp); automatic readiness is unproven. Manual forwarding is required.'
+    }
+    try {
     $hairpin = "skipped"
-    if ($upnp.Ok) {
+    if ($upnp -and $upnp.Ok) {
         Write-Host "UPnP: mapping accepted (UDP $Port -> $($upnp.LanIp))."
         $probeIp = if ($upnp.ExternalIp) { $upnp.ExternalIp } else { $publicIp }
         if ($probeIp -match '^\d') {
             Write-Host "Probing reachability via your own public IP (NAT hairpin) ..."
             $hairpin = Test-UpnpHairpin -Port $Port -ExternalIp $probeIp
         }
-        Remove-UpnpMapping -Port $Port
-    } else {
+    } elseif ($upnp) {
         Write-Host "UPnP: FAILED - $($upnp.Error)"
     }
+    } finally { if ($upnp -and ($upnp.Owned -or $upnp.Unresolved)) { Remove-UpnpMapping -Mapping $upnp } }
 
-    $cgnat = ($upnp.Ok -and $upnp.ExternalIp -and $publicIp -match '^\d' -and $upnp.ExternalIp -ne $publicIp)
+    $cgnat = ($upnp -and $upnp.Ok -and $upnp.ExternalIp -and $publicIp -match '^\d' -and $upnp.ExternalIp -ne $publicIp)
 
     Write-Host ""
     Write-Host "=================== CHECK RESULT ==================="
-    if ($upnp.Ok -and -not $cgnat) {
+    if ($upnp -and $upnp.Ok -and -not $cgnat -and $fwOk) {
         Write-Host " READY: the session script will open the port automatically."
         if ($hairpin -eq "reachable") {
             Write-Host " (Reachability probe PASSED - strongest possible pre-session signal.)"
@@ -186,7 +195,7 @@ if ($CheckOnly) {
     }
     if (-not $fwOk) { Write-Host " Also fix the Windows Firewall rule (see warning above)." }
     Write-Host "===================================================="
-    if ($upnp.Ok -and -not $cgnat -and $fwOk) { exit 0 } else { exit 1 }
+    if ($upnp -and $upnp.Ok -and -not $cgnat -and $fwOk) { exit 0 } else { exit 1 }
 }
 
 # ---- Locate Kenshi ---------------------------------------------------------------
@@ -200,14 +209,30 @@ if ($KenshiDir -eq "") {
 if ($KenshiDir -eq "" -or -not (Test-Path (Join-Path $KenshiDir "kenshi_x64.exe"))) {
     throw "Kenshi not found. Pass -KenshiDir 'C:\path\to\Kenshi'."
 }
+$KenshiDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KenshiDir)
 Write-Host "Kenshi install: $KenshiDir"
 
 Test-CoopPrereqs -KenshiDir $KenshiDir -UseSteam $useSteam
 
+Assert-CoopKit -KitDir $kitDir -Metadata $kit
+if (-not $Resume -and -not (Test-Path -LiteralPath (Join-Path $kitDir "save\$save\quick.save"))) { throw 'Complete fixture save required before installation.' }
+$ownedSaveNames = if ($Scenario -ne '') { @($save,'coopresume') } elseif (-not $Resume) { @($save) } else { @() }
+$runState = $null
+$restored = $false
+$failure = $null
+$upnp = $null
+$outDir = Join-Path $kitDir "results_$RunToken"
+$completionFile = Join-Path $kitDir "complete_$RunToken.json"
+if ((Test-Path -LiteralPath $outDir) -or (Test-Path -LiteralPath $completionFile)) { throw 'Run token has already been used.' }
+New-Item -ItemType Directory -Path $outDir | Out-Null
+try {
+$runState = New-CoopRunState -GameDirs @($KenshiDir) -SaveNames $ownedSaveNames -PreserveSaves:($Resume -and $Scenario -eq '')
+Clear-CoopRunEnvironment -State $runState -PreserveCredentials
+Set-CoopPrivateCredentials -Mode host -UseSteam $useSteam -GameDirs @($KenshiDir,$kitDir) -ProfilePath $UdpProfilePath
 # ---- Install mod + save ------------------------------------------------------------
 $modDst = Join-Path $KenshiDir "mods\KenshiCoop"
 New-Item -ItemType Directory -Force -Path $modDst | Out-Null
-Copy-Item -Force (Join-Path $kitDir "mod\*") $modDst
+foreach ($name in @('KenshiCoop.dll','KenshiCoopUI.dll','KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','KenshiCoop.mod','RE_Kenshi.json')) { Copy-Item -LiteralPath (Join-Path "$kitDir\mod" $name) -Destination $modDst -Force }
 Write-Host "Mod installed -> $modDst"
 
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
@@ -239,12 +264,11 @@ $upnp = $null
 $upnpNote = "n/a (steam transport)"
 $publicIp = "(n/a - steam transport)"
 if ($useSteam) {
-    $peerId64 = ConvertTo-SteamId64 $PeerSteamId
     Write-Host ""
     Write-Host "=============== HOST CHECKLIST (STEAM P2P) ==============="
     Write-Host " 1. Steam connects you BY STEAMID - no router setup, no port"
     Write-Host "    forwarding, no public IPs. Keep Steam ONLINE."
-    Write-Host " 2. Peering with the joining player's SteamID: $peerId64"
+    Write-Host " 2. Guests connect using YOUR SteamID; no guest allowlist is required."
     Write-Host " 3. YOUR SteamID is printed after launch - read it to them."
     Write-Host " 4. Leave this window open; the game closes itself when the"
     Write-Host "    test scenario finishes (free play: close the game when done)."
@@ -266,8 +290,8 @@ if ($publicIp -eq "") { $publicIp = "(could not detect - use whatismyip.com)" }
 Write-Host ""
 Write-Host "=================== HOST CHECKLIST ==================="
 if ($null -ne $upnp -and $upnp.Ok) {
-    Write-Host " 1. Router: UPnP mapping added automatically (UDP $Port -> $($upnp.LanIp))."
-    Write-Host "    No router setup needed."
+    Write-Host " 1. Router: compatible UPnP mapping accepted (UDP $Port -> $($upnp.LanIp))."
+    Write-Host "    Only a mapping created by this run is removed at session end."
     if ($upnp.ExternalIp -and $publicIp -match '^\d' -and $upnp.ExternalIp -ne $publicIp) {
         Write-Host "    NOTE: your router reports external IP $($upnp.ExternalIp) but the internet"
         Write-Host "    sees $publicIp - you may be behind a second NAT (carrier-grade NAT)"
@@ -289,49 +313,36 @@ Write-Host ""
 if (-not $NoPrompt) { Read-Host "Press Enter to launch the host" | Out-Null }
 
 # ---- Output + env -----------------------------------------------------------------------
-$stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$outDir = Join-Path $kitDir "results_$stamp"
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+$stamp = $RunToken
 $hostLog = Join-Path $outDir "host.log"
 
+if ($entry) { [void](Set-CoopDiagEnv -Entry $entry) }
+$env:KENSHICOOP_AUTOCONNECT = '1'
 $env:KENSHICOOP_MODE         = "host"
 $env:KENSHICOOP_IP           = "0.0.0.0"
 $env:KENSHICOOP_PORT         = "$Port"
 $env:KENSHICOOP_SAVE         = $save
 $env:KENSHICOOP_LOG          = $hostLog
 $env:KENSHICOOP_SCENARIO     = $Scenario
-$env:KENSHICOOP_SETUP        = ""
-$env:KENSHICOOP_TEST_SECONDS = if ($Scenario -ne "") { "600" }
-                               elseif ($FreePlayMinutes -gt 0) { "$($FreePlayMinutes * 60)" }
-                               else { "0" }
+$env:KENSHICOOP_SETUP        = if ($entry) { $entry.Setup } else { "" }
+$env:KENSHICOOP_TEST_SECONDS = "$seconds"
 $env:KENSHICOOP_FAKE_CLOCK_SKEW_MS = "0"
 # Scenario actions arm when the joining player's stream arrives; generous
 # fallback for a slow internet connect.
-$env:KENSHICOOP_ARM_TIMEOUT_MS = "240000"
+$env:KENSHICOOP_ARM_TIMEOUT_MS = "$($prof.ArmTimeoutMs)"
 if ($useSteam) {
     $env:KENSHICOOP_TRANSPORT  = "steam"
-    $env:KENSHICOOP_STEAM_PEER = "$(ConvertTo-SteamId64 $PeerSteamId)"
+    $env:KENSHICOOP_STEAM_PEER = "0"
 } else {
     $env:KENSHICOOP_TRANSPORT  = "udp"
     $env:KENSHICOOP_STEAM_PEER = "0"
 }
+Set-CoopPrivateCredentials -Mode host -UseSteam $useSteam -GameDirs @($KenshiDir,$kitDir) -ProfilePath $UdpProfilePath
 
-function Wait-ForLogLine {
-    param([string]$File, [string]$Pattern, [int]$TimeoutSec)
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        if (Test-Path $File) {
-            $hit = Select-String -Path $File -Pattern $Pattern -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $hit) { return $true }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    return $false
-}
+$game = $null
 
-try {
     Write-Host "Launching Kenshi as HOST on UDP $Port (save '$save', scenario '$Scenario')"
-    $out = & (Join-Path $kitDir "start_kenshi.ps1") -ExePath (Join-Path $KenshiDir "kenshi_x64.exe") -WorkDir $KenshiDir -TimeoutSec 240 6>&1
+    $out = Start-CoopOwnedGame -State $runState -ScriptDir $kitDir -ExePath (Join-Path $KenshiDir 'kenshi_x64.exe') -WorkDir $KenshiDir -TimeoutSec $prof.StartTimeoutSec
     $out | ForEach-Object { Write-Host "    $_" }
     $gamePid = 0
     $line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -First 1
@@ -339,32 +350,17 @@ try {
     if ($gamePid -eq 0) { throw "Kenshi failed to get past the launcher." }
     Write-Host "Game PID: $gamePid"
 
-    # Confirm RE_Kenshi actually loaded the plugin (its log appears immediately);
-    # otherwise the game is running vanilla and nobody will ever connect.
-    [void](Wait-PluginLoaded -LogPath $hostLog -KenshiDir $KenshiDir -TimeoutSec 120)
+    $game = $runState.Processes[$gamePid]
+    $runDeadline = if ($seconds -gt 0) { Get-CoopRunDeadline -Process $game -Seconds $seconds -StartTimeoutSec $prof.StartTimeoutSec -ArmTimeoutMs $prof.ArmTimeoutMs -KillGraceSec $killGraceSec } else { [DateTime]::MaxValue }
+    if (-not (Wait-CoopOwnedLogLine -Process $game -Deadline $runDeadline -File $hostLog -Pattern '.' -TimeoutSec 120)) { throw 'Owned game did not load the plugin.' }
 
-    # Steam transport: surface this machine's SteamID (plugin logs "[steam] id=")
-    # so the friend can read it to the joining player for their -HostSteamId.
     if ($useSteam) {
-        $deadline = (Get-Date).AddSeconds(120)
-        $myId = $null
-        while ((Get-Date) -lt $deadline -and $null -eq $myId) {
-            if (Test-Path $hostLog) {
-                $hit = Select-String -Path $hostLog -Pattern "\[steam\] id=(\d+)" -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($null -ne $hit) { $myId = $hit.Matches[0].Groups[1].Value }
-            }
-            if ($null -eq $myId) { Start-Sleep -Milliseconds 500 }
-        }
-        Write-Host ""
-        if ($null -ne $myId) {
-            Write-Host ">>> YOUR SteamID: $myId" -ForegroundColor Green
-            Write-Host ">>> The joining player runs: join_session.ps1 -HostSteamId $myId" -ForegroundColor Green
-        } else {
-            Write-Warning "No '[steam] id=' line in host.log - is Steam running and online?"
-        }
+        Show-MySteamId
+        Write-Host 'F2 displays the active native Steam identity/status; share that identity with the joining player.'
+        Write-Warning 'Actual two-account Steam P2P remains unverified; this runner does not certify it.'
     }
 
-    if (Wait-ForLogLine -File $hostLog -Pattern "peer connected" -TimeoutSec 300) {
+    if (Wait-CoopOwnedLogLine -Process $game -Deadline $runDeadline -File $hostLog -Pattern "peer connected" -TimeoutSec 300) {
         Write-Host "JOINING PLAYER CONNECTED."
     } elseif ($useSteam) {
         Write-Warning "No connection after 5 min - check that BOTH Steams are online and the"
@@ -377,38 +373,30 @@ try {
 
     # Screenshot once the scenario is live (best-effort evidence for the results zip).
     if ($Scenario -ne "") {
-        if (Wait-ForLogLine -File $hostLog -Pattern "SCENARIO MEMBER" -TimeoutSec 300) {
-            Start-Sleep -Seconds 2
+        if (Wait-CoopOwnedLogLine -Process $game -Deadline $runDeadline -File $hostLog -Pattern $shotAnchor -TimeoutSec $shotWait) {
             try {
+                if ([DateTime]::UtcNow.AddSeconds($shotDelay) -ge $runDeadline -or $game.HasExited) { throw 'Game/deadline ended before capture.' }
+                Start-Sleep -Seconds $shotDelay
                 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $kitDir "screenshot.ps1") `
-                    -ProcessId $gamePid -Out (Join-Path $outDir "host.png") -Frames 5 -IntervalMs 16
-            } catch {}
+                    -ProcessId $gamePid -ProcessStartTicks ($game.StartTime.ToUniversalTime().Ticks) -Out (Join-Path $outDir "host.png") -Frames 5 -IntervalMs 16
+                if ($LASTEXITCODE -ne 0) { throw 'Screenshot helper failed.' }
+            } catch {
+                if ($shotRequired) { throw }
+                Write-Warning "Screenshot evidence unavailable: $($_.Exception.Message)"
+            }
         }
-        Write-Host "Waiting for the scenario to finish (self-exit; 10 min hard cap) ..."
-        try { Wait-Process -Id $gamePid -Timeout 660 -ErrorAction Stop }
-        catch {
-            Write-Warning "Game did not self-exit; closing it."
-            try { Stop-Process -Id $gamePid -Force -ErrorAction SilentlyContinue } catch {}
-        }
-    } else {
-        Write-Host ""
-        Write-Host "FREE PLAY: play together; close the game window when the session ends."
-        Wait-Process -Id $gamePid -ErrorAction SilentlyContinue
-    }
-} finally {
-    # Don't leave the router mapping open after the session.
-    if ($null -ne $upnp -and $upnp.Ok) {
-        Remove-UpnpMapping -Port $Port
-        Write-Host "UPnP mapping removed."
-    }
 }
+Wait-CoopOwnedExit -Process $game -Deadline $runDeadline
+if (-not (Test-Path -LiteralPath $hostLog) -or -not (Select-String -LiteralPath $hostLog -Pattern 'gameplay started' -Quiet)) { throw 'No current-run gameplay evidence.' }
+if ($requireResult -and (Test-ScenarioResultPass -File $hostLog -Label host -Required $true -Scenario $Scenario) -ne 'PASS') { throw 'Scenario incomplete or failed; exit alone is not success.' }
+if ($shotRequired -and -not (Test-Path -LiteralPath (Join-Path $outDir 'host.png'))) { throw 'Required scenario capture is missing.' }
 
 # ---- Bundle results -----------------------------------------------------------------------
 @"
 role:          host
 kit save:      $save
 scenario:      $Scenario
-transport:     $(if ($useSteam) { "steam (peer $(ConvertTo-SteamId64 $PeerSteamId))" } else { "udp" })
+transport:     $(if ($useSteam) { "steam" } else { "udp" })
 port:          $Port
 public ip:     $publicIp
 upnp:          $upnpNote
@@ -418,10 +406,24 @@ utc offset:    $((Get-TimeZone).BaseUtcOffset)
 run stamp:     $stamp
 "@ | Set-Content (Join-Path $outDir "session_info.txt") -Encoding UTF8
 
-$zip = Join-Path $kitDir "KenshiCoop-results-$stamp.zip"
-Compress-Archive -Path "$outDir\*" -DestinationPath $zip -Force
-Write-Host ""
-Write-Host "==================================================================="
-Write-Host " Results bundled: $zip"
-Write-Host " Send this file back to the joining player."
-Write-Host "==================================================================="
+} catch {
+    $failure = $_
+} finally {
+    try {
+        $engineLog = Join-Path $KenshiDir 'kenshi_info.log'
+        if (Test-Path -LiteralPath $engineLog) { Copy-Item -LiteralPath $engineLog -Destination (Join-Path $outDir 'host_engine.log') }
+    } catch { if (-not $failure) { $failure = $_ } }
+    try { if ($upnp -and ($upnp.Owned -or $upnp.Unresolved)) { Remove-UpnpMapping -Mapping $upnp } }
+    catch { if (-not $failure) { $failure = $_ } }
+    finally { try { Restore-CoopRunState $runState; $restored = $true } catch { $failure = $_ } }
+}
+$zip = Join-Path $kitDir "KenshiCoop-results-$RunToken.zip"
+if (-not $failure) {
+    try { Compress-Archive -Path "$outDir\*" -DestinationPath $zip }
+    catch { $failure = $_ }
+}
+$status = @{ runToken=$RunToken; success=($null -eq $failure); restored=$restored; zip=$(if (-not $failure) { Split-Path -Leaf $zip } else { $null }); error=$(if ($failure) { "$failure" } else { $null }) }
+$status | ConvertTo-Json | Set-Content -LiteralPath "$completionFile.tmp" -Encoding UTF8
+Move-Item -LiteralPath "$completionFile.tmp" -Destination $completionFile
+if ($failure) { throw $failure }
+Write-Host "Results bundled after restoration: $zip"

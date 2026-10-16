@@ -171,7 +171,7 @@ function Test-MarchInPlace {
         # scenario, not here.
         $rlps = 0
         if ($line.Line -match "rlps=(\d+)") { $rlps = [int]$Matches[1] }
-        $idleFrac    = [math]::Round($holdStop / [double]$rest, 4)
+        $idleFrac    = $holdStop / [double]$rest
         $relapseFrac = [math]::Round($rlps / [double]$rest, 4)
         $ok = ($idleFrac -le $MaxIdleFrac)
         $v = if ($ok) { "PASS" } else { "FAIL" }
@@ -211,7 +211,7 @@ function Test-SnapRate {
     $series = @(foreach ($m in $lines) {
         $g = $m.Matches[0].Groups
         [pscustomobject]@{
-            t   = Convert-StampToMs -Groups $g -OffsetMs 0
+            t   = Get-LogTimeMs -Match $m
             sq  = [long]$g[5].Value
             npc = [long]$g[6].Value
         }
@@ -221,7 +221,7 @@ function Test-SnapRate {
     $startIdx = 0
     $om = Select-String -Path $File -Pattern "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[time\] OFFSET .*slew=1\.0" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -ne $om) {
-        $slewT = Convert-StampToMs -Groups $om.Matches[0].Groups -OffsetMs 0
+        $slewT = Get-LogTimeMs -Match $om
         for ($i = 0; $i -lt $series.Count; $i++) {
             if ($series[$i].t -le $slewT) { $startIdx = $i }
         }
@@ -241,7 +241,7 @@ function Test-SnapRate {
     # the correct convergence tool - only PLAYER-SQUAD snaps (the visible
     # rubber banding) gate there. At 1x both classes gate.
     $gated = if ($SquadOnly) { $dSq } else { $dSq + $dNpc }
-    $rate  = [math]::Round($gated / ($winSec / 60.0), 2)
+    $rate  = $gated / ($winSec / 60.0)
     $ok = ($rate -le $MaxPerMin)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     $scope = if ($SquadOnly) { "squad" } else { "squad+npc" }
@@ -401,14 +401,14 @@ function Test-RestFlap {
     $series = @(foreach ($m in $lines) {
         $g = $m.Matches[0].Groups
         [pscustomobject]@{
-            t = Convert-StampToMs -Groups $g -OffsetMs 0
+            t = Get-LogTimeMs -Match $m
             n = [long]$g[5].Value
         }
     })
     $startIdx = 0
     $om = Select-String -Path $File -Pattern "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[time\] OFFSET .*slew=1\.0" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -ne $om) {
-        $slewT = Convert-StampToMs -Groups $om.Matches[0].Groups -OffsetMs 0
+        $slewT = Get-LogTimeMs -Match $om
         for ($i = 0; $i -lt $series.Count; $i++) {
             if ($series[$i].t -le $slewT) { $startIdx = $i }
         }
@@ -422,7 +422,7 @@ function Test-RestFlap {
                     -Metrics @{ windowSec = $winSec } -Detail "window too short")
     }
     $flips = $last.n - $base.n
-    $rate  = [math]::Round($flips / ($winSec / 60.0), 2)
+    $rate  = $flips / ($winSec / 60.0)
     $ok = ($rate -le $MaxPerMin)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  [$Label] rest-flap $v - $flips walk->rest flip(s) over $([math]::Round($winSec,0))s = $rate/min (<= $MaxPerMin/min)"
@@ -479,7 +479,7 @@ function Test-ExistenceParity {
                     -Metrics @{ samples = $samples.Count } -Detail "too few fresh audit samples")
     }
     $withGhost = @($samples | Where-Object { $_.ghost -gt 0 }).Count
-    $frac = [math]::Round($withGhost / $samples.Count, 3)
+    $frac = $withGhost / $samples.Count
     $maxGhost = ($samples | Measure-Object -Property ghost -Maximum).Maximum
     # Longest consecutive run of ghost>0 samples = persistence signal
     # (5 s cadence, so a run of 4 means >= ~15 s of unjudged join-only NPCs).
@@ -518,24 +518,19 @@ function Get-WnpcRows {
     $rows = New-Object System.Collections.ArrayList
     if (-not (Test-Path $File)) { return $rows }
     $off = Get-LogClockOffsetMs -File $File
-    # hand5 keeps the WHOLE emitted tuple (index,serial,type,container,
-    # containerSerial). 'hand' stays index,serial because every existing caller
-    # pairs on it, but index,serial alone is a weak cross-client key for MINTED
-    # bodies - two engines allocate independently, so the same pair can name two
-    # different bodies. Callers that need identity rather than a pairing hint
-    # (dual_drive's roster signal) match on hand5.
+    # Roster identity is the entire emitted index,serial,type,container,
+    # containerSerial tuple. Independent bodies may share the short pair.
     $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO WNPC hand=(\d+),(\d+),(\d+),(\d+),(\d+) pos=([\-\d\.,]+) cls=(\w+) name='([^']*)'(?: task=(\d+) pelvis=(-?[\d\.]+) mv=(-?\d+)(?: carry=(-?\d+))?)?"
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
-        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+        $t = Get-LogTimeMs -Match $m
         $p = $g[10].Value.Split(',') | ForEach-Object { [double]$_ }
         $task = -1; $pelvis = -1.0; $mv = -1; $carry = -1
         if ($g[13].Success) { $task = [int]$g[13].Value }
         if ($g[14].Success) { $pelvis = [double]$g[14].Value }
         if ($g[15].Success) { $mv = [int]$g[15].Value }
         if ($g[16].Success) { $carry = [int]$g[16].Value }
-        [void]$rows.Add(@{ t = $t; hand = "$($g[5].Value),$($g[6].Value)"
-                           hand5 = "$($g[5].Value),$($g[6].Value),$($g[7].Value),$($g[8].Value),$($g[9].Value)"
+        [void]$rows.Add(@{ t = $t; hand = "$($g[5].Value),$($g[6].Value),$($g[7].Value),$($g[8].Value),$($g[9].Value)"
                            pos = $p; cls = $g[11].Value; name = $g[12].Value
                            task = $task; pelvis = $pelvis; mv = $mv; carry = $carry })
     }
@@ -551,11 +546,14 @@ function Get-WorldRows {
     param([string]$File)
     $rows = New-Object System.Collections.ArrayList
     if (-not (Test-Path $File)) { return $rows }
-    $off = Get-LogClockOffsetMs -File $File
-    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO WORLD n=(\d+) cls=(\w+)(?: drv=\d+ cen=\d+ hid=\d+ ghost=(\d+))?"
-    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
-        $g = $m.Matches[0].Groups
-        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO WORLD n=(\d+)(?: cls=(\w+))?(?: drv=\d+ cen=\d+ hid=\d+ ghost=(\d+))?(?: |$)"
+    foreach ($m in (Select-String -Path $File -Pattern 'SCENARIO WORLD n=' -Encoding UTF8)) {
+        $record = [regex]::Match($m.Line, $pat)
+        if (-not $record.Success -or ([int]$record.Groups[5].Value -gt 0 -and -not $record.Groups[6].Success)) {
+            throw "Malformed world roster header at ${File}:$($m.LineNumber)"
+        }
+        $g = $record.Groups
+        $t = Get-LogTimeMs -Match $m
         $ghost = 0
         if ($g[7].Success) { $ghost = [int]$g[7].Value }
         [void]$rows.Add(@{ t = $t; n = [int]$g[5].Value; cls = $g[6].Value; ghost = $ghost })
@@ -609,7 +607,6 @@ function Test-FollowTravel {
         $d = [math]::Sqrt($dx * $dx + $dz * $dz)
         if ($d -gt $travel) { $travel = $d }
     }
-    $travel = [math]::Round($travel, 1)
     # Host follow quality from the FOLLOW series.
     $gaps = New-Object System.Collections.ArrayList
     $t0 = $null
@@ -618,7 +615,7 @@ function Test-FollowTravel {
         $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO FOLLOW self=[\-\d\.,]+ peer=[\-\d\.,]+ gap=([\d\.]+)"
         foreach ($m in (Select-String -Path $HostFile -Pattern $pat -ErrorAction SilentlyContinue)) {
             $g = $m.Matches[0].Groups
-            $t = Convert-StampToMs -Groups $g -OffsetMs $off
+            $t = Get-LogTimeMs -Match $m
             if ($null -eq $t0) { $t0 = $t }
             if (($t - $t0) -lt $GraceMs) { continue } # follow spin-up
             [void]$gaps.Add([double]$g[5].Value)
@@ -631,7 +628,7 @@ function Test-FollowTravel {
                     -Detail "too few FOLLOW samples")
     }
     $sorted = @($gaps | Sort-Object)
-    $median = [math]::Round($sorted[[int]($sorted.Count / 2)], 1)
+    $median = [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
     # Lag runs: consecutive samples above $LagGap. A hop legitimately opens a
     # ~4000 u gap; the host's teleport catch-up must close it within
     # $MaxLagRun samples (~seconds) or the follow is not actually holding.
@@ -673,10 +670,10 @@ function Test-TravelParity {
     # a WORLD row is emitted even for an EMPTY dump (n=0), and the hop corridor
     # is mostly wilderness - an empty join dump aligned with an empty host dump
     # is a perfectly judged parity sample (nothing there on either side).
-    $joinWorld = Get-WorldRows -File $JoinFile | Where-Object { $_.cls -ne "host" }
-    $hostWorld = Get-WorldRows -File $HostFile | Where-Object { $_.cls -eq "host" }
-    $joinRows  = Get-WnpcRows -File $JoinFile
-    $hostRows  = Get-WnpcRows -File $HostFile
+    $joinWorld = @(Get-WorldRows -File $JoinFile | Where-Object { $_.cls -ne "host" })
+    $hostWorld = @(Get-WorldRows -File $HostFile | Where-Object { $_.cls -eq "host" })
+    $joinRows  = @(Get-WnpcRows -File $JoinFile)
+    $hostRows  = @(Get-WnpcRows -File $HostFile)
     # Join leader position over time (for the hostOnly range limit): the join's
     # MEMBER hand with the most samples is the traveling mover.
     $mem = Get-ScenarioSeries -File $JoinFile -Kind "MEMBER"
@@ -739,7 +736,7 @@ function Test-TravelParity {
         return (Add-GateResult -Name "travel_parity" -Status SKIP `
                     -Metrics @{ judged = $used } -Detail "too few aligned dumps")
     }
-    $frac = [math]::Round($ghostSamples / $used, 3)
+    $frac = $ghostSamples / $used
     $ok = ($frac -le $MaxGhostFrac) -and ($maxRun -le $MaxGhostRun)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  travel-parity $v - ghosts in $ghostSamples/$used samples (frac=$frac <= $MaxGhostFrac), longest run $maxRun (<= $MaxGhostRun), peak=$peakGhost; trueGhost=$trueGhosts laggard=$laggards diverged=$diverged hostOnly=$hostOnly"
@@ -793,7 +790,7 @@ function Test-SplitFar {
             $g = $m.Matches[0].Groups
             $ph = if ($g[14].Success) { $g[14].Value } else { "own" }
             [void]$rows.Add(@{
-                t = (Convert-StampToMs -Groups $g -OffsetMs $off)
+                t = (Get-LogTimeMs -Match $m)
                 side = $g[5].Value; hop = [int]$g[6].Value
                 sep = [double]$g[7].Value
                 popMover = [int]$g[8].Value; popStay = [int]$g[9].Value
@@ -855,7 +852,7 @@ function Test-SplitFar {
     $hostStay  = Get-Med @($hw | ForEach-Object { $_.popStay })
     $blind     = @($hw | Where-Object { $_.zMover -eq 0 }).Count
     $blindFrac = [Math]::Round($blind / $hw.Count, 3)
-    $seeFrac   = if ($joinPop -gt 0) { [Math]::Round($hostPop / $joinPop, 3) } else { 0.0 }
+    $seeFrac   = if ($joinPop -gt 0) { $hostPop / $joinPop } else { 0.0 }
 
     $ok = ($seeFrac -ge $MinSeeFrac)
     $v = if ($ok) { "PASS" } else { "FAIL" }
@@ -965,7 +962,7 @@ function Test-SplitFar2 {
         foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
             $g = $m.Matches[0].Groups
             [void]$rows.Add(@{
-                t = (Convert-StampToMs -Groups $g -OffsetMs $off)
+                t = (Get-LogTimeMs -Match $m)
                 side = $g[5].Value; phase = $g[6].Value; sep = [double]$g[7].Value
                 hostCellOk = [int]$g[8].Value
                 hostCell = "$($g[9].Value),$($g[10].Value)"
@@ -994,7 +991,7 @@ function Test-SplitFar2 {
         $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[cell\] MAP cells=(\d+) slots=(\d+)(.*)$"
         foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
             $g = $m.Matches[0].Groups
-            if ((Convert-StampToMs -Groups $g -OffsetMs $off) -gt $BeforeMs) { continue }
+            if ((Get-LogTimeMs -Match $m) -gt $BeforeMs) { continue }
             $n++
             $cur = @{}
             foreach ($p in ([regex]::Matches($g[7].Value, "(-?\d+),(-?\d+)=(\d+)"))) {
@@ -1012,7 +1009,7 @@ function Test-SplitFar2 {
                "hid=\+(\d+) culled=\+(\d+) minted=([+-]?\d+)"
         foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
             $g = $m.Matches[0].Groups
-            [void]$ev.Add(@{ t = (Convert-StampToMs -Groups $g -OffsetMs $off)
+            [void]$ev.Add(@{ t = (Get-LogTimeMs -Match $m)
                              bodies = [int]$g[5].Value; hid = [int]$g[6].Value
                              culled = [int]$g[7].Value; minted = [int]$g[8].Value })
         }
@@ -1239,8 +1236,8 @@ function Test-DualDrive {
     # cases that matter most. The container half of the hand carries identity
     # without assuming anything about where the body ended up.
     function Get-DrvBothRuns([string]$HostF, [string]$JoinF, [int]$WinMs) {
-        $hostSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $HostF)
-        $joinSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $JoinF)
+        $hostSamples = @(Group-WnpcSamples -Rows (Get-WnpcRows -File $HostF))
+        $joinSamples = @(Group-WnpcSamples -Rows (Get-WnpcRows -File $JoinF))
         $paired = New-Object System.Collections.ArrayList
         foreach ($hsamp in $hostSamples) {
             $jsamp = $null
@@ -1251,12 +1248,12 @@ function Test-DualDrive {
             }
             if ($null -eq $jsamp) { continue }
             $hDrv = @{}
-            foreach ($row in $hsamp.rows) { if ($row.cls -eq 'drv') { $hDrv[$row.hand5] = $row } }
+            foreach ($row in $hsamp.rows) { if ($row.cls -eq 'drv') { $hDrv[$row.hand] = $row } }
             $both = @{}
             foreach ($row in $jsamp.rows) {
                 if ($row.cls -ne 'drv') { continue }
-                if (-not $hDrv.ContainsKey($row.hand5)) { continue }
-                $both[$row.hand5] = $row.name
+                if (-not $hDrv.ContainsKey($row.hand)) { continue }
+                $both[$row.hand] = $row.name
             }
             [void]$paired.Add(@{ t = $hsamp.t; both = $both })
         }
@@ -1291,7 +1288,7 @@ function Test-DualDrive {
             $g = $m.Matches[0].Groups
             $h = $g[5].Value
             if (-not $s.ContainsKey($h)) { $s[$h] = New-Object System.Collections.ArrayList }
-            [void]$s[$h].Add((Convert-StampToMs -Groups $g -OffsetMs $off))
+            [void]$s[$h].Add((Get-LogTimeMs -Match $m))
         }
         return $s
     }
@@ -1438,7 +1435,7 @@ function Get-Median {
     param($Values)
     $s = @($Values | Sort-Object)
     if ($s.Count -eq 0) { return -1.0 }
-    if ($s.Count % 2 -eq 1) { return [double]$s[[int]($s.Count / 2)] }
+    if ($s.Count % 2 -eq 1) { return [double]$s[[int][Math]::Floor($s.Count / 2)] }
     return (([double]$s[$s.Count / 2 - 1] + [double]$s[$s.Count / 2]) / 2.0)
 }
 
@@ -1473,10 +1470,10 @@ function Test-WorldParity {
           [double]$MoverAllow = 100.0, [int]$PcMinRest = 3,
           [int]$WinMs = 6000, [int]$MinSamples = 6, [int]$GraceMs = 45000,
           [int]$TailGraceMs = 1000)
-    $hostAll = Get-WnpcRows -File $HostFile
-    $joinAll = Get-WnpcRows -File $JoinFile
-    $hostSamples = Group-WnpcSamples -Rows $hostAll
-    $joinSamples = Group-WnpcSamples -Rows $joinAll
+    $hostAll = @(Get-WnpcRows -File $HostFile)
+    $joinAll = @(Get-WnpcRows -File $JoinFile)
+    $hostSamples = @(Group-WnpcSamples -Rows $hostAll)
+    $joinSamples = @(Group-WnpcSamples -Rows $joinAll)
     if ($hostSamples.Count -lt $MinSamples -or $joinSamples.Count -lt $MinSamples) {
         Write-Host "  world-parity SKIP - $($hostSamples.Count) host / $($joinSamples.Count) join dump sample(s)"
         return (Add-GateResult -Name "world_parity" -Status SKIP `
@@ -1658,12 +1655,12 @@ function Test-WorldParity {
         $med = -1.0; $bound = $PcTol
         $restN = $pcDists[$h].Count
         if ($restN -ge $PcMinRest) {
-            $med = [math]::Round((Get-Median -Values $pcDists[$h]), 1)
+            $med = Get-Median -Values $pcDists[$h]
         } elseif ($pcDistsAll[$h].Count -gt 0) {
             # Never at rest (e.g. a chained PC streams mv=1 continuously), or
             # too few rest pairs to form a median: judge all pairs with the
             # mover misalignment allowance.
-            $med = [math]::Round((Get-Median -Values $pcDistsAll[$h]), 1)
+            $med = Get-Median -Values $pcDistsAll[$h]
             $bound = $PcTol + $MoverAllow
         }
         if ($med -gt $pcWorst) { $pcWorst = $med }
@@ -1673,12 +1670,12 @@ function Test-WorldParity {
     }
     $pcOk = ($pcJudged -ge 1 -and $pcBad.Count -eq 0)
     # Near/census verdicts.
-    $nearExist = if ($nearTotal -gt 0) { [math]::Round($nearHave / $nearTotal, 3) } else { -1 }
-    $nearPosR  = if ($nearPosPairs -gt 0) { [math]::Round($nearPosOk / $nearPosPairs, 3) } else { -1 }
-    $taskR     = if ($taskPairs -gt 0) { [math]::Round($taskMatch / $taskPairs, 3) } else { -1 }
-    $combatR   = if ($combatPairs -gt 0) { [math]::Round($combatMatch / $combatPairs, 3) } else { -1 }
-    $cenExist  = if ($cenTotal -gt 0) { [math]::Round($cenHave / $cenTotal, 3) } else { -1 }
-    $cenPosR   = if ($cenPosPairs -gt 0) { [math]::Round($cenPosOk / $cenPosPairs, 3) } else { -1 }
+    $nearExist = if ($nearTotal -gt 0) { $nearHave / $nearTotal } else { -1 }
+    $nearPosR  = if ($nearPosPairs -gt 0) { $nearPosOk / $nearPosPairs } else { -1 }
+    $taskR     = if ($taskPairs -gt 0) { $taskMatch / $taskPairs } else { -1 }
+    $combatR   = if ($combatPairs -gt 0) { $combatMatch / $combatPairs } else { -1 }
+    $cenExist  = if ($cenTotal -gt 0) { $cenHave / $cenTotal } else { -1 }
+    $cenPosR   = if ($cenPosPairs -gt 0) { $cenPosOk / $cenPosPairs } else { -1 }
     $nearOk = ($nearTotal -eq 0) -or
               (($nearExist -ge $NearExistMin) -and
                ($nearPosPairs -lt 10 -or $nearPosR -ge $PosOkMin) -and
@@ -1791,7 +1788,7 @@ function Test-AntiZombie {
         return (Add-GateResult -Name "anti_zombie" -Status SKIP `
                     -Metrics @{ judged = $judged } -Detail "too few moving-NPC windows")
     }
-    $frac = [math]::Round($zombies / $judged, 3)
+    $frac = $zombies / $judged
     $ok = ($frac -le $MaxZombieFrac)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  anti-zombie $v - $zombies/$judged moving-NPC windows frozen on the join (frac=$frac <= $MaxZombieFrac; $($zombieHands.Count) distinct hand(s))"
@@ -1891,9 +1888,9 @@ function Test-MintDistance {
                     -Detail "too few census mints")
     }
     $near = @($cen | Where-Object { $_ -lt $NearDist }).Count
-    $frac = [math]::Round($near / $cen.Count, 3)
+    $frac = $near / $cen.Count
     $sorted = @($cen | Sort-Object)
-    $median = [math]::Round($sorted[[int]($sorted.Count / 2)], 0)
+    $median = [math]::Round($sorted[[int][Math]::Floor($sorted.Count / 2)], 0)
     $minD   = [math]::Round($sorted[0], 0)
     $ok = ($frac -le $MaxNearFrac)
     $v = if ($ok) { "PASS" } else { "FAIL" }
@@ -2200,7 +2197,7 @@ function Get-TownMedian {
     param([double[]]$Values)
     if ($Values.Count -eq 0) { return -1.0 }
     $s = @($Values | Sort-Object)
-    return [double]$s[[int]($s.Count / 2)]
+    return [double]$s[[int][Math]::Floor($s.Count / 2)]
 }
 
 # town_arrive (PRIMARY): did both squads actually WALK into a POPULATED town?
@@ -2526,8 +2523,8 @@ function Test-PcDuplicates {
           [int]$MinSamples = 6, [int]$WinMs = 6000,
           [int]$GraceMs = 45000, [int]$TailGraceMs = 1000,
           [int]$MaxParityBad = 1, [double]$StackFracMax = 1.0)
-    $hostSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $HostFile)
-    $joinSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $JoinFile)
+    $hostSamples = @(Group-WnpcSamples -Rows (Get-WnpcRows -File $HostFile))
+    $joinSamples = @(Group-WnpcSamples -Rows (Get-WnpcRows -File $JoinFile))
     if ($hostSamples.Count -lt $MinSamples -or $joinSamples.Count -lt $MinSamples) {
         Write-Host "  pc-dupes SKIP - $($hostSamples.Count) host / $($joinSamples.Count) join dump sample(s)"
         return (Add-GateResult -Name "pc_dupes" -Status SKIP `

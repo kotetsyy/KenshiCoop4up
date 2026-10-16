@@ -23,6 +23,7 @@ function Get-PanelConnects {
     foreach ($m in @(Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
         $out += @{
+            line      = $m.LineNumber
             role      = $g[1].Value
             transport = $g[2].Value
             peer      = $g[3].Value
@@ -41,7 +42,7 @@ function Get-PanelIntents {
     $pat = '\[coop-ui\] CONNECT role=(HOST|JOIN) transport=(steam|udp)'
     foreach ($m in @(Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
-        $out += @{ role = $g[1].Value; transport = $g[2].Value }
+        $out += @{ role = $g[1].Value; transport = $g[2].Value; line = $m.LineNumber }
     }
     return $out
 }
@@ -58,9 +59,9 @@ function Test-PanelConfig {
     $intents  = @(Get-PanelIntents  -File $File)
 
     if ($connects.Count -eq 0) {
-        return (Add-GateResult -Name $GateName -Status SKIP `
-            -Metrics @{ connects = 0; intents = $intents.Count } `
-            -Detail "no '[coop-ui] connect:' lines (panel not used or pre-fix build)")
+        return (Add-GateResult -Name $GateName -Status $(if ($intents.Count) { 'FAIL' } else { 'SKIP' }) `
+            -Metrics @{ connects = 0; intents = $intents.Count; roleSourced = 0; problems = $intents.Count } `
+            -Detail $(if ($intents.Count) { 'panel connect attempted but never resolved' } else { 'panel not used' }))
     }
 
     $problems = @()
@@ -75,17 +76,14 @@ function Test-PanelConfig {
         }
     }
 
-    # Passthrough: each panel-intent (role,transport) must appear among resolved
-    # connects (proves the toggle selections reached coopUiConnect). Compared as
-    # multisets so repeated connects are allowed.
-    $resolvedKeys = @{}
-    foreach ($c in $connects) { $k = "$($c.role)/$($c.transport)"; $resolvedKeys[$k] = ($resolvedKeys[$k] + 1) }
-    foreach ($i in $intents) {
-        $k = "$($i.role)/$($i.transport)"
-        if (-not $resolvedKeys.ContainsKey($k) -or $resolvedKeys[$k] -lt 1) {
-            $problems += "panel intent $k never reached the connect path"
-        } else {
-            $resolvedKeys[$k] = $resolvedKeys[$k] - 1
+    # A resolution must follow its own intent and precede the next attempt.
+    # Older successes cannot satisfy newer failures.
+    for ($n = 0; $n -lt $intents.Count; $n++) {
+        $i = $intents[$n]
+        $end = if ($n + 1 -lt $intents.Count) { $intents[$n + 1].line } else { [int]::MaxValue }
+        $resolved = @($connects | Where-Object { $_.line -gt $i.line -and $_.line -lt $end })
+        if ($resolved.Count -ne 1 -or $resolved[0].role -ne $i.role -or $resolved[0].transport -ne $i.transport) {
+            $problems += "panel intent $($i.role)/$($i.transport) at line $($i.line) has no unique following matching resolution"
         }
     }
 

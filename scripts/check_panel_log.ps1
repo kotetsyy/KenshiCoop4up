@@ -47,8 +47,9 @@ if ($Log.Count -eq 0) {
 
 $anyFail = $false
 $anyJudged = $false
+$anySkip = $false
 foreach ($f in $Log) {
-    if (-not (Test-Path $f)) { Write-Host "  MISSING $f"; continue }
+    if (-not (Test-Path $f)) { Write-Host "  MISSING $f"; $anyFail = $true; continue }
     Reset-GateResults
     Write-Host ""
     Write-Host "== panel check: $f =="
@@ -60,10 +61,11 @@ foreach ($f in $Log) {
                 $m.connects, $m.intents, $m.roleSourced, $m.problems)
     if ($status -eq "FAIL") { $anyFail = $true; $anyJudged = $true }
     elseif ($status -eq "PASS") { $anyJudged = $true }
+    else { $anySkip = $true }
 }
 
 Write-Host ""
 if ($anyFail) { Write-Host "panel check: FAIL"; exit 1 }
-if (-not $anyJudged) { Write-Host "panel check: SKIP (no panel connects found in any log)"; exit 2 }
+if ($anySkip -or -not $anyJudged) { Write-Host "panel check: SKIP (one or more requested logs has no panel proof)"; exit 2 }
 Write-Host "panel check: PASS"
 exit 0

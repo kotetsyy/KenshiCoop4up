@@ -25,13 +25,14 @@ InterpConfig::InterpConfig()
       cadenceDelayK(2.0f), maxCadenceDelayMs(1200) {}
 
 EntityInterp::EntityInterp()
-    : count_(0), head_(0), lastArrival_(0),
+    : count_(0), head_(0), lastArrival_(0), maxIntervalMs_(0),
       avgIntervalMs_(50.0f), jitterMs_(0.0f), lagMs_(0.0f), haveLast_(false),
       lastMode_(SM_NONE), lastDelay_(0) {}
 
 void EntityInterp::clear() {
     count_ = 0; head_ = 0; lastArrival_ = 0;
     avgIntervalMs_ = 50.0f; jitterMs_ = 0.0f; lagMs_ = 0.0f;
+    maxIntervalMs_ = 0;
     haveLast_ = false; lastMode_ = SM_NONE; lastDelay_ = 0;
 }
 
@@ -43,7 +44,7 @@ const EntityInterp::Snap& EntityInterp::at(int i) const {
     return ring_[idx];
 }
 
-void EntityInterp::push(const EntityState& e, unsigned long nowMs, unsigned long arrivalMs) {
+bool EntityInterp::push(const EntityState& e, unsigned long nowMs, unsigned long arrivalMs) {
     // Wire v35 (send-stamped snapshots): a re-sent capture carries the SAME
     // stamp and a reordered datagram an OLDER one - recording either would
     // insert a zero/negative-duration segment that flattens the velocity
@@ -56,8 +57,9 @@ void EntityInterp::push(const EntityState& e, unsigned long nowMs, unsigned long
     if (count_ > 0) {
         long d = (long)(nowMs - at(count_ - 1).t);
         if (d <= 0) {
-            if (d > -250) return; // duplicate / small reorder: drop
+            if (d > -250) return false; // duplicate / small reorder: drop
             count_ = 0; head_ = 0; lastArrival_ = 0; // mapping rebased: restart
+            maxIntervalMs_ = 0;
         }
     }
 
@@ -87,6 +89,9 @@ void EntityInterp::push(const EntityState& e, unsigned long nowMs, unsigned long
     } else if (arrivalMs != 0) {
         lagMs_ *= 0.99f;
     }
+    const unsigned long gap = count_ > 0 ? nowMs - at(count_ - 1).t : 0;
+    const bool evictsMaximum = count_ == CAP &&
+        at(1).t - at(0).t == maxIntervalMs_;
 
     Snap s;
     s.t = nowMs;
@@ -94,16 +99,28 @@ void EntityInterp::push(const EntityState& e, unsigned long nowMs, unsigned long
     ring_[head_] = s;
     head_ = (head_ + 1) % CAP;
     if (count_ < CAP) ++count_;
+    if (gap >= maxIntervalMs_) {
+        maxIntervalMs_ = gap;
+    } else if (evictsMaximum) {
+        maxIntervalMs_ = 0;
+        for (int i = 1; i < count_; ++i) {
+            const unsigned long retainedGap = at(i).t - at(i - 1).t;
+            if (retainedGap > maxIntervalMs_) maxIntervalMs_ = retainedGap;
+        }
+    }
 
     last_ = e;
     haveLast_ = true;
+    return true;
 }
 
 unsigned long EntityInterp::renderDelay(const InterpConfig& cfg) const {
     // One packet interval of cushion plus a couple jitter deviations, plus the
     // path's queueing lag (v35: ring times are send-stamped, so late arrivals
     // no longer show up in the interval stats - lagMs_ carries them), clamped.
-    float d = avgIntervalMs_ + 2.0f * jitterMs_ + lagMs_;
+    float interval = avgIntervalMs_;
+    if ((float)maxIntervalMs_ > interval) interval = (float)maxIntervalMs_;
+    float d = interval + 2.0f * jitterMs_ + lagMs_;
 
     // The ceiling has to scale with the cadence THIS entity is sent at. A flat
     // 200 ms covers the dense near band; the round-robin mid band sends
@@ -119,7 +136,7 @@ unsigned long EntityInterp::renderDelay(const InterpConfig& cfg) const {
     // costs it visible lateness, which is the cheaper of the two errors: nobody
     // reads a wandering Paladin as late, everybody reads it as teleporting.
     float cap = (float)cfg.maxDelayMs;
-    float cadence = avgIntervalMs_ * cfg.cadenceDelayK;
+    float cadence = interval * cfg.cadenceDelayK;
     if (cadence > cap) cap = cadence;
     if (cap > (float)cfg.maxCadenceDelayMs) cap = (float)cfg.maxCadenceDelayMs;
 

@@ -12,8 +12,9 @@
        WANPPPConnection service - pure PowerShell sockets/HTTP, works
        regardless of the Windows network profile.
   No admin rights, no extra binaries; ships in the remote kit as a plain
-  script. Every failure is reported as Ok=$false with a reason (never a
-  throw) so callers fall back to the manual port-forward checklist.
+  script. Acquisition returns Ok/Owned/Unresolved and the original target
+  receipt. Unresolved attempted mutations and owned leases require cleanup;
+  cleanup throws unless absence on that original target is established.
 #>
 
 function Get-LanIPv4 {
@@ -112,121 +113,193 @@ function Invoke-UpnpSoap {
             -Headers @{ "SOAPAction" = "`"$ServiceType#$Action`"" } `
             -Body $body
         return [xml]$resp.Content
-    } catch [System.Net.WebException] {
-        # SOAP faults arrive as HTTP 500 with a UPnPError body.
-        $detail = ""
+    } catch {
+        $failure=$_
+        $detail=$failure.Exception.Message;$code=$null
         try {
-            $stream = $_.Exception.Response.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $errBody = $reader.ReadToEnd()
-            if ($errBody -match "<errorCode>(\d+)</errorCode>") { $detail = "UPnP error $($Matches[1])" }
-            if ($errBody -match "<errorDescription>([^<]+)</errorDescription>") { $detail += " ($($Matches[1]))" }
-        } catch { }
-        if ($detail -eq "") { $detail = $_.Exception.Message }
-        throw "$Action failed: $detail"
+            $response=$failure.Exception.Response
+            if ($response -and $response.PSObject.Methods['GetResponseStream']) {
+                $reader=New-Object IO.StreamReader($response.GetResponseStream())
+                try {$errBody=$reader.ReadToEnd()} finally {$reader.Dispose()}
+            } elseif ($response -and $response.Content) {
+                $errBody=$response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            } else {$errBody=''}
+            if ($errBody) {
+                $fault=[xml]$errBody
+                $errorNode=$fault.SelectSingleNode("//*[local-name()='errorCode']")
+                $descriptionNode=$fault.SelectSingleNode("//*[local-name()='errorDescription']")
+                if ($errorNode) {$code=[int]$errorNode.InnerText;$detail="UPnP error $code"}
+                if ($descriptionNode) {$detail+=" ($($descriptionNode.InnerText))"}
+            }
+        } catch {}
+        $errorObject=New-Object InvalidOperationException("$Action failed: $detail",$failure.Exception)
+        if ($null -ne $code) {$errorObject.Data['UPnPErrorCode']=$code}
+        throw $errorObject
     }
 }
 
 # ---- Public API --------------------------------------------------------------------
 
-function Add-UpnpMapping {
-    # Ask the router (via UPnP/IGD) to forward UDP $Port to this PC.
-    # Returns @{ Ok; ExternalIp; LanIp; Error }. ExternalIp is the address the
-    # IGD itself reports - if it differs from what api.ipify.org sees, the
-    # host is likely behind a second NAT (CGNAT) and the mapping won't help.
-    param(
-        [Parameter(Mandatory = $true)][int]$Port,
-        [string]$Description = "KenshiCoop"
-    )
-    $result = [pscustomobject]@{ Ok = $false; ExternalIp = $null; LanIp = $null; Error = "" }
-    $lanIp = Get-LanIPv4
-    if (-not $lanIp) {
-        $result.Error = "could not determine this PC's LAN IP"
-        return $result
-    }
-    $result.LanIp = $lanIp
-
-    # -- Strategy 1: Windows COM object (fast, but off on Public network profiles) --
+function Get-UpnpSoapMapping {
+    param($Igd,[int]$Port)
+    $args=New-Object Collections.Specialized.OrderedDictionary
+    $args['NewRemoteHost']='';$args['NewExternalPort']=$Port;$args['NewProtocol']='UDP'
     try {
-        $nat = New-Object -ComObject HNetCfg.NATUPnP
-        $col = $nat.StaticPortMappingCollection
-        if ($null -ne $col) {
-            [void]$col.Add($Port, "UDP", $Port, $lanIp, $true, $Description)
-            $check = $col.Item($Port, "UDP")
-            if ($null -ne $check) {
-                $result.Ok = $true
-                try { $result.ExternalIp = $check.ExternalIPAddress } catch {}
-                return $result
-            }
-        }
-    } catch { }
-
-    # -- Strategy 2: direct SSDP discovery + SOAP (network-profile independent) --
-    $igd = Find-UpnpIgd
-    if ($null -eq $igd) {
-        $result.Error = "router did not answer UPnP (it may be disabled in the router settings)"
-        return $result
-    }
-    try {
-        $addArgs = New-Object System.Collections.Specialized.OrderedDictionary
-        $addArgs["NewRemoteHost"]             = ""
-        $addArgs["NewExternalPort"]           = $Port
-        $addArgs["NewProtocol"]               = "UDP"
-        $addArgs["NewInternalPort"]           = $Port
-        $addArgs["NewInternalClient"]         = $lanIp
-        $addArgs["NewEnabled"]                = 1
-        $addArgs["NewPortMappingDescription"] = $Description
-        $addArgs["NewLeaseDuration"]          = 0
-        [void](Invoke-UpnpSoap -ControlUrl $igd.ControlUrl -ServiceType $igd.ServiceType `
-                               -Action "AddPortMapping" -Arguments $addArgs)
-
-        # Verify the router actually kept the mapping.
-        $qryArgs = New-Object System.Collections.Specialized.OrderedDictionary
-        $qryArgs["NewRemoteHost"]   = ""
-        $qryArgs["NewExternalPort"] = $Port
-        $qryArgs["NewProtocol"]     = "UDP"
-        $qry = Invoke-UpnpSoap -ControlUrl $igd.ControlUrl -ServiceType $igd.ServiceType `
-                               -Action "GetSpecificPortMappingEntry" -Arguments $qryArgs
-        $client = $qry.SelectSingleNode("//*[local-name()='NewInternalClient']")
-        if ($null -eq $client -or "$($client.InnerText)" -ne $lanIp) {
-            $result.Error = "router accepted the mapping but it points at '$($client.InnerText)' instead of $lanIp"
-            return $result
-        }
-
-        $result.Ok = $true
-        try {
-            $ext = Invoke-UpnpSoap -ControlUrl $igd.ControlUrl -ServiceType $igd.ServiceType `
-                                   -Action "GetExternalIPAddress" -Arguments $null
-            $node = $ext.SelectSingleNode("//*[local-name()='NewExternalIPAddress']")
-            if ($null -ne $node -and "$($node.InnerText)" -ne "") { $result.ExternalIp = $node.InnerText }
-        } catch { }
-        return $result
+        $query=Invoke-UpnpSoap -ControlUrl $Igd.ControlUrl -ServiceType $Igd.ServiceType -Action 'GetSpecificPortMappingEntry' -Arguments $args
     } catch {
-        $result.Error = "UPnP request failed: $_"
-        return $result
+        if ($_.Exception.Data['UPnPErrorCode'] -eq 714) {return $null}
+        throw
+    }
+    $values=@{}
+    foreach($name in @('NewInternalClient','NewInternalPort','NewEnabled','NewPortMappingDescription')) {
+        $node=$query.SelectSingleNode("//*[local-name()='$name']")
+        if (-not $node) {throw "Incomplete UPnP mapping response: $name"}
+        $values[$name]=$node.InnerText
+    }
+    $enabled = switch ($values.NewEnabled.Trim().ToLowerInvariant()) {
+        { $_ -in @('1','true','yes') } { $true; break }
+        { $_ -in @('0','false','no') } { $false; break }
+        default { throw "Malformed UPnP enabled value: $($values.NewEnabled)" }
+    }
+    return [pscustomobject]@{
+        ExternalPort=$Port;Protocol='UDP';InternalClient=$values.NewInternalClient
+        InternalPort=[int]$values.NewInternalPort;Enabled=$enabled
+        Description=$values.NewPortMappingDescription
     }
 }
 
-function Remove-UpnpMapping {
-    param([Parameter(Mandatory = $true)][int]$Port)
-    # Best effort on both paths; whichever created the mapping can delete it,
-    # and deleting a nonexistent mapping is harmless.
+function Test-UpnpMappingIdentity {
+    param($Entry,$Mapping)
+    return ($null -ne $Entry -and
+        [int]$Entry.ExternalPort -eq [int]$Mapping.Port -and
+        [string]$Entry.Protocol -ieq [string]$Mapping.Protocol -and
+        [string]$Entry.InternalClient -ceq [string]$Mapping.InternalClient -and
+        [int]$Entry.InternalPort -eq [int]$Mapping.InternalPort -and
+        [bool]$Entry.Enabled -and [string]$Entry.Description -ceq [string]$Mapping.Description)
+}
+
+function Add-UpnpMapping {
+    param([Parameter(Mandatory=$true)][ValidateRange(1,65535)][int]$Port,[string]$Description='KenshiCoop')
+    $result=[pscustomobject]@{
+        Ok=$false;Owned=$false;Unresolved=$false;ExternalIp=$null;LanIp=$null;Error=''
+        Port=$Port;Protocol='UDP';InternalPort=$Port;InternalClient=$null
+        Description=("$Description ["+[Guid]::NewGuid().ToString('N')+']')
+        Method='';ControlUrl='';ServiceType='';Collection=$null
+    }
+    $lanIp=Get-LanIPv4
+    if (-not $lanIp) {$result.Error="could not determine this PC's LAN IP";return $result}
+    $result.LanIp=$lanIp;$result.InternalClient=$lanIp
     try {
-        $nat = New-Object -ComObject HNetCfg.NATUPnP
-        $col = $nat.StaticPortMappingCollection
-        if ($null -ne $col) { $col.Remove($Port, "UDP") }
-    } catch {}
-    try {
-        $igd = Find-UpnpIgd
-        if ($null -ne $igd) {
-            $delArgs = New-Object System.Collections.Specialized.OrderedDictionary
-            $delArgs["NewRemoteHost"]   = ""
-            $delArgs["NewExternalPort"] = $Port
-            $delArgs["NewProtocol"]     = "UDP"
-            [void](Invoke-UpnpSoap -ControlUrl $igd.ControlUrl -ServiceType $igd.ServiceType `
-                                   -Action "DeletePortMapping" -Arguments $delArgs)
+        $nat=New-Object -ComObject HNetCfg.NATUPnP
+        $collection=$nat.StaticPortMappingCollection
+        if ($null -ne $collection) {
+            $existing=@($collection | Where-Object {$_.ExternalPort -eq $Port -and $_.Protocol -ieq 'UDP'} | Select-Object -First 1)
+            if ($existing.Count) {
+                $entry=$existing[0]
+                if ($entry.InternalClient -cne $lanIp -or $entry.InternalPort -ne $Port -or -not $entry.Enabled) {
+                    $result.Error='UDP port already maps to a different or disabled destination; not overwritten.'
+                    return $result
+                }
+                $result.Ok=$true;$result.Description=$entry.Description;$result.Method='com'
+                $result.ExternalIp=$entry.ExternalIPAddress
+                return $result
+            }
+            $result.Method='com';$result.Collection=$collection
+            $result.Unresolved=$true
+            [void]$collection.Add($Port,'UDP',$Port,$lanIp,$true,$result.Description)
+            $entry=$collection.Item($Port,'UDP')
+            if (-not (Test-UpnpMappingIdentity $entry $result)) {throw 'Created router mapping could not be verified.'}
+            $result.Owned=$true;$result.Unresolved=$false
+            $result.Ok=$true;$result.ExternalIp=$entry.ExternalIPAddress
+            return $result
         }
-    } catch {}
+    } catch {
+        if ($result.Owned) {$result.Error="UPnP metadata query failed after verified acquisition: $_";return $result}
+        if ($result.Unresolved) {
+            $result.Error="UPnP Add response/verification failed: $_"
+            # Never discover a different router after an attempted mutation.
+            try {
+                $entries=@($result.Collection | Where-Object {$_.ExternalPort -eq $Port -and $_.Protocol -ieq 'UDP'})
+                if (-not $entries.Count) { $result.Unresolved=$false }
+                elseif ($entries.Count -eq 1 -and (Test-UpnpMappingIdentity $entries[0] $result)) {
+                    $result.Owned=$true;$result.Unresolved=$false;$result.Ok=$true
+                    $result.ExternalIp=$entries[0].ExternalIPAddress;$result.Error=''
+                }
+            } catch { $result.Error+="; original-router ownership reconciliation unavailable: $_" }
+            return $result
+        }
+    }
+    $igd=Find-UpnpIgd
+    if ($null -eq $igd) {$result.Error='Router did not answer UPnP discovery.';return $result}
+    $result.Method='soap';$result.ControlUrl=$igd.ControlUrl;$result.ServiceType=$igd.ServiceType
+    try {
+        $existing=Get-UpnpSoapMapping $igd $Port
+        if ($existing) {
+            if ($existing.InternalClient -cne $lanIp -or $existing.InternalPort -ne $Port -or -not $existing.Enabled) {
+                $result.Error='UDP port already maps to a different or disabled destination; not overwritten.'
+                return $result
+            }
+            $result.Description=$existing.Description
+        } else {
+            $args=New-Object Collections.Specialized.OrderedDictionary
+            $args['NewRemoteHost']='';$args['NewExternalPort']=$Port;$args['NewProtocol']='UDP'
+            $args['NewInternalPort']=$Port;$args['NewInternalClient']=$lanIp;$args['NewEnabled']=1
+            $args['NewPortMappingDescription']=$result.Description;$args['NewLeaseDuration']=0
+            $result.Unresolved=$true
+            [void](Invoke-UpnpSoap -ControlUrl $igd.ControlUrl -ServiceType $igd.ServiceType -Action 'AddPortMapping' -Arguments $args)
+            if (-not (Test-UpnpMappingIdentity (Get-UpnpSoapMapping $igd $Port) $result)) {throw 'Created router mapping could not be verified.'}
+            $result.Owned=$true;$result.Unresolved=$false
+        }
+        $result.Ok=$true
+        try {
+            $external=Invoke-UpnpSoap -ControlUrl $igd.ControlUrl -ServiceType $igd.ServiceType -Action 'GetExternalIPAddress' -Arguments $null
+            $node=$external.SelectSingleNode("//*[local-name()='NewExternalIPAddress']")
+            if ($node) {$result.ExternalIp=$node.InnerText}
+        } catch {}
+    } catch {
+        $result.Error="UPnP request failed: $_"
+        if ($result.Unresolved) {
+            try {
+                $entry=Get-UpnpSoapMapping $igd $Port
+                if (-not $entry) { $result.Unresolved=$false }
+                elseif (Test-UpnpMappingIdentity $entry $result) {
+                    $result.Owned=$true;$result.Unresolved=$false;$result.Ok=$true;$result.Error=''
+                }
+            } catch { $result.Error+="; original-router ownership reconciliation unavailable: $_" }
+        }
+    }
+    return $result
+}
+
+function Remove-UpnpMapping {
+    param([Parameter(Mandatory=$true)]$Mapping)
+    if (-not ($Mapping.Owned -or $Mapping.Unresolved)) {return}
+    try {
+        if ($Mapping.Method -eq 'com') {
+            $collection=$Mapping.Collection
+            if ($null -eq $collection) {throw 'The original router mapping collection is unavailable.'}
+            $entries=@($collection | Where-Object {$_.ExternalPort -eq $Mapping.Port -and $_.Protocol -ieq $Mapping.Protocol})
+            if (-not $entries.Count) {$Mapping.Unresolved=$false;return}
+            if ($entries.Count -ne 1 -or -not (Test-UpnpMappingIdentity $entries[0] $Mapping)) {throw 'Mapping changed ownership; it was not removed.'}
+            $collection.Remove($Mapping.Port,$Mapping.Protocol)
+            $remaining=@($collection | Where-Object {$_.ExternalPort -eq $Mapping.Port -and $_.Protocol -ieq $Mapping.Protocol})
+            if ($remaining.Count) {throw 'Original router still reports the mapping after deletion.'}
+        } elseif ($Mapping.Method -eq 'soap') {
+            $igd=@{ControlUrl=$Mapping.ControlUrl;ServiceType=$Mapping.ServiceType}
+            $entry=Get-UpnpSoapMapping $igd $Mapping.Port
+            if (-not $entry) {$Mapping.Unresolved=$false;return}
+            if (-not (Test-UpnpMappingIdentity $entry $Mapping)) {throw 'Mapping changed ownership; it was not removed.'}
+            $args=New-Object Collections.Specialized.OrderedDictionary
+            $args['NewRemoteHost']='';$args['NewExternalPort']=$Mapping.Port;$args['NewProtocol']=$Mapping.Protocol
+            try {
+                [void](Invoke-UpnpSoap -ControlUrl $Mapping.ControlUrl -ServiceType $Mapping.ServiceType -Action 'DeletePortMapping' -Arguments $args)
+            } catch {
+                if ($_.Exception.Data['UPnPErrorCode'] -ne 714) {throw}
+            }
+            if (Get-UpnpSoapMapping $igd $Mapping.Port) {throw 'Original router still reports the mapping after deletion.'}
+        } else {throw 'Unknown mapping ownership method; it was not removed.'}
+        $Mapping.Unresolved=$false
+    } catch {throw "Owned/unresolved UPnP mapping cleanup was not completed on the original router: $_"}
 }
 
 function Test-UpnpHairpin {

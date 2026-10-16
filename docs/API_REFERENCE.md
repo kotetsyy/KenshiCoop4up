@@ -722,8 +722,8 @@ Use that registry rather than a historical two-scenario list.
 
 [`src/netproto/Wire.h`](../src/netproto/Wire.h) — namespace `coop`. Plain C++03,
 little-endian, one-byte-packed structs sent as raw bytes. The handshake checks
-`PROTOCOL_VERSION`: public Release uses **70**; Harness with
-`KENSHICOOP_NET_DIAG` uses **71** and adds bounded reliable join-log chunks.
+`PROTOCOL_VERSION`: unpublished local Release uses **80**; Harness with
+`KENSHICOOP_NET_DIAG` uses **81** and adds bounded reliable join-log chunks.
 Mismatched protocols are rejected; the build/release version is a separate axis.
 
 The live packet set covers owner-tagged entity batches and transition events,
@@ -740,6 +740,50 @@ ACK quantities never include a fabricated source shortfall. Spawn descriptions
 also carry a merchant's five-field `shopHome` handle for binding the native
 shop's furniture inventory, not merely copying NPC pockets.
 
+Complete inventory snapshots are revisioned, digest-checked assemblies of up to
+4096 entries, in frames of at most 64 entries. `parentIdx` names the particular
+container instance; equal bag templates do not make their contents interchangeable.
+Native commerce/extraction intents carry operation IDs and source revisions;
+commerce additionally binds an actor revision and a native price quote. HOST
+verdicts and exact actor checkpoint acknowledgments fence further mutations.
+Checkpoint ACKs and non-transfer operation requests terminate at HOST, never
+relay to unrelated JOINs. Merchant drag selections retain their selected quantity;
+HOST executes native one-unit player trades and acknowledges only conserved
+source/destination units, including a partial result. The full-selection quote
+constrains each native price. Held native cursor state defers reconciliation and
+commerce admission until the physical source baseline is restored. Native drag,
+refusal recovery and nested-bag gameplay still require paired in-game verification.
+
+Procedural scene controls use the selected native provider's reliable gameplay
+lane. `ProceduralObject` is a packed 274-byte descriptor; its control packet is
+312 bytes. World/load/region/epoch fencing, explicit snapshot BEGIN/ROW/END,
+count/digest checks, region retirement and a committed current membership set
+prevent partial or stale snapshots from satisfying readiness. JOIN sends ACK
+only after native object capture matches the authoritative set. Rotation
+comparison normalizes the full quaternion, including equivalent `q`/`-q`;
+yaw alone is insufficient for native beds placed on slopes.
+Scope membership includes only enabled regions, not every native loaded cell.
+After a complete native registry proves no enabled region is loaded, an explicit
+zero-count `PROC_SCOPE_COMMIT` may certify that empty scope; pending retirements
+must be queued first. JOIN local READY also waits for successful commit queuing.
+
+Only positively identified procedural Camp Beds are managed across loaded
+regions. Saved/player-built beds, including beds currently owned by the player
+despite an older procedural birth record, are not deletion candidates. Unknown
+provenance keeps that region incomplete and blocks READY; it must not be
+silently reclassified or omitted to pass an admission test. Native creation
+input provenance is captured before the factory consumes or mutates save state.
+Native deferred creation, complete zone census, occupancy and AI/reference
+safety checks belong to the engine adapter, not packet validation.
+`procedural_beds_outside_lifecycle` extends the Hub full-set/use probes to
+streamed regions; existence of the scenario is not a passing native result.
+
+Loose environment reconciliation remains Harness-only and explicitly opt-in
+(`KENSHICOOP_ENVIRONMENT_ITEMS=1`). Unverified saved ItemGroup provenance is not
+adopted or deleted. Character-owned anchors require authenticated actor bindings;
+pre-READY bootstrap of those bindings remains unverified. This experimental
+path is not a completed fix for all saved-world environment items.
+
 - `u8 packetType(const void* data, unsigned int len)` — First byte/type tag,
   or zero for null/empty input.
 - `template<typename T> bool readPacket(const void* data, unsigned int len, T* out)` — Copy the fixed struct if pointers are non-null and the buffer is at least
@@ -752,31 +796,81 @@ historical packet table, define the precise packet shapes.
 ## 11. `NetLink`
 
 [`src/plugin/net/NetLink.h`](../src/plugin/net/NetLink.h) — namespace `coop`.
-Owns ENet on a dedicated background thread; the game thread never touches
-`ENetHost`. Inbound messages cross through `Inbound`; the main thread publishes
-owned state and queues reliable events under locks.
+Owns only the selected real `KenshiCoopNetSteam.dll` or `KenshiCoopNetUDP.dll`
+through `src/transport/TransportApi.h` ABI1 on a dedicated worker. There is no
+ENet shim or fallback. Inbound carries owned validated messages to the game.
 
-- `bool startHost(int port, Inbound* inbound, NetTransport transport)`
-  / `bool startClient(const std::string& ip, int port, Inbound* inbound, NetTransport transport)` — Stop/reap any previous worker and launch a new one.
-  True means **launch accepted**, not listening/connected: transport opening and
-  handshake are asynchronous. Steam requires the tunnel to be initialized and
-  its peers set; UDP uses plain ENet UDP.
-- `void stop()` — Stop/reap the worker and reset lifecycle status to `NET_IDLE`.
-- `void copyStatus(NetStatus* out) const` — Coherent lifecycle facts: role,
-  requested vs active transport, phase, error, handshake count and accepted
-  membership mask. Raw ENet peer counts are not the accepted player roster.
-- `void setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int count)` — Copy the latest owned-entity snapshot for retransmission; zero publishes nothing.
-- `void queueEvent(const EventPacket& ev)` — Copy a reliable one-shot transition;
-  the network thread drains/sends it next tick.
-- `bool isRunning() const` — Worker-running flag, not transport/world readiness.
-- `u32 localId() const` — Host id zero, or the join's id assigned by WELCOME.
-- `void copyDebugStats(NetDebugStats* out) const` — Coherent traffic sample,
-  zeroed when stopped. ENet payload counters are sampled about once per second
-  in every build; diagnostic log streaming is separate and Harness-only.
+- `bool start(const NetStartOptions&, Inbound*)` — Stop/reap the previous worker
+  and asynchronously start the selected provider. Options contain role,
+  transport, numeric UDP endpoint/port, remote SteamID64, up to three allowed
+  guest SteamID64s, private UDP host profile path or join invitation. True means
+  **launch accepted**, not native admission, gameplay handshake or world READY.
+- `void pumpMainThread()` — Steam provider callback pump on the main game thread
+  only, outside GUI/scenario/title/loading early-return gates; UDP does not pump Steam.
+- `bool queueAllowSteamPeer(u64 sessionGeneration, u64 steamId)` — Generation-fenced
+  host admission command. Queueing is not success; inspect `admissionResult`.
+- `bool queueMakeUdpInvite(u64 sessionGeneration, u32 requestId)` and
+  `bool copyUdpInvite(u64 sessionGeneration, u32 requestId, char*, unsigned) const`
+  — Explicit generation/request-fenced invitation generation/copy; never status/log secret.
+- `void stop()` — Stop/reap/reset lifecycle and wipe ephemeral invitations.
+- `void copyStatus(NetStatus*) const` — Coherent transport/lifecycle/membership,
+  session generation, Steam identity/auth/relay and actual admission/invite
+  request/result facts. Raw native connections are not accepted gameplay players.
+- `void setOwnedEntities(u32, const EntityState*, unsigned)` — Locked snapshot publication.
+- `void queueEvent(const EventPacket&)` — Reliable one-shot publication.
+- `bool isRunning() const`, `u32 localId() const` — Worker state/assigned player ID,
+  not world readiness.
+- `void copyDebugStats(NetDebugStats*) const` — Per-lane pending reliable/state/bulk
+  and unacknowledged reliable bytes; stop resets facts, missing metrics stay unknown.
+
+GAME_RELIABLE, GAME_STATE and SAVE_BULK are independent native lanes. Reliable
+control has higher priority; state and bulk share the next priority with weights
+2:1, so continuous 100 Hz state cannot starve a save. State admission returns
+BACKPRESSURE before message allocation/copy when its native lane queue estimate
+reaches 200 ms; the core uses the next capture and rotates the first entity batch
+each tick so a congested link cannot permanently starve tail entities.
+Provider BACKPRESSURE retains reliable per-recipient progress/FIFO; bounded
+reliable exhaustion is an explicit failure, never silent event loss.
+Connection/session incarnation, accepted origin and host-coordinated world token
+fence messages before dispatch/relay and after simulated delay. Entity/stream
+chronology is not a single global unreliable sequence. LOAD_GO/READY still
+refer to the specific completed world load, not merely native connection.
+NPC census is bidirectional under presence authority: each authenticated owner
+may publish its own census, and the host relays guest census with the original
+owner intact. An empty census clears that owner's prior existence claim; it is
+not a protocol error. Owner/origin equality, reliable lane, exact row lengths,
+bounded count and finite positions remain mandatory.
 
 The header also declares the domain-specific reliable queue methods for
 inventory, world items, save/load and other replicated state. Their full
 signatures and ordering contracts live there.
+
+### Updater and distribution
+
+`net/UpdatePackage.h/.cpp` is the production schema parser and four-image disk
+transaction used by Updater and disposable `updater_tests.exe`. Schema2/ABI2
+requires all core/UI/Steam/UDP hashes and exact fixed release URLs; legacy
+`sha256`/`url`, duplicate/unknown keys and malformed version/hash/URL reject
+before fetch/mutation. Same-version checks compare all four. Flushed/rehashed
+stages precede a durable journal, checked promotion/rollback and verified
+next-launch cleanup. Incomplete rollback preserves backups and reports failure.
+Harness/Debug update `start` is unconditionally disabled.
+
+`net/RuntimeImages.h` owns one core-wide Win32 lifecycle gate. UI/provider loads
+and session starts take `RuntimeImageLoadGuard`; the first UI attempt (including
+failure or intentional omission) settles the updater prerequisite. The apply
+guard waits without holding the lock, then fences new loads before the first
+rename and owns the entire transaction. Success/unresolved recovery requires
+restart; only verified complete rollback reopens loads. Already mapped UI and
+active providers remain usable. Native mapped-PE race and isolated lifecycle/
+rollback fixtures exercise this without launching Kenshi.
+
+The first native upgrade uses the full exact six-file kit, preserving local
+config/saves/credentials. RE_Kenshi JSON loads only the core. Core/UI source
+receipts and native logical-configuration/source/hash receipts prevent stale or
+installed/newest fallback. `publish_release.ps1 -Local/-WhatIf` is non-mutating;
+the existing stable feed and release notes remain protected.
+
 
 ## 12. `Inbound`
 
@@ -1005,7 +1099,7 @@ in-game input; OIS is the lower layer beneath it.
 
 ## 16. Native UI companion C ABI
 
-[`src/ui/CoopUiApi.h`](../src/ui/CoopUiApi.h) is a Windows x64 POD C contract, API version 1, with
+[`src/ui/CoopUiApi.h`](../src/ui/CoopUiApi.h) is a Windows x64 POD C contract, API version 2, with
 explicit 8-byte packing and `__cdecl`. No STL, engine pointers, ownership
 transfer or network hooks cross this boundary.
 
@@ -1017,9 +1111,14 @@ transfer or network hooks cross this boundary.
   rows. Borrowed strings are valid during `tick` only; retained text is copied.
   Player membership is independent of whether a nickname has arrived. Unknown
   world readiness is not treated as ready.
-- `CoopUiCommand` returns at most one `NONE`, `REMEMBER`, `CONNECT` or
-  `DISCONNECT`, with bounded POD settings. Widget callbacks only queue actions;
-  `Plugin.cpp::coopPanelDrive` executes them after UI tick, on the main thread.
+- `CoopUiCommand` returns at most one `NONE`, `REMEMBER`, `CONNECT`, `DISCONNECT`,
+  `ALLOW_STEAM_PEER` or `MAKE_UDP_INVITE`. Commands carry session generation,
+  admission SteamID64/request ID and ephemeral UDP invitation; Settings retain
+  ordinary endpoint/role/nick and up to three allowed SteamID64s, never credentials.
+  Widget callbacks only queue POD actions; core executes after tick on main thread.
+  Snapshot results expose completed admission/invite facts. Borrowed `udpInvite`
+  is present only for matching explicit successful request and copied ephemerally
+  into masked UI storage. Reports/logs/remembered Settings never receive secrets.
   Live sessions reject a new CONNECT and changes to role/transport/endpoint.
 - `shutdown` hides the UI and blocks later ticks; it never disconnects or
   destroys the native widget hierarchy.

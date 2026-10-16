@@ -4,12 +4,9 @@
   live Kenshi save folder (%LOCALAPPDATA%\kenshi\save\<name>) before a test run.
 
 .DESCRIPTION
-  Both the host and Kenshi-Join installs load saves from the SAME per-user folder.
-  During a co-op session the host connect-push bakes the live world over the loaded
-  save and the join stream-commits into it, so a validation fixture drifts across
-  runs. This script mirrors the repo's pristine copy over the AppData copy so every
-  run starts from a known-good state; the game only ever mutates the AppData copy,
-  which this discards on the next restore.
+  Restores into the explicitly selected -SaveRoot (AppData by default). Runners
+  must pass each installation's configured root. Each save is staged, hashed and
+  atomically replaced; staging failures leave the previous save untouched.
 
   Uses robocopy /MIR, so the destination becomes an EXACT copy of the repo fixture
   (stale drift files are removed). Debug saves that have no repo fixture are skipped.
@@ -38,6 +35,13 @@ $ErrorActionPreference = "Stop"
 $scriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot    = Split-Path -Parent $scriptDir
 $fixturesDir = Join-Path $repoRoot "fixtures\saves"
+. (Join-Path $scriptDir 'capture_save.ps1')
+$SaveRoot=Get-CoopSaveFullPath $SaveRoot
+$fixturesDir=Get-CoopSaveFullPath $fixturesDir
+if (-not $All) { Assert-CoopSaveName $Save }
+if (Test-CoopSavePathOverlap $fixturesDir $SaveRoot) { throw 'Live save root and pristine fixture store must not overlap.' }
+Assert-CoopSavePath $fixturesDir
+Assert-CoopSavePath $SaveRoot
 
 if (-not $All -and $Save -eq "") {
     throw "Specify -Save <name> or -All."
@@ -54,11 +58,9 @@ if (-not $Force) {
     }
 }
 
-New-Item -ItemType Directory -Force -Path $SaveRoot | Out-Null
-
 # Resolve the target list.
 if ($All) {
-    $targets = Get-ChildItem -Path $fixturesDir -Directory -ErrorAction SilentlyContinue | ForEach-Object Name
+    $targets = @(Get-ChildItem -LiteralPath $fixturesDir -Directory | ForEach-Object Name)
     if (-not $targets -or $targets.Count -eq 0) { Write-Host "No fixtures under $fixturesDir; nothing to restore."; exit 0 }
 } else {
     $targets = @($Save)
@@ -67,17 +69,16 @@ if ($All) {
 $restored = 0
 $skipped  = 0
 foreach ($name in $targets) {
+    Assert-CoopSaveName $name
     $src = Join-Path $fixturesDir $name
-    if (-not (Test-Path (Join-Path $src "quick.save"))) {
+    if (-not (Test-Path -LiteralPath (Join-Path $src "quick.save") -PathType Leaf)) {
         # No repo fixture (e.g. a debug save): leave whatever is in AppData as-is.
         Write-Host "  skip '$name' (no repo fixture)"
         $skipped++
         continue
     }
     $dst = Join-Path $SaveRoot $name
-    & robocopy $src $dst /MIR /R:1 /W:1 /NFL /NDL /NP /NJH /NJS | Out-Null
-    $rc = $LASTEXITCODE
-    if ($rc -ge 8) { throw "robocopy failed restoring '$name' (rc=$rc): $src -> $dst" }
+    Copy-CoopSaveTransaction -Source $src -Destination $dst
     Write-Host "  restored '$name' -> $dst"
     $restored++
 }

@@ -10,6 +10,39 @@
 namespace coop {
 namespace {
 
+    // The squad LEADER (index 0 = tab 0, host-owned) and its first gear item of the
+    // requested category (2 = WEAPON, 3 = ARMOUR), preferring an EQUIPPED piece.
+    // Deterministic across clients (same save), so host (owner) drops it and join
+    // (non-owner) mirrors.
+    static bool findLeaderGear(GameWorld* gw, unsigned int gearCat, unsigned int out[5],
+                               char* outSid, unsigned int outLen, unsigned int* outType,
+                               bool npc) {
+        unsigned int h[5];
+        if (npc) {
+            unsigned int other[5];
+            if (!engine::pickDuelSubjects(gw,h,other)) return false;
+        } else {
+            const unsigned int MAX_SQUAD=32;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n=engine::captureSquad(gw,true,sq,MAX_SQUAD);
+            if (!n) return false;
+            h[0]=sq[0].hType; h[1]=sq[0].hContainer; h[2]=sq[0].hContainerSerial;
+            h[3]=sq[0].hIndex; h[4]=sq[0].hSerial;
+        }
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int cnt = engine::captureContainerContents(gw, h, it, INV_ITEMS_MAX, 0);
+        for (unsigned int pass = 0; pass < 2; ++pass) {
+            for (unsigned int i = 0; i < cnt; ++i) {
+                if (it[i].itemType != gearCat) continue;
+                if (pass == 0 && !it[i].equipped) continue; // prefer an equipped piece
+                for (int k = 0; k < 5; ++k) out[k] = h[k];
+                strncpy(outSid, it[i].stringID, outLen - 1); outSid[outLen - 1] = '\0';
+                if (outType) *outType = it[i].itemType;
+                return true;
+            }
+        }
+        return false;
+    }
 
 // world_weapon_drop / world_armor_drop (Phase W2 oracle): CROSS-CLIENT conservation drop.
 // The HOST owns the leader (tab 0) and DROPS a piece of its gear (the real action a player
@@ -23,10 +56,11 @@ namespace {
 // (2 = WEAPON, 3 = ARMOUR); both variants share the WDROP log contract and oracle.
 class WorldGearDropScenario : public Scenario {
 public:
-    WorldGearDropScenario(const char* scenarioName, unsigned int gearCat)
+    WorldGearDropScenario(const char* scenarioName, unsigned int gearCat, bool npc=false)
         : passed_(false), have_(false), isHost_(false), baseType_(0), step_(0),
           invBase_(0), invAfter_(-1), grndAfter_(-1), invMin_(999), grndMax_(0),
-          scenarioName_(scenarioName), gearCat_(gearCat) {
+          scenarioName_(scenarioName), gearCat_(gearCat), npc_(npc), grndBase_(0),
+          finalInv_(-1), finalGround_(-1), conservationFailed_(false) {
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
         baseSid_[0] = '\0';
     }
@@ -34,11 +68,12 @@ public:
 
     virtual void onStart(const ScenarioContext& ctx) {
         isHost_ = ctx.isHost;
-        have_ = findLeaderGear(ctx.gw, gearCat_, hand_, baseSid_, sizeof(baseSid_), &baseType_);
+        have_ = findLeaderGear(ctx.gw, gearCat_, hand_, baseSid_, sizeof(baseSid_), &baseType_,npc_);
         if (have_) {
             invBase_ = invCount(ctx.gw);
             invMin_  = invBase_;
-            grndMax_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, baseSid_, baseType_, radius());
+            grndBase_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, baseSid_, baseType_, radius());
+            grndMax_ = grndBase_;
         }
         char b[200];
         _snprintf(b, sizeof(b) - 1, "WDROP start role=%s have=%d sid='%s' type=%u invBase=%d",
@@ -49,6 +84,7 @@ public:
 
     virtual bool onTick(const ScenarioContext& ctx) {
         if (!have_ || !baseSid_[0]) { if (ctx.elapsedMs >= 6000) { passed_ = false; return true; } return false; }
+        if (npc_ && isHost_) engine::holdDuelistsPeaceful(ctx.gw);
 
         if (isHost_) {
             // ACTOR: drop the leader's weapon once (unequip to loose first if worn).
@@ -79,19 +115,29 @@ public:
             if (inv  < invMin_) invMin_  = inv;
             if (grnd > grndMax_) grndMax_ = grnd;
         }
+        finalInv_=invCount(ctx.gw);
+        finalGround_=engine::countFreeGroundItemsNear(ctx.gw,hand_,baseSid_,baseType_,radius());
+        if (ctx.elapsedMs>=12000 &&
+            finalInv_+finalGround_!=invBase_+grndBase_) conservationFailed_=true;
 
         if (ctx.elapsedMs >= 22000) {
+            char conservation[200]; _snprintf(conservation,sizeof(conservation)-1,
+                "WDROP conservation role=%s npc=%d initial=%d final=%d bag=%d ground=%d stable=%d",
+                isHost_ ? "host" : "join",npc_ ? 1 : 0,invBase_+grndBase_,
+                finalInv_+finalGround_,finalInv_,finalGround_,conservationFailed_ ? 0 : 1);
+            conservation[sizeof(conservation)-1]='\0'; coop::logLine(conservation);
             if (isHost_) {
-                bool dropped = (invAfter_ >= 0) && (invAfter_ <= invBase_ - 1) && (grndAfter_ >= 1);
-                passed_ = have_ && (invBase_ >= 1) && dropped;
+                bool dropped = (invAfter_ == invBase_ - 1) && (grndAfter_ == grndBase_ + 1);
+                passed_ = have_ && (invBase_ >= 1) && dropped &&
+                    finalInv_==invBase_-1 && finalGround_==grndBase_+1 && !conservationFailed_;
                 char b[200]; _snprintf(b, sizeof(b) - 1,
                     "WDROP verdict role=host pass=%d sid='%s' invBase=%d invAfter=%d grndAfter=%d",
                     passed_ ? 1 : 0, baseSid_, invBase_, invAfter_, grndAfter_);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             } else {
-                bool leftBag   = (invMin_ <= invBase_ - 1);
-                bool onGround  = (grndMax_ >= 1);
-                passed_ = have_ && (invBase_ >= 1) && leftBag && onGround;
+                bool leftBag   = (finalInv_ == invBase_ - 1);
+                bool onGround  = (finalGround_ == grndBase_ + 1);
+                passed_ = have_ && (invBase_ >= 1) && leftBag && onGround && !conservationFailed_;
                 char b[220]; _snprintf(b, sizeof(b) - 1,
                     "WDROP verdict role=join pass=%d sid='%s' invBase=%d invMin=%d grndMax=%d relocated=%d",
                     passed_ ? 1 : 0, baseSid_, invBase_, invMin_, grndMax_, (leftBag && onGround) ? 1 : 0);
@@ -104,7 +150,6 @@ public:
     virtual bool passed() const { return passed_; }
 
 private:
-    static const unsigned int MAX_SQUAD = 32;
     static float radius() { return 18.0f; }
 
     int invCount(GameWorld* gw) {
@@ -114,31 +159,6 @@ private:
         for (unsigned int i = 0; i < n; ++i)
             if (it[i].itemType == baseType_ && strcmp(it[i].stringID, baseSid_) == 0) ++c;
         return c;
-    }
-    // The squad LEADER (index 0 = tab 0, host-owned) and its first gear item of the
-    // requested category (2 = WEAPON, 3 = ARMOUR), preferring an EQUIPPED piece.
-    // Deterministic across clients (same save), so host (owner) drops it and join
-    // (non-owner) mirrors.
-    static bool findLeaderGear(GameWorld* gw, unsigned int gearCat, unsigned int out[5],
-                               char* outSid, unsigned int outLen, unsigned int* outType) {
-        EntityState sq[MAX_SQUAD];
-        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ true, sq, MAX_SQUAD);
-        if (n == 0) return false;
-        unsigned int h[5] = { sq[0].hType, sq[0].hContainer, sq[0].hContainerSerial,
-                              sq[0].hIndex, sq[0].hSerial };
-        InvItemEntry it[INV_ITEMS_MAX];
-        unsigned int cnt = engine::captureContainerContents(gw, h, it, INV_ITEMS_MAX, 0);
-        for (unsigned int pass = 0; pass < 2; ++pass) {
-            for (unsigned int i = 0; i < cnt; ++i) {
-                if (it[i].itemType != gearCat) continue;
-                if (pass == 0 && !it[i].equipped) continue; // prefer an equipped piece
-                for (int k = 0; k < 5; ++k) out[k] = h[k];
-                strncpy(outSid, it[i].stringID, outLen - 1); outSid[outLen - 1] = '\0';
-                if (outType) *outType = it[i].itemType;
-                return true;
-            }
-        }
-        return false;
     }
 
     bool         passed_;
@@ -152,7 +172,284 @@ private:
     int          invMin_, grndMax_;
     const char*  scenarioName_;
     unsigned int gearCat_;
+    bool         npc_;
+    int          grndBase_, finalInv_, finalGround_;
+    bool         conservationFailed_;
 };
+
+// Real duel1 objects exercise identity selection and ordered native histories.
+// A final bag count alone cannot prove that a same-frame drop/pickup was consumed;
+// the paired oracle additionally requires the real peer APPLY/PICKUP-APPLY rows.
+class WorldGearIdentityScenario : public Scenario {
+public:
+    enum Mode { DifferentGrade=0, FastPickup=1, FastCycle=2, DrawnIdentity=3 };
+    WorldGearIdentityScenario(const char* scenarioName,Mode mode)
+        : scenarioName_(scenarioName),mode_(mode),ready_(false),passed_(false),
+          original_(0),variant_(0),step_(0),lastSample_(0),stable_(true),
+          actorProof_(false),sawFloor_(false),sampleComplete_(false),duelStarted_(false),
+          originalBag_(0),variantBag_(0),originalFloor_(0),variantFloor_(0) {
+        memset(owner_,0,sizeof(owner_));
+        memset(originalHand_,0,sizeof(originalHand_));
+        memset(variantHand_,0,sizeof(variantHand_));
+        memset(&originalIdentity_,0,sizeof(originalIdentity_));
+        memset(&variantIdentity_,0,sizeof(variantIdentity_));
+    }
+    virtual const char* name() const { return scenarioName_; }
+    virtual bool passed() const { return passed_; }
+    virtual void onStart(const ScenarioContext& ctx) {
+        prepare(ctx);
+    }
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.isHost && (mode_!=DrawnIdentity || !duelStarted_ || step_!=0))
+            engine::holdDuelistsPeaceful(ctx.gw);
+        if (!ready_) {
+            prepare(ctx);
+            if (!ready_ && ctx.elapsedMs>=6000) {
+                char b[256]; _snprintf(b,sizeof(b)-1,
+                    "WIDENT setup-failed original=%d variant=%d sampleComplete=%d "
+                    "originalBag=%d variantBag=%d originalGround=%d variantGround=%d",
+                    original_ ? 1 : 0,variant_ ? 1 : 0,sampleComplete_ ? 1 : 0,
+                    originalBag_,variantBag_,originalFloor_,variantFloor_);
+                b[sizeof(b)-1]='\0'; coop::logLine(b);
+                return true;
+            }
+            if (!ready_) return false;
+        }
+        bool canDrop=true;
+        if (ctx.isHost && mode_==DrawnIdentity && step_==0) {
+            if (ctx.elapsedMs>=4000 && !duelStarted_) duelStarted_=engine::startDuel(ctx.gw)>0;
+            if (duelStarted_) engine::rearmDuelScene(ctx.gw);
+            canDrop=duelStarted_ && bothEquipped(ctx.gw) &&
+                engine::physicalWeaponIsDrawn(ctx.gw,owner_,originalHand_);
+            if (!canDrop && ctx.elapsedMs>=20000) {
+                coop::logLine("WIDENT drawn-state-unavailable (genuine dual equipped/held/absent-section state not observed)");
+                step_=-1; // explicit failure, never substitute the loose-grade exercise
+            }
+        }
+        if (ctx.isHost && step_==0 && ctx.elapsedMs>=8000 && canDrop) {
+            if (mode_==DrawnIdentity) {
+                char b[220]; _snprintf(b,sizeof(b)-1,
+                    "WIDENT drawn-proof role=host mode=3 held=1 absentSection=1 spareEquipped=1 "
+                    "originalHand=%u,%u,%u,%u,%u variantHand=%u,%u,%u,%u,%u",
+                    originalHand_[0],originalHand_[1],originalHand_[2],originalHand_[3],originalHand_[4],
+                    variantHand_[0],variantHand_[1],variantHand_[2],variantHand_[3],variantHand_[4]);
+                b[sizeof(b)-1]='\0'; coop::logLine(b);
+            }
+            step_=1;
+            int dropped=engine::dropPhysicalItemByHand(ctx.gw,originalHand_,originalHand_);
+            // The known registered real item proves this immediate transition.
+            // Loaded-zone registry insertion can settle on the next native tick.
+            bool floorProof=dropped==1 && sourceState(ctx.gw,false);
+            if (mode_==FastPickup && floorProof) {
+                int picked=engine::pickupPhysicalItemByHand(ctx.gw,owner_,originalHand_,originalHand_);
+                actorProof_=picked==1 && sourceState(ctx.gw,true);
+            } else actorProof_=dropped==1 && floorProof;
+            char b[220]; _snprintf(b,sizeof(b)-1,
+                "WIDENT native-source mode=%d phase=drop role=host dropped=%d transientFloor=%d "
+                "actorProof=%d originalHand=%u,%u,%u,%u,%u",
+                (int)mode_,dropped,floorProof ? 1 : 0,actorProof_ ? 1 : 0,
+                originalHand_[0],originalHand_[1],originalHand_[2],originalHand_[3],originalHand_[4]);
+            b[sizeof(b)-1]='\0'; coop::logLine(b);
+        }
+        if (ctx.isHost && mode_==FastCycle && step_==1 && ctx.elapsedMs>=14000) {
+            step_=2;
+            int picked=engine::pickupPhysicalItemByHand(ctx.gw,owner_,originalHand_,originalHand_);
+            bool bagProof=picked==1 && sourceState(ctx.gw,true);
+            int dropped=bagProof ? engine::dropPhysicalItemByHand(ctx.gw,originalHand_,originalHand_) : 0;
+            actorProof_=actorProof_ && bagProof && dropped==1 && sourceState(ctx.gw,false);
+            char b[160]; _snprintf(b,sizeof(b)-1,
+                "WIDENT native-source mode=2 phase=pickup-drop role=host picked=%d transientBag=%d "
+                "dropped=%d actorProof=%d",picked,bagProof ? 1 : 0,dropped,actorProof_ ? 1 : 0);
+            b[sizeof(b)-1]='\0'; coop::logLine(b);
+        }
+        if (!lastSample_ || ctx.elapsedMs-lastSample_>=500) {
+            lastSample_=ctx.elapsedMs;
+            sampleComplete_=sample(ctx.gw);
+            if (sampleComplete_) {
+                if (originalFloor_==1 && originalBag_==0) sawFloor_=true;
+                if (originalBag_+originalFloor_!=1 || variantBag_+variantFloor_!=1) stable_=false;
+            }
+            engine::ScenarioItemSample state; memset(&state,0,sizeof(state));
+            state.bag=originalBag_; state.source=variantBag_; state.ground=originalFloor_;
+            state.location=variantFloor_; memcpy(state.itemHand,originalHand_,sizeof(originalHand_));
+            for (int k=0;k<5;++k) state.metadataHash=state.metadataHash*131u+variantHand_[k];
+            continuity_.observe(sampleComplete_,state,ctx.elapsedMs);
+        }
+        if (ctx.elapsedMs<24000) return false;
+        sampleComplete_=sample(ctx.gw);
+        engine::ScenarioItemSample finalState; memset(&finalState,0,sizeof(finalState));
+        finalState.bag=originalBag_; finalState.source=variantBag_; finalState.ground=originalFloor_;
+        finalState.location=variantFloor_; memcpy(finalState.itemHand,originalHand_,sizeof(originalHand_));
+        for (int k=0;k<5;++k) finalState.metadataHash=finalState.metadataHash*131u+variantHand_[k];
+        continuity_.observe(sampleComplete_,finalState,ctx.elapsedMs);
+        bool expected=mode_==FastPickup
+            ? originalBag_==1 && originalFloor_==0
+            : originalBag_==0 && originalFloor_==1;
+        passed_=ready_ && sampleComplete_ && stable_ && continuity_.stable() && expected &&
+            variantBag_==1 && variantFloor_==0 && (!ctx.isHost || actorProof_) &&
+            (mode_!=FastCycle || sawFloor_);
+        char b[512]; _snprintf(b,sizeof(b)-1,
+            "WIDENT verdict role=%s mode=%d pass=%d complete=%d stable=%d actorProof=%d "
+            "originalLevel=%u variantLevel=%u originalBag=%d originalGround=%d variantBag=%d variantGround=%d "
+            "originalHand=%u,%u,%u,%u,%u variantHand=%u,%u,%u,%u,%u stableMs=%lu sampleCount=%u",
+            ctx.isHost ? "host" : "join",(int)mode_,passed_ ? 1 : 0,sampleComplete_ ? 1 : 0,
+            stable_ && continuity_.stable() ? 1 : 0,actorProof_ ? 1 : 0,(unsigned)originalIdentity_.level,
+            (unsigned)variantIdentity_.level,originalBag_,originalFloor_,variantBag_,variantFloor_,
+            originalHand_[0],originalHand_[1],originalHand_[2],originalHand_[3],originalHand_[4],
+            variantHand_[0],variantHand_[1],variantHand_[2],variantHand_[3],variantHand_[4],
+            continuity_.stableMs,continuity_.sampleCount);
+        b[sizeof(b)-1]='\0'; coop::logLine(b);
+        return true;
+    }
+private:
+    static bool sameIdentity(const InvItemEntry& a,const InvItemEntry& b) {
+        return a.itemType==b.itemType && a.level==b.level && a.quality==b.quality &&
+            strcmp(a.stringID,b.stringID)==0 && strcmp(a.manufacturer,b.manufacturer)==0 &&
+            strcmp(a.material,b.material)==0;
+    }
+    void prepare(const ScenarioContext& ctx) {
+        if (ready_) return;
+        unsigned int other[5];
+        if (!owner_[3] && !owner_[4] &&
+            !engine::pickDuelSubjects(ctx.gw,owner_,other)) return;
+        char sids[INV_ITEMS_MAX][48]; void* items[INV_ITEMS_MAX];
+        unsigned int count=engine::captureWeaponPtrs(ctx.gw,owner_,sids,items,INV_ITEMS_MAX);
+        if (!original_) for (unsigned int i=0;i<count;++i) {
+            InvItemEntry row; unsigned int key[5],root[5]; bool inBag=false; void* physical=0;
+            if (!engine::readPhysicalItemMetadata(reinterpret_cast<Item*>(items[i]),&row,key) ||
+                row.itemType!=2 || !row.equipped || row.quantity!=1 || row.level==GRADE_NA ||
+                !engine::readPhysicalItemLocation(key,root,&inBag,&physical) || !inBag ||
+                memcmp(root,owner_,sizeof(root))!=0) continue;
+            original_=physical; originalIdentity_=row;
+            memcpy(originalHand_,key,sizeof(key));
+            variantIdentity_=row; variantIdentity_.equipped=0;
+            variantIdentity_.slot=0; variantIdentity_.section=0;
+            variantIdentity_.level=row.level==10 ? 5 : 10;
+            break;
+        }
+        if (!original_) return;
+        if (!variant_) {
+            // A peer snapshot may already have delivered the host's explicit
+            // fixture. Reuse that exact real object, never seed a second copy.
+            void* candidate=0; unsigned int candidateHand[5]={0,0,0,0,0};
+            for (unsigned int i=0;i<count;++i) {
+                InvItemEntry row; unsigned int key[5],root[5]; bool inBag=false; void* physical=0;
+                if (!engine::readPhysicalItemMetadata(reinterpret_cast<Item*>(items[i]),&row,key))
+                    return; // unclassified holdings cannot prove fixture uniqueness
+                if ((row.equipped && mode_!=DrawnIdentity) || !sameIdentity(row,variantIdentity_)) continue;
+                if (candidate || row.quantity!=1 ||
+                    !engine::readPhysicalItemLocation(key,root,&inBag,&physical) || !inBag ||
+                    physical!=items[i] || memcmp(root,owner_,sizeof(root))!=0) return;
+                candidate=physical; memcpy(candidateHand,key,sizeof(key));
+            }
+            variant_=candidate;
+            if (variant_) memcpy(variantHand_,candidateHand,sizeof(candidateHand));
+            if (!variant_) {
+                if (!ctx.isHost || !engine::seedGearIdentityVariant(
+                        ctx.gw,owner_,variantIdentity_,&variant_)) return;
+            }
+            if (!engine::readPhysicalItemMetadata(reinterpret_cast<Item*>(variant_),
+                    &variantIdentity_,variantHand_)) return;
+        }
+        if (mode_==DrawnIdentity && !bothEquipped(ctx.gw)) {
+            if (!engine::equipPhysicalItemByHand(ctx.gw,owner_,variantHand_) || !bothEquipped(ctx.gw))
+                return;
+        }
+        sampleComplete_=sample(ctx.gw);
+        if (!sampleComplete_ || originalBag_!=1 || variantBag_!=1 ||
+            originalFloor_!=0 || variantFloor_!=0) return;
+        ready_=true;
+        char b[420]; _snprintf(b,sizeof(b)-1,
+            "WIDENT start role=%s mode=%d sid='%s' owner=%u,%u,%u,%u,%u originalLevel=%u variantLevel=%u "
+            "originalHand=%u,%u,%u,%u,%u variantHand=%u,%u,%u,%u,%u totals=1,1",
+            ctx.isHost ? "host" : "join",(int)mode_,originalIdentity_.stringID,
+            owner_[0],owner_[1],owner_[2],owner_[3],owner_[4],(unsigned)originalIdentity_.level,
+            (unsigned)variantIdentity_.level,originalHand_[0],originalHand_[1],originalHand_[2],
+            originalHand_[3],originalHand_[4],variantHand_[0],variantHand_[1],variantHand_[2],
+            variantHand_[3],variantHand_[4]);
+        b[sizeof(b)-1]='\0'; coop::logLine(b);
+    }
+    bool bothEquipped(GameWorld* gw) {
+        unsigned int root[5],actual[5]; bool inBag=false; void* physical=0;
+        InvItemEntry row;
+        if (!engine::readPhysicalItemLocation(originalHand_,root,&inBag,&physical) ||
+            !inBag || physical!=original_ || memcmp(root,owner_,sizeof(root))!=0 ||
+            !engine::readPhysicalItemMetadata(reinterpret_cast<Item*>(physical),&row,actual) ||
+            !row.equipped || !sameIdentity(row,originalIdentity_)) return false;
+        return engine::readPhysicalItemLocation(variantHand_,root,&inBag,&physical) &&
+            inBag && physical==variant_ && memcmp(root,owner_,sizeof(root))==0 &&
+            engine::readPhysicalItemMetadata(reinterpret_cast<Item*>(physical),&row,actual) &&
+            row.equipped && sameIdentity(row,variantIdentity_);
+    }
+    bool sourceState(GameWorld* gw,bool expectBag) {
+        unsigned int root[5]; bool inBag=false; void* physical=0;
+        if (!engine::readPhysicalItemLocation(originalHand_,root,&inBag,&physical) ||
+            physical!=original_ || inBag!=expectBag ||
+            (inBag && memcmp(root,owner_,sizeof(root))!=0)) return false;
+        InvItemEntry rows[INV_ITEMS_MAX]; bool truncated=false;
+        unsigned int count=engine::captureContainerContents(
+            gw,owner_,rows,INV_ITEMS_MAX,0,&truncated,true);
+        if (!engine::containerInventoryAvailable(owner_) || truncated || count>=INV_ITEMS_MAX) return false;
+        int originalCount=0,variantCount=0;
+        for (unsigned int i=0;i<count;++i) {
+            if (sameIdentity(rows[i],originalIdentity_)) originalCount+=rows[i].quantity;
+            if (sameIdentity(rows[i],variantIdentity_)) variantCount+=rows[i].quantity;
+        }
+        return originalCount==(expectBag ? 1 : 0) && variantCount==1;
+    }
+    bool sample(GameWorld* gw) {
+        originalBag_=variantBag_=originalFloor_=variantFloor_=0;
+        InvItemEntry rows[INV_ITEMS_MAX]; bool truncated=false;
+        unsigned int count=engine::captureContainerContents(
+            gw,owner_,rows,INV_ITEMS_MAX,0,&truncated,true);
+        if (!engine::containerInventoryAvailable(owner_) || truncated || count>=INV_ITEMS_MAX) return false;
+        for (unsigned int i=0;i<count;++i) {
+            if (sameIdentity(rows[i],originalIdentity_)) originalBag_+=rows[i].quantity;
+            if (sameIdentity(rows[i],variantIdentity_)) variantBag_+=rows[i].quantity;
+        }
+        engine::GroundItemCensusStatus status;
+        count=engine::captureLoadedGroundItems(gw,ground_,GROUND_CAPACITY,&status);
+        if (!status.complete) return false;
+        for (unsigned int i=0;i<count;++i) {
+            InvItemEntry row; unsigned int actual[5];
+            Item* physical=reinterpret_cast<Item*>(engine::resolveObjectByHand(ground_[i].hand));
+            if (!engine::readPhysicalItemMetadata(physical,&row,actual) ||
+                memcmp(actual,ground_[i].hand,sizeof(actual))!=0 ||
+                !engine::physicalItemIsOnGround(physical)) return false;
+            bool duplicate=false;
+            // Compare only matching native identities, never template names
+            // alone; the controlled fixture has at most two matching objects.
+            if (sameIdentity(row,originalIdentity_) || sameIdentity(row,variantIdentity_)) {
+                for (unsigned int j=0;j<i;++j)
+                    if (memcmp(ground_[j].hand,ground_[i].hand,sizeof(ground_[i].hand))==0) {
+                        duplicate=true; break;
+                    }
+            }
+            if (duplicate) continue;
+            if (sameIdentity(row,originalIdentity_)) originalFloor_+=row.quantity;
+            if (sameIdentity(row,variantIdentity_)) variantFloor_+=row.quantity;
+        }
+        unsigned int root[5]; bool inBag=false; void* physical=0;
+        // Full native identities resolve to the ORIGINAL physical objects,
+        // not merely a replacement with matching display metadata.
+        if (!engine::readPhysicalItemLocation(originalHand_,root,&inBag,&physical) ||
+            physical!=original_ || (inBag && memcmp(root,owner_,sizeof(root))!=0)) return false;
+        if (!engine::readPhysicalItemLocation(variantHand_,root,&inBag,&physical) ||
+            physical!=variant_ || !inBag || memcmp(root,owner_,sizeof(root))!=0) return false;
+        return true;
+    }
+    static const unsigned int GROUND_CAPACITY=4096;
+    const char* scenarioName_; Mode mode_;
+    bool ready_,passed_; void* original_; void* variant_;
+    unsigned int owner_[5],originalHand_[5],variantHand_[5];
+    InvItemEntry originalIdentity_,variantIdentity_;
+    engine::GroundItemRow ground_[GROUND_CAPACITY];
+    int step_; unsigned long lastSample_;
+    bool stable_,actorProof_,sawFloor_,sampleComplete_,duelStarted_;
+    int originalBag_,variantBag_,originalFloor_,variantFloor_;
+    engine::ScenarioItemStability continuity_;
+};
+
 
 // weapon_loot (weapon-fabrication sync validation): a weapon that exists in NO shared-save
 // inventory enters play mid-session on the ACQUIRING client - the loot / vendor-buy /
@@ -568,115 +865,92 @@ private:
 // the claim retired it. WPMIRROR log contract; judged by Test-WorldPickupMirror.
 class WorldPickupMirrorScenario : public TimedScenario {
 public:
-    WorldPickupMirrorScenario()
-        : TimedScenario("world_pickup_mirror", 0), have_(false), lastLogMs_(0), step_(0),
-          seeded_(0), dropped_(0), pickedUp_(0), dropType_(0),
-          grndPeak_(0), grndFinal_(-1) {
-        for (int i = 0; i < 5; ++i) hand_[i] = 0;
-        sid_[0] = '\0';
+    WorldPickupMirrorScenario() : TimedScenario("world_pickup_mirror",0),have_(false),
+        baseline_(false),complete_(false),lastSample_(0),step_(0),seeded_(0),
+        dropped_(0),pickedUp_(0),type_(0),bagBase_(0),groundBase_(0),peak_(0) {
+        memset(owner_,0,sizeof(owner_)); memset(item_,0,sizeof(item_));
+        memset(after_,0,sizeof(after_)); memset(&witness_,0,sizeof(witness_));
+        memset(&final_,0,sizeof(final_)); sid_[0]='\0';
     }
-
     virtual void onStart(const ScenarioContext& ctx) {
-        have_ = engine::pickInventoryContainer(ctx.gw, hand_);
-        char b[180];
-        _snprintf(b, sizeof(b) - 1,
+        EntityState squad[32]; unsigned int n=engine::captureSquad(ctx.gw,false,squad,32);
+        int i=tabLeaderIdx(squad,n,ctx.isHost ? 0u : 1u);
+        if (i>=0) handFromEntity(squad[i],owner_);
+        have_=i>=0 && n<32 && engine::containerInventoryAvailable(owner_) &&
+            engine::commonTestItemSid(ctx.gw,sid_,sizeof(sid_),&type_)==1;
+        // JOIN's own bag and ground must be measured before any host-authored proxy exists.
+        if (!ctx.isHost && have_) baseline_=baseline(ctx.gw);
+        char b[240]; _snprintf(b,sizeof(b)-1,
             "WPMIRROR start role=%s have=%d hand=%u,%u,%u,%u,%u",
-            ctx.isHost ? "host" : "join", have_ ? 1 : 0,
-            hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            ctx.isHost ? "host" : "join",have_ ? 1 : 0,
+            owner_[0],owner_[1],owner_[2],owner_[3],owner_[4]);
+        b[sizeof(b)-1]='\0'; coop::logLine(b);
     }
-
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (!have_) { if (ctx.elapsedMs >= 6000) { passed_ = false; return true; } return false; }
-
-        // HOST authors the drop through the hooked inventory path, so the edge is
-        // captured query-free and W1 streams a proxy to the join.
-        if (ctx.isHost && step_ == 0 && ctx.elapsedMs >= DROP_MS) {
-            step_ = 1;
-            seeded_ = engine::addTestItemsToContainer(ctx.gw, hand_, 1, sid_, sizeof(sid_));
-            InvItemEntry items[INV_ITEMS_MAX];
-            unsigned int n = engine::captureContainerContents(ctx.gw, hand_, items, INV_ITEMS_MAX, 0);
-            for (unsigned int i = 0; i < n; ++i)
-                if (!items[i].equipped && strcmp(items[i].stringID, sid_) == 0) {
-                    dropType_ = items[i].itemType; break;
-                }
-            dropped_ = engine::dropItemFromInventory(ctx.gw, hand_, sid_, dropType_, 1);
-            char b[200]; _snprintf(b, sizeof(b) - 1,
-                "WPMIRROR drop seeded=%d dropped=%d sid='%s' type=%u",
-                seeded_, dropped_, sid_[0] ? sid_ : "(none)", dropType_);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (have_ && ctx.isHost && step_==0 && ctx.elapsedMs>=6000) {
+            step_=1;
+            // Detached inventory fabrication has no resolvable native handle.
+            // Seed through the world factory, then move that exact object into
+            // the source bag before measuring its physical baseline.
+            float x=0,y=0,z=0;
+            Character* source=engine::resolveChar(ObjectHand::fromObjOrder(owner_));
+            RootObject* fixture=source && engine::readPos(source,&x,&y,&z) ?
+                engine::spawnWorldItemProxy(ctx.gw,sid_,type_,1,x,y,z) : 0;
+            seeded_=fixture ? engine::addItemPtrToInventory(ctx.gw,owner_,fixture) : 0;
+            InvItemEntry row;
+            baseline_=seeded_==1 && engine::pickScenarioPhysicalItem(ctx.gw,owner_,sid_,type_,item_,&row) &&
+                baseline(ctx.gw);
+            if (baseline_) dropped_=engine::dropPhysicalItemByHand(ctx.gw,item_,after_);
+            if (dropped_==1) memcpy(item_,after_,sizeof(item_));
         }
-
-        // JOIN consumes the proxy. Its sid/type come off the scan row, so the join never
-        // has to agree with the host about WHICH template was seeded. Relocation (not
-        // fabrication) is what a real UI pickup does to the proxy object.
-        if (!ctx.isHost && step_ == 0 && ctx.elapsedMs >= PICKUP_MS) {
-            engine::WorldItemRaw raw[16];
-            unsigned int n = engine::captureWorldItems(ctx.gw, raw, 16, radius());
-            if (n > 0) {
-                step_ = 1;
-                strncpy(sid_, raw[0].stringID, sizeof(sid_) - 1); sid_[sizeof(sid_) - 1] = '\0';
-                dropType_ = raw[0].itemType;
-                pickedUp_ = engine::pickupWorldItemIntoInventory(ctx.gw, hand_, sid_,
-                                                                 dropType_, radius());
-                char b[200]; _snprintf(b, sizeof(b) - 1,
-                    "WPMIRROR pickup n=%u got=%d sid='%s' type=%u",
-                    n, pickedUp_, sid_, dropType_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (have_ && baseline_ && !witness_.eventId && ctx.queryItemWitness) {
+            if (ctx.queryItemWitness(ctx.gw,1,sid_,type_,ctx.isHost ? after_ : 0,&witness_)) {
+                if (!ctx.isHost) memcpy(item_,witness_.itemHand,sizeof(item_));
             }
         }
-
-        // HOST samples its OWN free-ground count for the dropped template: it must rise to
-        // 1 on the drop and fall back to 0 once the join's claim lands.
-        if (ctx.isHost && sid_[0] && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
-            lastLogMs_ = ctx.elapsedMs;
-            int grnd = engine::countFreeGroundItemsNear(ctx.gw, hand_, sid_, dropType_, radius());
-            if (grnd > (int)grndPeak_) grndPeak_ = (unsigned int)grnd;
-            char b[180]; _snprintf(b, sizeof(b) - 1,
-                "WPMIRROR host t=%lu ground=%d peak=%u",
-                (unsigned long)ctx.elapsedMs, grnd, grndPeak_);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
-
-        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
-        if (ctx.elapsedMs >= dur) {
-            if (ctx.isHost) {
-                grndFinal_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, sid_,
-                                                              dropType_, radius());
-                passed_ = (dropped_ > 0) && (grndPeak_ >= 1) && (grndFinal_ == 0);
-                char b[220]; _snprintf(b, sizeof(b) - 1,
-                    "WPMIRROR verdict role=host pass=%d sid='%s' dropped=%d grndPeak=%u grndFinal=%d",
-                    passed_ ? 1 : 0, sid_[0] ? sid_ : "(none)", dropped_, grndPeak_, grndFinal_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            } else {
-                passed_ = (pickedUp_ > 0);
-                char b[200]; _snprintf(b, sizeof(b) - 1,
-                    "WPMIRROR verdict role=join pass=%d sid='%s' pickedUp=%d",
-                    passed_ ? 1 : 0, sid_[0] ? sid_ : "(none)", pickedUp_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!ctx.isHost && baseline_ && witness_.eventId && !pickedUp_ && ctx.elapsedMs>=14000)
+            pickedUp_=engine::pickupPhysicalItemByHand(ctx.gw,owner_,item_,after_);
+        if (!lastSample_ || ctx.elapsedMs-lastSample_>=500 || ctx.elapsedMs>=(ctx.isHost ? 26000u : 22000u)) {
+            lastSample_=ctx.elapsedMs;
+            // Host destruction is certified by actual CLAIM-APPLY destroyed=1, never handle absence.
+            complete_=baseline_ && engine::sampleScenarioItem(ctx.gw,owner_,0,sid_,type_,
+                ctx.isHost ? 0 : (pickedUp_ ? after_ : item_),&final_);
+            if (complete_) {
+                if (final_.ground>peak_) peak_=final_.ground;
+                if (ctx.isHost) memcpy(final_.itemHand,item_,sizeof(item_));
             }
-            return true;
+            stability_.observe(complete_,final_,ctx.elapsedMs);
         }
-        return false;
+        if (ctx.elapsedMs<(ctx.isHost ? 26000u : 22000u)) return false;
+        passed_=have_ && baseline_ && complete_ && stability_.stable() && witness_.eventId &&
+            final_.bag==bagBase_+(ctx.isHost ? -1 : 1) && final_.ground==groundBase_ &&
+            (ctx.isHost ? dropped_==1 && peak_>=groundBase_+1 : pickedUp_==1 && final_.location==2);
+        char b[640]; _snprintf(b,sizeof(b)-1,
+            "WPMIRROR verdict role=%s pass=%d sid='%s' dropped=%d grndPeak=%d grndFinal=%d pickedUp=%d "
+            "type=%u bagBase=%d bagFinal=%d groundBase=%d groundFinal=%d stable=%d complete=%d "
+            "stableMs=%lu sampleCount=%u itemHand=%u,%u,%u,%u,%u dropOwner=%u dropId=%u claimOwner=%u "
+            "afterItemHand=%u,%u,%u,%u,%u",
+            ctx.isHost ? "host" : "join",passed_ ? 1 : 0,sid_,dropped_,peak_,final_.ground,pickedUp_,
+            type_,bagBase_,final_.bag,groundBase_,final_.ground,stability_.stable() ? 1 : 0,
+            complete_ ? 1 : 0,stability_.stableMs,stability_.sampleCount,
+            item_[0],item_[1],item_[2],item_[3],item_[4],witness_.ownerId,witness_.eventId,witness_.claimOwner,
+            after_[0],after_[1],after_[2],after_[3],after_[4]);
+        b[sizeof(b)-1]='\0'; coop::logLine(b);
+        return true;
     }
-
 private:
-    static const unsigned long DROP_MS          = 6000;  // host drops
-    static const unsigned long PICKUP_MS        = 14000; // join consumes the proxy
-    static const unsigned long JOIN_DURATION_MS = 22000;
-    static const unsigned long HOST_DURATION_MS = 26000; // outlive the join + claim slack
-    static float radius() { return 60.0f; }
-    bool          have_;
-    unsigned long lastLogMs_;
-    int           step_;
-    int           seeded_;
-    int           dropped_;
-    int           pickedUp_;
-    unsigned int  dropType_;
-    unsigned int  grndPeak_;
-    int           grndFinal_;
-    unsigned int  hand_[5];
-    char          sid_[48];
+    bool baseline(GameWorld* gw) {
+        engine::ScenarioItemSample s;
+        if (!engine::sampleScenarioItem(gw,owner_,0,sid_,type_,0,&s)) return false;
+        bagBase_=s.bag; groundBase_=s.ground; return true;
+    }
+    bool have_,baseline_,complete_;
+    unsigned long lastSample_; int step_,seeded_,dropped_,pickedUp_;
+    unsigned int type_,owner_[5],item_[5],after_[5];
+    int bagBase_,groundBase_,peak_; char sid_[48];
+    engine::ScenarioItemWitness witness_;
+    engine::ScenarioItemSample final_;
+    engine::ScenarioItemStability stability_;
 };
 
 // rejoin_items (Phase 3 item-dup fix): a reload must NOT duplicate save-native
@@ -1138,6 +1412,15 @@ Scenario* makeWorldItemScenario(const std::string& name) {
     if (name == "world_item_drop") return new WorldItemDropScenario();
     if (name == "world_item_join") return new WorldItemSyncScenario(/*joinAuthor*/ true);
     if (name == "world_weapon_drop") return new WorldGearDropScenario("world_weapon_drop", 2);
+    if (name == "world_npc_gear_drop") return new WorldGearDropScenario("world_npc_gear_drop",2,true);
+    if (name=="world_gear_identity")
+        return new WorldGearIdentityScenario("world_gear_identity",WorldGearIdentityScenario::DifferentGrade);
+    if (name=="world_gear_fast_pickup")
+        return new WorldGearIdentityScenario("world_gear_fast_pickup",WorldGearIdentityScenario::FastPickup);
+    if (name=="world_gear_fast_cycle")
+        return new WorldGearIdentityScenario("world_gear_fast_cycle",WorldGearIdentityScenario::FastCycle);
+    if (name=="world_gear_drawn_identity")
+        return new WorldGearIdentityScenario("world_gear_drawn_identity",WorldGearIdentityScenario::DrawnIdentity);
     if (name == "world_armor_drop")  return new WorldGearDropScenario("world_armor_drop", 3);
     // Protocol 47: the worn CONTAINER (itemType 46) joined the conservation channel, so it
     // gates on exactly the same contract as weapons/armour - the peer must RELOCATE its

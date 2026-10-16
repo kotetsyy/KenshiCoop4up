@@ -329,14 +329,8 @@ const char kCopy[] =
     "\xD0\x9A\xD0\x9E\xD0\x9F\xD0\x98\xD0\xA0\xD0\x9E\xD0\x92\xD0\x90\xD0\xA2\xD0\xAC"; // КОПИРОВАТЬ
 const char kSteamMissing[] =
     "Steam \xD0\xBD\xD0\xB5 \xD0\xBD\xD0\xB0\xD0\xB9\xD0\xB4\xD0\xB5\xD0\xBD"; // Steam не найден
-const char kHostHintSteam[] =
-    "\xD0\x92\xD1\x8B \xD0\xB8 \xD0\xB4\xD0\xBE 3 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB7\xD0\xB5\xD0\xB9. \xD0\x9E\xD1\x82\xD0\xBF\xD1\x80\xD0\xB0\xD0\xB2\xD1\x8C\xD1\x82\xD0\xB5 \xD0\xB8\xD0\xBC \xD1\x8D\xD1\x82\xD0\xBE\xD1\x82 Steam ID."; // Вы и до 3 друзей. Отправьте им этот Steam ID.
-const char kHostHintUdp[] =
-    "\xD0\x92\xD1\x8B \xD0\xB8 \xD0\xB4\xD0\xBE 3 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB7\xD0\xB5\xD0\xB9. \xD0\x94\xD1\x80\xD1\x83\xD0\xB7\xD1\x8C\xD1\x8F\xD0\xBC \xD0\xBD\xD1\x83\xD0\xB6\xD0\xBD\xD1\x8B \xD0\xB2\xD0\xB0\xD1\x88 IP \xD0\xB8 \xD1\x8D\xD1\x82\xD0\xBE\xD1\x82 \xD0\xBF\xD0\xBE\xD1\x80\xD1\x82. \xD0\x94\xD0\xBB\xD1\x8F \xD0\xB8\xD0\xBD\xD1\x82\xD0\xB5\xD1\x80\xD0\xBD\xD0\xB5\xD1\x82\xD0\xB0 \xD0\xBD\xD1\x83\xD0\xB6\xD0\xBD\xD0\xBE \xD0\xBE\xD1\x82\xD0\xBA\xD1\x80\xD1\x8B\xD1\x82\xD1\x8C UDP-\xD0\xBF\xD0\xBE\xD1\x80\xD1\x82."; // Вы и до 3 друзей. Друзьям нужны ваш IP и этот порт. Для интернета нужно открыть UDP-порт.
 const char kJoinHintSteam[] =
     "\xD0\x9D\xD1\x83\xD0\xB6\xD0\xB5\xD0\xBD SteamID64 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0 - 17 \xD1\x86\xD0\xB8\xD1\x84\xD1\x80, \xD0\xB0 \xD0\xBD\xD0\xB5 \xD0\xB8\xD0\xBC\xD1\x8F \xD0\xB0\xD0\xBA\xD0\xBA\xD0\xB0\xD1\x83\xD0\xBD\xD1\x82\xD0\xB0 \xD0\xB8 \xD0\xBD\xD0\xB5 Lobby ID."; // Нужен SteamID64 хоста - 17 цифр, а не имя аккаунта и не Lobby ID.
-const char kJoinHintUdp[] =
-    "\xD0\x9D\xD0\xB0\xD0\xBF\xD1\x80\xD0\xB8\xD0\xBC\xD0\xB5\xD1\x80 192.168.1.50:27800. \xD0\x91\xD0\xB5\xD0\xB7 \xD0\xBF\xD0\xBE\xD1\x80\xD1\x82\xD0\xB0 \xD0\xB1\xD1\x83\xD0\xB4\xD0\xB5\xD1\x82 27800."; // Например 192.168.1.50:27800. Без порта будет 27800.
 const char kErrNickEmpty[] =
     "\xD0\x92\xD0\xB2\xD0\xB5\xD0\xB4\xD0\xB8\xD1\x82\xD0\xB5 \xD0\xBD\xD0\xB8\xD0\xBA."; // Введите ник.
 const char kErrNickLong[] =
@@ -908,7 +902,8 @@ struct PanelWidgets {
     Ctl      hdrNick;   Field nick; Ctl nickNote;
     Ctl      hdrTrans;  Selector selSteam, selUdp;
     Ctl      hdrEndpoint;
-    Field    hostId, addr, port;
+    Field    hostId, addr, port, invitation;
+    Ctl      makeInvite, copyInvite;
     Ctl      selfBg, selfText, copyId;
     Ctl      epNote[2];
     Selector primary;   Ctl primaryNote;
@@ -926,7 +921,7 @@ struct PanelWidgets {
     PanelWidgets() : msgRows(0) {}
 };
 
-enum PanelAction { ACT_NONE, ACT_START, ACT_STOP, ACT_CONFIRM_STOP };
+enum PanelAction { ACT_NONE, ACT_START, ACT_STOP, ACT_CONFIRM_STOP, ACT_INVITE };
 
 struct CoopPanelUi {
     DatapanelGUI*  frame;         // the one native outer window
@@ -1000,7 +995,7 @@ bool registerUnlinkerSeh(MyGUI::IUnlinkWidget* u) {
 }
 
 // ---- Fields: drafts vs remembered values -----------------------------------------
-enum FieldId { FLD_NICK, FLD_HOSTID, FLD_ADDR, FLD_PORT, FLD_COUNT };
+enum FieldId { FLD_NICK, FLD_HOSTID, FLD_ADDR, FLD_PORT, FLD_INVITE, FLD_COUNT };
 enum Verdict { V_OK, V_EMPTY, V_BAD, V_LONG, V_POISON, V_UNREAD };
 
 struct Draft {
@@ -1027,6 +1022,19 @@ int                g_udpPort = kDefaultPort; // one port in the C ABI and saved 
 const size_t       kUdpIpCap = sizeof(((CoopUiSettings*)0)->udpIp);
 bool               g_memorySeeded = false;
 bool               g_rememberPending = false; // settings changed: queue REMEMBER
+char g_joinInvitation[4096] = {};
+bool g_joinInvitationValid = false;
+coopui::Invitation g_invitation;
+unsigned long long g_sessionGeneration = 0;
+unsigned int g_nextInviteRequest = 0;
+
+void clearSecrets() {
+    coopui::wipe(g_joinInvitation, sizeof(g_joinInvitation));
+    g_joinInvitationValid = false;
+    g_invitation.clear();
+    if (g_ui.invitation.edit.w && !g_panelLost)
+        coopui::native::write(static_cast<MyGUI::EditBox*>(g_ui.invitation.edit.w), "");
+}
 
 const int kNickMaxChars = coop::PLAYER_NICK_MAX + 1; // allow overflow to be rejected, not silently accepted
 const int kIdMaxChars   = 40;
@@ -1038,6 +1046,7 @@ Ctl& fieldEdit(int f) {
     case FLD_HOSTID: return g_ui.hostId.edit;
     case FLD_ADDR:   return g_ui.addr.edit;
     case FLD_PORT:   return g_ui.port.edit;
+    case FLD_INVITE: return g_ui.invitation.edit;
     default:         return g_ui.nick.edit;
     }
 }
@@ -1113,12 +1122,25 @@ void validate(int f) {
 // Pull every live field's text (10 Hz while open, and right before a start).
 void readDrafts() {
     if (!g_panel.built) return;
-    char buf[1024];
+    char buf[4096];
     for (int f = 0; f < FLD_COUNT; ++f) {
         Ctl& e = fieldEdit(f);
         if (!e.w) continue;
+        if (f == FLD_INVITE) {
+            coopui::wipe(g_joinInvitation, sizeof(g_joinInvitation));
+            g_joinInvitationValid = coopui::native::read(static_cast<MyGUI::EditBox*>(e.w), g_joinInvitation, sizeof(g_joinInvitation)) && g_joinInvitation[0];
+            continue;
+        }
         if (coopui::native::read(static_cast<MyGUI::EditBox*>(e.w), buf, sizeof(buf))) {
+            if (std::strstr(buf, "KCU1")) {
+                if (!g_draft[f].text.empty()) coopui::wipe(&g_draft[f].text[0], g_draft[f].text.size());
+                g_draft[f].text.clear(); g_draft[f].verdict = V_BAD;
+                coopui::native::write(static_cast<MyGUI::EditBox*>(e.w), "");
+                coopui::wipe(buf, sizeof(buf));
+                continue;
+            }
             if (g_draft[f].verdict == V_UNREAD || g_draft[f].text != buf) {
+                if (!g_draft[f].text.empty()) coopui::wipe(&g_draft[f].text[0], g_draft[f].text.size());
                 g_draft[f].text = buf;
                 g_draft[f].verdict = V_EMPTY;
                 validate(f);
@@ -1127,6 +1149,7 @@ void readDrafts() {
             g_draft[f].verdict = V_UNREAD;
             logErrLine("[coop-ui] field read FAILED");
         }
+        coopui::wipe(buf, sizeof(buf));
     }
 }
 
@@ -1151,6 +1174,7 @@ int firstInvalidField() {
     if (g_draft[FLD_NICK].verdict != V_OK) return FLD_NICK;
     const int ep = activeEndpoint();
     if (ep >= 0 && g_draft[ep].verdict != V_OK) return ep;
+    if (!g_panel.hostFlag && !g_panel.steamFlag && !g_joinInvitationValid) return FLD_INVITE;
     return -1;
 }
 bool startReady() { return firstInvalidField() < 0; }
@@ -1215,7 +1239,7 @@ void seedDraft(int f, const std::string& text) {
 std::string addrText(const std::string& ip, int port) {
     if (ip.empty()) return std::string();
     char b[300];
-    _snprintf(b, sizeof(b) - 1, "%s:%d", ip.c_str(), port);
+    _snprintf(b, sizeof(b) - 1, ip.find(':') == std::string::npos ? "%s:%d" : "[%s]:%d", ip.c_str(), port);
     b[sizeof(b) - 1] = '\0';
     return b;
 }
@@ -1284,12 +1308,14 @@ bool g_pendingDiscord = false;
 
 void selectRole(bool host) {
     if (g_locked || g_panel.hostFlag == host) return;
+    clearSecrets();
     g_panel.hostFlag = host;
     logLine(host ? "[coop-ui] role -> Host" : "[coop-ui] role -> Join");
     fireRemember();
 }
 void selectTransport(bool steam) {
     if (g_locked || g_panel.steamFlag == steam) return;
+    clearSecrets();
     g_panel.steamFlag = steam;
     logLine(steam ? "[coop-ui] transport -> Steam" : "[coop-ui] transport -> UDP");
     fireRemember();
@@ -1320,7 +1346,6 @@ void onPrimary() {
         g_panel.pendingAction = ACT_STOP;
     } else {
         g_panel.pendingAction = ACT_START;
-        logLine("[coop-ui] connection -> ONLINE");
     }
 }
 
@@ -1342,6 +1367,11 @@ void onPanelClick(MyGUI::Widget* w) {
     else if (w == u.addr.button.w)   g_pendingPaste = FLD_ADDR;
     else if (w == u.port.button.w)   g_pendingPaste = FLD_PORT;
     else if (w == u.copyId.w)        copySelfId();
+    else if (w == u.makeInvite.w)   g_panel.pendingAction = ACT_INVITE;
+    else if (w == u.copyInvite.w && g_locked && g_invitation.text()[0]) {
+        const bool ok = clipboardSetText(g_invitation.text());
+        setNote(NOTE_EP, ok ? "Invitation copied" : "Clipboard unavailable", ok ? TONE_GOOD : TONE_BAD);
+    }
     else if (w == u.primary.btn.w)   onPrimary();
     else if (w == u.btnDiscord.w)    g_pendingDiscord = true;
     else if (w == u.btnDiag.w)       g_panel.diagOpen = !g_panel.diagOpen;
@@ -1661,6 +1691,7 @@ const char* verdictText(int f, int v) {
         return v == V_LONG ? ru::kErrNickLong : v == V_POISON ? ru::kErrNickBad : ru::kErrNickEmpty;
     case FLD_HOSTID: return v == V_EMPTY ? ru::kErrIdEmpty : ru::kErrIdBad;
     case FLD_ADDR:   return v == V_EMPTY ? ru::kErrAddrEmpty : ru::kErrAddrBad;
+    case FLD_INVITE: return "Private invitation required (Ctrl+V); maximum 4095 bytes";
     default:         return v == V_EMPTY ? ru::kErrPortEmpty : ru::kErrPortBad;
     }
 }
@@ -1866,7 +1897,7 @@ bool buildPanelWidgets(ForgottenGUI* g, MyGUI::Widget* parent, int cw, int ch) {
     mkRect(b, u.footRule, kPad, ch - footerH, cw - 2 * kPad, 1, C_RULE, 0.45f);
 
     // Left column: fixed blocks; the slack is spread over the four section gaps.
-    const int leftFixed = 4 * head + 2 * kSelH + 2 * (kFieldH + 4) + 3 * kNoteH +
+    const int leftFixed = 4 * head + 2 * kSelH + 3 * (kFieldH + 4) + 3 * kNoteH +
                           kPrimaryH + 6 + kNoteH;
     const int gapL = clampi((avail - leftFixed) / 4, 8, 30);
     int y = top;
@@ -1897,6 +1928,14 @@ bool buildPanelWidgets(ForgottenGUI* g, MyGUI::Widget* parent, int cw, int ch) {
     mkRect(b, u.selfBg, x0, y, sw, kFieldH, C_BLACK, 0.45f);
     mkLabel(b, u.selfText, F_BODY, x0 + 12, y, sw - 24, kFieldH);
     mkButton(b, u.copyId, F_SMALL, x0 + sw + 10, y, kSmallBtnW, kFieldH);
+    y += kFieldH + 4;
+    mkField(b, u.invitation, x0, y, lw, kFieldH, 4096, false);
+    if (u.invitation.edit.w) {
+        MyGUI::EditBox* secret = static_cast<MyGUI::EditBox*>(u.invitation.edit.w);
+        secret->setEditPassword(true);
+    }
+    mkButton(b, u.makeInvite, F_SMALL, x0, y, (lw - 10) / 2, kFieldH);
+    mkButton(b, u.copyInvite, F_SMALL, x0 + (lw + 10) / 2, y, (lw - 10) / 2, kFieldH);
     y += kFieldH + 4;
     mkLabel(b, u.epNote[0], F_SMALL, x0, y, lw, kNoteH);
     mkLabel(b, u.epNote[1], F_SMALL, x0, y + kNoteH, lw, kNoteH);
@@ -2283,6 +2322,7 @@ void forgetPanel(const char* why) {
     g_aux = AuxiliaryUi(); // GUI reset invalidated every auxiliary pointer as well.
     g_ownedN = 0;
     g_ui = PanelWidgets();
+    clearSecrets();
     g_panel.frame = 0;
     g_panel.gui = 0;
     g_panel.win = 0;
@@ -2418,10 +2458,20 @@ void refreshLeft(const CoopUiSnapshot* st, int focused) {
     ctlVisible(u.copyId, self);
     ctlEnabled(u.copyId, st->selfSteamId != 0);
     ctlButtonColour(u.copyId, st->selfSteamId ? C_SOFT : C_DIM, C_HOVER);
+    styleField(u.invitation, FLD_INVITE, !host && !steam, g_locked, idle, focused);
+    ctlText(u.makeInvite, "Create invite");
+    ctlText(u.copyInvite, "Copy invite");
+    ctlVisible(u.makeInvite, host && !steam);
+    ctlVisible(u.copyInvite, host && !steam);
+    ctlEnabled(u.makeInvite, g_locked && st->phase == COOP_HOSTING && !g_invitation.pending());
+    ctlEnabled(u.copyInvite, g_locked && g_invitation.text()[0] != 0);
 
-    const char* hint = host ? (steam ? ru::kHostHintSteam : ru::kHostHintUdp)
-                            : (steam ? ru::kJoinHintSteam : ru::kJoinHintUdp);
-    fieldNote(u.epNote, 2, ep < 0 ? FLD_NICK : ep, NOTE_EP, hint, ep >= 0 && idle);
+    if (host && steam)
+        fieldNote(u.epNote, 2, -1, NOTE_EP, "Give guests your Steam ID to connect.", false);
+    else if (host)
+        fieldNote(u.epNote, 2, FLD_PORT, NOTE_EP, g_invitation.pending() ? "Invitation pending" : g_invitation.text()[0] ? "Invitation ready: explicitly Copy for one client" : g_invitation.result() > 0 ? "Invitation failed" : "Create session, then Create a per-client invitation", false);
+    else
+        fieldNote(u.epNote, 2, ep, NOTE_EP, steam ? ru::kJoinHintSteam : "Numeric endpoint + private invitation (Ctrl+V)", idle);
 
     // Primary action: exactly one, captioned by the state it acts on.
     const char* primary;
@@ -2684,11 +2734,12 @@ void hoverPass() {
 
 // Tab / Shift+Tab: the visible editable fields, in reading order, wrapping.
 void cycleFocus(int dir) {
-    MyGUI::Widget* order[2];
+    MyGUI::Widget* order[4];
     int n = 0;
     if (g_ui.nick.edit.w) order[n++] = g_ui.nick.edit.w;
     const int ep = activeEndpoint();
     if (ep >= 0 && !g_locked && fieldEdit(ep).w) order[n++] = fieldEdit(ep).w;
+    if (!g_panel.hostFlag && !g_panel.steamFlag && !g_locked && g_ui.invitation.edit.w) order[n++] = g_ui.invitation.edit.w;
     if (!n) return;
     const int at = focusedField();
     int cur = -1;
@@ -2727,6 +2778,12 @@ void fillSettings(CoopUiSettings* s) {
 void emitCommand(CoopUiCommand* cmd) {
     const int act = g_panel.pendingAction;
     g_panel.pendingAction = ACT_NONE;
+    if (act == ACT_INVITE && cmd && g_locked && g_panel.hostFlag && !g_panel.steamFlag && !g_invitation.pending()) {
+        if (++g_nextInviteRequest == 0) ++g_nextInviteRequest;
+        g_invitation.request(g_sessionGeneration, g_nextInviteRequest);
+        cmd->kind = COOP_UI_MAKE_UDP_INVITE; cmd->sessionGeneration = g_sessionGeneration;
+        cmd->inviteRequestId = g_nextInviteRequest; return;
+    }
     if (act == ACT_START && !g_locked) {
         readDrafts(); // the text typed since the last refresh counts
         if (!startReady()) {
@@ -2744,6 +2801,9 @@ void emitCommand(CoopUiCommand* cmd) {
         if (cmd) {
             cmd->kind = COOP_UI_CONNECT;
             fillSettings(&cmd->settings);
+            if (!g_panel.hostFlag && !g_panel.steamFlag)
+                std::memcpy(cmd->udpJoinInvite, g_joinInvitation, sizeof(g_joinInvitation));
+            clearSecrets();
             g_rememberPending = false;
         }
         return;
@@ -2755,7 +2815,7 @@ void emitCommand(CoopUiCommand* cmd) {
         else disconnect = g_stop.request() == coopui::StopConfirmation::DISCONNECT;
         if (disconnect) {
             closeStopWindow();
-            logLine("[coop-ui] connection -> OFFLINE");
+            clearSecrets();
             logLine("[coop-ui] DISCONNECT requested");
             cmd->kind = COOP_UI_DISCONNECT;
         }
@@ -2771,6 +2831,11 @@ void emitCommand(CoopUiCommand* cmd) {
 
 void panelTick(const CoopUiSnapshot* st, CoopUiCommand* cmd) {
     seedMemory(st);
+    if (g_sessionGeneration != st->sessionGeneration) {
+        clearSecrets();
+        g_sessionGeneration = st->sessionGeneration;
+    }
+    if (g_invitation.observe(*st)) g_dirty = true;
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
     { static void* s_last = (void*)-1;
       if ((void*)g != s_last) { s_last = (void*)g;
@@ -3087,7 +3152,7 @@ int COOP_UI_CALL apiInitialize(const CoopUiHost* host) {
 }
 
 void COOP_UI_CALL apiTick(const CoopUiSnapshot* st, CoopUiCommand* cmd) {
-    if (!g_initialized || g_stopped || !st || st->structSize < sizeof(CoopUiSnapshot))
+    if (!g_initialized || g_stopped || !st || st->structSize != sizeof(CoopUiSnapshot))
         return;
     if (cmd && cmd->structSize != sizeof(CoopUiCommand)) cmd = 0;
     try {
@@ -3095,6 +3160,11 @@ void COOP_UI_CALL apiTick(const CoopUiSnapshot* st, CoopUiCommand* cmd) {
         bannerTick(st);
     } catch (...) {
         // Never let a C++ exception cross the C boundary.
+        clearSecrets();
+        if (cmd) {
+            SecureZeroMemory(cmd, sizeof(*cmd));
+            cmd->structSize = sizeof(*cmd);
+        }
         logErrLine("[coop-ui] tick exception");
     }
 }
@@ -3104,6 +3174,7 @@ void COOP_UI_CALL apiTick(const CoopUiSnapshot* st, CoopUiCommand* cmd) {
 void COOP_UI_CALL apiShutdown(void) {
     if (!g_initialized || g_stopped) return;
     g_stopped = true;
+    clearSecrets();
     // Give the keyboard back first: focus in a panel field, then the game-input
     // lease (both no-ops when not held). A lost panel is not touched.
     if (g_panel.built && !g_panelLost) coopui::native::releaseFocus(g_panel.win);

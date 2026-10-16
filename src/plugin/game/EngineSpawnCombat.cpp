@@ -18,6 +18,32 @@ namespace coop {
 namespace engine {
 
 // ---- Protocol 21: runtime-spawn proxy replication ---------------------------
+// Same opt-in as npc-pair; no extra native reads unless a bounded event is
+// admitted. Spawn events retain the local full hand so rekey logs can join them.
+static void tracePairNative(Character* c, const char* path,
+                            float x, float y, float z, int result) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = getenv("KENSHICOOP_NPC_PAIR_TRACE");
+        enabled = (v && v[0]=='1') ? 1 : 0;
+    }
+    if (!enabled) return;
+    static unsigned int count = 0;
+    if (count >= 256) return;
+    ++count;
+    unsigned int h[5] = {};
+    readObjectHand(static_cast<RootObject*>(c),h);
+    float px=0,py=0,pz=0;
+    bool pose = readPose(c,&px,&py,&pz,0);
+    DriveProbe pr = {};
+    bool probe = readDriveProbe(c,&pr);
+    char b[640];
+    _snprintf(b,sizeof(b)-1,
+        "[npc-pair-native] now=%lu path=%s r=%d local=%u,%u,%u,%u,%u source=spawn-info requested=%.2f,%.2f,%.2f pose=%d:%.2f,%.2f,%.2f probe=%d mv=%.2f,%.2f,%.2f hk=%.2f,%.2f,%.2f",
+        GetTickCount(),path,result,h[0],h[1],h[2],h[3],h[4],x,y,z,
+        pose?1:0,px,py,pz,probe?1:0,pr.mvX,pr.mvY,pr.mvZ,pr.hkX,pr.hkY,pr.hkZ);
+    b[sizeof(b)-1]=0; coop::logLine(b);
+}
 
 // SEH shims: the public entry points below hold std::string locals (destructors
 // forbid __try in the same frame, the loadSave pattern), so the raw engine
@@ -298,11 +324,15 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
     }
     // Land exactly on the host transform, facing the host heading (createChar
     // grounds/settles on its own); the stream drives it from here.
-    park(c, x, y, z, heading);
+    tracePairNative(c,"spawn-created-pre-park",x,y,z,0);
+    bool parked = park(c, x, y, z, heading);
+    tracePairNative(c,"spawn-post-park",x,y,z,parked?1:0);
     // Quiet its local AI immediately: the host stream is the sole task
     // authority for a proxy (AI-suspend re-asserts this every driven tick).
     detachFromTownAI(c);
+    tracePairNative(c,"spawn-post-detach",x,y,z,0);
     clearGoals(c);
+    tracePairNative(c,"spawn-post-clear",x,y,z,0);
     return c;
 }
 
@@ -1321,6 +1351,24 @@ bool setupSquadScene(GameWorld* gw) {
         coop::logLine("SETUP(squad): member dump faulted");
     }
     return ra || rb;
+}
+
+bool validateJoinSquadClaim(GameWorld* gw, Character* actor,
+                           unsigned playerId, unsigned playerCount) {
+    if (!gw || !actor || playerCount<2 || playerCount>MAX_PLAYERS ||
+        playerId==0 || playerId>=playerCount) return false;
+    __try {
+        if (!gw->player || gw->player->playerCharacters.size()==0) return false;
+        unsigned int leader[5], member[5];
+        Character* first=gw->player->playerCharacters[0];
+        if (!first || !readObjectHand(static_cast<RootObject*>(first),leader) ||
+            !readObjectHand(static_cast<RootObject*>(actor),member) ||
+            leader[1]!=member[1] || leader[2]!=member[2]) return false;
+        for (unsigned i=1;i<gw->player->playerCharacters.size();++i)
+            if (gw->player->playerCharacters[i]==actor)
+                return i%playerCount==playerId;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return false;
 }
 
 bool claimJoinSquadTab(GameWorld* gw, unsigned int playerId, unsigned int nPlayers,

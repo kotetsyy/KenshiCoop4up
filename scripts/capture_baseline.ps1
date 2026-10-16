@@ -27,41 +27,50 @@
 [CmdletBinding()]
 param(
     # Path to the canonical Release DLL to hash (defaults to the build output).
-    [string]$Dll = ""
+    [string]$Dll = "",
+    [ValidateSet('Harness','Release')][string]$Configuration = 'Harness',
+    [string]$NativeBin = ""
 )
+
+function Get-CoopBaselineProtocol {
+    param([string]$Source, [ValidateSet('Harness','Release')][string]$BuildConfiguration)
+    $branch=[regex]::Match($Source,'(?s)#ifdef\s+KENSHICOOP_NET_DIAG\b(?<private>.*?)#else(?<public>.*?)#endif')
+    if (-not $branch.Success) { throw 'Cannot identify Wire.h conditional protocol contract.' }
+    $selected=if ($BuildConfiguration -eq 'Harness') { $branch.Groups['private'].Value } else { $branch.Groups['public'].Value }
+    $value=[regex]::Matches($selected,'PROTOCOL_VERSION\s*=\s*(\d+)')
+    if ($value.Count -ne 1) { throw 'Missing or ambiguous selected wire protocol.' }
+    return [int]$value[0].Groups[1].Value
+}
+function Read-CoopBaselineProtoOutput {
+    param([string[]]$Lines, [string[]]$RequiredTypes)
+    $sizes=@{}; $protocol=$null; $hello=$null; $hash=$null; $terminal=$false
+    $nonempty=@($Lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not $nonempty.Count -or $nonempty[-1] -notmatch '^prototest: ([1-9][0-9]*)/([1-9][0-9]*) checks passed - PASS$') { throw 'Missing terminal native success record.' }
+    foreach ($line in $Lines) {
+        if ($line -match '\bFAIL\b') { throw 'Native prototest reported failure.' }
+        if ($line -match 'ok\s+sizeof\(([A-Za-z0-9_]+)\)\s+\(=\s*(\d+)\)') { $sizes[$Matches[1]]=[int]$Matches[2] }
+        if ($line -match '^prototest: .* \(protocol v(\d+)\)$') { $protocol=[int]$Matches[1] }
+        if ($line -match 'ok\s+HELLO version field offset\s+\(=\s*(\d+)\)') { $hello=[int]$Matches[1] }
+        if ($line -match 'canonical invEntryHash.*=\s*(\d+)\s*$') { $hash=[long]$Matches[1] }
+        if ($line -match '^prototest: ([1-9][0-9]*)/([1-9][0-9]*) checks passed - PASS$') { $terminal=$Matches[1] -eq $Matches[2] }
+    }
+    if (-not $terminal -or $null -eq $protocol -or $hello -ne $protocol -or $null -eq $hash -or -not $RequiredTypes.Count) { throw 'Incomplete native prototest output.' }
+    foreach ($type in $RequiredTypes) { if (-not $sizes.ContainsKey($type)) { throw "Missing native wire-size evidence: $type" } }
+    return [pscustomobject]@{Sizes=$sizes;Protocol=$protocol;Hash=$hash}
+}
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
+. (Join-Path $scriptDir 'NativeBuild.ps1') -Configuration $Configuration
+$native = Get-NativeBuild -Configuration $Configuration -NativeBin $NativeBin
+$core = Get-CoreBuild -Configuration $Configuration
 
 function Get-Sha256 {
     param([string]$Path)
-    if (-not (Test-Path $Path)) { return $null }
-    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash
-}
-
-# ---- protocol version (from Wire.h) -------------------------------------------
-$wire = Join-Path $repoRoot "src\netproto\Wire.h"
-$proto = $null
-$pm = Select-String -Path $wire -Pattern 'PROTOCOL_VERSION\s*=\s*(\d+)' | Select-Object -First 1
-if ($null -ne $pm) { $proto = [int]$pm.Matches[0].Groups[1].Value }
-
-# ---- packet-size inventory + canonical hashes (from prototest) ----------------
-$prototest = Join-Path $repoRoot "dist\prototest.exe"
-$sizes = @{}
-$protoFromTest = $null
-$invEntryHash = $null
-if (Test-Path $prototest) {
-    $out = & $prototest 2>&1
-    foreach ($line in $out) {
-        if ("$line" -match 'ok\s+sizeof\(([A-Za-z0-9_]+)\)\s+\(=\s*(\d+)\)') {
-            $sizes[$Matches[1]] = [int]$Matches[2]
-        }
-        if ("$line" -match 'PROTOCOL_VERSION.*\(=\s*(\d+)\)') { $protoFromTest = [int]$Matches[1] }
-        if ("$line" -match 'canonical invEntryHash.*=\s*(\d+)') { $invEntryHash = [long]$Matches[1] }
-    }
-} else {
-    Write-Host "WARNING: dist\prototest.exe not found - build it (scripts\verify.ps1) for the packet-size inventory."
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Required baseline input missing: $Path" }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
 # ---- DLL hashes ---------------------------------------------------------------
@@ -70,14 +79,32 @@ if (Test-Path $prototest) {
 # the caller points at as the primary $dllHash (default: the test/Harness DLL that
 # the baseline verdicts actually ran against), plus the shipped Release hash when
 # a Release build is present, so both are diffable later.
-if ($Dll -eq "") {
-    $harnessDll = Join-Path $repoRoot "src\plugin\x64\Harness\KenshiCoop.dll"
-    $releaseDll = Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"
-    if (Test-Path $harnessDll) { $Dll = $harnessDll } else { $Dll = $releaseDll }
-}
-$dllHash = Get-Sha256 -Path $Dll
-$releaseDllPath = Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"
-$shippedDllHash = if (Test-Path $releaseDllPath) { Get-Sha256 -Path $releaseDllPath } else { "" }
+if ($Dll -eq "") { $Dll=$core.Files['KenshiCoop.dll'] }
+$Dll=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Dll)
+$dllHash=Get-Sha256 -Path $Dll
+if ($dllHash.ToLowerInvariant() -cne $core.Receipt.files.'KenshiCoop.dll') { throw 'Selected DLL does not match the selected core configuration/source/hash receipt.' }
+$releaseDllPath=Join-Path $repoRoot 'src\plugin\x64\Release\KenshiCoop.dll'
+$shippedDllHash=''
+# Optional Release bytes are explicitly unvalidated observations, not selected-build proof.
+if (Test-Path -LiteralPath $releaseDllPath -PathType Leaf) { $shippedDllHash=Get-Sha256 $releaseDllPath }
+
+# ---- protocol version (from Wire.h) -------------------------------------------
+$wire = Join-Path $repoRoot "src\netproto\Wire.h"
+$wireSource=Get-Content -LiteralPath $wire -Raw
+$proto=Get-CoopBaselineProtocol $wireSource $Configuration
+
+# ---- packet-size inventory + canonical hashes (from prototest) ----------------
+$unitBuild=Get-CoopTestBuild -Kind Protocol -Configuration Release
+$prototest=$unitBuild.Files['prototest.exe']
+$unitSource=Join-Path $repoRoot 'src\prototest\main.cpp'
+$requiredTypes=@([regex]::Matches((Get-Content -LiteralPath $unitSource -Raw),'CHECK_EQ\("sizeof\(([A-Za-z0-9_]+)\)"') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -ne 'DebugLogFileHeader' } | Sort-Object -Unique)
+$out = & $prototest 2>&1
+$unitExit=$LASTEXITCODE
+if ($unitExit -ne 0) { throw "Native prototest failed (exit $unitExit); baseline not changed." }
+$facts=Read-CoopBaselineProtoOutput -Lines @($out | ForEach-Object { "$_" }) -RequiredTypes $requiredTypes
+$sizes=$facts.Sizes; $protoFromTest=$facts.Protocol; $invEntryHash=$facts.Hash
+$standaloneProtocol=Get-CoopBaselineProtocol $wireSource Release
+if ($protoFromTest -ne $standaloneProtocol) { throw 'Standalone public prototest protocol disagrees with Wire.h Release branch.' }
 
 # ---- manifest + config source hashes ------------------------------------------
 $manifestHash = Get-Sha256 -Path (Join-Path $repoRoot "scripts\scenarios.psd1")
@@ -99,10 +126,17 @@ $baseline = [pscustomobject]@{
     dirty           = $dirty
     protocolVersion = $proto
     protocolFromTest = $protoFromTest
+    prototest = @{ path=$prototest; sha256=(Get-Sha256 $prototest); configuration='Release'; protocol=$protoFromTest; exitCode=$unitExit; receipt=$unitBuild.Receipt }
+    coreReceipt = $core.Receipt
     packetSizes     = $sizes
     invEntryHash    = $invEntryHash
     canonicalDll    = @{ path = $Dll; sha256 = $dllHash }
-    shippedDll      = @{ path = $releaseDllPath; sha256 = $shippedDllHash }
+    shippedDll      = @{ path = $releaseDllPath; sha256 = $shippedDllHash; receiptValidated = $false }
+    nativeConfiguration = $Configuration
+    nativeProviderHashes = @{
+        steam = Get-Sha256 $native.Files['KenshiCoopNetSteam.dll']
+        udp = Get-Sha256 $native.Files['KenshiCoopNetUDP.dll']
+    }
     manifestSha256  = $manifestHash
     configSha256    = $configHash
     gameVerdicts    = @{
@@ -113,11 +147,16 @@ $baseline = [pscustomobject]@{
 
 $outDir = Join-Path $repoRoot "tools\baseline"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-$outFile = Join-Path $outDir "baseline_$stamp.json"
+$outFile = Join-Path $outDir ("baseline_${stamp}_"+[guid]::NewGuid().ToString('N')+'.json')
 $latest  = Join-Path $outDir "latest.json"
 $json = $baseline | ConvertTo-Json -Depth 6
-$json | Set-Content -Path $outFile -Encoding UTF8
-$json | Set-Content -Path $latest  -Encoding UTF8
+$temporary=Join-Path $outDir ('.baseline-'+[guid]::NewGuid().ToString('N')+'.json')
+try {
+    [IO.File]::WriteAllText($temporary,$json,[Text.UTF8Encoding]::new($false))
+    [IO.File]::Copy($temporary,$outFile,$false)
+    if (Test-Path -LiteralPath $latest) { [IO.File]::Replace($temporary,$latest,$null) }
+    else { [IO.File]::Move($temporary,$latest) }
+} finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
 
 Write-Host "=== Phase 0 baseline captured ==="
 Write-Host ("  protocol version : {0}" -f $proto)

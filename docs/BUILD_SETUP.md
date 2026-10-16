@@ -1,30 +1,34 @@
 # Build setup
 
+## Scope: unpublished local native gameplay cutover
+
+This checkout targets **0.2.0**, public protocol **80**, private Harness protocol
+**81**. The selected real native provider carries gameplay: Steamworks P2P or
+authenticated direct UDP, never ENet or a fallback. This is a local test build,
+not a published release. The existing stable v0.1.31 feed and published notes
+remain unchanged. The user explicitly waived the two-account Steam pre-core
+gate for local integration; **real two-account Steam P2P remains unverified**.
+Provider tests/interface acquisition do not establish gameplay or Internet reachability.
+
 ## Prerequisites
 
-- Windows x64; VC++ 2010 x64 compiler (v100), Windows SDK 7.1 and KB2519277.
-- VS2022 Build Tools for MSBuild; `vswhere` resolves its path.
-- External KenshiLib/Boost dependencies restored below, plus pinned, patched ENet;
-  these dependency sources are not included in a fresh project checkout.
-- `KENSHILIB_DIR` pointing to `third_party\KenshiLib_deps\KenshiLib` and
-  `BOOST_INCLUDE_PATH` pointing to `third_party\KenshiLib_deps\boost_1_60_0`.
+- Windows x64; VC++2010 x64/v100, Windows SDK7.1 and KB2519277 for engine core/UI.
+- VS2022 Build Tools, v143 x64 and Windows SDK10 for the isolated providers/tools.
+- CMake >=3.24, Git, `tar.exe`, PowerShell, network access to pinned archives.
+  If CMake is absent, `build_transports.ps1` can use installed `uv`/CMake4.4.4.
+- Git LFS and the external KenshiLib/Boost dependencies below.
+- `KENSHILIB_DIR` = `third_party\KenshiLib_deps\KenshiLib` and
+  `BOOST_INCLUDE_PATH` = `third_party\KenshiLib_deps\boost_1_60_0`.
 
-`scripts\v100_env.cmd` supplies PATH, INCLUDE, LIB and an absolute `MtToolPath`
-from an installed SDK. Build commands fail if either DLL fails.
+VS2022 orchestrates MSBuild, not the engine C++ ABI. Core/UI remain v100 with
+the game-compatible release STL/CRT layout. No STL, exceptions, SDK objects or
+cross-CRT frees cross `CoopUiApi.h` (ABI3) or `TransportApi.h` (ABI2).
+The providers use v143 **static CRT**, with pinned static GNS/protobuf contained
+in the UDP DLL. No modern runtime/dependency DLL accompanies the runtime kit.
 
-## Restore external dependencies
+## Restore external engine dependencies
 
-Clone the public source repository, then check out the exact existing release
-tag whose binaries you intend to reproduce (replace `<source-tag>`):
-
-```bat
-git clone https://github.com/kotetsyy/KenshiCoop4up.git
-cd KenshiCoop4up
-git checkout <source-tag>
-```
-
-From a fresh checkout of the release tag, restore the dependency revisions used
-for public builds. Git LFS is required for KenshiLib libraries and the Boost archive:
+Check out the exact source revision you intend to build; never dependency `latest`.
 
 ```bat
 git clone https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git third_party/KenshiLib_deps
@@ -32,173 +36,387 @@ git -C third_party/KenshiLib_deps checkout b566d74bf3d74629cc2fb632a97595b820299
 git -C third_party/KenshiLib_deps apply ../vc10_compat/kenshilib-v100.patch
 git -C third_party/KenshiLib_deps lfs pull
 tar -xf third_party/KenshiLib_deps/boost_1_60_0/boost.zip --directory third_party/KenshiLib_deps/boost_1_60_0
-git clone https://github.com/lsalzman/enet.git third_party/enet/enet
-git -C third_party/enet/enet checkout 5a9c537fd464b3c6d3c55e1d3bd47588faf71b42
-git apply third_party/enet/patches/0001-enet-c89-for-loops.patch
-git apply third_party/enet/patches/0002-enet-socket-hooks.patch
 ```
 
-Keep these revisions pinned when reproducing an existing release. A future
-dependency change requires an explicit source/release update, not a checkout
-of dependency `latest`. External libraries remain outside the mod ZIP; the
-patches and v100 compatibility headers are tracked in this repository.
+The tracked v100 compatibility patch guards the shared enum and supplies a
+`CraftingItem` placeholder for a by-value container declaration; it is **not**
+a recovered native crafting ABI. Do not construct/access native crafting objects
+using that placeholder. ENet/tunnel build sources are no longer used.
 
-`kenshilib-v100.patch` records the existing v100 header compatibility fixes:
-a shared enum guard and a complete `CraftingItem` placeholder for a by-value
-container declaration. The placeholder is not a recovered native ABI layout;
-do not construct native crafting objects or access their item containers with it.
+## Exact native provider build and receipts
 
-## Build without touching the game
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_transports.ps1 -Configuration Release
+# Optional clean source build outside the checkout:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_transports.ps1 -Configuration Harness -BuildRoot C:\CoopNativeClean
+```
+
+The build clears inherited v100/compiler SDK variables and selects the VS2022
+v143 x64 generator explicitly. `build_plugin.cmd` runs this independent modern
+build **before** entering `v100_env.cmd`. Optional `-CMake` selects an explicit
+executable; `-Jobs` is 1..64. Default root is
+`%LOCALAPPDATA%\KenshiCoop\native-build`. Outputs are exactly
+`providers-v143-<checkout-path-id>-<Release|Harness>\bin`; CMake's physical Release
+configuration is separate from the recorded **logical** configuration.
+Debug core/UI uses native Harness, not a Debug provider CRT.
+
+`NativeBuild.ps1` explicitly imports this engine's Utility module. A Windows
+PowerShell 5.1 child of PowerShell 7 otherwise inherits a module search path that
+can select incompatible PS7 hashing/JSON commands and prevent real native builds.
+
+`src/transport/dependencies.json` pins:
+
+| Input | Revision | Archive SHA-256 |
+|---|---|---|
+| GameNetworkingSockets | 1.6.1 / `d534c19aa760df3fb75fd20db13ba1932b8a5463` | `099d4b0ff1837f0f27c83d4ce05869ec1d32136866f69a3336cc137e951189ab` |
+| protobuf | 21.12 / `f0dc78d7e6e331b8c6bb2d5283e06aa26883ca7c` | `d594b561fb41bf243233d8f411c7f2b7d913e5c9c1be4ca439baf7e48384c893` |
+| authenticated-IP patch | `src/transport/patches/gns-authenticated-ip.patch` | `03f1df288dc04e64c00f64055a3af288144a075fe2a0c4937d377a753d402f11` |
+
+Archive hashes verify before extraction; CMake checks the patch hash and applies
+it with Git. Cached extracted dependencies are private build inputs, not source
+extras in the ZIP. Do not manually modify those cached inputs.
+
+The output contains two providers, the sanctioned Steam probe, real
+`transport_integration.exe` and private `transport_credentials.exe`. A
+`native-build.json` receipt records the exact checkout, logical configuration,
+source digest, pins, ABI and hashes of providers/controller/credential tool.
+`NativeBuild.ps1` resolves only that canonical output or an explicit `-NativeBin`;
+it rejects missing/mismatched receipts, changed sources and changed DLLs.
+It never picks the newest directory or an installed DLL. Receipts are not shipped.
+
+## Core/UI build without touching the game
 
 ```bat
 scripts\build_plugin.cmd Release
 scripts\build_plugin.cmd Harness
+scripts\build_plugin.cmd Debug
 ```
 
-`build_plugin.cmd` builds both `src\plugin\x64\<Config>\KenshiCoop.dll` and
-`src\ui\x64\<Config>\KenshiCoopUI.dll`. Default configuration is Harness;
-Release excludes the scenario harness. `build_ui.cmd` builds only the UI;
-`deploy.cmd ... ui` replaces only the UI. Keep the game closed while deploying.
+The core and UI outputs are canonical `src\plugin\x64\<Config>\KenshiCoop.dll`
+and `src\ui\x64\<Config>\KenshiCoopUI.dll`. A source snapshot taken before
+compilation must still match afterward; `dist\build-receipts\core-<Config>.json`
+records source/configuration and both hashes. Kits/deploy/publication reject stale
+or independently replaced outputs. Release excludes the scenario runner;
+Harness/Debug keep it and forcibly disable the updater in `start`, regardless
+of config or caller-provided settings. `build_ui.cmd` remains an iteration tool,
+not a way to create an installable matching runtime. No UI-only deploy exists.
 
-The UI uses v100 `/MD` and the game's release STL layout, including in its Debug
-configuration: it modifies engine-owned strings. Cross-DLL communication uses
-only the packed, versioned POD C ABI in `src\ui\CoopUiApi.h`. RE_Kenshi loads
-only the core; the core loads and pins the UI beside itself. No hot reload.
+RE_Kenshi loads **only** KenshiCoop.dll. Core loads/pins UI and dynamically loads
+only the selected transport beside itself. Steam borrows the game's already
+initialized `steam_api64.dll`; it neither loads/replaces/initializes/shuts down
+another Steam context nor substitutes UDP if interface/authentication fails.
+Steam callback dispatch runs on the main game thread: the game's
+`SteamAPI_RunCallbacks` serves lobby callbacks, followed by an explicit sockets
+`RunCallbacks` drain. The legacy Steam API did not deliver callbacks configured on
+the borrowed `SteamNetworkingSockets012` interface in the actual game probe;
+native timeout state alone must not be mistaken for a delivered disconnect.
+Provider startup and teardown are fenced against the mod's pump.
+Direct UDP never loads Steam, uses no Steam IDs/relay/NAT service, and requires a
+reachable numeric IPv4/IPv6 host endpoint, firewall allowance and any necessary
+router port forwarding.
 
-VS2022 supplies MSBuild orchestration, not a replacement C++ ABI. The compiler,
-SDK and `/MD` runtime must remain v100 / SDK 7.1 / KB2519277 as above; an ordinary
-modern-compiler hosted build is not an ABI-compatible substitute. This repository
-has no root GitHub Actions workflows: builds and publication are manual and
-controlled on a suitably provisioned Windows machine.
+## Credentials and F2
 
-Game-independent verification (builds/runs local test artifacts, does not install
-into or launch Kenshi):
+Steam HOST shares its own SteamID64; no guest ID list or Allow command is required.
+Up to three guests may connect using authenticated, encrypted Steam identities.
+JOIN still verifies the expected host identity. Native admission is separate
+from the gameplay handshake and load-specific READY barrier.
+
+This change removes fields/functions from the provider and UI contracts:
+install the complete matching six-file kit on every peer with Kenshi closed.
+Do not mix the new provider ABI2/UI ABI3 with older DLLs. Old `steamAllow` config
+entries are ignored; UDP still requires a private signed invitation, not an IP list.
+
+UDP host keeps its DPAPI/ACL-protected private host profile under its own Windows
+account. F2 creates a separate invitation for each guest and copies it only by
+an explicit action. UDP join requires both the numeric endpoint and masked
+invitation. Invitations are sensitive `KCU1:` credentials, not ordinary config:
+never put them in argv, logs, reports, source control, screenshots or kits.
+Do not mirror a host profile to a join. Invitations expire within seven days,
+bounded by root expiry; expiry checks apply to new handshakes, not live revocation.
+Private runners can use `transport_credentials.exe --udp <absolute-provider>
+--profile <private-outside-game-file> --invite-file <new-private-file>`; file contents
+stay out of arguments and output. No invitation-discovery or CGNAT bypass is promised.
+
+## Unified game-independent verification
 
 ```powershell
-pwsh -NoProfile -File scripts/verify.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1 -Configuration Release -NativeBin C:\exact\bin
+# Reuse artifacts only after their integrated build:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1 -SkipBuild -Configuration Harness -NativeBin C:\exact\Harness\bin -CoreRunner C:\exact\core_native_tests.exe
 ```
 
-No historical test count is evidence that the current checkout passes. Record
-the actual output for the source/configuration being released.
-The crawl-oracle fixtures format numeric log fields with invariant culture,
-matching the decimal-point native logs regardless of the Windows locale.
+The gate retains wire/save/interpolation units, scenario/contract drift fixtures
+and oracle fixtures. It additionally runs actual C++ updater parser/transaction
+code in disposable installs, production six-file ZIP/publisher/preflight tests,
+the real separate-process native controller, and the real separate-process
+NetLink consumer (`core_native_tests.exe --controller --udp ... --steam ...`).
+Missing native/core runners fail; no mock replaces them. `build_prototest.cmd`
+builds `prototest.exe`, `updater_tests.exe` and actual `native_frame_tests.exe`; the parent-owned
+`build_core_native_tests.cmd` builds the core consumer. Verification does not
+launch Kenshi. No historical test count is proof of this checkout's result.
 
-## Deployment side effects
+Steam inspect/host/join remains a separate installed-game probe:
 
-These commands are not verification commands. `deploy.cmd` mutates the selected
-installation **and also `%USERPROFILE%\Kenshi-Join` if that install exists**,
-including in UI-only mode. Keep both games closed; do not use this helper for
-an isolated deployment or a read-only audit. For a single intended installation,
-manually copy the four-file kit described below, preserving `coop_config.json`.
-Secondary mod/loader copy failures are not reliably propagated by this helper;
-verify every copied file rather than treating exit code 0 as complete deployment.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_steam_probe.ps1 -ProbeDll C:\exact\bin\KenshiCoopSteamProbe.dll -GameRoot D:\Kenshi -Role inspect
+# Different real users, concurrently on their own machines:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_steam_probe.ps1 -ProbeDll C:\exact\bin\KenshiCoopSteamProbe.dll -GameRoot D:\Kenshi -Role host -Seconds 145
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_steam_probe.ps1 -ProbeDll C:\exact\bin\KenshiCoopSteamProbe.dll -GameRoot D:\Kenshi -Role join -PeerSteamId '<real-host-SteamID64>' -Seconds 145
+```
+
+Exercise actual Steam allocated-message ownership without another account:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_steam_probe.ps1 -ProbeDll C:\exact\bin\KenshiCoopSteamProbe.dll -GameRoot D:\Kenshi -Role loopback -Seconds 45
+```
+
+This uses the borrowed native Steam library's network-loopback socket pair,
+not the standalone UDP provider. It calls the production sender with delayed
+delivery in both directions on all three lanes, compares exact payload bytes
+and lane IDs, rejects duplicates, and checks recovery after an invalid send.
+The runner requires the current PID's fresh `LOOPBACK PASS` record; a stale
+appended log or merely surviving the timer cannot pass. It still refuses an
+existing game and restores the original loader/probe/display configuration.
+This does not exercise Steam P2P admission, remote routing or reconnect and is
+not certification of a distinct-account HOST/JOIN session.
+
+Only actual distinct-account payload/identity/route evidence certifies Steam
+P2P. Interface acquisition and relay availability alone do not. Visible game
+checks must fail closed without the non-primary monitor; no primary fallback.
+Preserve user config/save/display, restore loader changes and terminate only
+owned process trees. Reported trade/merchant/time/bed/combat issues are not
+claimed fixed by transport or build checks.
+
+### Procedural Hub beds: native reconciliation
+
+Only the verified Hub region `(20,32)` and Camp Bed template are enabled.
+Native generation is not suppressed. Birth scopes and deferred native work
+record positive provenance; unknown provenance blocks reconciliation instead
+of authorizing deletion. Other categories and regions remain native-only.
+
+The reliable gameplay lane carries complete region/epoch snapshots with an
+explicit end marker. JOIN acknowledges only after a fresh native census equals
+HOST, including full quaternion, floor, parents, ownership and native state.
+`WORLD_READY` also requires current **enabled** region membership and these
+acknowledgements, followed by a successfully queued reliable scope commit.
+A complete native registry with no enabled region uses an explicit zero-count
+commit, after any pending retirements. Unknown or incomplete native registries
+cannot certify an empty scope. JOIN never waits for snapshots of native-only
+regions which HOST has not loaded.
+Unreconciled procedural beds reject native interaction. Removal requires fresh
+positive procedural provenance and native occupancy/AI/reference safety checks.
+No raw network handle or approximate nearest-object lookup authorizes removal.
+
+`procedural_beds` exercises the basic native vertical slice; its first successful
+local run is `tools/test-runs/procedural-beds-native-20261015-3`. It matched
+20 procedural beds per peer and actual native sleep occupancy. That result does
+not certify reconnect, unload/reload, player construction or arbitrary AI/nav
+behavior. `procedural_beds_lifecycle` is the separate extended native check;
+game-independent oracles cannot substitute for its actual engine evidence.
+
+The full native census also records protected saved/player-built beds by their
+complete native handles, separately from procedural IDs. Compare their raw
+native states: existing saved beds can have construction progress `5`; it is
+not a normalized fraction and must not be clipped to `1`. The first extended
+run matched 18 procedural plus 6 protected beds per peer, but correctly failed
+because its movement scaffold never proved native region unload. A stale bed
+task immediately after native release is not occupied-bed position evidence.
+
+The extended native run
+`tools/test-runs/procedural-beds-lifecycle-native-20261015-3` passed on two owned
+Steam 1.0.65 installations on the secondary monitor. Before reconciliation JOIN
+had 24 procedural beds versus HOST's 23; native removal and creation completed
+before ACK, scope commit and `WORLD_READY`. Both complete current sets matched.
+Actual native unload/reload changed HOST's layout to 19 procedural beds in epoch
+2; JOIN adopted that complete set, rather than retaining a fixed expected count.
+After a real disconnect and forced streamed-save reconnect, both peers retained
+the same 19 logical IDs and 6 protected native handles/descriptors. Distinct HOST
+and JOIN characters then occupied logical bed `24` in turn, as observed in both
+native processes. Native path orders, occupancy, player-built ownership and
+engine-integrity gates passed; no global AI/navigation guarantee is implied.
+
+Full native XYZ, type, floor, parent and gameplay-state fields matched; quaternion
+components differed by at most `1.19e-7` after native normalization, below the
+canonical comparison precision. Protected saved/player-built states were
+unchanged. Screenshot timing reported `captureOk=false`; PNGs exist, but HOST's
+camera was occluded, so they are not full visual layout proof. Loopback evidence
+does not certify WAN, separate-account Steam P2P, GOG or other procedural categories.
+
+Run owned, separate game installations on the non-primary monitor with the same
+exact Harness build and independent save roots. Force save streaming when
+testing bootstrap; a copied fixture is not proof of network transfer. Do not
+publish these local builds or replace the stable release feed.
+
+
+## Local audit integration checks
+
+Run `scripts/tests/AuditIntegration.Tests.ps1` with both Windows PowerShell 5.1
+and PowerShell 7. It exercises environment cleanup, scenario precedence,
+byte-preserving configuration changes, save transactions and failed restoration
+without launching Kenshi or changing system settings. Free play removes
+diagnostic overrides; only scripted entries pin `CELL_AUTH=0`. An absent
+environment variable must be passed as `[NullString]::Value`: PowerShell `$null`
+leaves an empty variable in the .NET setter under PowerShell 7.
+
+`scripts/verify.ps1 -SkipBuild` also runs the crawl and audit integration fixtures.
+Build current native/protocol/core consumer artifacts first. Run the two shells
+sequentially because they share build outputs. Crawl coordinates use invariant
+formatting, independently of the Windows locale. These checks do not certify
+floor-item identity, NPC poses, engine pause or disconnect recovery in Kenshi.
+
+Source receipts use ordinal path ordering: Windows PowerShell's NLS collation
+and PowerShell 7's ICU collation otherwise hash the same SDK files in different
+orders. `NativeBuild.ps1` also puts the running engine's built-in modules first
+for child processes while retaining external module paths. This prevents a
+Windows PS5.1 child of `pwsh` from binding incompatible PS7 Utility modules.
+`BuildDistributionRegression.Tests.ps1` exercises both real engines against the
+same consumed-input tree and rejects stale receipts after a header change.
+`kit_preflight.ps1` applies the same engine-local builtin resolution before
+standalone harness consumers run, not only after native-build helpers load.
+This also covers `HarnessSafetyRegression.Tests.ps1` launched directly by a
+PS7 parent: Get-FileHash and native input boundary compilation run in PS5.1.
+The native item witness is compiled in `verify.ps1` through `v100_env.cmd`; it
+does not require a caller-preconfigured `cl.exe` in PATH.
+
+`Clear-CoopRunEnvironment` treats an absent or empty preservation list as
+preserve-nothing. Explicit scenario keys restore only their captured values;
+stale credentials do not survive implicitly. Both engines exercise this against
+the real process environment before any game launch.
+
+Physical W1/W2 oracles consume the emitted full before/after item handles,
+recipient container, item type, occurrence ID and simultaneous bag/ground
+quantities. Host seat `0` is valid; a missing occurrence ID is not. A successful
+parser fixture does not certify the native item transition in Kenshi.
+Floor screenshot anchors use `WPMIRROR`/`WGRP` startup records instead of
+unrelated movement markers, so captures happen while both owned games are live.
+For a run without a named scenario, `run_test.ps1` starts its screenshot clock
+at the first observed HOST gameplay entry, before launching JOIN. Time consumed
+by the staggered JOIN startup is deducted rather than slept a second time.
+
+`world_pickup_mirror` seeds its material through the registered world-object
+factory, then moves that exact object into the source bag before measuring the
+baseline. Detached inventory fabrication produces a `4,0,0,0,0` handle and cannot
+prove a physical transition; do not bypass handle resolution to make it pass.
+The real owned HOST/JOIN run covers the full spawn/pickup/claim transaction,
+not initial-world parity or simultaneous pickup arbitration.
+`speed_pause_ui` defaults to the tracked `squad1` fixture, not an installation's
+untracked `autosave0`. Its observer requires four actual host/client UI or
+keyboard transitions and eight-second engine-clock holds; direct speed setters
+cannot satisfy the scenario.
+The observer first requires one uninterrupted second in the requested state:
+local UI prediction may briefly revert before the host's reply. Only this settle
+period restarts; a relapse during the subsequent strict eight-second hold is
+still a failure, and the 45-second phase deadline is unchanged. MainBar's
+`setGameSpeed(0, true)` is captured as a pause command while preserving the
+previous speed tier; automatic/guarded zero writes do not create user votes.
+The actual owned HOST/JOIN run passed all four transitions (eight peer holds),
+with zero clock advance during both pause phases. This does not certify NPC
+animation or all time-speed combinations.
+
+
+During the STOP audit, the primary checkout at
+`C:\Users\kotetsy\source\KenshiCoop` rebuilt v100 core/UI and v143 providers;
+current checkout/configuration/source/output receipts validated in PS5.1 and PS7.
+Both sequential `verify.ps1 -SkipBuild -Configuration Harness` runs passed:
+543 protocol checks, production updater transactions, native frame checks,
+filesystem/harness/oracle regressions, the real UDP controller and the real
+NetLink host-plus-three consumer. The latter exercised READY load tokens, pause
+heartbeat precedence, exact reliable/bulk delivery, world/session replay fences
+and reconnect. These primary-build/consumer results alone do **not** prove
+that floor items, NPC poses, engine pause or four Kenshi worlds agree. The
+separate real-UI pause proof is described above.
+
+The current protocol must be checked on both participants; old proto73 archives
+are not current artifacts. To exercise the bounded menu/provider smoke with the
+user's game closed, use the freshly built exact six-file Harness kit:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_native_smoke.ps1 -Kit C:\Downloads\KenshiCoop-dev-kit.zip -GameRoot D:\Kenshi -NativeBin C:\exact\Harness\bin -AutoConnect -Seconds 120
+```
+
+This uses the installed sanctioned loader, a private host profile and the shared
+owned-process/non-primary-monitor guard. It does not select a user's save or
+certify Internet reachability. In-world HOST/JOIN and two-account Steam P2P
+require separate observed verification.
+
+
+## Exact six-file distribution and safe deploy
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make_mod_kit.ps1 -SkipBuild -Configuration Release -NativeBin C:\exact\bin
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make_mod_kit.ps1 -SkipBuild -Configuration Harness -NativeBin C:\exact\Harness\bin -OutputZip C:\Downloads\KenshiCoop-local.zip
+```
+
+The ZIP has exactly `KenshiCoop/` entries: **KenshiCoop.dll, KenshiCoopUI.dll,
+KenshiCoopNetSteam.dll, KenshiCoopNetUDP.dll, KenshiCoop.mod, RE_Kenshi.json**.
+JSON `Plugins` lists only the core. Canonical core/UI and native receipts must
+match current source/configuration; all ZIP hashes match those inputs. No
+config, secret, launcher, provenance, source, probe, test or document is included.
 
 ```bat
-scripts\deploy.cmd "D:\SteamLibrary\steamapps\common\Kenshi" Harness
-scripts\deploy.cmd "D:\SteamLibrary\steamapps\common\Kenshi" Harness ui
+scripts\deploy.cmd "D:\explicit\Kenshi" Harness nomirror "C:\exact\Harness\bin"
 ```
 
-## Distribution and updates
+Deploy requires an explicit installation and defaults to **no mirror**. `mirror`
+in the third argument explicitly adds `%USERPROFILE%\Kenshi-Join`; the fourth
+argument supplies the exact native bin. The helper preflights all six inputs
+and every destination before copying, propagates copy/hash failures, and never
+copies/removes user config, saves or credentials. Keep the games closed.
+The initial migration must be installed as the full kit, not through an old updater.
 
-Package the matching Release pair from the repository root:
+## Four-component updater and non-mutating publisher
+
+Schema2 requires `transportAbi=2`, `version`, and all four
+`coreSha256/coreUrl`, `uiSha256/uiUrl`, `steamSha256/steamUrl`,
+`udpSha256/udpUrl` pairs. **No legacy sha256/url fields**: the published old
+parser rejects before fetching/replacing the core. Hashes are lowercase SHA-256;
+URLs are exactly the fixed repository/release/version/component asset paths.
+Duplicate/unknown fields, malformed versions, hashes and URLs reject before
+payload fetch or disk mutation. Same-version comparison checks all four images.
+
+All four payloads validate before mutation; each stage write, flush and on-disk
+hash must succeed before the durable recovery journal. Backup and promotion
+failures check reverse rollback. Incomplete rollback preserves journal/backups
+and cannot report success. A verified committed marker allows next-launch
+cleanup only after all four live hashes match; incomplete transactions recover
+before companions load. Recovery changing the currently mapped core blocks
+startup until restart. Private Harness/Debug never sweeps public recovery files;
+it fails closed without mutation when any are pending. Orphaned/corrupt recovery
+data is preserved, never blindly deleted. Config/save/profile files are outside
+the transaction.
+
+Runtime application also owns the shared `RuntimeImages.h` lifecycle barrier:
+the first UI attempt must settle before replacement, UI/provider loaders cannot
+overlap renames, and new companion loads/session starts are refused after apply
+until Kenshi restarts. Intentionally omitted/failed UI attempts settle too.
+Complete verified rollback reopens loading; pending recovery never does. This
+is separate from disk crash recovery and keeps a mapped old core from loading
+new companions during the current process.
 
 ```powershell
-pwsh -NoProfile -File scripts/make_mod_kit.ps1 -Configuration Release -SkipBuild
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish_release.ps1 -NativeBin C:\exact\bin -Local
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish_release.ps1 -NativeBin C:\exact\bin -WhatIf
 ```
 
-This creates `dist/KenshiCoop-kit.zip` with exactly four runtime files under
-`KenshiCoop/`: core DLL, UI DLL, mod and RE_Kenshi JSON. Packaged hashes are
-checked against build outputs; no `PROVENANCE.json` is shipped. `-SkipBuild`
-requires the matching pair to have been built already. F2 creates
-`coop_config.json` when saving settings; updates must preserve it.
+Both modes and the default are read-only. The helper validates source receipts
+and exact six-file kit hashes, prints schema2 and **unexecuted** five-asset upload
+commands (kit plus four DLLs), and never uploads/tags/pushes. Explicit
+`-WriteManifest -Out <new-non-stable-file>` can create a new local candidate;
+`-Local`/`-WhatIf` still suppress it. Stable `dist/UPDATE.txt` and notes cannot be
+written by the publisher. Publication requires explicit maintainer authorization.
+After authorization, publish the matching source/tag and complete five-asset
+release, verify downloaded hashes, then advance public `main` and its schema2
+feed with a normal fast-forward. Never point the stable feed at missing assets
+or merge the divergent private debug history over public history.
 
-### Manual future publication
+## Source and license obligations
 
-Use an exact existing source tag at the commit used to build the DLLs, not an
-automatically created tag at whatever branch tip happens to be current. Replace
-`<source-tag>` below with that tag, and check its source and build version agree.
-Publish three assets: the four-file ZIP and the standalone core/UI DLL pair.
-Release installation instructions belong in the notes file:
-
-```powershell
-gh release create <source-tag> dist/KenshiCoop-kit.zip src/plugin/x64/Release/KenshiCoop.dll src/ui/x64/Release/KenshiCoopUI.dll --repo kotetsyy/KenshiCoop4up --verify-tag --title <source-tag> --notes-file dist/RELEASE_NOTES.md
-```
-
-The command above publishes remotely: do not run it during a documentation audit.
-For local publisher inspection only:
-
-```powershell
-pwsh -NoProfile -File scripts/publish_release.ps1 -Owner kotetsyy -Repo KenshiCoop4up -WhatIf
-```
-
-The helper checks that the ZIP has exactly those four runtime files and that
-all four packaged hashes match the selected DLL, mod and loader JSON inputs.
-It prints, but never executes, the
-three-asset `gh` commands with an explicit repository, an existing source tag
-(`--verify-tag`) and `-ReleaseNotes` / `--notes-file`. `-Notes` is only the short
-manifest summary. `-Owner` and `-Repo` override independently; omitted values
-come from the existing manifest. `-WhatIf` performs these checks and previews
-the manifest and commands without writing the manifest or publishing anything.
-Keep the canonical input basenames `KenshiCoop.dll`, `KenshiCoopUI.dll` and
-`KenshiCoop-kit.zip`, even when selecting files from custom directories. The
-printed upload commands do not rename assets, while the feed and installation
-instructions use those canonical names.
-
-Never run the publisher without `-WhatIf` during an audit: its normal mode writes
-the stable manifest. A real release must upload and verify all assets first,
-then publish the stable manifest referencing the available core/UI URLs and
-hashes. Both payloads are verified before replacing the installed pair; restart
-the game to use them. Manual installation must replace both DLLs together.
-
-### Source and dependency obligations
-
-Link the exact public source tag in the release body; GitHub's automatic source
-downloads contain the tracked project files, not the external dependencies.
-The pinned fetch instructions above, ordered patches and compatibility headers
-are part of reproducing the build. Do not add a separate player-facing source
-archive as a release asset. Preserve nhoral's original authorship and
-https://github.com/nhoral/KenshiCoop credit; kotetsyy maintains this derivative.
-
-Preserve the project's AGPL-3.0 and all applicable GPL/dependency notices,
-including ENet's MIT notice and the notices accompanying KenshiLib, Boost and
-other linked dependencies. Before distribution, ensure corresponding source and
-required notices for the actual distributed components remain available under
-their respective licenses; do not assume a precompiled dependency bundle or
-the project's automatic source ZIP alone satisfies every obligation.
-
-The current public Release pair uses protocol 70; the Harness pair uses
-`NET_DIAG` protocol 71. Both share the load-specific READY barrier and a 1 ms
-maximum idle ENet wait; only the diagnostic pair mirrors the client's local log.
-Harness forcibly disables the public updater; distribute it as a manual kit.
-The packed `TimePacket` is 21 bytes in both configurations (`readyLoadId` is
-always present). Earlier public 59/64/66/68 and diagnostic 63/65/67/69 pairs are rejected at handshake.
-`InvItemEntry` is 165 bytes: stock snapshots also carry the native loose section
-and two grid coordinates. Complete building stock restores the host's physical
-stacks at those positions instead of attempting a different greedy packing.
-`SpawnInfoPacket` is 211 bytes: a merchant description includes its shop home
-and the actual host platoon template SID. Native `isATrader` reads that
-template's `is trader` flag; the character SID and squad role alone are insufficient.
-
-Historical v0.1.25 behavior: it targets 100 Hz entity snapshots with a 10 ms send interval on the existing
-monotonic QPC clock, not the coarse `GetTickCount` clock. The sender retains its
-snapshot buffer capacity between sends and preserves capture-time wire stamps.
-Fresh captures remain game-frame-paced; interpolation adapts to those stamps
-and ignores duplicate captures. The 50 ms distant-NPC slice selection and other
-channel budgets are unchanged. Its public 64/diagnostic 65 packet formats did not change.
-
-### Manual Harness kit installation
-
-```powershell
-pwsh -NoProfile -File scripts/make_mod_kit.ps1 -Configuration Harness -SkipBuild
-```
-
-After building the matching Harness core/UI pair, this creates the four-file
-`dist/KenshiCoop-dev-kit.zip`. With both games closed, install the same kit on
-HOST and JOIN by copying `KenshiCoop/` into `<Kenshi>/mods/`, replacing the two
-DLLs, mod and RE_Kenshi JSON while leaving `coop_config.json` intact. Launch
-through Steam or `kenshi_x64.exe`; no separate launcher or private update feed
-is required or provided by this public source process.
-
-This remains experimental two-player co-op. Three/four-player sessions are not
-validated; see the README's known issues and report-bugs directions rather than
-treating a build or a historical regression report as game-level validation.
+Preserve nhoral's original authorship and AGPL-3.0; KenshiLib/RE_Kenshi GPL,
+Boost, Valve GameNetworkingSockets BSD-3-Clause, protobuf BSD and all applicable
+linked dependency notices. The release source revision and pinned fetch/patch
+instructions are part of corresponding-source availability; do not assume a
+precompiled bundle or automatic project source ZIP alone satisfies obligations.
+Do not attach a separate player-facing source ZIP or put notices/source extras
+inside the exact six-file runtime kit. Make applicable notices and sources
+available with the source/release documentation instead.

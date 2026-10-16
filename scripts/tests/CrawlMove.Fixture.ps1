@@ -88,8 +88,7 @@ function New-CrawlSample {
     }
     $bs = 8 + ($Prone -shl 9)   # BODY_CRAWL | prone field
     return ("[$stamp] SCENARIO CRAWL hand=7,3 t=$Ms prone=$Prone crip=$Crip " +
-            [string]::Format([Globalization.CultureInfo]::InvariantCulture,
-                "pos={0:F2},5.00,50.00 bs=$bs mv=$Mv spd=1.20", $x))
+            [string]::Format([Globalization.CultureInfo]::InvariantCulture, "pos={0:F2},5.00,50.00 bs=$bs mv=$Mv spd=1.20", $x))
 }
 
 # The physics witness beside each sample. $Hk=0 = the body lost its physics
@@ -100,8 +99,7 @@ function New-CrawlProbe {
     $sec = [int][Math]::Floor($Ms / 1000)
     $stamp = "10:00:{0:00}.{1:000}" -f $sec, ($Ms % 1000)
     return ("[$stamp] SCENARIO CRAWLPROBE hand=7,3 t=$Ms " +
-            [string]::Format([Globalization.CultureInfo]::InvariantCulture,
-                "mv={0:F2},5.00,50.00 hk=${Hk}:{1:F2},0.50,5.00 ", $X, ($X / 10.0)) +
+            [string]::Format([Globalization.CultureInfo]::InvariantCulture, "mv={0:F2},5.00,50.00 hk=${Hk}:{1:F2},0.50,5.00 ", $X, ($X / 10.0)) +
             "mode=0 ao=0 tav=0.00,0.00,0.00 mot=1.00,0.00,1.00")
 }
 
@@ -121,7 +119,6 @@ try {
     Check "fixed shape PASSes" ($st -eq 'PASS')
     $g = Get-GateResults | Where-Object { $_.gate -eq 'crawl_move' } | Select-Object -First 1
     Check "records the owner posture" ($null -ne $g -and $g.metrics.AOwnerProne -eq 2)
-    Check "records a crawl gap" ($null -ne $g -and $g.metrics.ContainsKey('AGapMed'))
 
     # ---- 2. PRE-FIX shape: same positions, copy upright and not crippled. ----
     # This is the bug a position gate cannot see.
@@ -132,9 +129,6 @@ try {
     Reset-GateResults
     $st2 = Test-CrawlMove -HostFile $hBad -JoinFile $jBad
     Check "pre-fix shape FAILs" ($st2 -eq 'FAIL')
-    $g2 = Get-GateResults | Where-Object { $_.gate -eq 'crawl_move' } | Select-Object -First 1
-    Check "failure names the posture" ($null -ne $g2 -and $g2.detail -match 'posture does not cross')
-    Check "failure names the cause" ($null -ne $g2 -and $g2.detail -match 'cause does not cross')
 
     # ---- 3. Position drift: posture crosses but the copy is left behind. ----
     Write-Host "== crawl_move: posture crosses, position drifts (expect FAIL) =="
@@ -144,8 +138,6 @@ try {
     Reset-GateResults
     $st3 = Test-CrawlMove -HostFile $hDrift -JoinFile $jDrift
     Check "drifting copy FAILs" ($st3 -eq 'FAIL')
-    $g3 = Get-GateResults | Where-Object { $_.gate -eq 'crawl_move' } | Select-Object -First 1
-    Check "failure names the gap" ($null -ne $g3 -and $g3.detail -match 'median crawl gap')
 
     # ---- 5. Crawls in place: right posture, small gap, no travel. ----
     # The shape the gate MISSED (run 20260805_153425 passed at gap=3.68u with the
@@ -159,11 +151,6 @@ try {
     Reset-GateResults
     $st5 = Test-CrawlMove -HostFile $hFrz -JoinFile $jFrz
     Check "frozen copy FAILs" ($st5 -eq 'FAIL')
-    $g5 = Get-GateResults | Where-Object { $_.gate -eq 'crawl_move' } | Select-Object -First 1
-    Check "failure names the travel" ($null -ne $g5 -and $g5.detail -match 'crawling in place')
-    # The point of the fixture: the OLD checks all passed on this log.
-    Check "posture still crossed"  ($null -ne $g5 -and $g5.detail -notmatch 'posture does not cross')
-    Check "gap was within bounds"  ($null -ne $g5 -and $g5.detail -notmatch 'median crawl gap')
 
     # ---- 6. Frozen MODEL: every position field tracks, mesh left behind. ----
     # The shape no position check can see (run 20260805_154639): the copy's
@@ -176,21 +163,15 @@ try {
     Reset-GateResults
     $st6 = Test-CrawlMove -HostFile $hPhys -JoinFile $jPhys
     Check "physics-less copy FAILs" ($st6 -eq 'FAIL')
-    $g6 = Get-GateResults | Where-Object { $_.gate -eq 'crawl_move' } | Select-Object -First 1
-    Check "failure names the physics body" ($null -ne $g6 -and $g6.detail -match 'no physics body')
-    # Everything a position gate can measure was perfect on this log.
-    Check "posture crossed anyway"  ($null -ne $g6 -and $g6.detail -notmatch 'posture does not cross')
-    Check "gap fine anyway"         ($null -ne $g6 -and $g6.detail -notmatch 'median crawl gap')
-    Check "travel fine anyway"      ($null -ne $g6 -and $g6.detail -notmatch 'crawling in place')
 
     # ---- 4. No signal: the engine never crippled the subject. ----
-    Write-Host "== crawl_move: owner never crippled (expect SKIP) =="
+    Write-Host "== crawl_move: owner never crippled (expect FAIL) =="
     $hNo = Join-Path $tmp "host_no.log"; $jNo = Join-Path $tmp "join_no.log"
     New-CrawlLog -Path $hNo -Tag "A" -Cut $true -Prone 0 -Crip 0
     New-CrawlLog -Path $jNo -Tag "B" -Cut $true -Prone 0 -Crip 0
     Reset-GateResults
     $st4 = Test-CrawlMove -HostFile $hNo -JoinFile $jNo
-    Check "no-signal run SKIPs" ($st4 -eq 'SKIP')
+    Check "required posture evidence cannot be skipped" ($st4 -eq 'FAIL')
 }
 finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

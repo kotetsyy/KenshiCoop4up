@@ -1,77 +1,109 @@
-// UdpEndpoint.h - paste-parse a host:port from clipboard text (pure, no Win32).
-//
-// The F2 panel has no text fields, so a join on UDP pastes an address the same
-// way they paste a Steam ID. Clipboard text is noisy (whitespace, "ip:port",
-// "host port", a trailing newline). This keeps only the first host token and an
-// optional port so junk is rejected before it is written to coop_config.json.
+// Numeric direct-UDP endpoint grammar shared by core and F2.
+// IPv4[:port], bare IPv6, [IPv6][:port], or address followed by a port.
+// DNS names and trailing tokens are rejected; output is unchanged on failure.
 
 #ifndef COOP_UDP_ENDPOINT_H
 #define COOP_UDP_ENDPOINT_H
 
 #include <string>
 
+// The stable Winsock parser needs no WSAStartup or socket. Forward declaration
+// avoids pulling conflicting Winsock headers into the legacy engine headers.
+extern "C" __declspec(dllimport) int __stdcall inet_pton(
+    int family, const char* address, void* output);
+#pragma comment(lib, "ws2_32.lib")
+
 namespace coop {
 
-// Parse an IPv4 / hostname endpoint. On success writes ip and, if a port was
-// present, port (1..65535). If the text has a host but no port, ip is written
-// and port is left untouched. Returns false on empty / invalid input (out
-// params unchanged).
+inline bool udpEndpointSpace(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
 inline bool parseUdpEndpoint(const std::string& text, std::string& ip, int& port) {
-    std::string t;
-    t.reserve(text.size());
-    for (size_t i = 0; i < text.size(); ++i) {
-        char ch = text[i];
-        if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
-        t += ch;
-    }
-    size_t a = 0;
-    while (a < t.size() && t[a] == ' ') ++a;
-    size_t b = t.size();
-    while (b > a && t[b - 1] == ' ') --b;
-    if (a >= b) return false;
-    t = t.substr(a, b - a);
+    if (text.empty() || text.size() > 160) return false;
+    size_t a = 0, b = text.size();
+    while (a < b && udpEndpointSpace(text[a])) ++a;
+    while (b > a && udpEndpointSpace(text[b - 1])) --b;
+    if (a == b) return false;
 
-    std::string host;
-    std::string portStr;
-    size_t colon = t.rfind(':');
-    size_t space = t.find(' ');
-    if (colon != std::string::npos && (space == std::string::npos || colon < space)) {
-        host = t.substr(0, colon);
-        size_t pe = colon + 1;
-        while (pe < t.size() && t[pe] != ' ') ++pe;
-        portStr = t.substr(colon + 1, pe - (colon + 1));
-    } else if (space != std::string::npos) {
-        host = t.substr(0, space);
-        size_t ps = space + 1;
-        while (ps < t.size() && t[ps] == ' ') ++ps;
-        size_t pe = ps;
-        while (pe < t.size() && t[pe] != ' ') ++pe;
-        portStr = t.substr(ps, pe - ps);
-    } else {
-        host = t;
-    }
-    while (!host.empty() && host[host.size() - 1] == ' ') host.erase(host.size() - 1);
-    if (host.empty() || host.size() > 253) return false;
-    for (size_t i = 0; i < host.size(); ++i) {
-        char ch = host[i];
-        bool ok = (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
-                  (ch >= 'a' && ch <= 'z') || ch == '.' || ch == '-';
-        if (!ok) return false;
-    }
-    if (host[0] == '.' || host[0] == '-') return false;
-
-    int p = -1;
-    if (!portStr.empty()) {
-        if (portStr.size() > 5) return false;
-        p = 0;
-        for (size_t i = 0; i < portStr.size(); ++i) {
-            if (portStr[i] < '0' || portStr[i] > '9') return false;
-            p = p * 10 + (portStr[i] - '0');
+    size_t hostStart = a, hostEnd = b, tail = b;
+    size_t portStart = b;
+    bool explicitPort = false, bracketed = text[a] == '[';
+    if (bracketed) {
+        hostStart = a + 1;
+        hostEnd = text.find(']', hostStart);
+        if (hostEnd == std::string::npos || hostEnd >= b) return false;
+        tail = hostEnd + 1;
+        if (tail < b && text[tail] == ':') {
+            explicitPort = true;
+            portStart = ++tail;
+        } else if (tail < b && !udpEndpointSpace(text[tail])) {
+            return false;
         }
-        if (p < 1 || p > 65535) return false;
+    } else {
+        hostEnd = a;
+        unsigned colons = 0;
+        size_t colon = b;
+        while (hostEnd < b && !udpEndpointSpace(text[hostEnd])) {
+            if (text[hostEnd] == ':') { ++colons; colon = hostEnd; }
+            ++hostEnd;
+        }
+        tail = hostEnd;
+        // A bare IPv6 suffix is an address group, never an implicit port.
+        if (colons == 1) {
+            explicitPort = true;
+            portStart = colon + 1;
+            hostEnd = colon;
+        }
     }
-    ip = host;
-    if (p >= 1) port = p;
+
+    size_t portEnd = b;
+    if (!explicitPort && tail < b) {
+        while (tail < b && udpEndpointSpace(text[tail])) ++tail;
+        if (tail < b) { explicitPort = true; portStart = tail; }
+    } else if (explicitPort && tail < b) {
+        // For IPv4:port the remaining whitespace is trailing-only.
+        while (tail < b && udpEndpointSpace(text[tail])) ++tail;
+        if (tail != b && tail != portStart) return false;
+    }
+    if (explicitPort) {
+        portEnd = portStart;
+        while (portEnd < b && !udpEndpointSpace(text[portEnd])) ++portEnd;
+        size_t after = portEnd;
+        while (after < b && udpEndpointSpace(text[after])) ++after;
+        if (after != b || portStart == portEnd || portEnd - portStart > 5)
+            return false;
+    }
+
+    const size_t hostSize = hostEnd - hostStart;
+    if (!hostSize || hostSize > 128) return false;
+    char numeric[129];
+    for (size_t i = 0; i < hostSize; ++i) {
+        const char ch = text[hostStart + i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+              (ch >= 'A' && ch <= 'F') || ch == ':' || ch == '.'))
+            return false;
+        numeric[i] = ch;
+    }
+    numeric[hostSize] = '\0';
+    unsigned char address[16];
+    const int windowsAfInet = 2, windowsAfInet6 = 23;
+    if (bracketed ? inet_pton(windowsAfInet6, numeric, address) != 1 :
+        (inet_pton(windowsAfInet, numeric, address) != 1 &&
+         inet_pton(windowsAfInet6, numeric, address) != 1))
+        return false;
+
+    int parsedPort = port;
+    if (explicitPort) {
+        parsedPort = 0;
+        for (size_t i = portStart; i < portEnd; ++i) {
+            if (text[i] < '0' || text[i] > '9') return false;
+            parsedPort = parsedPort * 10 + text[i] - '0';
+        }
+        if (parsedPort < 1 || parsedPort > 65535) return false;
+    }
+    ip.assign(numeric, hostSize);
+    port = parsedPort;
     return true;
 }
 

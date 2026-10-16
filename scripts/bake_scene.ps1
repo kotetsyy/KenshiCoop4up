@@ -1,108 +1,83 @@
 <#
 .SYNOPSIS
-  Bake a fixture save: launch a single HOST instance, auto-load a base save,
-  run a setup scene (KENSHICOOP_SETUP), then auto-write the fixture save
-  (KENSHICOOP_BAKESAVE) - no manual save-menu round-trip.
-
-  Example (bed+cage occupancy fixture):
-    powershell -ExecutionPolicy Bypass -File scripts\bake_scene.ps1 `
-        -Setup bedcage -BaseSave squad1 -BakeSave bedcage1
-
-  Add -Promote to also capture the fresh save into the repo fixture store
-  (fixtures\saves\<BakeSave>), the sanctioned way to update a tracked fixture:
-    powershell -ExecutionPolicy Bypass -File scripts\bake_scene.ps1 `
-        -Setup bedcage -BaseSave squad1 -BakeSave bedcage1 -Promote
+  Bake duel, splitfar, bedcage, pole or buffpc from a named base save.
+  Success requires exact native completion, stable save contents and clean owned
+  process exit. -Promote transactionally captures into the tracked fixture store.
 #>
 param(
-    [Parameter(Mandatory=$true)][string]$Setup,
-    [string]$BaseSave = "squad1",
-    [Parameter(Mandatory=$true)][string]$BakeSave,
-    [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi",
-    [int]$Seconds = 120,
-    [int]$StartTimeoutSec = 240,
-    [switch]$SkipDeploy,
-    # After a successful bake, capture the fresh save into the repo fixture store
-    # (fixtures\saves\<BakeSave>) via capture_save.ps1 so the pristine copy is
-    # version-controlled and restored on future test runs.
-    [switch]$Promote
+    [ValidateSet('duel','splitfar','bedcage','pole','buffpc')][string]$Setup,
+    [string]$BaseSave='squad1', [string]$BakeSave,
+    [string]$HostDir='C:\Program Files (x86)\Steam\steamapps\common\Kenshi',
+    [ValidateRange(1,86400)][int]$Seconds=120,
+    [ValidateRange(1,3600)][int]$StartTimeoutSec=240,
+    [switch]$SkipDeploy, [switch]$Promote
 )
-$ErrorActionPreference = "Stop"
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repo      = Split-Path -Parent $scriptDir
-
-$hostExe = Join-Path $HostDir "kenshi_x64.exe"
-if (-not (Test-Path $hostExe)) { throw "Kenshi not found at $HostDir" }
-
-$saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
-if (-not (Test-Path (Join-Path $saveRoot $BaseSave))) {
-    throw "Base save '$BaseSave' not found in $saveRoot"
+function Read-CoopBakeCompletion {
+    param([string[]]$Lines, [string]$Name, [string]$Folder)
+    $pattern="\[setup\] auto-bake save COMPLETED name='"+[regex]::Escape($Name)+"' folder='(.+)' native=complete files=([1-9][0-9]*) bytes=([1-9][0-9]*)\s*$"
+    $records=@($Lines | Where-Object { $_ -match $pattern })
+    if ($records.Count -ne 1 -or $records[0] -notmatch $pattern) { throw 'Missing or ambiguous exact native bake completion.' }
+    $nativeFolder=$Matches[1]; $files=[long]$Matches[2]; $bytes=[long]$Matches[3]
+    if (-not [IO.Path]::IsPathRooted($nativeFolder) -or (Get-CoopSaveFullPath $nativeFolder) -ine (Get-CoopSaveFullPath $Folder)) { throw 'Native bake save root disagrees with the selected save root.' }
+    return [pscustomobject]@{Files=$files;Bytes=$bytes}
 }
-
-if (-not $SkipDeploy) {
-    Write-Host "Deploying freshly built plugin ..."
-    & cmd /c "`"$scriptDir\deploy.cmd`" `"$HostDir`""
-    if ($LASTEXITCODE -ne 0) { throw "deploy.cmd failed ($LASTEXITCODE)" }
-}
-
-$log = Join-Path $repo "tools\_bake_$Setup.log"
-Remove-Item $log -ErrorAction SilentlyContinue
-
-$env:KENSHICOOP_MODE         = "host"
-$env:KENSHICOOP_SAVE         = $BaseSave
-$env:KENSHICOOP_SETUP        = $Setup
-$env:KENSHICOOP_BAKESAVE     = $BakeSave
-$env:KENSHICOOP_TEST_SECONDS = "$Seconds"
-$env:KENSHICOOP_LOG          = $log
-$env:KENSHICOOP_SCENARIO     = ""
-$env:KENSHICOOP_ARM_TIMEOUT_MS = "1"
-
-Write-Host "Launching HOST for bake (setup=$Setup base=$BaseSave -> bake=$BakeSave) ..."
-$out = & (Join-Path $scriptDir "start_kenshi.ps1") -ExePath $hostExe -WorkDir $HostDir -TimeoutSec $StartTimeoutSec 6>&1
-$out | ForEach-Object { Write-Host "    $_" }
-$line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -First 1
-if (-not ($line -and ("$line" -match "GAMEPID=(\d+)"))) { throw "Host failed to get past the launcher." }
-$gamePid = [int]$Matches[1]
-Write-Host "Game PID=$gamePid; waiting for auto-bake (timeout $($Seconds + 120)s) ..."
-
-$deadline = (Get-Date).AddSeconds($Seconds + 120)
-$baked = $false
-while ((Get-Date) -lt $deadline) {
-    if (Test-Path $log) {
-        $hit = Select-String -Path $log -Pattern "auto-bake save" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $hit) { Write-Host "  $($hit.Line)"; $baked = $hit.Line -match "ISSUED"; break }
-    }
-    if (-not (Get-Process -Id $gamePid -ErrorAction SilentlyContinue)) {
-        Write-Warning "Game exited before auto-bake line appeared."
-        break
-    }
-    Start-Sleep -Seconds 2
-}
-
-# Give the save write time to finish, then stop the game.
-Start-Sleep -Seconds 20
-if (Get-Process -Id $gamePid -ErrorAction SilentlyContinue) {
-    Stop-Process -Id $gamePid -Force -ErrorAction SilentlyContinue
-    Write-Host "Game process stopped."
-}
-
-$bakedDir = Join-Path $saveRoot $BakeSave
-if (Test-Path (Join-Path $bakedDir "quick.save")) {
-    Write-Host "OK: baked save present at $bakedDir"
+if ($MyInvocation.InvocationName -eq '.') { return }
+$ErrorActionPreference='Stop'
+$scriptDir=$PSScriptRoot; $repo=Split-Path $scriptDir -Parent
+. (Join-Path $scriptDir 'capture_save.ps1')
+. (Join-Path $scriptDir 'kit_preflight.ps1')
+if (-not $Setup) { throw 'Specify one supported automatic-bake Setup.' }
+Assert-CoopSaveName $BaseSave -Bake; Assert-CoopSaveName $BakeSave -Bake
+if ($BaseSave -ieq $BakeSave) { throw 'Bake input and output names must be distinct.' }
+$HostDir=Get-CoopSaveFullPath $HostDir
+$hostExe=Join-Path $HostDir 'kenshi_x64.exe'
+if (-not(Test-Path -LiteralPath $hostExe -PathType Leaf)) { throw "Kenshi not found at $HostDir" }
+$saveRoot=Resolve-CoopSelectedSaveRoot $HostDir
+if (Test-CoopSavePathOverlap $saveRoot (Join-Path $repo 'fixtures\saves')) { throw 'Bake live root must not overlap pristine fixtures.' }
+$baseDir=Join-Path $saveRoot $BaseSave; $bakedDir=Join-Path $saveRoot $BakeSave
+Assert-CoopSavePath $baseDir; Assert-CoopSavePath $bakedDir
+if (-not(Test-Path -LiteralPath (Join-Path $baseDir 'quick.save') -PathType Leaf)) { throw "Base save has no quick.save at $baseDir" }
+$runState=New-CoopRunState -GameDirs @($HostDir) -SaveNames @()
+$complete=$false
+try {
+    Clear-CoopRunEnvironment -State $runState -PreserveCredentials -PreserveVariables @('KENSHICOOP_SPLITFAR_AT')
+    Add-CoopRunBackup -State $runState -Path $baseDir
+    Add-CoopRunBackup -State $runState -Path $bakedDir
+    if (-not $SkipDeploy) { Install-CoopHarnessRuntime -RepoRoot $repo -GameDirs @($HostDir) }
+    # Remove the old output under its snapshot: old bytes can never certify this run.
+    if (Test-Path -LiteralPath $bakedDir) { Remove-Item -LiteralPath $bakedDir -Recurse -Force }
+    $log=Join-Path $repo ('tools\_bake_'+$Setup+'_'+[guid]::NewGuid().ToString('N')+'.log')
+    New-Item -ItemType Directory -Force -Path (Split-Path $log -Parent) | Out-Null
+    $env:KENSHICOOP_MODE='host'; $env:KENSHICOOP_SAVE=$BaseSave
+    $env:KENSHICOOP_SETUP=$Setup; $env:KENSHICOOP_BAKESAVE=$BakeSave
+    $env:KENSHICOOP_TEST_SECONDS="$Seconds"; $env:KENSHICOOP_LOG=$log
+    $env:KENSHICOOP_ARM_TIMEOUT_MS='1'; $env:KENSHICOOP_TRANSPORT='udp'; $env:KENSHICOOP_STEAM_PEER='0'
+    $env:KENSHICOOP_SAVE_SYNC='0'; $env:KENSHICOOP_LOAD_SYNC='0'
+    Set-CoopPrivateCredentials -Mode host -UseSteam $false -GameDirs @($HostDir)
+    $out=Start-CoopOwnedGame -State $runState -ScriptDir $scriptDir -ExePath $hostExe -WorkDir $HostDir -TimeoutSec $StartTimeoutSec
+    $line=@($out | Where-Object { "$_" -match '^GAMEPID=([1-9][0-9]*)$' })
+    if ($line.Count -ne 1 -or "$($line[0])" -notmatch '^GAMEPID=([1-9][0-9]*)$') { throw 'Host failed native process handoff.' }
+    $gamePid=[int]$Matches[1]; $process=$runState.Processes[$gamePid]
+    $deadline=Get-CoopRunDeadline -Process $process -Seconds $Seconds -StartTimeoutSec $StartTimeoutSec -ArmTimeoutMs 1 -KillGraceSec 120
+    $pattern="\[setup\] auto-bake save COMPLETED name='"+[regex]::Escape($BakeSave)+"' "
+    if (-not(Wait-CoopOwnedLogLine -Process $process -Deadline $deadline -File $log -Pattern $pattern -TimeoutSec ($Seconds+$StartTimeoutSec+120))) { throw "No native completed bake; see $log" }
+    $record=Read-CoopBakeCompletion (Get-Content -LiteralPath $log -Encoding UTF8) $BakeSave $bakedDir
+    $before=@(Get-CoopSaveInventory $bakedDir)
+    Wait-CoopOwnedExit -Process $process -Deadline $deadline
+    $after=@(Get-CoopSaveInventory $bakedDir)
+    if (($before -join "`n") -cne ($after -join "`n")) { throw 'Baked files changed after native completion.' }
+    $files=@(Get-ChildItem -LiteralPath $bakedDir -Recurse -File -Force)
+    if ($files.Count -ne $record.Files -or [long](($files | Measure-Object Length -Sum).Sum) -ne $record.Bytes) { throw 'Completed bake inventory disagrees with disk.' }
     if ($Promote) {
-        # Wait for Kenshi to fully exit before capturing (capture_save.ps1 refuses
-        # while the game is running, to avoid grabbing a mid-write save).
-        $exitDeadline = (Get-Date).AddSeconds(20)
-        while ((Get-Date) -lt $exitDeadline -and `
-               @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue).Count -gt 0) {
-            Start-Sleep -Milliseconds 500
-        }
-        Write-Host "Promoting baked save into the repo fixture store ..."
-        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "capture_save.ps1") -Save $BakeSave
-        if ($LASTEXITCODE -ne 0) { Write-Warning "capture_save.ps1 failed ($LASTEXITCODE); baked save is in AppData but NOT promoted." }
+        $shell=(Get-Process -Id $PID).Path
+        & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir 'capture_save.ps1') -Save $BakeSave -SaveRoot $saveRoot
+        $captureExit=$LASTEXITCODE
+        if ($captureExit -ne 0) { throw "Requested fixture promotion failed (exit $captureExit)." }
     }
-    exit 0
-} else {
-    Write-Warning "Baked save NOT found at $bakedDir (baked=$baked). Check $log"
-    Get-Content $log -Tail 40 -ErrorAction SilentlyContinue
-    exit 1
+    $complete=$true
+    Write-Host "OK: completed bake at $bakedDir"
+} finally {
+    # Retain only the completed output; every failure restores its previous bytes.
+    if ($complete) { $runState.Backups=@($runState.Backups | Where-Object { $_.Path -ine $bakedDir }) }
+    Restore-CoopRunState $runState
 }

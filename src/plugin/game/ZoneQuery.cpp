@@ -20,21 +20,28 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>             // memset (CellProbe zero-fill)
+#include <stdlib.h>             // getenv (ground diagnostic gate)
+#include <float.h>              // finite native transforms before absence verdicts
 
 #include <core/Functions.h>     // KenshiLib::GetRealAddress
 #include <kenshi/GameWorld.h>   // GameWorld::zoneMgr
 #include <kenshi/ZoneManager.h> // ZoneManager::_NV_isZoneLoadedT / _NV_isZoneBeingLoadedT
-#ifdef KENSHICOOP_NET_DIAG
-#include <kenshi/Building/Building.h>
+#include <kenshi/Item.h>
 #include <kenshi/GameData.h>
 #include <kenshi/ZoneMapContent.h>
-#endif
+#include <kenshi/Building/Building.h>
+#include <kenshi/SharedKing.h>
+#include <kenshi/Town.h>
 
 #include "Engine.h"             // coop::engine::CellProbe (POD; pulls no kenshi headers)
+#include "EngineProcedural.h"
 #ifdef KENSHICOOP_NET_DIAG
 #include <kenshi/util/lektor.h>
 #endif
 #include "../CoopLog.h"         // the sector-call shape tripwire
+// Globals.h's foliage namespace conflicts with ZoneMapContent's SDK class.
+// Import only the native global this isolated registry TU actually consumes.
+__declspec(dllimport) extern SharedKing* shou;
 
 namespace coop {
 namespace engine {
@@ -44,7 +51,7 @@ namespace {
 typedef bool (__fastcall* ZoneLoadedFn)(ZoneManager* self, const Ogre::Vector3* pos);
 ZoneLoadedFn g_zoneLoadedFn      = 0;
 ZoneLoadedFn g_zoneBeingLoadedFn = 0;
-#ifdef KENSHICOOP_NET_DIAG
+// Main-thread loaded-zone registry census, independent of the spatial query.
 // getAllActiveZones writes into the caller's lektor. Keep the buffer across
 // samples: lektor has no owning destructor, so a temporary would leak storage.
 typedef void (__fastcall* ActiveZonesFn)(ZoneManager*, lektor<ZoneMap*>*);
@@ -52,6 +59,12 @@ ActiveZonesFn g_activeZonesFn = 0;
 typedef bool (__fastcall* ZoneStateFn)(ZoneMap*);
 ZoneStateFn g_zoneIsLoadedFn = 0;
 ZoneStateFn g_zoneIsLoadingFn = 0;
+typedef bool (__fastcall* GroundOnGroundFn)(const InventoryItemBase*);
+GroundOnGroundFn g_groundOnGroundFn = 0;
+typedef int (__fastcall* GlobalZoneLoadingFn)(ZoneManager*);
+GlobalZoneLoadingFn g_globalZoneLoadingFn = 0;
+typedef lektor<RootObject*>* (__fastcall* AllNativeTownsFn)(TownList*);
+AllNativeTownsFn g_allNativeTownsFn = 0;
 
 // The vendored CategorisedSet<BuildingFunction, Building*> spells its set
 // element T2* (Building**), although the actual registry stores Building*
@@ -61,6 +74,7 @@ typedef std::set<Building**, std::less<Building**>,
 typedef std::map<BuildingFunction, BedSet, std::less<BuildingFunction>,
                  Ogre::STLAllocator<std::pair<BuildingFunction const, BedSet>,
                                     Ogre::GeneralAllocPolicy> > BedMap;
+#ifdef KENSHICOOP_NET_DIAG
 
 struct BedRow {
     unsigned int hand[5], inside[5];
@@ -185,14 +199,19 @@ void resolveZoneQuery() {
         &ZoneManager::_NV_isZoneLoadedT);
     g_zoneBeingLoadedFn = (ZoneLoadedFn)KenshiLib::GetRealAddress(
         &ZoneManager::_NV_isZoneBeingLoadedT);
-#ifdef KENSHICOOP_NET_DIAG
+
     g_activeZonesFn = (ActiveZonesFn)KenshiLib::GetRealAddress(
         &ZoneManager::getAllActiveZones);
     g_zoneIsLoadedFn = (ZoneStateFn)KenshiLib::GetRealAddress(
         &ZoneMap::isLoadedMT);
     g_zoneIsLoadingFn = (ZoneStateFn)KenshiLib::GetRealAddress(
         &ZoneMap::isBeingLoadedMT);
-#endif
+    g_groundOnGroundFn = (GroundOnGroundFn)KenshiLib::GetRealAddress(
+        &InventoryItemBase::onGround);
+    g_globalZoneLoadingFn = (GlobalZoneLoadingFn)KenshiLib::GetRealAddress(
+        &ZoneManager::isLoading);
+    g_allNativeTownsFn = (AllNativeTownsFn)KenshiLib::GetRealAddress(
+        &TownList::getAllTowns);
 
     // Non-virtual, so the member pointer is the real address (the RootObjectFactory
     // ::createItem precedent). getMapSector is overloaded, so it needs a typed
@@ -251,6 +270,227 @@ bool cellProbe(GameWorld* gw, float x, float y, float z, CellProbe* out) {
     }
 }
 
+namespace {
+struct LoadedObjectHandScan {
+    unsigned int nativeType,capacity,written;
+    unsigned int (*out)[5];
+    float x,y,z,radius;
+    bool complete;
+};
+
+void appendLoadedObjectHand(LoadedObjectHandScan* scan,RootObject* object) {
+    if (!object || (unsigned int)object->getDataType()!=scan->nativeType) return;
+    unsigned int key[5];
+    if (!readObjectHand(object,key) || resolveObjectByHand(key)!=object) {
+        scan->complete=false; return;
+    }
+    Ogre::Vector3 p=object->getPosition();
+    if (!_finite(p.x) || !_finite(p.y) || !_finite(p.z)) {
+        scan->complete=false; return;
+    }
+    float dx=p.x-scan->x,dy=p.y-scan->y,dz=p.z-scan->z;
+    if (dx*dx+dy*dy+dz*dz>scan->radius*scan->radius) return;
+    // The near-point result is bounded; duplicate native category/zone
+    // registrations must not turn one physical fixture into an ambiguity.
+    for (unsigned int i=0;i<scan->written;++i)
+        if (memcmp(scan->out[i],key,sizeof(key))==0) return;
+    if (scan->written>=scan->capacity) { scan->complete=false; return; }
+    memcpy(scan->out[scan->written++],key,sizeof(key));
+}
+
+void collectLoadedBuildingHands(GameWorld* gw,LoadedObjectHandScan* scan) {
+    ZoneManager* zm=gw->zoneMgr;
+    int minX,minY,maxX,maxY;
+    if (!zm || !cellAt(gw,scan->x-scan->radius,scan->z-scan->radius,&minX,&minY) ||
+        !cellAt(gw,scan->x+scan->radius,scan->z+scan->radius,&maxX,&maxY) ||
+        minX<0 || minY<0 || maxX>=64 || maxY>=64 || minX>maxX || minY>maxY) {
+        scan->complete=false; return;
+    }
+    static lektor<ZoneMap*> zones;
+    zones.clear();
+    g_activeZonesFn(zm,&zones);
+    if (zones.size()>4096) { scan->complete=false; return; }
+    unsigned int loaded=0;
+    for (unsigned int zi=0;zi<zones.size();++zi) {
+        ZoneMap* zone=zones[zi];
+        if (!zone) { scan->complete=false; continue; }
+        if (zone->coordinates.x<minX || zone->coordinates.x>maxX ||
+            zone->coordinates.y<minY || zone->coordinates.y>maxY) continue;
+        if (!g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone)) {
+            scan->complete=false; continue;
+        }
+        ZoneMapContent* content=zone->mapContent;
+        if (!content || !content->loaded) { scan->complete=false; continue; }
+        ++loaded;
+        const BedMap& registry=content->buildingList.list;
+        const size_t before=registry.size();
+        for (BedMap::const_iterator cat=registry.begin();cat!=registry.end();++cat) {
+            const size_t categoryBefore=cat->second.size();
+            for (BedSet::const_iterator it=cat->second.begin();it!=cat->second.end();++it) {
+                if (!*it) { scan->complete=false; continue; }
+                // BF_ANY can repeat a pointer in its functional category.
+                // Consult previous native sets without allocating a copied set.
+                bool seen=false;
+                for (BedMap::const_iterator prior=registry.begin();prior!=cat;++prior)
+                    if (prior->second.find(*it)!=prior->second.end()) { seen=true; break; }
+                if (!seen)
+                    appendLoadedObjectHand(scan,reinterpret_cast<Building*>(*it));
+            }
+            if (categoryBefore!=cat->second.size()) scan->complete=false;
+        }
+        if (before!=registry.size() || !content->loaded ||
+            !g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone)) scan->complete=false;
+    }
+    const unsigned int expected=(unsigned int)((maxX-minX+1)*(maxY-minY+1));
+    if (loaded!=expected) scan->complete=false;
+}
+
+void collectLoadedTownHands(GameWorld* gw,LoadedObjectHandScan* scan) {
+    if (!gw->zoneMgr || !::shou || !::shou->townList) {
+        scan->complete=false; return;
+    }
+    // Town root objects remain native/identifiable when the town is inactive.
+    // Do not equate inactivity or an unloaded town-center terrain cell with
+    // absence. Global save/world initialization still forbids absence verdicts.
+    if (g_globalZoneLoadingFn(gw->zoneMgr)) scan->complete=false;
+    lektor<RootObject*>* towns=g_allNativeTownsFn(::shou->townList);
+    if (!towns) { scan->complete=false; return; }
+    const unsigned int before=towns->size();
+    for (unsigned int i=0;i<before;++i) appendLoadedObjectHand(scan,(*towns)[i]);
+    if (before!=towns->size() || g_globalZoneLoadingFn(gw->zoneMgr)) scan->complete=false;
+}
+
+bool collectLoadedObjectHandsGuarded(GameWorld* gw,LoadedObjectHandScan* scan) {
+    __try {
+        if (scan->nativeType==(unsigned int)BUILDING) collectLoadedBuildingHands(gw,scan);
+        else collectLoadedTownHands(gw,scan);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void collectGroundRows(GameWorld* gw,GroundItemRow* rows,unsigned int capacity,
+                       GroundItemCensusStatus* status) {
+    ZoneManager* zm=gw->zoneMgr;
+    if (!zm) { status->unavailable=true; return; }
+    // getAllActiveZones appends to caller-owned storage. Retain its native
+    // lektor buffer (which has no owning destructor), and never copy registries.
+    static lektor<ZoneMap*> zones;
+    zones.clear();
+    g_activeZonesFn(zm,&zones);
+    status->activeZones=zones.size();
+    if (status->activeZones>4096) { status->fault=true; return; }
+    for (unsigned int zi=0;zi<status->activeZones;++zi) {
+        ZoneMap* zone=zones[zi];
+        if (!zone) { ++status->noContentZones; continue; }
+        if (!g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone)) {
+            ++status->loadingZones; continue;
+        }
+        ZoneMapContent* content=zone->mapContent;
+        if (!content || !content->loaded) { ++status->noContentZones; continue; }
+        ++status->loadedZones;
+        const ogre_unordered_set<hand>::type& items=content->items;
+        const size_t before=items.size();
+        for (ogre_unordered_set<hand>::type::const_iterator it=items.begin();it!=items.end();++it) {
+            ++status->registryItems;
+            const hand& h=*it;
+            unsigned int key[5]={(unsigned int)h.type,h.container,h.containerSerial,h.index,h.serial};
+            RootObject* object=resolveObjectByHand(key);
+            unsigned int actual[5];
+            if (!object || !object->typeIsAnItem() ||
+                !readObjectHand(object,actual) || memcmp(key,actual,sizeof(key))!=0) {
+                ++status->unresolved; continue;
+            }
+            Item* item=static_cast<Item*>(object);
+            // Native onGround distinguishes floor Items from NPC render
+            // attachments. Explicit inventory/equipped exclusions remain
+            // necessary even when the zone registry still holds a hand.
+            if (item->isInInventory) { ++status->inventoryItems; continue; }
+            if (item->isEquipped) { ++status->equippedItems; continue; }
+            if (!g_groundOnGroundFn(item)) { ++status->notGround; continue; }
+            ++status->groundItems;
+            if (status->written>=capacity) { ++status->overflow; continue; }
+            Ogre::Vector3 position=item->getPosition();
+            const int floor=item->floorNum;
+            GroundItemRow& row=rows[status->written];
+            memcpy(row.hand,actual,sizeof(row.hand));
+            row.zoneX=zone->coordinates.x; row.zoneY=zone->coordinates.y;
+            row.floor=floor;
+            row.x=position.x; row.y=position.y; row.z=position.z;
+            ++status->written;
+        }
+        if (before!=items.size()) status->fault=true;
+        if (!g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone) || !content->loaded)
+            ++status->loadingZones;
+    }
+}
+bool collectGroundRowsGuarded(GameWorld* gw,GroundItemRow* rows,unsigned int capacity,
+                              GroundItemCensusStatus* status) {
+    // STL iterator unwinding must stay out of this SEH wrapper on v100.
+    __try {
+        collectGroundRows(gw,rows,capacity,status);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+} // namespace
+
+unsigned int captureLoadedGroundItems(GameWorld* gw,GroundItemRow* rows,unsigned int capacity,
+                                     GroundItemCensusStatus* status) {
+    if (!status) return 0;
+    memset(status,0,sizeof(*status));
+    if (!gw || (!rows && capacity) || !g_activeZonesFn ||
+        !g_zoneIsLoadedFn || !g_zoneIsLoadingFn || !g_groundOnGroundFn) {
+        status->unavailable=true; return 0;
+    }
+    if (!collectGroundRowsGuarded(gw,rows,capacity,status)) status->fault=true;
+    status->complete=status->activeZones>0 && !status->unavailable && !status->fault &&
+        !status->loadingZones && !status->noContentZones && !status->unresolved && !status->overflow;
+    return status->written;
+}
+
+void logLoadedGroundItems(GameWorld* gw) {
+    const char* enabled=getenv("KENSHICOOP_INV_DUMP");
+    if (!gw || !enabled || enabled[0]!='1') return;
+    static unsigned long lastMs=0;
+    unsigned long now=GetTickCount();
+    if (lastMs && now-lastMs<15000) return;
+    lastMs=now;
+    static GroundItemRow rows[1024];
+    GroundItemCensusStatus status;
+    unsigned int count=captureLoadedGroundItems(gw,rows,1024,&status);
+    char line[4096];
+    _snprintf(line,sizeof(line)-1,
+        "[wi] GROUND-CENSUS active=%u loaded=%u loading=%u noContent=%u registry=%u "
+        "ground=%u logged=%u overflow=%u unresolved=%u notGround=%u inventory=%u equipped=%u "
+        "unavailable=%d fault=%d complete=%d",
+        status.activeZones,status.loadedZones,status.loadingZones,status.noContentZones,
+        status.registryItems,status.groundItems,status.written,status.overflow,status.unresolved,
+        status.notGround,status.inventoryItems,status.equippedItems,
+        status.unavailable ? 1 : 0,status.fault ? 1 : 0,status.complete ? 1 : 0);
+    line[sizeof(line)-1]='\0'; coop::logLine(line);
+    for (unsigned int i=0;i<count;++i) {
+        GroundItemIdentityRow identity;
+        bool readable=readGroundItemIdentity(rows[i].hand,&identity);
+        const GroundItemRow& row=rows[i];
+        _snprintf(line,sizeof(line)-1,
+            "[wi] GROUND-ROW zone=%d,%d floor=%d hand=%u.%u.%u.%u.%u pos=%.3f,%.3f,%.3f "
+            "read=%d sid='%s' type=%u qty=%u condition=%.3f grade=%u maker='%s' material='%s' "
+            "charges=%.3f/%.3f saved=%d firstTime=%d truncated=%d "
+            "instance='%s' source='%s' ref='%s' base='%s' "
+            "properOwner=%u.%u.%u.%u.%u inventoryOwner=%u.%u.%u.%u.%u inside=%u.%u.%u.%u.%u",
+            row.zoneX,row.zoneY,row.floor,row.hand[0],row.hand[1],row.hand[2],row.hand[3],row.hand[4],
+            row.x,row.y,row.z,readable ? 1 : 0,identity.item.stringID,identity.item.itemType,
+            (unsigned int)identity.item.quantity,identity.condition,(unsigned int)identity.item.level,
+            identity.item.manufacturer,identity.item.material,identity.charges,identity.fullCharge,
+            identity.savedInput ? 1 : 0,identity.firstTime ? 1 : 0,identity.identityTruncated ? 1 : 0,
+            identity.instanceID,identity.sourceName,identity.instanceRef,identity.baseSID,
+            identity.properOwner[0],identity.properOwner[1],identity.properOwner[2],
+            identity.properOwner[3],identity.properOwner[4],identity.inventoryOwner[0],
+            identity.inventoryOwner[1],identity.inventoryOwner[2],identity.inventoryOwner[3],
+            identity.inventoryOwner[4],identity.insideBuilding[0],identity.insideBuilding[1],
+            identity.insideBuilding[2],identity.insideBuilding[3],identity.insideBuilding[4]);
+        line[sizeof(line)-1]='\0'; coop::logLine(line);
+    }
+}
 #ifdef KENSHICOOP_NET_DIAG
 struct BedCensusSample {
     enum { ROWS = 32 };
@@ -375,5 +615,179 @@ void logBedCensus(GameWorld* gw) {
 }
 #endif
 
+unsigned int listLoadedObjectHands(GameWorld* gw,unsigned int nativeType,
+                                   float x,float y,float z,float radius,
+                                   unsigned int (*out)[5],unsigned int maxOut,bool* complete) {
+    if (complete) *complete=false;
+    if (!complete || !gw || (!out && maxOut) || radius<0 ||
+        !_finite(x) || !_finite(y) || !_finite(z) || !_finite(radius)) return 0;
+    if (nativeType==(unsigned int)BUILDING) {
+        if (!g_activeZonesFn || !g_zoneIsLoadedFn || !g_zoneIsLoadingFn) return 0;
+    } else if (nativeType==(unsigned int)TOWN) {
+        if (!g_allNativeTownsFn || !g_globalZoneLoadingFn) return 0;
+    } else return 0;
+    LoadedObjectHandScan scan;
+    scan.nativeType=nativeType; scan.out=out; scan.capacity=maxOut; scan.written=0;
+    scan.x=x; scan.y=y; scan.z=z; scan.radius=radius; scan.complete=true;
+    if (!collectLoadedObjectHandsGuarded(gw,&scan)) scan.complete=false;
+    *complete=scan.complete;
+    return scan.written;
+}
+namespace {
+unsigned int proceduralZones(GameWorld* world,ProceduralRegionRead* out,unsigned int cap,bool* complete) {
+    static lektor<ZoneMap*> zones;
+    zones.clear(); g_activeZonesFn(world->zoneMgr,&zones);
+    if (zones.size()>4096) { *complete=false; return 0; }
+    unsigned int n=0;
+    for (unsigned int i=0;i<zones.size();++i) {
+        ZoneMap* zone=zones[i];
+        if (!zone) { *complete=false; continue; }
+        if (!g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone)) { *complete=false; continue; }
+        if (n==cap) { *complete=false; continue; }
+        out[n].x=zone->coordinates.x; out[n].z=zone->coordinates.y;
+        out[n].complete=zone->mapContent && zone->mapContent->loaded;
+        if (!out[n].complete) *complete=false;
+        ++n;
+    }
+    return n;
+}
+unsigned int proceduralBeds(GameWorld* world,i32 x,i32 z,ProceduralBedRead* out,unsigned int cap,bool* complete) {
+    static lektor<ZoneMap*> zones;
+    zones.clear(); g_activeZonesFn(world->zoneMgr,&zones);
+    if (zones.size()>4096) { *complete=false; return 0; }
+    unsigned int n=0,matched=0;
+    for (unsigned int i=0;i<zones.size();++i) {
+        ZoneMap* zone=zones[i];
+        if (!zone) { *complete=false; continue; }
+        if (zone->coordinates.x!=x || zone->coordinates.y!=z) continue;
+        ++matched;
+        if (!g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone) || !zone->mapContent || !zone->mapContent->loaded) { *complete=false; continue; }
+        ZoneMapContent* content=zone->mapContent;
+        const BedMap& registry=content->buildingList.list;
+        const BuildingFunction kinds[2]={BF_BED,BF_SKELETON_BED};
+        for (int kind=0;kind<2;++kind) {
+            BedMap::const_iterator category=registry.find(kinds[kind]);
+            if (category==registry.end()) continue;
+            const size_t before=category->second.size();
+            for (BedSet::const_iterator it=category->second.begin();it!=category->second.end();++it) {
+                Building* bed=reinterpret_cast<Building*>(*it);
+                if (!bed) { *complete=false; continue; }
+                ProceduralBedRead row;
+                if (!readProceduralBedNative(world,bed,&row)) { *complete=false; continue; }
+                if (proceduralBedTemplate(row.object.sid) && proceduralBedOrigin(row.hand)<0) *complete=false;
+                bool duplicate=false;
+                for (unsigned int j=0;j<n;++j) if (memcmp(out[j].hand,row.hand,20)==0) { duplicate=true; break; }
+                if (duplicate) continue;
+                if (n==cap) { *complete=false; continue; }
+                out[n++]=row;
+            }
+            if (before!=category->second.size()) *complete=false;
+        }
+        if (!content->loaded || !g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone)) *complete=false;
+    }
+    if (matched!=1) *complete=false;
+    return n;
+}
+}
+unsigned int enumerateProceduralRegions(GameWorld* world,ProceduralRegionRead* out,unsigned int cap,bool* complete) {
+    if (complete) *complete=false;
+    if (!complete || !world || !world->zoneMgr || (!out && cap) || !g_activeZonesFn || !g_zoneIsLoadedFn || !g_zoneIsLoadingFn || !g_globalZoneLoadingFn) return 0;
+    unsigned int n=0;
+    __try { *complete=!g_globalZoneLoadingFn(world->zoneMgr); n=proceduralZones(world,out,cap,complete); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { *complete=false; }
+    return n;
+}
+unsigned int captureProceduralBeds(GameWorld* world,i32 x,i32 z,ProceduralBedRead* out,unsigned int cap,bool* complete) {
+    if (complete) *complete=false;
+    if (!complete || !world || !world->zoneMgr || (!out && cap) || !g_activeZonesFn || !g_zoneIsLoadedFn || !g_zoneIsLoadingFn || !g_globalZoneLoadingFn) return 0;
+    unsigned int n=0;
+    bool hooks=false,loading=true,idle=false,stable=false;
+    __try {
+        const u64 revision=proceduralOriginRevision();
+        hooks=proceduralWorldHooksReady();
+        loading=g_globalZoneLoadingFn(world->zoneMgr);
+        idle=proceduralRegionGenerationIdle(world,x,z);
+        *complete=hooks && !loading && idle;
+        n=proceduralBeds(world,x,z,out,cap,complete);
+        stable=revision==proceduralOriginRevision();
+        idle=idle && proceduralRegionGenerationIdle(world,x,z);
+        if (!stable || !idle) *complete=false;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) { *complete=false; }
+#ifdef KENSHICOOP_HARNESS
+    struct CensusDiagnostic { i32 x,z; DWORD at; bool used,complete; };
+    static CensusDiagnostic diagnostics[32]={};
+    static unsigned int nextDiagnostic=0;
+    CensusDiagnostic* diagnostic=0;
+    for (unsigned int i=0;i<32;++i)
+        if (diagnostics[i].used && diagnostics[i].x==x && diagnostics[i].z==z) { diagnostic=&diagnostics[i]; break; }
+    if (!diagnostic) {
+        diagnostic=&diagnostics[nextDiagnostic++%32];
+        diagnostic->used=false;
+    }
+    const DWORD now=GetTickCount();
+    if (!diagnostic->used || diagnostic->complete!=*complete || (!*complete && now-diagnostic->at>=2000)) {
+        unsigned int generated=0,replicas=0,unknown=0;
+        for (unsigned int i=0;i<n;++i) {
+            if (out[i].procedural) ++generated;
+            if (out[i].replica) ++replicas;
+            if (proceduralBedTemplate(out[i].object.sid) && proceduralBedOrigin(out[i].hand)<0) ++unknown;
+        }
+        char line[256];
+        _snprintf(line,sizeof(line)-1,
+            "[procworld] NATIVE region=%d,%d complete=%d beds=%u generated=%u replicas=%u unknown=%u hooks=%d loading=%d idle=%d stable=%d",
+            x,z,*complete?1:0,n,generated,replicas,unknown,hooks?1:0,loading?1:0,idle?1:0,stable?1:0);
+        line[sizeof(line)-1]=0; coop::logLine(line);
+        diagnostic->x=x; diagnostic->z=z; diagnostic->at=now;
+        diagnostic->used=true; diagnostic->complete=*complete;
+    }
+#endif
+    return n;
+}
+bool proceduralRegionAtObject(void* opaque,i32* x,i32* z) {
+    if (!opaque || !x || !z) return false;
+    __try {
+        ZoneMap* zone=static_cast<Building*>(opaque)->getZoneMapLocation();
+        if (!zone || !g_zoneIsLoadedFn || !g_zoneIsLoadingFn || !g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone) || !zone->mapContent || !zone->mapContent->loaded) return false;
+        *x=zone->coordinates.x; *z=zone->coordinates.y; return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+namespace {
+bool loadedReferencesClear(GameWorld* world,Building* bed) {
+    unsigned int h[5]; if (!readObjectHand(bed,h)) return false;
+    static lektor<ZoneMap*> zones;
+    zones.clear(); g_activeZonesFn(world->zoneMgr,&zones);
+    if (zones.size()>4096 || g_globalZoneLoadingFn(world->zoneMgr)) return false;
+    for (unsigned int i=0;i<zones.size();++i) {
+        ZoneMap* zone=zones[i];
+        if (!zone || !g_zoneIsLoadedFn(zone) || g_zoneIsLoadingFn(zone) || !zone->mapContent || !zone->mapContent->loaded) return false;
+        ZoneMapContent* content=zone->mapContent;
+        const BedMap& registry=content->buildingList.list;
+        for (BedMap::const_iterator cat=registry.begin();cat!=registry.end();++cat)
+            for (BedSet::const_iterator it=cat->second.begin();it!=cat->second.end();++it) {
+                Building* other=reinterpret_cast<Building*>(*it);
+                if (!other) return false;
+                if (other==bed) continue;
+                const hand& inside=other->isInsideBuilding;
+                unsigned int parent[5]={(unsigned int)inside.type,inside.container,inside.containerSerial,inside.index,inside.serial};
+                if (memcmp(parent,h,20)==0 || other->furnitureParentBuilding()==bed) return false;
+            }
+        const unsigned int before=content->things.size();
+        if (before>65536) return false;
+        for (unsigned int j=0;j<before;++j) {
+            RootObject* object=content->things[j];
+            if (!object) return false;
+            if (object->getDataType()==CHARACTER && !proceduralCharacterReferencesClear(object,h)) return false;
+        }
+        if (before!=content->things.size() || !content->loaded || g_zoneIsLoadingFn(zone)) return false;
+    }
+    return true;
+}
+}
+bool proceduralLoadedReferencesClear(GameWorld* world,void* bed) {
+    if (!world || !world->zoneMgr || !bed || !g_activeZonesFn || !g_globalZoneLoadingFn || !g_zoneIsLoadedFn || !g_zoneIsLoadingFn) return false;
+    __try { return loadedReferencesClear(world,static_cast<Building*>(bed)); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 } // namespace engine
 } // namespace coop

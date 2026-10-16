@@ -118,6 +118,8 @@ const unsigned long TASK_RETRY_MS = 1500;  // throttle between pose apply attemp
 // reproducing the order. Above transient blips (1-2 frames at 20 Hz), below the
 // player-perceptible "why is it still mining" threshold.
 const unsigned long TASK_CLEAR_MS = 1200;
+// Also bounds a driven NPC's combat->NONE removal when a newer receipt confirms
+// the quiet interval; silence alone keeps the longer combat disarm allowance.
 // A far-fixture apply (r=3) is RETRIED, not latched bad: a snap-into-fixture on
 // the owner (bed entry teleports the body ~9 u instantly) streams the task while
 // the join's interp target is still mid-glide, so the first distance gate fails
@@ -163,9 +165,9 @@ const unsigned int  COMBAT_REISSUE_CAP    = 5;    // max timer re-issues per epi
                                                   // that won't engage (fleeing template,
                                                   // blocked ring spot) is POSITION-driven
                                                   // from then on, never AI-reset forever
-const unsigned long COMBAT_DISARM_MS      = 4000; // host-stream combat gap before the copy
-                                                  // is disarmed (stance samples ride the
-                                                  // lossy batch; a gap must not AI-reset)
+const unsigned long COMBAT_DISARM_MS      = 4000; // fallback for an unconfirmed combat gap;
+                                                  // continued received NONE can release
+                                                  // at the existing TASK_CLEAR_MS window
 const unsigned long COMBAT_SNAP_COOL_MS   = 3000; // min gap between hard snaps per body (a
                                                   // snap that can't stick - stagger, stale
                                                   // interp - must not re-fire every frame)
@@ -208,12 +210,6 @@ const unsigned long STEALTH_RESEND_MS = 2000; // unchanged-map safety resend (un
 const unsigned int  TRUST_STREAK_FRAMES = 150;  // sustained agreement before trusting
 const float         TRUST_DRIFT_MAX     = 4.0f; // trusted body must stay this close
 
-// Absolute ceiling on how long publishInventories will hold a container's snapshot while
-// the W2 gear census adjudicates a drop (see Replicator::wdPendingDrop). The census retry
-// budget is frame-denominated AND re-armable by xferPendingLoss, so it can cycle for as long
-// as the transfer detector keeps an unresolved loss - without this cap a single unresolved
-// gear decrease starves the peer's view of that bag indefinitely.
-const unsigned long WD_HOLD_MAX_MS = 1500;
 
 // Consecutive ZERO-ROW container reads before an EMPTY gear baseline is accepted. A
 // container that is merely still resolving fills in within a tick or two; one that is
@@ -222,41 +218,6 @@ const unsigned long WD_HOLD_MAX_MS = 1500;
 // of identity-less PICKUP intents at connect.
 const unsigned int  WD_EMPTY_SEED_TICKS = 5;
 
-// How long the author keeps retrying a FAILED conservation re-home (peer picked our
-// dropped gear up, but our own bag refused the object - occupied equip slot, no room,
-// container still resolving) before it may resolve the split by destroying its ground
-// copy. Only ever destroys after SEEING the item in the target container, so the item
-// cannot be lost; the cap exists so a permanently-refusing bag does not leave a
-// duplicate lying around forever.
-const unsigned long WD_REHOME_MAX_MS = 8000;
-
-// Consecutive ticks a tracked ground object must fail to read as a free ground item before
-// its track is retired. Forgetting a track that is actually still on the ground is the
-// expensive mistake - the author then has no answer for the peer's pickup and its copy stays
-// there forever - so the read has to agree with itself first.
-const unsigned int  WD_DEAD_READS_MAX = 3;
-
-// ...and how long that disagreement must LAST. The read count alone is denominated in engine
-// ticks, and the main loop runs at ~100-125 Hz, so three of them is a ~25 ms tolerance: a
-// player's session showed a track retired 29 ms after its own drop, and the pickup that
-// arrived 32 s later was answered "untracked" with the ground copy left lying there - the
-// duplicate. The cost is asymmetric (a forgotten track is a permanent duplicate; a stale one
-// costs a pointer until the next read), so the streak must also survive real time.
-const unsigned long WD_DEAD_HOLD_MS = 3000;
-
-// Ceiling for a track whose object has NEVER once read live. WD_DEAD_HOLD_MS assumes there was
-// something there to lose; a track minted around an object that never resolved at all has
-// nothing to protect and would otherwise be retried forever.
-const unsigned long WD_NEVER_LIVE_MAX_MS = 10000;
-
-// Cap on parked-but-unsatisfied pickup intents (see Replicator::PendingPickup). Each expires on
-// its own within WD_REHOME_MAX_MS, so this only bounds a pathological burst.
-const unsigned int  WD_PENDING_PICKUPS_MAX = 64;
-
-// Radius for the LAST-RESORT spatial re-home: an identified pickup arrived for a drop we no
-// longer have tracked, so the object is found by (sid,type) near the picking character
-// instead. Only ever used for an intent that NAMES a drop, never for an identity-less one.
-const float         WD_REHOME_SCAN_R = 60.0f;
 
 float dist3(float ax, float ay, float az, float bx, float by, float bz) {
     float dx = ax - bx, dy = ay - by, dz = az - bz;

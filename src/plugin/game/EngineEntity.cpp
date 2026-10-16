@@ -135,6 +135,42 @@ bool resolveSubjectPos(u32 idx, u32 ser, u32 type, u32 cont, u32 contSer,
     }
 }
 
+// Runtime camp fixtures often have no save/layout id. Record the actual native
+// ownership and orientation rather than assuming a same-template neighbour is
+// the same task subject.
+void logPoseFixtureIdentity(u32 idx, u32 ser, u32 type, u32 cont, u32 contSer) {
+    if (type != BUILDING || !g_handGetRootFn || !g_handCtorFn) return;
+    __try {
+        char hb[sizeof(hand) + 16] = { 0 };
+        hand* h = reinterpret_cast<hand*>(hb);
+        g_handCtorFn(h, idx, ser, BUILDING, cont, contSer);
+        Building* b = static_cast<Building*>(g_handGetRootFn(h));
+        if (!b) return;
+        GameData* gd = b->getGameData();
+        Ogre::Vector3 p = b->getPosition();
+        Ogre::Quaternion q = b->getOrientation();
+        char ownerSid[48] = { 0 };
+        facSidOf(b->owner, ownerSid, sizeof(ownerSid));
+        char line[768];
+        _snprintf(line, sizeof(line) - 1,
+            "[posefixture] hand=%u.%u.%u.%u.%u sid='%s' pos=%.2f,%.2f,%.2f yaw=%.4f cls=%d inv=%d ownerSet=%d ownerSid='%s' town=%u.%u.%u.%u.%u inside=%u.%u.%u.%u.%u floor=%d outside=%d layoutSet=%d uid='%.80s' layout='%.48s'",
+            type, cont, contSer, idx, ser, gd ? gd->stringID.c_str() : "",
+            p.x, p.y, p.z, q.getYaw().valueRadians(), (int)b->classType,
+            b->getInventory() ? 1 : 0, b->owner ? 1 : 0, ownerSid,
+            (u32)b->_town.type, (u32)b->_town.container, (u32)b->_town.containerSerial,
+            (u32)b->_town.index, (u32)b->_town.serial,
+            (u32)b->isInsideBuilding.type, (u32)b->isInsideBuilding.container,
+            (u32)b->isInsideBuilding.containerSerial, (u32)b->isInsideBuilding.index,
+            (u32)b->isInsideBuilding.serial, b->floorNum,
+            b->isOutsideFurniture ? 1 : 0, b->isFurnitureOf ? 1 : 0,
+            b->instanceID.uid.c_str(), b->layoutInstanceID.c_str());
+        line[sizeof(line) - 1] = '\0';
+        coop::logLine(line);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[posefixture] native descriptor unreadable");
+    }
+}
+
 } // namespace
 
 // DIAGNOSTIC (host-side): once per (npc,fixture) pair, log where THIS client
@@ -160,9 +196,79 @@ void logSeatResolveOnce(const char* side, int task, u32 npcIdx, u32 npcSer,
               side, task, npcIdx, npcSer, sIdx, sSer, ok ? 1 : 0, npx, npz, sx, sz, d);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
+    if (task == PRETEND_TO_OPERATE_MACHINERY && ok)
+        logPoseFixtureIdentity(sIdx, sSer, sType, sCont, sContSer);
 }
 
 namespace {
+// Observation only: preserve the native NULL_ITEM payload and existing combat
+// derivation. Ignore NULL_ITEM's unused fields only in the diagnostic transition key.
+void tracePairCapture(const EntityState& e, const CombatRead& cr, bool read) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = getenv("KENSHICOOP_NPC_PAIR_TRACE");
+        enabled = (v && v[0] == '1') ? 1 : 0;
+    }
+    if (!enabled) return;
+    struct Sample { u32 h[5]; u32 target[5]; u16 task; unsigned long tick;
+                    unsigned int periodic; unsigned int critical;
+                    bool used; bool engaged; bool readable; bool hasTarget; };
+    static Sample samples[64] = {};
+    static unsigned int periodicTotal = 0, criticalTotal = 0;
+    const u32 h[5] = {e.hType,e.hContainer,e.hContainerSerial,e.hIndex,e.hSerial};
+    bool engaged = cr.inCombat || cr.modeActive;
+    bool combatTask = coop::taskIsCombat(e.task);
+    Sample* s = 0;
+    Sample* free = 0;
+    for (unsigned int n=0; n<64; ++n) {
+        if (samples[n].used && !memcmp(samples[n].h,h,sizeof(h))) {
+            s=&samples[n]; break;
+        }
+        if (!samples[n].used && !free && (n<32 || engaged || combatTask))
+            free=&samples[n];
+    }
+    if (!s) s=free;
+    if (!s) return;
+    unsigned long now = GetTickCount();
+    bool targetChanged = s->target[0] != cr.target[0] ||
+        (cr.target[0] != (u32)NULL_ITEM &&
+         (s->hasTarget != cr.hasTarget ||
+          (cr.hasTarget && memcmp(s->target,cr.target,sizeof(s->target)))));
+    bool critical = !s->used ? (engaged || combatTask) :
+        (s->readable != read || s->engaged != engaged || targetChanged ||
+         ((combatTask || coop::taskIsCombat(s->task)) && s->task != e.task));
+    bool periodicDue = !s->used || now-s->tick >= 1000;
+    // Track observations even when capped; idle task/NULL_ITEM garbage churn
+    // cannot spend the reserved transition budget or hide the next real edge.
+    memcpy(s->h,h,sizeof(h)); memcpy(s->target,cr.target,sizeof(s->target));
+    s->used=true; s->task=e.task; s->engaged=engaged;
+    s->readable=read; s->hasTarget=cr.hasTarget;
+    // Fixed lifetime partitions: at most 32 lines/actor and 1024 globally.
+    // Periodic warm-up cannot consume the 24/actor, 768/global transition reserve.
+    // Idle actors use only the first 32 slots; late first-seen combatants can
+    // use the reserved slots and transition budget after periodic warm-up ends.
+    if (critical) {
+        if (s->critical >= 24 || criticalTotal >= 768) return;
+        ++s->critical; ++criticalTotal;
+    } else {
+        if (!periodicDue || s->periodic >= 8 || periodicTotal >= 256) return;
+        ++s->periodic; ++periodicTotal;
+    }
+    s->tick=now;
+    char b[768];
+    _snprintf(b,sizeof(b)-1,
+        "[npc-pair-capture] now=%lu key=%u,%u,%u,%u,%u read=%d native=%d,%d,%d,%d,%d,%d hasTarget=%d nullType=%d nullUnused=%d nullCombat=%d target=%u,%u,%u,%u,%u task=%u raw=%u subject=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f",
+        now,h[0],h[1],h[2],h[3],h[4],read?1:0,
+        cr.inCombat?1:0,cr.modeActive?1:0,cr.underMelee?1:0,cr.ranged?1:0,
+        cr.waiting?1:0,cr.swordState,cr.hasTarget?1:0,
+        cr.target[0]==(u32)NULL_ITEM?1:0,
+        cr.target[0]==(u32)NULL_ITEM && cr.hasTarget?1:0,
+        cr.target[0]==(u32)NULL_ITEM && coop::taskIsCombat(e.task)?1:0,
+        cr.target[0],cr.target[1],cr.target[2],cr.target[3],cr.target[4],
+        e.task,e.rawTask,e.sType,e.sContainer,e.sContainerSerial,e.sIndex,e.sSerial,
+        e.x,e.y,e.z);
+    b[sizeof(b)-1]=0; coop::logLine(b);
+}
 // SEH-guarded capture of a single Character into an EntityState. Kept in its own
 // __try frame (no C++ unwinding objects) so a bad pointer degrades to a skip.
 bool captureOne(Character* c, EntityState* e) {
@@ -255,7 +361,8 @@ bool captureOne(Character* c, EntityState* e) {
             // between combo sections / slot rotations, and a flickering stream
             // disarm-reset the peer's copies every gap (measured in combat_crowd:
             // a fighting hand's streamed task alternated combat/none all fight).
-            if (readCombat(c, &cr) && (cr.inCombat || cr.modeActive) &&
+            bool combatRead = readCombat(c, &cr);
+            if (combatRead && (cr.inCombat || cr.modeActive) &&
                 cr.hasTarget && (cr.target[3] != 0 || cr.target[4] != 0)) {
                 // Stance split (protocol 15): an attack-slot-QUEUED combatant
                 // streams TASK_COMBAT_WAIT so the join holds its copy in the
@@ -267,6 +374,7 @@ bool captureOne(Character* c, EntityState* e) {
                 e->sIndex           = cr.target[3];
                 e->sSerial          = cr.target[4];
             }
+            tracePairCapture(*e, cr, combatRead);
         }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -426,6 +534,18 @@ bool teleportVisual(Character* c, float x, float y, float z, float heading) {
     }
 }
 
+bool faceWorkPose(Character* c, const EntityState& e) {
+    if (!c || e.task != PRETEND_TO_OPERATE_MACHINERY) return false;
+    __try {
+        if (!c->movement) return false;
+        Ogre::Quaternion rot(Ogre::Radian(e.heading), Ogre::Vector3::UNIT_Y);
+        c->movement->faceDirection(rot * Ogre::Vector3::NEGATIVE_UNIT_Z);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool readPos(Character* c, float* x, float* y, float* z) {
     if (!c) return false;
     __try {
@@ -572,6 +692,59 @@ int readTaskKey(Character* c) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
+}
+
+bool readTaskSubject(Character* c, ObjectHand& out) {
+    if (!c) return false;
+    __try {
+        Tasker* t = c->body ? c->body->currentAction : 0;
+        if (!t) return false;
+        const hand& s = t->subject;
+        out.type = (u32)s.type; out.container = s.container;
+        out.containerSerial = s.containerSerial;
+        out.index = s.index; out.serial = s.serial;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void logPoseObservation(const char* side, const EntityState& wire, Character* local) {
+    if (!local) return;
+    unsigned int lh[5] = { 0 }, sh[5] = { 0 };
+    readObjectHand(static_cast<RootObject*>(local), lh);
+    ObjectHand subject;
+    bool haveSubject = readTaskSubject(local, subject);
+    if (haveSubject) subject.toObjOrder(sh);
+    float x = 0, y = 0, z = 0, heading = 0, pelvis = -1;
+    int idle = -1, crouched = -1, task = -1;
+    bool positioned = readPose(local, &x, &y, &z, &heading);
+    bool rendered = readPoseState(local, &pelvis, &idle, &crouched, &task) && pelvis > 0.0f;
+    ContRead fixture;
+    memset(&fixture, 0, sizeof(fixture));
+    bool resolved = haveSubject && sh[0] == (unsigned int)BUILDING &&
+                    readContainerByHand(sh, &fixture);
+    PoseFixtureRead pose;
+    memset(&pose, 0, sizeof(pose));
+    bool descriptor = resolved && readPoseFixtureByHand(sh, &pose);
+    char line[2048];
+    _snprintf(line, sizeof(line) - 1,
+        "[poseobserve] side=%s wire=%u.%u.%u.%u.%u local=%u.%u.%u.%u.%u raw=%u task=%u native=%d wireSub=%u.%u.%u.%u.%u localSub=%u.%u.%u.%u.%u subjectRead=%d resolved=%d sid='%s' fixture=%.2f,%.2f,%.2f descriptor=%d yaw=%.4f owner='%s' pos=%.2f,%.2f,%.2f actorYaw=%.4f positioned=%d rendered=%d pelvis=%.3f idle=%d crouch=%d floor=%d outside=%d insideSid='%s' townSid='%s' class=%d inv=%d complete=%d ownerPresent=%d inside=%u.%u.%u.%u.%u insidePos=%.2f,%.2f,%.2f town=%u.%u.%u.%u.%u townPos=%.2f,%.2f,%.2f",
+        side, wire.hType, wire.hContainer, wire.hContainerSerial, wire.hIndex, wire.hSerial,
+        lh[0], lh[1], lh[2], lh[3], lh[4], (unsigned)wire.rawTask, (unsigned)wire.task, task,
+        wire.sType, wire.sContainer, wire.sContainerSerial, wire.sIndex, wire.sSerial,
+        sh[0], sh[1], sh[2], sh[3], sh[4], haveSubject ? 1 : 0, resolved ? 1 : 0,
+        fixture.sid, fixture.x, fixture.y, fixture.z, descriptor ? 1 : 0,
+        pose.heading, pose.ownerSid, x, y, z, heading, positioned ? 1 : 0, rendered ? 1 : 0,
+        pelvis, idle, crouched, pose.floor, pose.outsideFurniture ? 1 : 0,
+        pose.insideSid, pose.townSid, fixture.classType, fixture.hasInv, fixture.complete,
+        pose.ownerPresent ? 1 : 0,
+        pose.inside[0], pose.inside[1], pose.inside[2], pose.inside[3], pose.inside[4],
+        pose.insideX, pose.insideY, pose.insideZ,
+        pose.town[0], pose.town[1], pose.town[2], pose.town[3], pose.town[4],
+        pose.townX, pose.townY, pose.townZ);
+    line[sizeof(line) - 1] = '\0';
+    coop::logLine(line);
 }
 
 bool isNodeAnchoredPose(int taskKey) { return isNodeAnchoredPoseImpl(taskKey); }

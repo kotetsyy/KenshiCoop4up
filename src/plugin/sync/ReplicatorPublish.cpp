@@ -25,6 +25,37 @@ static bool fillDropPose(EventPacket& ev, Character* who) {
     return false;
 }
 
+// Furniture may have no task subject or belong to a third-party passenger.
+static void queueFurnitureDescriptor(NetLink& net,u32 owner,u32& seq,
+                                     const EventPacket& enter) {
+    if ((int)enter.arg==3) return;
+    unsigned int native[5]={enter.aType,enter.aContainer,enter.aContainerSerial,
+                            enter.aIndex,enter.aSerial};
+    engine::PoseFixtureRead d;
+    if (!engine::readPoseFixtureByHand(native,&d)) return;
+    FixturePacket p; memset(&p,0,sizeof(p));
+    p.type=(u8)PKT_FIXTURE; p.ownerId=owner; p.seq=seq++;
+    memcpy(p.hand,native,sizeof(p.hand));
+    p.x=d.fixture.x; p.y=d.fixture.y; p.z=d.fixture.z;
+    p.classType=(u8)d.fixture.classType;
+    memcpy(p.sid,d.fixture.sid,sizeof(p.sid));
+    p.poseActor.type=enter.sType; p.poseActor.container=enter.sContainer;
+    p.poseActor.containerSerial=enter.sContainerSerial;
+    p.poseActor.index=enter.sIndex; p.poseActor.serial=enter.sSerial;
+    p.poseFlags=POSE_FIXTURE_VALID;
+    if (d.ownerPresent) p.poseFlags|=POSE_FIXTURE_OWNER_PRESENT;
+    if (d.outsideFurniture) p.poseFlags|=POSE_FIXTURE_OUTSIDE;
+    p.heading=d.heading; p.floor=d.floor;
+    memcpy(p.ownerSid,d.ownerSid,sizeof(p.ownerSid));
+    p.town=ObjectHand::fromObjOrder(d.town);
+    memcpy(p.townSid,d.townSid,sizeof(p.townSid));
+    p.townX=d.townX; p.townY=d.townY; p.townZ=d.townZ;
+    p.inside=ObjectHand::fromObjOrder(d.inside);
+    memcpy(p.insideSid,d.insideSid,sizeof(p.insideSid));
+    p.insideX=d.insideX; p.insideY=d.insideY; p.insideZ=d.insideZ;
+    net.queueFixture(p);
+}
+
 void Replicator::emitBodyStateEdges(NetLink& net, u32 ownerId, const Key& k,
                                     u16 cur, unsigned long nowPub, bool touchSeen) {
     std::map<Key, HostBody>::iterator pit = hostBody_.find(k);
@@ -61,11 +92,11 @@ void Replicator::emitBodyStateEdges(NetLink& net, u32 ownerId, const Key& k,
                 ev.aIndex = a.i; ev.aSerial = a.s;
             }
             net.queueEvent(ev);
-            char b[200]; _snprintf(b, sizeof(b) - 1,
-                "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u actor=%u,%u bs %u->%u",
+            char b[320]; _snprintf(b, sizeof(b) - 1,
+                "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u actor=%u,%u bs %u->%u owner=%u actor5=%u,%u,%u,%u,%u",
                 ev.eventId, (unsigned)evType, k.t, k.c, k.cs, k.i, k.s,
-                haveActor ? ev.aIndex : 0u, haveActor ? ev.aSerial : 0u,
-                (unsigned)prev, (unsigned)cur);
+                ev.aIndex, ev.aSerial, (unsigned)prev, (unsigned)cur, ev.ownerId,
+                ev.aType, ev.aContainer, ev.aContainerSerial, ev.aIndex, ev.aSerial);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
@@ -116,6 +147,11 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // captured member, before the ownership partition below decides which we own.
     allSquad_.clear();
     for (unsigned int i = 0; i < nSquad; ++i) allSquad_.insert(keyOf(raw[i]));
+    NetStatus peerStatus; net.copyStatus(&peerStatus);
+    if (playerClaimPeers_!=peerStatus.memberMask) {
+        playerClaimPeers_=peerStatus.memberMask;
+        announcedPlayerActors_.clear();
+    }
     unsigned int n = 0;
     for (unsigned int i = 0; i < nSquad && n < MAX_PUBLISH; ++i) {
         std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);
@@ -154,6 +190,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
         if (!owned) continue;
         ownHands_.insert(hk);
+        playerActorOwners_[hk]=ownerId;
         // Join-owned body in flight: host streams the pose; skip our ragdoll
         // snapshot so the two sims cannot fight.
         if (thrown_.find(ownedWireKey(hk)) != thrown_.end()) continue;
@@ -167,6 +204,27 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 buf[n - 1].hIndex = wt->second.i;
                 buf[n - 1].hSerial = wt->second.s;
             }
+        }
+        playerActorOwners_[keyOf(buf[n-1])]=ownerId;
+        // Default/explicit local partitions can already own a squad, bypassing
+        // the UI auto-claim path. Advertise that actual ownership reliably too;
+        // peers must not infer player ownership from arbitrary entity streams.
+        const Key wireActor=keyOf(buf[n-1]);
+        if (squadSync_ && announcedPlayerActors_.find(wireActor)==announcedPlayerActors_.end()) {
+            announcedPlayerActors_.insert(wireActor);
+            EventPacket claim; memset(&claim,0,sizeof(claim));
+            claim.type=(u8)PKT_EVENT; claim.event=EVT_SQUAD_MOVE;
+            claim.ownerId=ownerId; claim.eventId=nextEventId_++;
+            claim.sType=claim.aType=wireActor.t;
+            claim.sContainer=claim.aContainer=wireActor.c;
+            claim.sContainerSerial=claim.aContainerSerial=wireActor.cs;
+            claim.sIndex=claim.aIndex=wireActor.i;
+            claim.sSerial=claim.aSerial=wireActor.s;
+            net.queueEvent(claim);
+            char line[224]; _snprintf(line,sizeof(line)-1,
+                "[squad] OWNERSHIP-ANNOUNCE owner=%u hand=%u,%u,%u,%u,%u peers=%u",
+                ownerId,wireActor.t,wireActor.c,wireActor.cs,wireActor.i,wireActor.s,playerClaimPeers_);
+            line[sizeof(line)-1]=0; coop::logLine(line);
         }
     }
     const unsigned int ownedPublished = n;
@@ -477,14 +535,15 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 // Same 1 Hz staleness as the promotion loop above: re-check
                 // authorship against the freshly captured position.
                 if (cellAuth_ && !weAuthor(gw, ownerId, buf[n].x, buf[n].z)) continue;
-                // Movers only (Phase 2 refinement, run 112835): a stationary
-                // far NPC is covered by the 1 Hz census position (park
-                // fallback) - streaming it just fed the join a body to drive
-                // and starved Kenshi's character-update budget town-wide.
-                // Skipping WITHOUT consuming quota lets the scan reach past
-                // parked bodies, so a lone approaching raid effectively
-                // streams at near-full rate while a busy field shares ~2 Hz.
-                if (buf[n].cMoving == 0 && buf[n].cSpeed <= 0.25f) continue;
+                // Stationary poses still need task/subject snapshots. After a
+                // native release, continue sending the actual NONE on this same
+                // bounded quota so applyRest can debounce and clear the peer.
+                bool nativePose = buf[n].task != TASK_NONE &&
+                    !coop::taskIsCarry(buf[n].task) && !coop::taskIsCombat(buf[n].task);
+                if (nativePose) midPoseActors_.insert(mk);
+                if (buf[n].cMoving == 0 && buf[n].cSpeed <= 0.25f &&
+                    !nativePose && midPoseActors_.count(mk) == 0)
+                    continue;
                 ++n;
                 ++added;
             }
@@ -524,6 +583,103 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 buf[n].hContainerSerial = tk.cs;
                 buf[n].hIndex = tk.i; buf[n].hSerial = tk.s;
                 ++n;
+            }
+        }
+    }
+    // Announce the actual pose subject, not just inventory-bearing fixtures near
+    // our squad. Ambient work nodes are inventoryless runtime Buildings, and an
+    // authoritative NPC may use one outside the inventory census bubble.
+    if (fixtureSync_) {
+        unsigned long fixtureNow = nowMs();
+        static u64 posePublishRound = 0; // main-thread; distinct even within one millisecond
+        const u64 round = ++posePublishRound;
+        bool poseEligible[MAX_PUBLISH];
+        // Select one deterministic CURRENT author reference per subject before
+        // emitting. Shared fixtures must not alternate actor proofs each tick.
+        for (unsigned int i = 0; i < n; ++i) {
+            const EntityState& e = buf[i];
+            poseEligible[i] = e.task != TASK_NONE && !coop::taskIsCarry(e.task) &&
+                !coop::taskIsCombat(e.task) && !engine::isBuildSiteTask((int)e.task) &&
+                e.sType == 0 && (e.sIndex != 0 || e.sSerial != 0);
+            if (!poseEligible[i]) continue;
+            Key sk; sk.t = e.sType; sk.c = e.sContainer; sk.cs = e.sContainerSerial;
+            sk.i = e.sIndex; sk.s = e.sSerial;
+            Key actor = keyOf(e);
+            FixOut& fo = fixtureOut_[sk];
+            if (fo.poseCandidateRound != round) {
+                fo.poseCandidateRound = round; fo.poseCandidateActor = actor;
+            } else if (actor < fo.poseCandidateActor) {
+                fo.poseCandidateActor = actor;
+            }
+        }
+        for (unsigned int i = 0; i < n; ++i) {
+            const EntityState& e = buf[i];
+            if (!poseEligible[i]) continue;
+            Key sk; sk.t = e.sType; sk.c = e.sContainer; sk.cs = e.sContainerSerial;
+            sk.i = e.sIndex; sk.s = e.sSerial;
+            FixOut& fo = fixtureOut_[sk];
+            Key actor = keyOf(e);
+            if (!(actor == fo.poseCandidateActor)) continue;
+            bool actorChanged = !fo.poseSent || !(actor == fo.poseActor);
+            if (!actorChanged && (fixtureNow - fo.lastPoseSendMs) < 15000) continue;
+            unsigned int native[5] = { sk.t, sk.c, sk.cs, sk.i, sk.s };
+            engine::PoseFixtureRead pose;
+            bool descriptor = engine::readPoseFixtureByHand(native, &pose);
+            engine::ContRead fallback;
+            if (!descriptor && !engine::readContainerByHand(native, &fallback)) continue;
+            const engine::ContRead& r = descriptor ? pose.fixture : fallback;
+            if (!r.sid[0] || !r.complete) continue;
+            bool first = !fo.poseSent;
+            fo.poseSent = true;
+            fo.lastPoseSendMs = fixtureNow; fo.poseActor = actor;
+            FixturePacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type = (u8)PKT_FIXTURE; pkt.ownerId = ownerId;
+            pkt.seq = fixtureSeqOut_++;
+            memcpy(pkt.hand, native, sizeof(pkt.hand));
+            pkt.x = r.x; pkt.y = r.y; pkt.z = r.z;
+            pkt.classType = (u8)r.classType;
+            strncpy(pkt.sid, r.sid, sizeof(pkt.sid) - 1);
+            pkt.poseActor.type=e.hType; pkt.poseActor.container=e.hContainer;
+            pkt.poseActor.containerSerial=e.hContainerSerial;
+            pkt.poseActor.index=e.hIndex; pkt.poseActor.serial=e.hSerial;
+            if (descriptor) {
+                pkt.poseFlags = POSE_FIXTURE_VALID;
+                if (pose.ownerPresent) pkt.poseFlags |= POSE_FIXTURE_OWNER_PRESENT;
+                if (pose.outsideFurniture) pkt.poseFlags |= POSE_FIXTURE_OUTSIDE;
+                pkt.heading = pose.heading; pkt.floor = pose.floor;
+                memcpy(pkt.ownerSid, pose.ownerSid, sizeof(pkt.ownerSid));
+                pkt.town = ObjectHand::fromObjOrder(pose.town);
+                memcpy(pkt.townSid, pose.townSid, sizeof(pkt.townSid));
+                pkt.townX = pose.townX; pkt.townY = pose.townY; pkt.townZ = pose.townZ;
+                pkt.inside = ObjectHand::fromObjOrder(pose.inside);
+                memcpy(pkt.insideSid, pose.insideSid, sizeof(pkt.insideSid));
+                pkt.insideX = pose.insideX; pkt.insideY = pose.insideY;
+                pkt.insideZ = pose.insideZ;
+            }
+            net.queueFixture(pkt);
+            if (first) {
+                char b[272]; _snprintf(b, sizeof(b) - 1,
+                    "[fixture] POSE-SEND actor=%u,%u task=%u hand=%u.%u.%u.%u.%u "
+                    "cls=%d pos=%.1f,%.1f,%.1f sid='%s' inv=%d descriptor=%d seq=%u",
+                    e.hIndex, e.hSerial, (unsigned)e.task,
+                    sk.t, sk.c, sk.cs, sk.i, sk.s, r.classType,
+                    r.x, r.y, r.z, r.sid, r.hasInv, descriptor ? 1 : 0, pkt.seq);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+    // Observe the actual authored NPC and its rendered/native state. The peer's
+    // matching row comes from its resolved driven body, not a nearby template.
+    if (auditRows_) {
+        static unsigned long poseObserveTick = 0;
+        unsigned long observedAt = nowMs();
+        if (poseObserveTick == 0 || observedAt - poseObserveTick >= 500) {
+            poseObserveTick = observedAt;
+            for (unsigned int i = 0; i < n; ++i) {
+                Character* body=engine::resolve(buf[i]);
+                if (body && !engine::isLocalPlayerChar(gw,body))
+                    engine::logPoseObservation("SRC",buf[i],body);
             }
         }
     }
@@ -666,6 +822,8 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (carrySync_ && carryAuthor) {
             bool carryNow = coop::taskIsCarry(e.task);
             bool sameBody = hb.carrying && carryNow &&
+                            hb.carried[0] == e.sType && hb.carried[1] == e.sContainer &&
+                            hb.carried[2] == e.sContainerSerial &&
                             hb.carried[3] == e.sIndex && hb.carried[4] == e.sSerial;
             if ((hb.carrying && !carryNow) || (hb.carrying && carryNow && !sameBody)) {
                 // Drop edge (also fires as the first half of a carried-body
@@ -682,9 +840,22 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 ev.arg = DROP_ARG_RAGDOLL; // ragdoll release (start thrown/flight)
                 Key pk; pk.t = ev.sType; pk.c = ev.sContainer; pk.cs = ev.sContainerSerial;
                 pk.i = ev.sIndex; pk.s = ev.sSerial;
+                CarryPlacement& placement = carryPlacements_[pk];
+                placement.owner = ownerId; placement.local = true;
+                placement.released = false; placement.pending = false;
                 Character* dropBody = resolveEventChar(pk);
                 if (!fillDropPose(ev, dropBody)) dropFallback.push_back(pk);
-                beginThrown(pk);
+                engine::FurnitureRead dropFurniture;
+                bool inFurniture = dropBody && engine::readFurniture(dropBody, &dropFurniture) &&
+                                   dropFurniture.valid && dropFurniture.kind != 0;
+                if (!inFurniture) {
+                    beginThrown(pk);
+                    carryPlacements_.erase(pk); // a later unrelated bed use is not a carry placement
+                } else {
+                    placement.released = dropFurniture.kind == 1;
+                    ev.arg = 0; // native placement, not a thrown/ragdoll episode
+                    clearThrown(pk, "furniture-placement");
+                }
                 net.queueEvent(ev);
                 {
                     Character* who = dropBody;
@@ -730,6 +901,16 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 hb.carried[0] = e.sType; hb.carried[1] = e.sContainer;
                 hb.carried[2] = e.sContainerSerial;
                 hb.carried[3] = e.sIndex; hb.carried[4] = e.sSerial;
+                Key passenger; passenger.t = e.sType; passenger.c = e.sContainer;
+                passenger.cs = e.sContainerSerial; passenger.i = e.sIndex; passenger.s = e.sSerial;
+                if (!sameBody) {
+                    CarryPlacement& placement = carryPlacements_[passenger];
+                    placement.owner = ownerId; placement.local = true;
+                    placement.released = false; placement.pending = false;
+                    pendingFurnitureEvents_.erase(passenger);
+                    furnitureEnterApplied_.erase(passenger);
+                    ownFurnExit_.erase(passenger);
+                }
             }
         }
         // Furniture occupancy (protocol 19): emit reliable enter/exit edges on
@@ -741,7 +922,8 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         // poses (USE_BED / USE_BED_ORDER / SLEEP_ON_FLOOR): those stream their
         // TASK and the peer's copy walks in via the validated L3 fixture-pose
         // path (bed_pose) - an ENTER event would teleport it in and fight that.
-        if (furnSync_ && carryAuthor && !engine::taskIsBedPose((int)e.task)) {
+        if (furnSync_ && carryAuthor &&
+            (!engine::taskIsBedPose((int)e.task) || hb.furnKind != 0)) {
             // Chained/pole prisoner (protocol 41) rides this pipeline as kind=3
             // (readFurniture puts the OWNER hand in fr.furn). Gated by chainSync_
             // so it can be disabled without losing bed/cage sync.
@@ -770,6 +952,9 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                     // Protocol 36 race guard: a stale in-flight PEER-ENTER
                     // must not re-jail this body right after we freed it.
                     ownFurnExit_[keyOf(e)] = nowPub;
+                    carryPlacements_.erase(k);
+                    pendingFurnitureEvents_.erase(k);
+                    furnitureEnterApplied_.erase(k);
                     hb.furnKind = 0;
                     hb.furn[0] = hb.furn[1] = hb.furn[2] = hb.furn[3] = hb.furn[4] = 0;
                 }
@@ -791,6 +976,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                         ev.aContainerSerial = fr.furn[2];
                         ev.aIndex = fr.furn[3]; ev.aSerial = fr.furn[4];
                         ev.arg = (f32)curKind;
+                        if (fixtureSync_) queueFurnitureDescriptor(net,ownerId,fixtureSeqOut_,ev);
                         net.queueEvent(ev);
                         hb.furnKind = curKind;
                         for (int fi = 0; fi < 5; ++fi) hb.furn[fi] = fr.furn[fi];
@@ -932,6 +1118,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             ev.aContainerSerial = pe.furn[2];
             ev.aIndex = pe.furn[3]; ev.aSerial = pe.furn[4];
             ev.arg = (f32)pe.kind;
+            if (fixtureSync_) queueFurnitureDescriptor(net,ownerId,fixtureSeqOut_,ev);
             net.queueEvent(ev);
             char b[176]; _snprintf(b, sizeof(b) - 1,
                 "[furn] SEND PEER-ENTER id=%u occ=%u,%u furn=%u,%u kind=%d",
@@ -1046,10 +1233,10 @@ void Replicator::emitPcRows(GameWorld* gw) {
 }
 
 void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
-    // Host-only existence broadcast (protocol 36): hands of every world NPC
-    // within the census radius, 1 Hz. Position streaming stays at the ~200 u
-    // bubble; this only answers "does this NPC exist on the host" so the join
-    // can cull local-only ghosts at render range.
+    // Presence-authority existence broadcast: NPCs owned by this sender within
+    // the census radius, at 1 Hz. Both host and clients publish with cellAuth.
+    // Position streaming is separate; census lets receivers cull local-only
+    // ghosts at render range without stealing another sender's existence claim.
     if (!gw || !streamNpcs_ || censusRadius_ <= 0.0f) return;
     unsigned long now = nowMs();
     if (censusSendMs_ != 0 && (now - censusSendMs_) < 1000) return;
@@ -1226,6 +1413,13 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         // remainder keeps the census-park fallback it always had.
         const unsigned int MID_BAND_MAX = 48;
         if (midBand_.size() > MID_BAND_MAX) midBand_.resize(MID_BAND_MAX);
+        for (std::set<Key>::iterator pi = midPoseActors_.begin(); pi != midPoseActors_.end(); ) {
+            bool present = false;
+            for (unsigned int i = 0; i < midBand_.size() && !present; ++i)
+                present = midBand_[i].k == *pi;
+            if (!present) midPoseActors_.erase(pi++);
+            else ++pi;
+        }
         if (midCursor_ >= midBand_.size()) midCursor_ = 0;
     }
 

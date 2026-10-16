@@ -145,7 +145,8 @@ inline bool read(MyGUI::EditBox* edit, char* out, size_t capacity) {
     out[0] = 0;
     if (!edit) return false;
     if (detail::readSeh(edit, out, capacity) == 1) return true;
-    out[0] = 0;
+    volatile char* p = out;
+    for (size_t i = 0; i < capacity; ++i) p[i] = 0;
     return false;
 }
 

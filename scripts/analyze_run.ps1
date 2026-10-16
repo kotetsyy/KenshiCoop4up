@@ -46,7 +46,7 @@ if ($RunDir -ne "") {
     if ($JoinLog -eq "") { $JoinLog = Join-Path $RunDir "join.log" }
 }
 if ($HostLog -eq "" -or -not (Test-Path $HostLog)) { throw "Host log not found: '$HostLog' (use -RunDir or -HostLog)" }
-if ($JoinLog -ne "" -and -not (Test-Path $JoinLog)) { Write-Warning "Join log not found: $JoinLog (judging host-only)" }
+if ($JoinLog -eq "" -or -not (Test-Path $JoinLog)) { Write-Warning "Required JOIN log missing: '$JoinLog'; analysis will FAIL incomplete participant evidence." }
 
 $manifest = Get-ScenarioManifest
 if ($Tolerance -eq 0) {
@@ -64,7 +64,7 @@ Write-Host ""
 
 $expSkew = if ($ExpectedSkewMs -ne "") { [int]$ExpectedSkewMs } else { $null }
 $verdict = Invoke-RunAnalysis -HostLog $HostLog -JoinLog $JoinLog -Scenario $Scenario `
-              -Tolerance $Tolerance -JoinExpected ($JoinLog -ne "") `
+              -Tolerance $Tolerance -JoinExpected $true `
               -RunInfo @{ offline = $true; hostLog = $HostLog; joinLog = $JoinLog
                           outDir = $RunDir } `
               -ExpectedSkewMs $expSkew -WanActive ([bool]$WanActive) -OutJson $OutJson

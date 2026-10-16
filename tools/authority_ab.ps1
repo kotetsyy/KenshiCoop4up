@@ -3,9 +3,9 @@
   Run one scenario under several authority arms and print one comparison table.
 
 .DESCRIPTION
-  An arm is a name plus a DiagEnv override, so anything Config.cpp reads from the
-  environment can be compared without touching the committed manifest. The
-  default pair is the original question - KENSHICOOP_CELL_AUTH=0 restores
+  An arm is a name plus supported, verifiable native boolean overrides. Keys
+  without an effective-config readback are rejected rather than assumed applied.
+  The default pair is the original question - KENSHICOOP_CELL_AUTH=0 restores
   unconditional host authority (the v0.46 model), so it is a ready-made control
   against today's bidirectional cell authority.
 
@@ -28,22 +28,22 @@
   passed per run via run_test.ps1 -DiagEnvOverride.
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File tools\authority_ab.ps1 -Scenario escape_cohesion -Runs 4
+  powershell -ExecutionPolicy Bypass -File tools\authority_ab.ps1 -Scenario escape_cohesion -Runs 4 -HostDir C:\PublicHost -JoinDir C:\PublicJoin -NativeBin C:\PublicNative
 
 .EXAMPLE
   # The far-apart control: does host-only still lose when the squads are split?
-  powershell -ExecutionPolicy Bypass -File tools\authority_ab.ps1 -Scenario split_far2 -Runs 3
+  powershell -ExecutionPolicy Bypass -File tools\authority_ab.ps1 -Scenario split_far2 -Runs 3 -HostDir C:\PublicHost -JoinDir C:\PublicJoin -NativeBin C:\PublicNative
 
 .EXAMPLE
   # Three arms: today's split, the co-location collapse, and the host-only
   # reference the collapse is supposed to reproduce while the squads are together.
-  powershell -ExecutionPolicy Bypass -File tools\authority_ab.ps1 -Scenario escape_cohesion -Runs 4 -Arms "cellauth:KENSHICOOP_CELL_AUTH=1,KENSHICOOP_CELL_COLLAPSE=0;collapse:KENSHICOOP_CELL_AUTH=1,KENSHICOOP_CELL_COLLAPSE=1;hostonly:KENSHICOOP_CELL_AUTH=0"
+  powershell -ExecutionPolicy Bypass -File tools\authority_ab.ps1 -Scenario escape_cohesion -Runs 4 -HostDir C:\PublicHost -JoinDir C:\PublicJoin -NativeBin C:\PublicNative -Arms "cellauth:KENSHICOOP_CELL_AUTH=1,KENSHICOOP_CELL_COLLAPSE=0;collapse:KENSHICOOP_CELL_AUTH=1,KENSHICOOP_CELL_COLLAPSE=1;hostonly:KENSHICOOP_CELL_AUTH=0"
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Scenario,
-    [int]$Runs = 4,
+    [ValidatePattern('^[a-z0-9_]+$')][string]$Scenario,
+    [ValidateRange(1, 2147483647)][int]$Runs = 4,
     # Arms to compare, each "name:KEY=VAL[,KEY2=VAL2]". The name becomes the run
     # directory prefix and the table's row label; the rest is handed to
     # run_test.ps1 -DiagEnvOverride verbatim.
@@ -65,7 +65,11 @@ param(
     # Score whatever run dirs the batch already holds and launch nothing. Unlike
     # -ReuseDir with a run count, this does not care how many runs each arm has,
     # which is what an arm topped up to a valid-run target looks like.
-    [switch]$ScoreOnly
+    [switch]$ScoreOnly,
+    # Launch mode requires explicit public installs and the intended native artifact.
+    [string]$HostDir = "",
+    [string]$JoinDir = "",
+    [string]$NativeBin = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,89 +77,76 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
 $runner    = Join-Path $repoRoot "scripts\run_test.ps1"
 
-# Env key -> the name it answers to in the plugin's startup config dump. This is
-# what makes an arm checkable: setting a variable proves nothing, the dump is the
-# game telling us what it actually read. A key absent here is simply not verified.
+Import-Module (Join-Path $repoRoot 'scripts\CoopOracles.psm1') -Force
+$PSNativeCommandUseErrorActionPreference = $false
+# Only booleans with real native effective-config readback are supported.
 $script:FlagFields = @{
-    'KENSHICOOP_CELL_AUTH'     = 'cellAuth'
+    'KENSHICOOP_CELL_AUTH' = 'cellAuth'
     'KENSHICOOP_CELL_COLLAPSE' = 'cellCollapse'
+    'KENSHICOOP_CENSUS_FREEZE_AI' = 'censusFreezeAi'
+    'KENSHICOOP_CAM_INTEREST' = 'camInterest'
 }
 
 function Parse-Arm([string]$Spec) {
     $i = $Spec.IndexOf(':')
-    if ($i -lt 1) { throw "Arm '$Spec' is not 'name:KEY=VAL[,KEY2=VAL2]'." }
+    if ($i -lt 1) { throw "Arm '$Spec' is not name:KEY=VALUE." }
     $name = $Spec.Substring(0, $i).Trim()
-    # NOT named $env: that is the environment provider's drive name and shadowing
-    # it here would be a trap for anyone later adding an $env:FOO read.
+    if ($name -cnotmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$' -or
+        $name -match '^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') { throw "Unsafe arm name '$name'." }
     $envSpec = $Spec.Substring($i + 1).Trim()
-    $expect = @{}
+    if ($envSpec -eq '') { throw "Arm '$name' has no overrides." }
+    $expect = @{}; $overrides = @{}
     foreach ($pair in ($envSpec -split ',')) {
-        $t = $pair.Trim()
-        if ($t -eq "") { continue }
-        $kv = $t -split '=', 2
-        if ($kv.Count -ne 2) { throw "Arm '$name': '$t' is not KEY=VALUE." }
-        $key = $kv[0].Trim()
-        if ($script:FlagFields.ContainsKey($key)) {
-            $expect[$script:FlagFields[$key]] = [int]$kv[1].Trim()
-        }
+        $kv = $pair.Trim() -split '=', 2
+        if ($kv.Count -ne 2) { throw "Arm '$name': '$pair' is not KEY=VALUE." }
+        $key = $kv[0].Trim(); $value = $kv[1].Trim()
+        if (-not $script:FlagFields.ContainsKey($key)) { throw "Arm '$name': unsupported effective-config readback for '$key'." }
+        if ($value -eq '' -or $overrides.ContainsKey($key)) { throw "Arm '$name': empty or duplicate override '$key'." }
+        $overrides[$key] = $value
+        # Native Config.cpp tests value != "0", not an integer conversion.
+        $expect[$script:FlagFields[$key]] = [int]($value -cne '0')
     }
-    return [pscustomobject]@{ name = $name; diagEnv = $envSpec; expect = $expect }
+    return [pscustomobject]@{ name=$name; diagEnv=$envSpec; expect=$expect; overrides=$overrides }
 }
 
 # ---- log parsing --------------------------------------------------------------
 
-function Convert-StampToMs([string]$Line) {
-    # "[HH:MM:SS.mmm] ..." -> ms since midnight. Both clients stamp the same way.
-    if ($Line -match '^\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]') {
-        return ([int]$Matches[1] * 3600000) + ([int]$Matches[2] * 60000) +
-               ([int]$Matches[3] * 1000) + [int]$Matches[4]
-    }
-    return -1
-}
-
 function Get-DrvPerDump([string]$LogFile) {
-    <#
-      Mean cls=drv rows per WNPC dump. The dumps come in bursts - one line per
-      body, all within a few ms - so a gap larger than any intra-burst spacing
-      separates them. 1500 ms matches the grouping the motion oracles use.
-    #>
-    if (-not (Test-Path $LogFile)) { return [pscustomobject]@{ mean = -1; dumps = 0; peak = 0 } }
+    if (-not (Test-Path -LiteralPath $LogFile)) { return [pscustomobject]@{mean=-1;dumps=0;peak=0} }
+    $bursts = @(Group-WnpcSamples -Rows @(Get-WnpcRows -File $LogFile) -GapMs 1500)
     $samples = New-Object System.Collections.ArrayList
-    $curT = -1
-    $curDrv = 0
-    $curAny = 0
-    foreach ($line in [System.IO.File]::ReadLines((Resolve-Path $LogFile).Path)) {
-        if ($line -notlike '*SCENARIO WNPC*') { continue }
-        $t = Convert-StampToMs $line
-        if ($t -lt 0) { continue }
-        if ($curT -lt 0 -or ($t - $curT) -gt 1500) {
-            if ($curAny -gt 0) { [void]$samples.Add($curDrv) }
-            $curDrv = 0
-            $curAny = 0
-        }
-        $curT = $t
-        $curAny++
-        if ($line -match 'cls=drv') { $curDrv++ }
+    foreach ($burst in $bursts) { [void]$samples.Add(@($burst.rows | Where-Object { $_.cls -eq 'drv' }).Count) }
+    foreach ($world in @(Get-WorldRows -File $LogFile)) {
+        $paired = @($bursts | Where-Object { [math]::Abs($_.t - $world.t) -le 1500 })
+        $npcRows = @($paired | ForEach-Object { $_.rows } | Where-Object { $_.cls -ne 'pc' })
+        if ($world.n -gt 0 -and -not $npcRows.Count) { throw "Nonempty WORLD has no NPC roster in $LogFile" }
+        if ($world.n -eq 0 -and $npcRows.Count) { throw "Empty WORLD conflicts with NPC roster in $LogFile" }
+        # WORLD n counts census NPCs, not the separately emitted cls=pc rows.
+        # A PC-only burst already represents this zero-driving sample.
+        if ($world.n -eq 0 -and -not $paired.Count) { [void]$samples.Add(0) }
     }
-    if ($curAny -gt 0) { [void]$samples.Add($curDrv) }
-    if ($samples.Count -eq 0) { return [pscustomobject]@{ mean = -1; dumps = 0; peak = 0 } }
-    $sum = 0; $peak = 0
-    foreach ($s in $samples) { $sum += $s; if ($s -gt $peak) { $peak = $s } }
-    return [pscustomobject]@{
-        mean  = [math]::Round($sum / $samples.Count, 1)
-        dumps = $samples.Count
-        peak  = $peak
-    }
+    if (-not $samples.Count) { return [pscustomobject]@{mean=-1;dumps=0;peak=0} }
+    $stats = $samples | Measure-Object -Average -Maximum
+    return [pscustomobject]@{mean=[math]::Round($stats.Average,1);dumps=$samples.Count;peak=$stats.Maximum}
 }
 
 function Get-LoggedFlag([string]$LogFile, [string]$Field) {
-    # Reads one flag out of the Config startup dump. -1 when the line is absent,
-    # which is itself disqualifying: the client died before it got that far.
-    if (-not (Test-Path $LogFile)) { return -1 }
-    foreach ($line in [System.IO.File]::ReadLines((Resolve-Path $LogFile).Path)) {
-        if ($line -match "$Field=(\d)") { return [int]$Matches[1] }
+    if (-not (Test-Path -LiteralPath $LogFile)) { return -1 }
+    $values = @()
+    foreach ($line in (Get-Content -LiteralPath $LogFile -Encoding UTF8)) {
+        if ($line -notmatch "^\[\d\d:\d\d:\d\d\.\d\d\d\](?: \[(?:HOST|JOIN)\])?(?: INFO:)? KenshiCoop: effective cfg scenario='([^']*)' ") { continue }
+        if ($Matches[1] -cne $Scenario) { return -1 }
+        $exact = [regex]::Match($line, '(?:^| )' + [regex]::Escape($Field) + '=([01])(?: |$)')
+        if ($exact.Success) { $values += [int]$exact.Groups[1].Value; continue }
+        $on = [regex]::Match($line, '(?:^| )on=\[([^\]]*)\](?: |$)')
+        $off = [regex]::Match($line, '(?:^| )off=\[([^\]]*)\](?: |$)')
+        $inOn = $on.Success -and ($on.Groups[1].Value -split ',') -ccontains $Field
+        $inOff = $off.Success -and ($off.Groups[1].Value -split ',') -ccontains $Field
+        if ($inOn -eq $inOff) { return -1 }
+        $values += [int]$inOn
     }
-    return -1
+    if (-not $values.Count -or @($values | Select-Object -Unique).Count -ne 1) { return -1 }
+    return $values[0]
 }
 
 function Test-ArmApplied([string]$HostLog, [string]$JoinLog, $Expect) {
@@ -183,7 +174,7 @@ function Get-EscapeCells([string]$LogFile) {
     if (-not (Test-Path $LogFile)) { return 0 }
     $seen = @{}
     foreach ($line in [System.IO.File]::ReadLines((Resolve-Path $LogFile).Path)) {
-        if ($line -match 'SCENARIO ESCAPE .*cell=(\d+,\d+)') { $seen[$Matches[1]] = 1 }
+        if ($line -match 'SCENARIO ESCAPE .*?(?:^| )cell=(-?\d+,-?\d+)(?: |$)') { $seen[$Matches[1]] = 1 }
     }
     return $seen.Count
 }
@@ -249,12 +240,10 @@ function Get-CollapseFlips([string]$LogFile) {
     $flips = New-Object System.Collections.ArrayList
     $last = -1
     if (-not (Test-Path $LogFile)) { return [pscustomobject]@{ n = 0; at = $flips } }
-    foreach ($line in [System.IO.File]::ReadLines((Resolve-Path $LogFile).Path)) {
-        if ($line -notmatch '\[cell\] MAP .*collapse=(\d)') { continue }
-        $v = [int]$Matches[1]
+    foreach ($record in (Select-String -LiteralPath $LogFile -Encoding UTF8 -Pattern '\[cell\] MAP .*collapse=([01])(?: |$)')) {
+        $v = [int]$record.Matches[0].Groups[1].Value
         if ($last -ge 0 -and $v -ne $last) {
-            $t = Convert-StampToMs $line
-            [void]$flips.Add([pscustomobject]@{ t = $t; to = $v })
+            [void]$flips.Add([pscustomobject]@{ t=(Get-LogTimeMs -Match $record); to=$v })
         }
         $last = $v
     }
@@ -284,10 +273,10 @@ function Get-Counter([string]$LogFile, [string]$Name) {
 function Get-GateMap([string]$VerdictFile) {
     $map = @{}
     if (-not (Test-Path $VerdictFile)) { return $map }
-    try { $j = Get-Content -Raw $VerdictFile | ConvertFrom-Json } catch { return $map }
+    try { $j = Get-Content -LiteralPath $VerdictFile -Encoding UTF8 -Raw | ConvertFrom-Json } catch { return $map }
     foreach ($g in $j.gates) {
-        $name = if ($g.PSObject.Properties.Name -contains 'gate') { $g.gate } else { $g.id }
-        $map[$name] = $g
+        if ($null -eq $g -or [string]::IsNullOrWhiteSpace($g.gate)) { return @{} }
+        $map[$g.gate] = $g
     }
     return $map
 }
@@ -310,9 +299,42 @@ function Get-PrimaryGateName([string]$VerdictFile) {
     # The primary gate is named in the verdict, not after the scenario:
     # escape_cohesion's is pc_dupes, split_far2's is split_far2.
     if (-not (Test-Path $VerdictFile)) { return "" }
-    try { $j = Get-Content -Raw $VerdictFile | ConvertFrom-Json } catch { return "" }
+    try { $j = Get-Content -LiteralPath $VerdictFile -Encoding UTF8 -Raw | ConvertFrom-Json } catch { return "" }
     if ($j.PSObject.Properties.Name -contains 'primary') { return "$($j.primary)" }
     return ""
+}
+
+function Test-ArchiveEvidence($ArmDef, [string]$OutDir, $GateMap) {
+    try {
+        $run = Get-Content -LiteralPath (Join-Path $OutDir 'run.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+        $verdict = Get-Content -LiteralPath (Join-Path $OutDir 'verdict.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+        if ($run.scenario -cne $Scenario -or $verdict.scenario -cne $Scenario) { return 'SCENARIO-MISMATCH' }
+        if ($run.diagEnvOverride -isnot [pscustomobject] -or
+            @($run.diagEnvOverride.PSObject.Properties).Count -ne $ArmDef.overrides.Count) { return 'OVERRIDE-MISMATCH' }
+        foreach ($key in $ArmDef.overrides.Keys) {
+            if ($run.diagEnvOverride.PSObject.Properties.Name -cnotcontains $key -or
+                [string]$run.diagEnvOverride.$key -cne $ArmDef.overrides[$key]) { return 'OVERRIDE-MISMATCH' }
+        }
+        if ($verdict.pass -isnot [bool] -or $verdict.gates -isnot [array] -or
+            [string]::IsNullOrWhiteSpace($verdict.primary) -or -not $GateMap.ContainsKey($verdict.primary) -or
+            $verdict.gating -isnot [array] -or -not $verdict.gating.Count) { return 'INCOMPLETE-VERDICT' }
+        $seen = @{}
+        foreach ($g in $verdict.gates) {
+            if ([string]::IsNullOrWhiteSpace($g.gate) -or $g.status -cnotin @('PASS','FAIL','SKIP') -or $seen.ContainsKey($g.gate)) { return 'INVALID-VERDICT' }
+            $seen[$g.gate] = $true
+        }
+        foreach ($name in @('health_host','health_join','check_fail','result_host','result_join','process_exit')) {
+            if ((Get-Status $GateMap $name) -ne 'PASS') { return "INCOMPLETE-$name" }
+        }
+        foreach ($name in $verdict.gating) { if (-not $seen.ContainsKey($name)) { return 'INCOMPLETE-GATING' } }
+        foreach ($side in @('host','join')) {
+            $file = Join-Path $OutDir "$side.log"
+            if ((Test-LogHealth -File $file -Label $side -Required $true -CleanPattern 'SCENARIO RESULT') -ne 'PASS' -or
+                (Test-ScenarioResultPass -File $file -Label $side -Required $true -Scenario $Scenario) -ne 'PASS') { return "INCOMPLETE-NATIVE-$side" }
+        }
+        if ((Test-NoCheckFail -HostFile (Join-Path $OutDir 'host.log') -JoinFile (Join-Path $OutDir 'join.log')) -ne 'PASS') { return 'INCOMPLETE-NATIVE-CHECK' }
+        return 'ok'
+    } catch { return "INVALID-ARCHIVE: $($_.Exception.Message)" }
 }
 
 function Test-RunValid([string]$ScenarioName, $GateMap, [int]$CellsVisited) {
@@ -348,15 +370,19 @@ function Invoke-Arm($ArmDef, [int]$Index, [string]$BatchDir) {
         # String form of -DiagEnvOverride: -File stringifies every argument, so a
         # hashtable literal cannot be passed this way.
         & powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
-            -Scenario $Scenario -OutDir $outDir `
+            -Scenario $Scenario -OutDir $outDir -HostDir $HostDir -JoinDir $JoinDir -NativeBin $NativeBin `
             -DiagEnvOverride $ArmDef.diagEnv 2>&1 |
             Select-String -Pattern '^RESULT:|^  (dual_drive|pc_dupes|world_parity|lockpick_escape|split_far2)' |
             ForEach-Object { Write-Host ("    " + $_.Line.Trim()) }
+        $childExit = $LASTEXITCODE
+        # Exit 1 can be a completed negative oracle result, not a harness failure.
+        if ($childExit -notin @(0,1)) { throw "A/B runner failed with exit $childExit for $outDir" }
     }
     return Measure-Run $ArmDef $Index $outDir
 }
 
 function Measure-Run($ArmDef, [int]$Index, [string]$OutDir) {
+    Reset-GateResults
     $ArmName = $ArmDef.name
     $hostLog = Join-Path $OutDir "host.log"
     $joinLog = Join-Path $OutDir "join.log"
@@ -367,7 +393,7 @@ function Measure-Run($ArmDef, [int]$Index, [string]$OutDir) {
     $mapW    = [math]::Max((Get-CellMapWidth $hostLog), (Get-CellMapWidth $joinLog))
     $cells   = [math]::Max((Get-EscapeCells $hostLog), (Get-EscapeCells $joinLog))
 
-    $armBad = Test-ArmApplied $hostLog $joinLog $ArmDef.expect
+    $armBad = @(Test-ArmApplied $hostLog $joinLog $ArmDef.expect)
     $armOk  = ($armBad.Count -eq 0)
 
     $drvHost = Get-DrvPerDump $hostLog
@@ -375,7 +401,8 @@ function Measure-Run($ArmDef, [int]$Index, [string]$OutDir) {
     $popH    = Get-SplitFarPops $hostLog
     $popJ    = Get-SplitFarPops $joinLog
 
-    $valid = if (-not $armOk) { "ARM-MISMATCH" } else { Test-RunValid $Scenario $gates $cells }
+    $evidence = Test-ArchiveEvidence $ArmDef $OutDir $gates
+    $valid = if ($evidence -ne 'ok') { $evidence } elseif (-not $armOk) { "ARM-MISMATCH" } elseif ($drvHost.dumps -eq 0 -or $drvJoin.dumps -eq 0) { 'NO-ROSTER-EVIDENCE' } elseif ($Scenario -eq 'split_far2' -and ($popH.rows -eq 0 -or $popJ.rows -eq 0)) { 'NO-POPULATION-EVIDENCE' } else { Test-RunValid $Scenario $gates $cells }
 
     return [pscustomobject]@{
         arm         = $ArmName
@@ -495,6 +522,18 @@ function Show-Arm([string]$ArmName, $Rows) {
 
 # ---- main ---------------------------------------------------------------------
 
+# Validate before creating artifacts or querying any game/launch boundary.
+$armDefs = @($Arms | ForEach-Object { $_ -split ';' } | ForEach-Object { Parse-Arm $_ })
+if (-not $armDefs.Count) { throw 'At least one verifiable arm is required.' }
+$names = @{}
+foreach ($arm in $armDefs) {
+    if ($names.ContainsKey($arm.name)) { throw "Duplicate arm name '$($arm.name)'." }
+    $names[$arm.name] = $true
+}
+if ($ScoreOnly -and $ReuseDir -eq '') { throw 'ScoreOnly requires an existing ReuseDir.' }
+if (-not $ScoreOnly -and ($HostDir -eq '' -or $JoinDir -eq '' -or $NativeBin -eq '')) {
+    throw 'Launch mode requires explicit -HostDir, -JoinDir and -NativeBin.'
+}
 # Two batches at once are worse than useless: both drive the same pair of Kenshi
 # installs, the same fixture save and the same port 27800, so the runs interleave
 # and every number produced is garbage - and a save restore racing a live client
@@ -521,16 +560,15 @@ if ($ReuseDir -ne "") {
 Write-Host "Authority A/B: scenario=$Scenario runs=$Runs arms=$($Arms -join ' | ')"
 Write-Host "  batch dir: $batchDir"
 
-$armDefs = @($Arms | ForEach-Object { $_ -split ';' } |
-             Where-Object { $_.Trim() -ne "" } |
-             ForEach-Object { Parse-Arm $_ })
 $all = New-Object System.Collections.ArrayList
 foreach ($ad in $armDefs) {
     if ($ScoreOnly) {
-        $dirs = @(Get-ChildItem -Directory $batchDir -Filter "$($ad.name)_*" |
-                  Sort-Object { [int]($_.Name -replace '^.*_', '') })
+        $pattern = '^' + [regex]::Escape($ad.name) + '_(\d+)$'
+        $dirs = @(Get-ChildItem -Directory -LiteralPath $batchDir |
+                  Where-Object { $_.Name -cmatch $pattern } |
+                  Sort-Object { [int]($_.Name.Substring($ad.name.Length + 1)) })
         foreach ($d in $dirs) {
-            $idx = [int]($d.Name -replace '^.*_', '')
+            $idx = [int]$d.Name.Substring($ad.name.Length + 1)
             [void]$all.Add((Measure-Run $ad $idx $d.FullName))
         }
     } else {
@@ -567,8 +605,8 @@ if ($Scenario -eq "split_far2") {
         Out-String | Write-Host
 }
 
-$all | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $batchDir "ab_runs.json")
-$summaries | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $batchDir "ab_summary.json")
+ConvertTo-Json -InputObject @($all.ToArray()) -Depth 6 | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $batchDir "ab_runs.json")
+ConvertTo-Json -InputObject @($summaries.ToArray()) -Depth 6 | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $batchDir "ab_summary.json")
 Write-Host "  wrote $batchDir\ab_runs.json + ab_summary.json"
 
 $bad = @($all | Where-Object { $_.valid -eq "ARM-MISMATCH" })
@@ -578,3 +616,9 @@ if ($bad.Count -gt 0) {
     Write-Host "         The override did not reach the game - do not read the table above."
     foreach ($b in $bad) { Write-Host ("         " + $b.dir + ": " + $b.armBad) }
 }
+Write-Host 'DIAGNOSTIC ONLY: arm comparisons are not gameplay certification.'
+if (@($all | Where-Object { $_.valid -ne 'ok' }).Count -or $summaries.Count -ne $armDefs.Count) {
+    Write-Host 'INCOMPLETE: invalid archives or an arm without comparable evidence.'
+    exit 2
+}
+exit 0

@@ -7,11 +7,23 @@
 //
 // Owner state: section-private statics/anon-namespace helpers only (r401 lever
 // cache).
-// Must NOT: define g_* engine pointers (EngineInternal.cpp owns them - EngineInternal.h
-// declares them), install hooks, or change any log string - log phrasing is
-// the API consumed by the PowerShell oracles (see resources/CODE_MAP.md).
+// Must NOT: define shared g_* engine pointers (EngineInternal.cpp owns them), or
+// change existing oracle log strings. Saved-ground input identity hooks below
+// own only their private trampolines/records; no replication verdict uses them
+// until actual paired-engine identity evidence establishes a safe namespace.
 
 #include "EngineInternal.h"
+#include "EngineProcedural.h"
+#include "EngineEnvironmentItems.h"
+#include <kenshi/GameDataManager.h>
+#include <kenshi/Building/ProductionBuilding.h>
+#include <kenshi/gui/InventoryGUI.h>
+#include <kenshi/gui/InventoryTraderGUI.h>
+#include <kenshi/ShopTraderInventory.h>
+#include <algorithm>
+#include <memory>
+#include "InventoryTransactionBridge.h"
+#include "../core/InventoryTransactionRules.h"
 
 namespace coop {
 namespace engine {
@@ -27,6 +39,7 @@ RootObject* resolveObjectByHand(const unsigned int cHand[5]) {
 }
 
 namespace {
+bool inventoryContainsPhysicalItem(Inventory* inventory,Item* item);
 
 // invEntryHash / sectionNameHash moved to ../../netproto/ContentHash.h (shared
 // with the prototest unit layer, which locks their cross-client stability).
@@ -133,12 +146,10 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
     if (!inv || !out || maxOut == 0) return 0;
     unsigned int n = 0;
     bool trunc = false;
-    // Local mirror of the captured Item*s. The nested-container pass needs the parent objects
-    // to reach into their private inventories, and most callers pass outItems = 0; every real
-    // caller reads at most INV_ITEMS_MAX entries, so a fixed mirror covers them all.
-    const unsigned int MIRROR_MAX = 64;
-    Item* mine[64];
-    memset(mine, 0, sizeof(mine));
+    // Full staged snapshots include real merchant stock. Game-thread capture
+    // never recurses, so reuse a bounded physical-pointer mirror.
+    const unsigned int MIRROR_MAX = INV_SNAPSHOT_ITEMS_MAX;
+    static Item* mine[INV_SNAPSHOT_ITEMS_MAX];
     // EQUIPPED gear (Phase 4a equipment sync). Worn items - EVERY equippable slot:
     // weapons, all armour pieces, belt, worn backpack, ... - live in the inventory's
     // equip SECTIONS, not the loose _allItems list. Walk every section and capture the
@@ -205,15 +216,11 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                 if (!gd) continue;
                 const char* sid = gd->stringID.c_str();
                 unsigned int wtype = (unsigned int)gd->type;
-                // Dedup by (stringID, itemType) against already-captured EQUIPPED entries:
-                // a sheathed weapon is exposed BOTH as a section item and via this pointer,
-                // and the two are distinct Item* objects, so pointer identity won't catch
-                // it. Matching on template avoids double-counting the same worn weapon.
-                bool dup = false;
-                for (unsigned int j = 0; j < n; ++j)
-                    if (out[j].equipped && out[j].itemType == wtype &&
-                        strncmp(out[j].stringID, sid ? sid : "",
-                                sizeof(out[j].stringID)) == 0) { dup = true; break; }
+                // A section and a held-slot getter may expose the SAME physical
+                // weapon. Distinct weapons of one template are never duplicates.
+                bool dup=false;
+                for (unsigned int j=0;j<n && j<MIRROR_MAX;++j)
+                    if (mine[j]==it) { dup=true; break; }
                 if (dup) continue;
                 if (n >= maxOut) { trunc = true; break; }
                 memset(&out[n], 0, sizeof(InvItemEntry));
@@ -225,10 +232,9 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                 out[n].level    = gradeLevelOf(it);
                 out[n].equipped = 1;
                 out[n].slot     = (unsigned char)((unsigned int)it->slotType & 0xFFu);
-                // A pointer-only weapon isn't in a getAllSections() section, so there is
-                // no section name to hash - leave 0 (the peer equips it to the default
-                // weapon slot; sheathed weapons are captured WITH a section above).
-                out[n].section  = 0;
+                // Native slot context survives drawing; use the same actual
+                // section identity captured by the pre-drop native hook.
+                out[n].section=sectionNameHash(it->inventorySection.c_str());
                 fillItemProvenance(it, out[n]); // weapon manufacturer/material (required to recreate)
                 if (outItems) outItems[n] = it;
                 if (n < MIRROR_MAX) mine[n] = it;
@@ -301,7 +307,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
-        for (unsigned int p = 0; p < nTop && n < maxOut; ++p) {
+        for (unsigned int p = 0; p < nTop && !trunc; ++p) {
             Item* parent = mine[p];
             if (!parent) continue;
             __try {
@@ -309,7 +315,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                 if (!sub || sub == inv) continue; // not a container item
                 lektor<InventorySection*>* subSecs = g_getSectionsFn(sub);
                 unsigned int nss = subSecs ? subSecs->size() : 0;
-                for (unsigned int s = 0; s < nss && n < maxOut; ++s) {
+                for (unsigned int s = 0; s < nss && !trunc; ++s) {
                     InventorySection* sec = (*subSecs)[s];
                     if (!sec) continue;
                     const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
@@ -331,7 +337,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                         out[n].equipped  = 0;
                         out[n].slot      = (unsigned char)((unsigned int)it->slotType & 0xFFu);
                         out[n].section   = 0;
-                        out[n].parentIdx = (unsigned char)((p + 1) & 0xFFu);
+                        out[n].parentIdx = (unsigned short)(p + 1);
                         fillItemProvenance(it, out[n]);
                         if (outItems) outItems[n] = it;
                         ++n;
@@ -419,7 +425,23 @@ static GameData* recordBySid(GameWorld* gw, const char* sid) {
 }
 
 
-// Fabricate detached native items so stock layout can be validated before mutation.
+// Native by-value hand construction needs C++ unwinding outside the SEH caller.
+static Item* constructExactSword(GameData* base, GameData* maker, GameData* material,
+                                 const hand& handle, int level) {
+    return new Sword(base, maker, material, handle, level);
+}
+// createItem/the exact Sword constructor accept a detached, empty hand.
+// Inventory placement does not register it. copyItem is the SDK's native
+// creation path that also allocates a live item handle; keep its prototype
+// detached and scoped, rather than inserting an unresolvable item into stock.
+static Item* registerFabricatedItem(RootObjectFactory* factory,Item* item) {
+    std::auto_ptr<Item> prototype(item);
+    unsigned int actual[5];
+    if (readObjectHand(item,actual) && resolveObjectByHand(actual)==item)
+        return prototype.release();
+    return factory->copyItem(prototype.get());
+}
+// Create registered native items off-inventory so layout can be validated before mutation.
 static Item* fabricateItem(GameWorld* gw, const char* sid, unsigned int typeCat,
                            int qualityBucket, const char* manufacturer,
                            const char* material, unsigned char level) {
@@ -435,19 +457,12 @@ static Item* fabricateItem(GameWorld* gw, const char* sid, unsigned int typeCat,
         GameData* mat=recordBySid(gw,material);
         if ((manufacturer && manufacturer[0] && !man) ||
             (material && material[0] && !mat)) return 0;
-        // THE GRADE. Kenshi's named grades (Prototype 5, Shoddy 20, Standard 40, High 60,
-        // Specialist 80, Masterwork 95) are points on a 1-100 craft level that the factory
-        // bakes into Gear::level / level_0_100 at construction, from THIS argument, and that
-        // nothing writes afterwards. So a hardcoded override rebuilt every piece at the
-        // factory's default grade no matter what the author had - and the quality patch
-        // further down could not repair it, because quality is CONDITION, a different axis:
-        // a pristine Shoddy and a pristine Masterwork both read 100. That is the reported
-        // bug, and the reason the grade needed its own wire field (protocol 51).
-        //
-        // GRADE_NA means the author had no craft level to report (a non-Gear stack), so the
-        // engine's own per-branch default stands. KENSHICOOP_GEAR_LEVEL=0 forces that path
-        // for everything, restoring the pre-fix constants: this argument sits INSIDE the
-        // spike-451 weapon recipe, which is delicate enough to want a one-env rollback.
+        // Condition and native craft level are independent. The procedural weapon
+        // factory selects level from the manufacturer's material/model list and
+        // ignores levelOverride in its weapon branch. For a known wire level,
+        // construct the native Sword directly with the Ogre allocator. Its
+        // detached handle is registered through the native copy path below.
+        // Unknown levels retain native procedural generation.
         static int lvlOn = -1;
         if (lvlOn < 0) { const char* e = getenv("KENSHICOOP_GEAR_LEVEL"); lvlOn = (e && e[0] == '0') ? 0 : 1; }
         int gradeLevel = -1; // -1 = "no wire grade": use the per-branch engine default
@@ -463,20 +478,18 @@ static Item* fabricateItem(GameWorld* gw, const char* sid, unsigned int typeCat,
                 if (dbg) coop::logLine("[mk] weapon-fab disabled (KENSHICOOP_WEAPON_FAB=0)");
                 return 0;
             }
-            // Spike 451: for WEAPONS the 6-arg createItem's first two GameData roles
-            // are SWAPPED - the engine passes the WEAPON_MANUFACTURER record FIRST and
-            // the weapon template THIRD (the header's misleading "weaponMesh" slot).
-            // Template-first returns null for every weapon template (the old 0/24);
-            // manufacturer-first fabricates (replay proved created=1 added=1). The
-            // engine's own mint shape: blank NULL_ITEM hand, levelOverride 0, no faction.
+            // The procedural weapon factory takes manufacturer FIRST and template
+            // THIRD. An exact native constructor instead takes template FIRST.
             if (!man) man = fallbackWeaponManufacturer(gw);
             if (man) {
                 char wb[sizeof(hand) + 16];
                 memset(wb, 0, sizeof(wb));
                 hand* wh = reinterpret_cast<hand*>(wb);
                 g_handCtorFn(wh, 0, 0, NULL_ITEM, 0, 0);
-                it = g_createItemFn(gw->theFactory, man, wh, tmpl, mat,
-                                    (gradeLevel >= 0) ? gradeLevel : 0, 0);
+                if (gradeLevel >= 0)
+                    it = constructExactSword(tmpl, man, mat, *wh, gradeLevel);
+                else
+                    it = g_createItemFn(gw->theFactory, man, wh, tmpl, mat, 0, 0);
             } else if (dbg) {
                 coop::logLine("[mk] weapon manufacturer unresolved (no provenance, no fallback)");
             }
@@ -498,11 +511,15 @@ static Item* fabricateItem(GameWorld* gw, const char* sid, unsigned int typeCat,
         }
         if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return 0; }
         if (qualityBucket > 0) it->quality = (float)qualityBucket / 100.0f;
-        return it;
+        return registerFabricatedItem(gw->theFactory,it);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (dbg) coop::logLine("[mk] SEH-except");
         return 0;
     }
+}
+Item* fabricateEnvironmentItem(GameWorld* gw,const InvItemEntry& item) {
+    return fabricateItem(gw,item.stringID,item.itemType,item.quality,
+                         item.manufacturer,item.material,item.level);
 }
 
 bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
@@ -641,8 +658,7 @@ int correctWeaponSlot(Inventory* inv, const char* sid, unsigned int type,
 } // namespace
 
 bool containerInventoryAvailable(const unsigned int cHand[5]) {
-    RootObject* ro = resolveObjectByHand(cHand);
-    return ro && invOf(ro) != 0;
+    return transactionInventory(cHand)!=0;
 }
 
 unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
@@ -652,9 +668,7 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
     if (outHash) *outHash = 0;
     if (outTruncated) *outTruncated = false;
     if (!gw || !out || maxOut == 0) return 0;
-    RootObject* ro = resolveObjectByHand(cHand);
-    if (!ro) return 0;
-    Inventory* inv = invOf(ro);
+    Inventory* inv = transactionInventory(cHand);
     if (!inv) return 0;
     unsigned int n = readInvItems(inv, out, 0, maxOut, outTruncated, includeNested);
     if (outHash) {
@@ -676,10 +690,12 @@ static bool sameStockItem(const InvItemEntry& a, const InvItemEntry& b) {
 static bool applyStockLayout(GameWorld* gw, Inventory* inv,
                              const InvItemEntry* desired, unsigned int count,
                              const InvItemEntry* cur, Item** curItems, unsigned int ncur) {
-    Item* placed[INV_ITEMS_MAX]={0};
-    InventorySection* sections[INV_ITEMS_MAX]={0};
-    bool reused[INV_ITEMS_MAX]={0};
-    bool used[INV_ITEMS_MAX]={0};
+    if (count>INV_SNAPSHOT_ITEMS_MAX || ncur>INV_SNAPSHOT_ITEMS_MAX) return false;
+    static Item* placed[INV_SNAPSHOT_ITEMS_MAX];
+    static InventorySection* sections[INV_SNAPSHOT_ITEMS_MAX];
+    static bool reused[INV_SNAPSHOT_ITEMS_MAX],used[INV_SNAPSHOT_ITEMS_MAX];
+    memset(placed,0,count*sizeof(placed[0])); memset(sections,0,count*sizeof(sections[0]));
+    memset(reused,0,count*sizeof(reused[0])); memset(used,0,ncur*sizeof(used[0]));
     bool changed=count!=ncur;
     bool valid=true;
     // Snapshot relocation is not a mouse drag or a new transfer intent.
@@ -758,7 +774,7 @@ static bool applyStockLayout(GameWorld* gw, Inventory* inv,
 static bool reconcileInventory(GameWorld* gw, Inventory* inv,
                              const InvItemEntry* items, unsigned int count,
                              bool truncated) {
-    if (!gw || !inv) return false;
+    if (!gw || !inv || count>INV_SNAPSHOT_ITEMS_MAX || (count && !items)) return false;
 
     // Snapshot current contents (with parallel Item* for removal). If OUR OWN read
     // overflowed, `cur` undercounts what we hold, so every apparent shortfall might be an
@@ -766,13 +782,13 @@ static bool reconcileInventory(GameWorld* gw, Inventory* inv,
     // truncated local read as "cannot create" the same way a truncated desired list means
     // "cannot delete": for a container neither side can fully describe, the reconcile
     // degrades to moves only rather than guessing in either direction.
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
-    Item* curItems[64];
+    const unsigned int MAXC = INV_SNAPSHOT_ITEMS_MAX;
+    static InvItemEntry cur[INV_SNAPSHOT_ITEMS_MAX];
+    static Item* curItems[INV_SNAPSHOT_ITEMS_MAX];
     bool curTruncated = false;
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC, &curTruncated);
     if (inv->owner && inv->owner->getDataType()==BUILDING && !truncated &&
-        !curTruncated && count<=INV_ITEMS_MAX && g_getSectionsFn && g_destroyObjFn) {
+        !curTruncated && count<=INV_SNAPSHOT_ITEMS_MAX && g_getSectionsFn && g_destroyObjFn) {
         if (inventoryGuiOpen(inv) && !g_invGuiRefreshFn) return false;
         return applyStockLayout(gw,inv,items,count,cur,curItems,ncur);
     }
@@ -793,7 +809,7 @@ static bool reconcileInventory(GameWorld* gw, Inventory* inv,
         unsigned char lvlEq, lvlLoose;
         char manufacturer[48]; char material[48]; // weapon provenance (needed to recreate)
     };
-    Grp g[128];
+    static Grp g[INV_SNAPSHOT_ITEMS_MAX*2];
     unsigned int ng = 0;
     for (unsigned int i = 0; i < count; ++i) {
         unsigned int j = 0;
@@ -801,7 +817,7 @@ static bool reconcileInventory(GameWorld* gw, Inventory* inv,
             if (g[j].type == items[i].itemType && strcmp(g[j].sid, items[i].stringID) == 0 &&
                 strcmp(g[j].manufacturer,items[i].manufacturer)==0 &&
                 strcmp(g[j].material,items[i].material)==0) break;
-        if (j == ng && ng < 128) {
+        if (j == ng && ng < INV_SNAPSHOT_ITEMS_MAX*2) {
             memset(&g[ng], 0, sizeof(Grp));
             g[ng].lvlEq = g[ng].lvlLoose = GRADE_NA; // 0 would mean "mint at level 0"
             strncpy(g[ng].sid, items[i].stringID, sizeof(g[ng].sid) - 1);
@@ -825,7 +841,7 @@ static bool reconcileInventory(GameWorld* gw, Inventory* inv,
             if (g[j].type == cur[i].itemType && strcmp(g[j].sid, cur[i].stringID) == 0 &&
                 strcmp(g[j].manufacturer,cur[i].manufacturer)==0 &&
                 strcmp(g[j].material,cur[i].material)==0) break;
-        if (j == ng && ng < 128) {
+        if (j == ng && ng < INV_SNAPSHOT_ITEMS_MAX*2) {
             memset(&g[ng], 0, sizeof(Grp));
             g[ng].lvlEq = g[ng].lvlLoose = GRADE_NA; // 0 would mean "mint at level 0"
             strncpy(g[ng].sid, cur[i].stringID, sizeof(g[ng].sid) - 1);
@@ -1003,6 +1019,9 @@ static bool reconcileInventory(GameWorld* gw, Inventory* inv,
 static bool applyToInventory(GameWorld* gw, Inventory* inv,
                              const InvItemEntry* items, unsigned int count,
                              bool truncated) {
+    // A native pickup has already detached/split stock but has not chosen its
+    // destination. Reconciliation here would repopulate that stock under it.
+    if (nativeInventoryCursorActive()) return false;
     // Snapshot moves are not cursor moves. Section-level adds bypass the
     // inventory add hook, so their removals must never enter cursor capture.
     const bool saved = g_invVetoSuspend;
@@ -1091,9 +1110,9 @@ int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const c
 //
 // The drop MIRROR needs that reach anyway: a peer who hoovers a pile of loot into one character
 // overflows the grid, so the engine puts the tail inside the worn backpack. When that character
-// later drops such an item, a top-level-only search finds nothing, the mirror concludes it has
-// no copy, and fabricates one - leaving the real item in the bag and a minted duplicate on the
-// ground. Relocating out of the bag conserves the object instead.
+// later drops such an item, a top-level-only search finds nothing. The former reconstruction
+// fallback then minted a duplicate while the saved object remained in the bag.
+// Relocating out of the bag conserves the object instead.
 int dropItemFromNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
                                 unsigned int typeCat, int qty, void** outLastDropped) {
     if (outLastDropped) *outLastDropped = 0;
@@ -1153,7 +1172,8 @@ int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const cha
 static bool applyInventoryContents(GameWorld* gw, Inventory* inv,
                                    const InvItemEntry* items, unsigned int count,
                                    bool truncated) {
-    if (!gw || !inv) return false;
+    if (!gw || !inv || count>INV_SNAPSHOT_ITEMS_MAX || (count && !items)) return false;
+    if (nativeInventoryCursorActive()) return false;
 
     bool changed = false;
     __try {
@@ -1162,22 +1182,22 @@ static bool applyInventoryContents(GameWorld* gw, Inventory* inv,
     // must be reconciled separately or the two would fight: a bagged item counted at the top
     // level looks like a loose item the peer is missing, so the reconcile mints a second copy
     // out on the character and the bag stays empty.
-    InvItemEntry top[INV_ITEMS_MAX];
-    unsigned char topSrcIdx[INV_ITEMS_MAX]; // original index, so children can find their parent
+    static InvItemEntry top[INV_SNAPSHOT_ITEMS_MAX];
+    static unsigned short topSrcIdx[INV_SNAPSHOT_ITEMS_MAX];
     unsigned int nTop = 0;
     unsigned int nNested = 0;
-    for (unsigned int i = 0; i < count && nTop < INV_ITEMS_MAX; ++i) {
+    for (unsigned int i = 0; i < count && nTop < INV_SNAPSHOT_ITEMS_MAX; ++i) {
         if (items[i].parentIdx != 0) { ++nNested; continue; }
-        topSrcIdx[nTop] = (unsigned char)i;
+        topSrcIdx[nTop] = (unsigned short)i;
         top[nTop++] = items[i];
     }
     changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated);
 
     // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about
     // to fill, and a bag identified from the stale read would be the wrong object (or gone).
-    InvItemEntry cur[INV_ITEMS_MAX];
-    Item* curItems[INV_ITEMS_MAX];
-    unsigned int ncur = readInvItems(inv, cur, curItems, INV_ITEMS_MAX, 0);
+    static InvItemEntry cur[INV_SNAPSHOT_ITEMS_MAX];
+    static Item* curItems[INV_SNAPSHOT_ITEMS_MAX];
+    unsigned int ncur = readInvItems(inv, cur, curItems, INV_SNAPSHOT_ITEMS_MAX, 0);
 
     static int dbg = -1;
     if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
@@ -1186,18 +1206,18 @@ static bool applyInventoryContents(GameWorld* gw, Inventory* inv,
     // indistinguishable by (sid,type), and a plain first-match rule pointed BOTH parents'
     // contents at whichever we happened to read first: the second apply reconciled away what
     // the first had just placed, and the other bag was never reconciled at all.
-    Inventory* used[INV_ITEMS_MAX];
+    static Inventory* used[INV_SNAPSHOT_ITEMS_MAX];
     unsigned int nUsed = 0;
     unsigned int claimed = 0; // nested entries some parent accounted for
 
     for (unsigned int t = 0; t < nTop; ++t) {
+        if (!isContainerItemType(top[t].itemType)) continue;
         // Gather this parent's children. The wire names the parent by its index in the
         // ORIGINAL entry array, which survives the split via topSrcIdx.
-        InvItemEntry kids[INV_ITEMS_MAX];
+        static InvItemEntry kids[INV_SNAPSHOT_ITEMS_MAX];
         unsigned int nk = 0;
-        for (unsigned int i = 0; i < count && nk < INV_ITEMS_MAX; ++i)
-            if (items[i].parentIdx == (unsigned char)(topSrcIdx[t] + 1)) kids[nk++] = items[i];
-        if (!isContainerItemType(top[t].itemType)) continue;
+        for (unsigned int i = 0; i < count && nk < INV_SNAPSHOT_ITEMS_MAX; ++i)
+            if (items[i].parentIdx == (unsigned short)(topSrcIdx[t] + 1)) kids[nk++] = items[i];
         claimed += nk;
 
         // Which copy of this template is it, in the SENDER's order? The sender's Nth bag of a
@@ -1210,9 +1230,9 @@ static bool applyInventoryContents(GameWorld* gw, Inventory* inv,
         // OUR copies of that template, in local carry order. Only an entry that actually owns
         // an inventory qualifies - matching on template alone could hand us a same-sid item
         // that is not a container at all.
-        Inventory* cands[INV_ITEMS_MAX];
+        static Inventory* cands[INV_SNAPSHOT_ITEMS_MAX];
         unsigned int ncand = 0;
-        for (unsigned int c = 0; c < ncur && ncand < INV_ITEMS_MAX; ++c) {
+        for (unsigned int c = 0; c < ncur && ncand < INV_SNAPSHOT_ITEMS_MAX; ++c) {
             if (cur[c].itemType != top[t].itemType) continue;
             if (strcmp(cur[c].stringID, top[t].stringID) != 0) continue;
             if (!curItems[c]) continue;
@@ -1252,7 +1272,7 @@ static bool applyInventoryContents(GameWorld* gw, Inventory* inv,
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
         }
-        if (nUsed < INV_ITEMS_MAX) used[nUsed++] = sub;
+        if (nUsed < INV_SNAPSHOT_ITEMS_MAX) used[nUsed++] = sub;
         if (dbg) { char b[220]; _snprintf(b, sizeof(b) - 1,
             "[recon] NESTED sid='%s' type=%u kids=%u rank=%u local=%u",
             top[t].stringID, top[t].itemType, nk, rank, ncand);
@@ -1278,8 +1298,10 @@ static bool applyInventoryContents(GameWorld* gw, Inventory* inv,
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                             const InvItemEntry* items, unsigned int count,
                             bool truncated) {
-    RootObject* ro = resolveObjectByHand(cHand);
-    return ro && applyInventoryContents(gw, invOf(ro), items, count, truncated);
+    // A shop catalog is a native projection over physical furniture stock.
+    // Rewriting it alongside those furniture snapshots creates two writers.
+    if (isMerchantInventory(cHand)) return false;
+    return applyInventoryContents(gw,transactionInventory(cHand),items,count,truncated);
 }
 
 bool captureBagContents(Item* bag, std::vector<InvItemEntry>& contents) {
@@ -1321,9 +1343,7 @@ bool applyTransferredBagContents(GameWorld* gw, Item* bag,
 // two sides diverged in a way no later snapshot describes.
 bool containerGuiOpen(GameWorld* gw, const unsigned int cHand[5]) {
     if (!gw || !cHand) return false;
-    RootObject* ro = resolveObjectByHand(cHand);
-    if (!ro) return false;
-    Inventory* inv = invOf(ro);
+    Inventory* inv = transactionInventory(cHand);
     if (!inv) return false;
     if (inventoryGuiOpen(inv)) return true;
     // Carried containers: their private inventories each get their own panel.
@@ -1617,10 +1637,12 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
     Inventory* src = invOf(srcRo);
     Inventory* dst = invOf(dstRo);
     if (!src || !dst) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
-    Item* curItems[64];
-    unsigned int ncur = readInvItems(src, cur, curItems, MAXC, 0, true);
+    const unsigned int MAXC = INV_SNAPSHOT_ITEMS_MAX;
+    static InvItemEntry cur[INV_SNAPSHOT_ITEMS_MAX];
+    static Item* curItems[INV_SNAPSHOT_ITEMS_MAX];
+    bool truncatedSource=false;
+    unsigned int ncur = readInvItems(src, cur, curItems, MAXC, &truncatedSource, true);
+    if (truncatedSource) return 0;
     int moved = 0;
     // Sanctioned sync moves suspend veto/capture, but still respect reservations
     // below unless rollback explicitly opts out. Native UI-like moves leave the
@@ -1658,8 +1680,9 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                 }
                 bool added = dst->tryAddItem(taken, take);
                 if (!added && !isContainerItemType(typeCat)) {
-                    InvItemEntry bags[64]; Item* bagItems[64];
-                    unsigned int nb = readInvItems(dst,bags,bagItems,64,0);
+                    static InvItemEntry bags[INV_SNAPSHOT_ITEMS_MAX];
+                    static Item* bagItems[INV_SNAPSHOT_ITEMS_MAX];
+                    unsigned int nb = readInvItems(dst,bags,bagItems,INV_SNAPSHOT_ITEMS_MAX,0);
                     for (unsigned int b=0;b<nb && !added;++b) {
                         if (!bagItems[b]) continue;
                         Inventory* sub=bagItems[b]->getInventory();
@@ -1686,6 +1709,854 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
     }
     g_invVetoSuspend = vetoSav;
     return moved;
+}
+
+namespace {
+struct TransactionHand {
+    unsigned int words[5];
+    bool operator<(const TransactionHand& other) const {
+        for (unsigned int i=0;i<5;++i)
+            if (words[i]!=other.words[i]) return words[i]<other.words[i];
+        return false;
+    }
+};
+typedef inventory_transaction::Revision TransactionRevision;
+std::map<TransactionHand,TransactionRevision> transactionRevisions;
+std::map<TransactionHand,TransactionHand> merchantInventoryOwners;
+struct MerchantStockRow {
+    unsigned int source[5],hand[5],qualityBits,chargeBits,properOwner[5];
+    InventorySection* section;
+    Item* item;
+    Faction* uniform;
+    bool unique;
+    InvItemEntry metadata;
+    bool operator==(const MerchantStockRow& other) const {
+        return section==other.section && item==other.item && qualityBits==other.qualityBits &&
+            chargeBits==other.chargeBits && unique==other.unique && uniform==other.uniform &&
+            !memcmp(source,other.source,sizeof(source)) && !memcmp(hand,other.hand,sizeof(hand)) &&
+            !memcmp(properOwner,other.properOwner,sizeof(properOwner)) &&
+            !memcmp(&metadata,&other.metadata,sizeof(metadata));
+    }
+};
+struct MerchantStockView {
+    ShopTrader* native;
+    Inventory* projection;
+    bool stockKnown;
+    std::vector<MerchantStockRow> stock,observed;
+    MerchantStockView():native(0),projection(0),stockKnown(false) {}
+};
+std::map<TransactionHand,MerchantStockView> merchantViews;
+std::set<TransactionHand> inventoryCheckpointsPending;
+NativeShopIntent shopIntents[64];
+unsigned int shopIntentCount=0;
+unsigned long merchantCensusMs=0;
+unsigned int merchantHands[64][5],merchantCount=0;
+bool transactionHost=true, transactionEnabled=false, transactionCommerce=false;
+TransactionHand transactionHand(const unsigned int hand[5]) {
+    TransactionHand key; memcpy(key.words,hand,sizeof(key.words)); return key;
+}
+bool transactionOwner(RootObject* owner,unsigned int out[5]) {
+    unsigned int native[5];
+    if (!owner || !readObjectHand(owner,native)) return false;
+    for (std::map<TransactionHand,TransactionHand>::const_iterator it=merchantInventoryOwners.begin();
+         it!=merchantInventoryOwners.end();++it) {
+        if (memcmp(native,it->second.words,sizeof(native))) continue;
+        // ShopTrader handles are nonphysical and shared by several traders.
+        // Resolve the actual backing character, never the first equal handle.
+        Character* trader=g_shopGetTraderFn ? g_shopGetTraderFn(static_cast<ShopTrader*>(owner)) : 0;
+        return trader && readObjectHand(trader,out) &&
+            merchantInventoryOwners.count(transactionHand(out))!=0;
+    }
+    return readPhysicalInventoryRootOwner(owner,out);
+}
+// ShopTrader is a nonphysical view over the shop's real furniture inventories.
+// Own the view, never its stock; native construction/destruction preserves the
+// underlying items just as opening/closing the game's trade window does.
+ShopTrader* createMerchantView(Character* trader) { return new ShopTrader(trader); }
+void destroyMerchantView(MerchantStockView& view) {
+    delete view.native; view.native=0; view.projection=0; view.stockKnown=false;
+    view.stock.clear(); view.observed.clear();
+}
+bool captureMerchantSources(ShopTraderInventory* inventory,std::vector<MerchantStockRow>& out) {
+    typedef ogre_unordered_map<hand,InventorySection*>::type Sources;
+    const Sources& sources=inventory->inventories;
+    const size_t sourceCount=sources.size();
+    size_t total=0;
+    for (Sources::const_iterator it=sources.begin();it!=sources.end();++it) {
+        if (!it->second || it->second->items.size()>static_cast<size_t>(-1)-total) return false;
+        total+=it->second->items.size();
+    }
+    out.resize(total); // Retain both buffers; unchanged reads allocate no storage.
+    size_t written=0;
+    for (Sources::const_iterator it=sources.begin();it!=sources.end();++it) {
+        InventorySection* section=it->second;
+        const size_t count=section->items.size();
+        if (count>total-written) return false;
+        for (size_t i=0;i<count;++i) {
+            MerchantStockRow& row=out[written++];
+            row.source[0]=(unsigned int)it->first.type; row.source[1]=it->first.container;
+            row.source[2]=it->first.containerSerial; row.source[3]=it->first.index;
+            row.source[4]=it->first.serial;
+            row.section=section; row.item=section->items[i].item;
+            if (!readPhysicalItemMetadata(row.item,&row.metadata,row.hand)) return false;
+            memcpy(&row.qualityBits,&row.item->quality,sizeof(row.qualityBits));
+            // Native copyItem also copies remaining charges, uniqueness and
+            // ownership; these are not represented by the network entry.
+            memcpy(&row.chargeBits,&row.item->chargesLeft,sizeof(row.chargeBits));
+            row.unique=row.item->isUnique; row.uniform=row.item->isAFactionUniform();
+            const hand& owner=row.item->getProperOwner();
+            row.properOwner[0]=(unsigned int)owner.type; row.properOwner[1]=owner.container;
+            row.properOwner[2]=owner.containerSerial; row.properOwner[3]=owner.index;
+            row.properOwner[4]=owner.serial;
+            LockedArmour* locked=row.item->isLockedArmour();
+            row.metadata.locked=locked && locked->lock ? 1 : 0;
+        }
+        if (count!=section->items.size()) return false;
+    }
+    return written==total && sourceCount==sources.size();
+}
+Inventory* currentMerchantView(MerchantStockView& view,ShopTrader* native) {
+    Inventory* inventory=invOf(native);
+    if (!inventory || !captureMerchantSources(static_cast<ShopTraderInventory*>(inventory),view.observed))
+        return 0;
+    const bool unchanged=view.projection==inventory && view.stockKnown &&
+        view.stock.size()==view.observed.size() &&
+        std::equal(view.stock.begin(),view.stock.end(),view.observed.begin());
+    if (!unchanged) {
+        // A native refresh destroys/rebuilds the display's Item copies. Never
+        // do that for an unchanged physical stock set, nor use a timer/hash as
+        // evidence that the full item identities and properties still match.
+        if (inventoryGuiOpen(inventory) && !g_invGuiRefreshFn) return 0;
+        native->updateInventory();
+        inventoryGuiRefresh(inventory);
+        view.stock.swap(view.observed); view.projection=inventory; view.stockKnown=true;
+    }
+    return inventory;
+}
+CRITICAL_SECTION productionReplicaLock;
+bool productionReplicaLockReady=false,productionHookAttempted=false;
+volatile LONG productionReplicaActive=0; // Win32 aligned read; configure publishes after initialization.
+typedef void (__fastcall* ProductionOutputFn)(ProductionBuilding*,float);
+ProductionOutputFn productionOutputOriginal=0;
+void* productionOutputHookEntry=0;
+std::map<TransactionHand,bool> hostProductionReplicas;
+
+bool productionReplicaHand(Building* building,unsigned int hand[5],bool admitted=false) {
+    __try {
+        return building && building->classType==BCTYPE_PRODUCTION &&
+            building->_buildState.isComplete &&
+            (admitted || !(building->owner && building->owner->isPlayer)) &&
+            static_cast<ProductionBuilding*>(building)->consumptionItems.size()==0 &&
+            readObjectHand(building,hand);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void* productionOutputVirtualEntry(Building* building) {
+    __try {
+        // ProductionBuilding::updateOutput(float), native 1.0.65 SDK vtable.
+        return (*reinterpret_cast<void***>(building))[0x5C0/sizeof(void*)];
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+void __fastcall hostProductionReplicaOutput(ProductionBuilding* building,float amount) {
+    if (!productionReplicaActive) {
+        if (productionOutputOriginal) productionOutputOriginal(building,amount);
+        return;
+    }
+    unsigned int hand[5];bool block=false,first=false;
+    // Native work adopts a neutral resource node into the worker's faction.
+    // Authority follows the admitted full lifetime hand, not that mutable owner.
+    // The map lookup below still excludes every unadmitted/player-built object.
+    if (productionReplicaHand(building,hand,true)) {
+        EnterCriticalSection(&productionReplicaLock);
+        if (transactionEnabled && !transactionHost) {
+            std::map<TransactionHand,bool>::iterator found=hostProductionReplicas.find(transactionHand(hand));
+            if (found!=hostProductionReplicas.end()) {
+                block=true;first=!found->second;found->second=true;
+            }
+        }
+        LeaveCriticalSection(&productionReplicaLock);
+    }
+    if (first) {
+        char line[160];_snprintf(line,sizeof(line)-1,
+            "[prod] NATIVE-REPLICA-GUARD hand=%u,%u,%u,%u,%u",
+            hand[0],hand[1],hand[2],hand[3],hand[4]);
+        line[sizeof(line)-1]=0;coop::logLine(line);
+    }
+    if (!block && productionOutputOriginal) productionOutputOriginal(building,amount);
+}
+}
+
+unsigned int enumMerchantInventoryHands(GameWorld* gw,unsigned int (*out)[5],unsigned int capacity) {
+    if (!gw || !out || !capacity) return 0;
+    if (capacity>64) capacity=64;
+    const unsigned long now=GetTickCount();
+    if (merchantCensusMs && now-merchantCensusMs<1000) {
+        unsigned int count=merchantCount<capacity ? merchantCount : capacity;
+        if (count) memcpy(out,merchantHands,count*sizeof(merchantHands[0]));
+        return count;
+    }
+    merchantCensusMs=now;
+    unsigned int written=0;
+    merchantInventoryOwners.clear();
+    __try {
+        if (!g_getCharsFn || !g_shopGetTraderFn) return 0;
+        static ContRead candidates[128];
+        unsigned int count=enumLootInventoriesNear(gw,400.0f,candidates,128,
+            transactionHost && transactionEnabled);
+        for (unsigned int i=0;i<count && written<64;++i) {
+            if (!candidates[i].isTrader) continue;
+            TransactionHand stable=transactionHand(candidates[i].hand),native;
+            if (merchantInventoryOwners.count(stable)) continue;
+            RootObject* actor=resolveObjectByHand(stable.words);
+            if (!actor || isPlayerSquad(gw,actor)) continue;
+            MerchantStockView& view=merchantViews[stable];
+            if (view.native && g_shopGetTraderFn(view.native)!=actor) destroyMerchantView(view);
+            if (!view.native) view.native=createMerchantView(static_cast<Character*>(actor));
+            if (!view.native || !invOf(view.native) || !readObjectHand(view.native,native.words)) continue;
+            // Refresh at the read boundary: a native purchase can invalidate
+            // borrowed item rows between census passes.
+            merchantInventoryOwners[stable]=native;
+            memcpy(merchantHands[written++],stable.words,sizeof(stable.words));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[shop] census fault: no fabricated merchant stock");
+    }
+    for (std::map<TransactionHand,MerchantStockView>::iterator it=merchantViews.begin();
+         it!=merchantViews.end();) {
+        if (merchantInventoryOwners.count(it->first)) { ++it;continue; }
+        destroyMerchantView(it->second);
+        merchantViews.erase(it++);
+    }
+    merchantCount=written;
+    const unsigned int count=written<capacity ? written : capacity;
+    if (count) memcpy(out,merchantHands,count*sizeof(merchantHands[0]));
+    return count;
+}
+
+Inventory* transactionInventory(const unsigned int hand[5]) {
+    std::map<TransactionHand,TransactionHand>::const_iterator it=
+        merchantInventoryOwners.find(transactionHand(hand));
+    if (it!=merchantInventoryOwners.end()) {
+        std::map<TransactionHand,MerchantStockView>::iterator view=merchantViews.find(it->first);
+        RootObject* actor=resolveObjectByHand(it->first.words);
+        if (view==merchantViews.end() || !view->second.native || !actor ||
+            g_shopGetTraderFn(view->second.native)!=actor) return 0;
+        __try {
+            // Reuse an already-open native trade view so reconciliation sees
+            // its GUI and refreshes its icons before deleting a physical item.
+            // Looking up a window never opens one or replaces the user's view.
+            InventoryGUI* window=::gui ? ::gui->getInventoryWindow(view->second.native->getHandle()) : 0;
+            if (window) {
+                Inventory* open=window->getInventory();
+                unsigned int owner[5];
+                if (open && readObjectHand(open->owner,owner) &&
+                    !memcmp(owner,it->second.words,sizeof(owner)) &&
+                    g_shopGetTraderFn(static_cast<ShopTrader*>(open->owner))==actor)
+                    return currentMerchantView(view->second,static_cast<ShopTrader*>(open->owner));
+            }
+            return currentMerchantView(view->second,view->second.native);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            coop::logLine("[shop] native stock view unavailable; transaction deferred");
+            return 0;
+        }
+    }
+    return invOf(resolveObjectByHand(hand));
+}
+bool isMerchantInventory(const unsigned int hand[5]) {
+    TransactionHand key=transactionHand(hand);
+    if (merchantInventoryOwners.count(key)) return true;
+    for (std::map<TransactionHand,TransactionHand>::const_iterator m=merchantInventoryOwners.begin();
+         m!=merchantInventoryOwners.end();++m)
+        if (!memcmp(hand,m->second.words,sizeof(m->second.words))) return true;
+    return false;
+}
+
+void configureInventoryTransactions(bool host,bool enabled,bool commerce) {
+    if (!productionReplicaLockReady) {
+        InitializeCriticalSection(&productionReplicaLock);productionReplicaLockReady=true;
+    }
+    EnterCriticalSection(&productionReplicaLock);
+    transactionHost=host; transactionEnabled=enabled; transactionCommerce=commerce;
+    if (!enabled || host) hostProductionReplicas.clear();
+    productionReplicaActive=(enabled && !host)?1:0;
+    LeaveCriticalSection(&productionReplicaLock);
+}
+bool noteHostProductionReplica(const unsigned int localHand[5]) {
+    if (!localHand || localHand[0]!=(unsigned int)BUILDING ||
+        !productionReplicaLockReady || !transactionEnabled || transactionHost) return false;
+    EnterCriticalSection(&productionReplicaLock);
+    const bool admitted=hostProductionReplicas.count(transactionHand(localHand))!=0;
+    LeaveCriticalSection(&productionReplicaLock);
+    RootObject* root=resolveObjectByHand(localHand);
+    unsigned int actual[5];
+    if (!root || !productionReplicaHand(static_cast<Building*>(root),actual,admitted) ||
+        memcmp(localHand,actual,sizeof(actual))) return false;
+    // Admission runs on the game thread. Hook the instance's real virtual entry:
+    // the SDK RVA can name a different body in a patched executable.
+    void* entry=productionOutputVirtualEntry(static_cast<Building*>(root));
+    if (!entry) return false;
+    if (!productionHookAttempted) {
+        productionHookAttempted=true;
+        if (KenshiLib::AddHook(entry,(void*)&hostProductionReplicaOutput,
+            (void**)&productionOutputOriginal)==KenshiLib::SUCCESS && productionOutputOriginal) {
+            productionOutputHookEntry=entry;
+            coop::logLine("[prod] native virtual output authority hook installed");
+        } else coop::logLine("[prod] native virtual output hook unavailable; replica production remains unguarded");
+    }
+    // Do not claim authority over another implementation we have not hooked.
+    if (!productionOutputOriginal || entry!=productionOutputHookEntry) return false;
+    EnterCriticalSection(&productionReplicaLock);
+    const bool enabled=transactionEnabled && !transactionHost;
+    const bool inserted=enabled &&
+        hostProductionReplicas.insert(std::make_pair(transactionHand(localHand),false)).second;
+    LeaveCriticalSection(&productionReplicaLock);
+    if (inserted) {
+        char line[160];_snprintf(line,sizeof(line)-1,
+            "[prod] NATIVE-REPLICA-ADMIT hand=%u,%u,%u,%u,%u",
+            localHand[0],localHand[1],localHand[2],localHand[3],localHand[4]);
+        line[sizeof(line)-1]=0;coop::logLine(line);
+    }
+    return enabled;
+}
+void clearInventoryTransactionState() {
+    transactionRevisions.clear(); shopIntentCount=0;
+    merchantInventoryOwners.clear();
+    for (std::map<TransactionHand,MerchantStockView>::iterator it=merchantViews.begin();
+         it!=merchantViews.end();++it) destroyMerchantView(it->second);
+    merchantViews.clear();
+    inventoryCheckpointsPending.clear();
+    if (productionReplicaLockReady) {
+        EnterCriticalSection(&productionReplicaLock);
+        hostProductionReplicas.clear();
+        LeaveCriticalSection(&productionReplicaLock);
+    }
+    merchantCensusMs=0; merchantCount=0;
+}
+void setInventoryCheckpointPending(const unsigned int hand[5],bool pending) {
+    if (pending) inventoryCheckpointsPending.insert(transactionHand(hand));
+    else inventoryCheckpointsPending.erase(transactionHand(hand));
+}
+bool inventoryCheckpointReady(Inventory* inventory) {
+    if (!transactionEnabled || transactionHost) return true;
+    __try {
+        unsigned int root[5];
+        if (!inventory || !transactionOwner(inventory->owner,root)) return false;
+        return inventoryCheckpointsPending.count(transactionHand(root))==0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void noteInventoryRevision(const unsigned int hand[5],unsigned int revision) {
+    transactionRevisions[transactionHand(hand)].adopt(revision);
+}
+void retireInventoryRevision(const unsigned int hand[5]) {
+    transactionRevisions[transactionHand(hand)].retire();
+    setInventoryCheckpointPending(hand,true);
+}
+bool inventoryCheckpointPending(const unsigned int hand[5]) {
+    return inventoryCheckpointsPending.count(transactionHand(hand))!=0;
+}
+bool admitInventoryCheckpoint(const unsigned int hand[5],unsigned int revision,
+    const InvItemEntry* wanted,unsigned int wantCount,
+    const InvItemEntry* actual,unsigned int actualCount,bool wantedTruncated,bool actualTruncated) {
+    return inventory_transaction::admitCheckpoint(transactionRevisions[transactionHand(hand)],
+        revision,wanted,wantCount,actual,actualCount,wantedTruncated,actualTruncated);
+}
+unsigned int inventoryRevision(const unsigned int hand[5]) {
+    std::map<TransactionHand,TransactionRevision>::const_iterator it=
+        transactionRevisions.find(transactionHand(hand));
+    return it==transactionRevisions.end() ? 0 : it->second.current();
+}
+unsigned int observeInventoryRevision(const unsigned int hand[5],unsigned int hash) {
+    return transactionRevisions[transactionHand(hand)].observe(hash);
+}
+unsigned int nextInventoryCheckpoint(const unsigned int hand[5]) {
+    return transactionRevisions[transactionHand(hand)].checkpoint();
+}
+
+bool inventoryTransactionRemovalReady(Inventory* source) {
+    if (!transactionEnabled || transactionHost) return true;
+    __try {
+        unsigned int hand[5];
+        if (!source || !transactionOwner(source->owner,hand)) return false;
+        if (inventoryCheckpointsPending.count(transactionHand(hand))) return false;
+        if (isMerchantInventory(hand)) return false; // only deferred player commerce may trade
+        if (inventoryOwnerClass(hand)!=0) return true; // ordinary squad inventory management
+        return inventoryRevision(hand)!=0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+namespace {
+struct NativeTradePriceContext {
+    Inventory* payer;
+    unsigned int operation;
+    int quote,quantity,actual;
+    bool seen,allowed;
+};
+__declspec(thread) NativeTradePriceContext* nativeTradePriceContext=0;
+int executeNativePlayerTrade(Inventory* source,Inventory* destination,Item* item,
+    bool sourceMerchant,bool destinationMerchant,const InvXferPacket& request);
+}
+
+int observeNativeTradePrice(int nativePrice) {
+    if (nativeTradePriceContext) {
+        nativeTradePriceContext->actual=nativePrice;
+        nativeTradePriceContext->seen=true;
+        nativeTradePriceContext->allowed=inventory_transaction::nativeBatchPriceWithinQuote(
+            nativeTradePriceContext->operation,nativePrice,
+            nativeTradePriceContext->quantity,nativeTradePriceContext->quote);
+    }
+    return nativePrice;
+}
+
+int constrainNativeTradeFunds(Inventory* payer,int nativeFunds) {
+    // Let the native insufficient-funds path restore its own split item before
+    // insertion/payment. Never alter prices or funds outside this exact call.
+    NativeTradePriceContext* context=nativeTradePriceContext;
+    return context && context->payer==payer && context->seen && !context->allowed ?
+        -1 : nativeFunds;
+}
+
+bool nativeShopTransactionsDeferred() {
+    return transactionEnabled && transactionCommerce && !transactionHost;
+}
+
+bool deferNativeShopTransaction(Inventory* source,Item* item,Inventory* destination,
+    unsigned int quantity) {
+    if (!nativeShopTransactionsDeferred()) return false;
+    // The native shop call must not run on JOIN, including before stock is
+    // certified. A refusal leaves both the purse and physical stock untouched.
+    __try {
+        if (!source || !source->owner || !destination || !destination->owner) return false;
+        NativeShopIntent request; memset(&request,0,sizeof(request));
+        if (!transactionOwner(source->owner,request.source) ||
+            !transactionOwner(destination->owner,request.destination)) return false;
+        if (!isMerchantInventory(request.source) && !isMerchantInventory(request.destination))
+            return false;
+        // RMB must not publish another drag's detached actor baseline. The drag
+        // frontend restores its source and clears the held cursor before enqueue.
+        if (nativeInventoryCursorActive()) return true;
+        if (!item || !nativePlayerTradeReady()) return true;
+        if (inventoryCheckpointsPending.count(transactionHand(request.source)) ||
+            inventoryCheckpointsPending.count(transactionHand(request.destination))) return true;
+        const int sourceClass=inventoryOwnerClass(request.source);
+        const int destinationClass=inventoryOwnerClass(request.destination);
+#ifdef KENSHICOOP_HARNESS
+        char t[224];_snprintf(t,sizeof(t),
+            "[test] NATIVE_TRADE_CLASSES sourceClass=%d destinationClass=%d sourceRevision=%u destinationRevision=%u",
+            sourceClass,destinationClass,inventoryRevision(request.source),inventoryRevision(request.destination));
+        t[sizeof(t)-1]=0;coop::logLine(t);
+#endif
+        request.operation=sourceClass==1 && destinationClass==0 ? 2 :
+                          sourceClass==0 && destinationClass==1 ? 1 : 0;
+        if (!request.operation || shopIntentCount==64) return true;
+        request.revision=inventoryRevision(request.source);
+        if (!request.revision) {
+            coop::logLine("[shop] WAIT authoritative stock revision"); return true;
+        }
+        unsigned int itemHand[5];
+        if (!readPhysicalItemMetadata(item,&request.item,itemHand) ||
+            !inventoryContainsPhysicalItem(source,item)) return true;
+        if (request.operation==2) {
+            unsigned int root[5];bool inInventory=false;void* physical=0;
+            if (!readPhysicalItemLocation(itemHand,root,&inInventory,&physical) ||
+                !inInventory || physical!=item || memcmp(root,request.source,sizeof(root))) return true;
+        }
+        // RMB explicitly selects one; drag carries the selected held quantity
+        // after restoring/reacquiring the real source stack.
+        if (!quantity || quantity>65535 || quantity>request.item.quantity) return true;
+        request.item.quantity=(unsigned short)quantity;
+        const int unit=item->getValueSingle(sourceClass==1);
+        if (unit<0 || unit>INT_MAX/request.item.quantity) return true;
+        request.quotedTotal=unit*request.item.quantity;
+        shopIntents[shopIntentCount++]=request;
+        // Freeze the actor immediately, not only when a HOST checkpoint
+        // arrives. Merchant removal already requires this deferred shop path.
+        setInventoryCheckpointPending(request.operation==2 ?
+            request.source : request.destination,true);
+        coop::logLine("[shop] DEFER native trade awaiting host verdict");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[shop] REFUSE invalid native trade");
+    }
+    return true;
+}
+
+unsigned int drainNativeShopTransactions(NativeShopIntent* out,unsigned int capacity) {
+    unsigned int count=shopIntentCount<capacity ? shopIntentCount : capacity;
+    if (count) memcpy(out,shopIntents,count*sizeof(NativeShopIntent));
+    shopIntentCount-=count;
+    if (shopIntentCount) memmove(shopIntents,shopIntents+count,
+                                shopIntentCount*sizeof(NativeShopIntent));
+    return count;
+}
+
+int commitNativeShopTransaction(GameWorld* gw,const unsigned int source[5],
+    const unsigned int destination[5],const InvXferPacket& request,int* wallet) {
+    if (wallet) *wallet=-1;
+    if (!transactionEnabled || !transactionCommerce || !transactionHost || !gw || !nativePlayerTradeReady() ||
+        (request.operation!=1 && request.operation!=2)) return 0;
+    __try {
+        Inventory* from=transactionInventory(source); Inventory* to=transactionInventory(destination);
+        if (!from || !to || from==to || !from->owner || !to->owner) return 0;
+        static InvItemEntry entries[INV_SNAPSHOT_ITEMS_MAX];
+        static Item* physical[INV_SNAPSHOT_ITEMS_MAX];
+        bool truncated=false;
+        unsigned int count=readInvItems(from,entries,physical,INV_SNAPSHOT_ITEMS_MAX,&truncated,true);
+        if (truncated) return 0;
+        Item* selected=0;
+        for (unsigned int i=0;i<count;++i) {
+            if (!physical[i] || entries[i].parentIdx ||
+                entries[i].itemType!=request.itemType ||
+                entries[i].quality!=request.quality || entries[i].level!=request.level ||
+                strcmp(entries[i].stringID,request.stringID) ||
+                strcmp(entries[i].manufacturer,request.manufacturer) ||
+                strcmp(entries[i].material,request.material)) continue;
+            // Admit one existing stack for the whole selection. The executor
+            // still licenses exactly one unit for every native RClick call.
+            if (request.quantity>0 && request.quantity<=entries[i].quantity) {
+                selected=physical[i]; break;
+            }
+        }
+        if (!selected) return 0;
+        int before=-1; if (!readPlayerWallet(gw,&before)) return 0;
+        if (!inventory_transaction::sourceRevisionMatches(
+                request.sourceRevision,inventoryRevision(source)) || request.quotedTotal<0)
+            return 0;
+        const bool saved=g_invVetoSuspend; g_invVetoSuspend=true;
+        int received=0;
+        __try {
+            // Use the real player implementation, including its price, room,
+            // legality, split/merge, payment and rollback rules. NPC buyItem is
+            // not a player commerce primitive.
+            received=executeNativePlayerTrade(from,to,selected,
+                isMerchantInventory(source),isMerchantInventory(destination),request);
+        } __finally { g_invVetoSuspend=saved; }
+        int after=-1; readPlayerWallet(gw,&after);
+        if (wallet) *wallet=after;
+        char line[224]; _snprintf(line,sizeof(line)-1,
+            "[shop] HOST-COMMIT op=%u id=%u owner=%u revision=%u quote=%d wallet=%d->%d ok=%d moved=%d",
+            (unsigned)request.operation,request.xferId,request.ownerId,request.sourceRevision,
+            request.quotedTotal,before,after,received ? 1 : 0,received);
+        line[sizeof(line)-1]=0; coop::logLine(line);
+        return received;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[shop] native transaction fault; no synthetic item grant");
+        return 0;
+    }
+}
+
+int commitNativeExtraction(GameWorld* gw,const unsigned int source[5],
+    const unsigned int destination[5],const InvXferPacket& request) {
+    if (!transactionEnabled || !transactionHost || request.operation!=3) return 0;
+    __try {
+        Inventory* from=transactionInventory(source),*to=transactionInventory(destination);
+        if (!from || !to || from==to) return 0;
+        static InvItemEntry rows[INV_SNAPSHOT_ITEMS_MAX];
+        static Item* physical[INV_SNAPSHOT_ITEMS_MAX]; bool truncated=false;
+        unsigned int count=readInvItems(from,rows,physical,INV_SNAPSHOT_ITEMS_MAX,&truncated,true);
+        if (truncated) return 0;
+        for (unsigned int i=0;i<count;++i) {
+            if (!physical[i] || rows[i].parentIdx || rows[i].itemType!=request.itemType ||
+                rows[i].quality!=request.quality || rows[i].level!=request.level ||
+                strcmp(rows[i].stringID,request.stringID) ||
+                strcmp(rows[i].manufacturer,request.manufacturer) ||
+                strcmp(rows[i].material,request.material)) continue;
+            if (inventory_transaction::validate(3,request.sourceRevision,inventoryRevision(source),
+                    request.quantity,rows[i].quantity,0,request.quotedTotal,0)!=
+                    inventory_transaction::VALID) continue;
+            if (!to->hasRoomForItem(physical[i]->getGameData())) return 0;
+            // One existing source stack, one reversible native move: a short
+            // request cannot silently consume several unrelated template matches.
+            return moveItemBetweenContainers(gw,source,destination,request.stringID,
+                request.itemType,request.quantity,true,0,0,physical[i],true);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
+namespace {
+typedef std::map<InventoryGUI*,InventoryGUI::InventoryTradeData,
+    std::less<InventoryGUI*>,Ogre::STLAllocator<
+    std::pair<InventoryGUI* const,InventoryGUI::InventoryTradeData>,
+    Ogre::GeneralAllocPolicy> > NativeTradePartners;
+
+NativeTradePartners* nativeTradePartners() {
+    // KenshiLib exports the method but not its static map. Verify both native
+    // RIP references agree before accessing the supported VC10 map layout.
+    const unsigned char* code=reinterpret_cast<const unsigned char*>(
+        KenshiLib::GetRealAddress(&InventoryGUI::clearTradePartners));
+    if (!code || memcmp(code+10,"\x48\x8b\x05",3) ||
+        memcmp(code+36,"\x48\x8d\x0d",3)) return 0;
+    const unsigned char* head=code+17+*reinterpret_cast<const int*>(code+13);
+    const unsigned char* map=code+43+*reinterpret_cast<const int*>(code+39);
+    if (head!=map+8) return 0;
+    NativeTradePartners* partners=reinterpret_cast<NativeTradePartners*>(
+        const_cast<unsigned char*>(map));
+    return partners->size()<=128 ? partners : 0;
+}
+
+class NativeTradeContext {
+    NativeTradePartners* partners_;
+    NativeTradePartners saved_;
+    hand town_;
+    InventoryGUI* source_;
+    InventoryGUI* destination_;
+    bool sourceMerchant_,destinationMerchant_;
+    NativeTradeContext(const NativeTradeContext&);
+    NativeTradeContext& operator=(const NativeTradeContext&);
+    InventoryGUI* makeWindow(Inventory* inventory,bool merchant) {
+        std::auto_ptr<InventoryLayout> layout(merchant ? static_cast<InventoryLayout*>(
+            new TraderInventoryLayout) : inventory->owner->createInventoryLayout());
+        if (!layout.get()) return 0;
+        std::auto_ptr<InventoryGUI> window(merchant ? static_cast<InventoryGUI*>(
+            new InventoryTraderGUI(inventory,layout.get(),inventory->owner)) :
+            new InventoryGUI(inventory,layout.get(),inventory->owner));
+        layout.release(); // native InventoryGUI owns its layout
+        window->show(false);
+        return window.release();
+    }
+public:
+    NativeTradeContext(bool sourceMerchant,bool destinationMerchant):
+        partners_(nativeTradePartners()),source_(0),destination_(0),
+        sourceMerchant_(sourceMerchant),destinationMerchant_(destinationMerchant) {
+        if (!partners_) return;
+        Town* current=InventoryGUI::getTradingTown();
+        if (current) town_=current->getHandle();
+        saved_.swap(*partners_);
+    }
+    bool prepare(Inventory* source,Inventory* destination) {
+        if (!partners_) return false;
+        source_=makeWindow(source,sourceMerchant_);
+        destination_=makeWindow(destination,destinationMerchant_);
+        if (!source_ || !destination_) return false;
+        RootObject* merchant=sourceMerchant_ ? source->owner : destination->owner;
+        TownBase* location=merchant->getCurrentTownLocation();
+        Town* town=location ? location->isTown() : 0;
+        if (!town) return false;
+        InventoryGUI::setTradingTown(town->getHandle());
+        InventoryGUI::addTradePartner(source_,true,false,!sourceMerchant_,
+            source->owner->getHandle());
+        InventoryGUI::addTradePartner(destination_,true,false,!destinationMerchant_,
+            destination->owner->getHandle());
+        return true;
+    }
+    ~NativeTradeContext() {
+        if (!partners_) return;
+        InventoryGUI::clearTradePartners();
+        // InventoryTraderGUI normally retires the global UI's ShopTrader.
+        // These hidden windows borrow existing native stock views instead.
+        if (source_ && sourceMerchant_) source_->callbackObject=0;
+        if (destination_ && destinationMerchant_) destination_->callbackObject=0;
+        delete source_; delete destination_;
+        saved_.swap(*partners_);
+        InventoryGUI::setTradingTown(town_);
+    }
+    bool run(Item* item) {
+        if (!partners_ || !source_ || !destination_) return false;
+        struct PlayerTradeAccess : InventoryGUI { using InventoryGUI::RClickAutoTrade; };
+        typedef InventoryGUI::TradeResult (InventoryGUI::*TradeFn)(
+            const std::string&,int,int,InventoryGUI*,bool,bool);
+        static TradeFn trade=static_cast<TradeFn>(&PlayerTradeAccess::RClickAutoTrade);
+        const InventoryGUI::TradeResult result=(source_->*trade)(
+            item->inventorySection,item->inventoryPos.x,item->inventoryPos.y,
+            destination_,true,false);
+        char line[128];_snprintf(line,sizeof(line)-1,
+            "[test] NATIVE_HIDDEN_PLAYER_TRADE result=%d",(int)result.value);
+        line[sizeof(line)-1]=0;coop::logLine(line);
+        return result.value==InventoryGUI::TradeResult::OK;
+    }
+};
+
+class NativeTradePriceScope {
+    NativeTradePriceContext context_;
+    NativeTradePriceContext* previous_;
+public:
+    NativeTradePriceScope(Inventory* payer,unsigned int operation,int quote,int quantity):
+        previous_(nativeTradePriceContext) {
+        context_.payer=payer; context_.operation=operation; context_.quote=quote;
+        context_.quantity=quantity;
+        context_.actual=0; context_.seen=false; context_.allowed=false;
+        nativeTradePriceContext=&context_;
+    }
+    ~NativeTradePriceScope() { nativeTradePriceContext=previous_; }
+    bool accepted() const { return context_.seen && context_.allowed; }
+};
+
+bool nativeTradeMatches(const InvItemEntry& row,const InvXferPacket& request) {
+    return row.itemType==request.itemType && row.quality==request.quality &&
+        row.level==request.level && !strcmp(row.stringID,request.stringID) &&
+        !strcmp(row.manufacturer,request.manufacturer) && !strcmp(row.material,request.material);
+}
+
+struct NativeTradeStock {
+    unsigned int rows,units,selectedQuantity,selectedRows;
+    unsigned int selectedHand[5];
+    bool selectedHandKnown;
+};
+
+bool readNativeTradeStock(Inventory* inventory,const InvXferPacket& request,
+    Item* selected,NativeTradeStock* stock) {
+    static InvItemEntry rows[INV_SNAPSHOT_ITEMS_MAX];
+    static Item* physical[INV_SNAPSHOT_ITEMS_MAX];
+    bool truncated=false;
+    memset(stock,0,sizeof(*stock));
+    stock->rows=readInvItems(inventory,rows,physical,INV_SNAPSHOT_ITEMS_MAX,&truncated,true);
+    if (truncated) return false;
+    unsigned int selectedIndex=INV_SNAPSHOT_ITEMS_MAX;
+    for (unsigned int i=0;i<stock->rows;++i) {
+        if (nativeTradeMatches(rows[i],request)) {
+            // Native auto-placement may put a purchased unit inside a worn
+            // backpack. Conservation covers the complete root inventory tree.
+            stock->units+=rows[i].quantity;
+            if (selected && !rows[i].parentIdx && physical[i]==selected) {
+                stock->selectedQuantity=rows[i].quantity; selectedIndex=i;
+                // Merchant display copies need not be registered world objects.
+                // Membership above licenses this read; registry resolution does not.
+                stock->selectedHandKnown=readObjectHand(
+                    static_cast<RootObject*>(physical[i]),stock->selectedHand);
+            }
+        }
+    }
+    if (selectedIndex!=INV_SNAPSHOT_ITEMS_MAX) {
+        stock->selectedRows=1;
+        for (unsigned int i=0;i<stock->rows;++i)
+            if (rows[i].parentIdx==selectedIndex+1) ++stock->selectedRows;
+    }
+    return true;
+}
+
+// No C++ ownership lives in this SEH boundary. Even a failed native result must
+// be read back before deciding what the batch actually committed.
+int runNativeTradeUnit(NativeTradeContext& context,Inventory* source,Inventory* destination,
+    Item* selected,const NativeTradeStock& original,unsigned int expectedQuantity,
+    const InvXferPacket& request,bool* nativeOK) {
+    *nativeOK=false;
+    __try {
+        NativeTradeStock fromBefore,toBefore,fromAfter,toAfter;
+        if (!readNativeTradeStock(source,request,selected,&fromBefore) ||
+            fromBefore.selectedQuantity!=expectedQuantity ||
+            (original.selectedHandKnown && (!fromBefore.selectedHandKnown ||
+                memcmp(original.selectedHand,fromBefore.selectedHand,sizeof(original.selectedHand)))) ||
+            !inventory_transaction::nativeQuantitySupported(request.operation,1,
+                fromBefore.selectedQuantity) ||
+            !readNativeTradeStock(destination,request,0,&toBefore) ||
+            toBefore.rows+fromBefore.selectedRows>INV_SNAPSHOT_ITEMS_MAX ||
+            !destination->hasRoomForItem(selected->getGameData())) return 0;
+        if (request.operation==2) {
+            unsigned int root[5],owner[5];bool inInventory=false;void* physical=0;
+            if (!transactionOwner(source->owner,owner) ||
+                !fromBefore.selectedHandKnown ||
+                !readPhysicalItemLocation(fromBefore.selectedHand,root,&inInventory,&physical) ||
+                !inInventory || physical!=selected || memcmp(root,owner,sizeof(root))) return 0;
+        }
+        __try { *nativeOK=context.run(selected); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            coop::logLine("[shop] native trade fault; reading back final physical unit");
+        }
+        // Native insertion may merge/free the moved item. Never dereference the
+        // pre-call pointer again; the next unit reacquires it from source rows.
+        if (!readNativeTradeStock(source,request,0,&fromAfter) ||
+            !readNativeTradeStock(destination,request,0,&toAfter)) return 0;
+        return inventory_transaction::nativeUnitMoved(fromBefore.units,fromAfter.units,
+            toBefore.units,toAfter.units);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[shop] native unit fault; stop batch without synthetic grant");
+        return 0;
+    }
+}
+
+int executeNativePlayerTrade(Inventory* source,Inventory* destination,Item* item,
+    bool sourceMerchant,bool destinationMerchant,const InvXferPacket& request) {
+    NativeTradeStock original;
+    if (!readNativeTradeStock(source,request,item,&original) || !request.quantity ||
+        request.quantity>original.selectedQuantity) return 0;
+    NativeTradeContext context(sourceMerchant,destinationMerchant);
+    if (!context.prepare(source,destination)) return 0;
+    int moved=0;
+    while (moved<request.quantity) {
+        // The native implementation quotes the split one-unit copy, checks the
+        // destination payer, inserts it, and only then transfers both purses.
+        // Never manually debit or invoke the cursor-dependent All/place paths.
+        NativeTradePriceScope price(destination,request.operation,request.quotedTotal,
+            request.quantity);
+        bool nativeOK=false;
+        const int actual=runNativeTradeUnit(context,source,destination,item,original,
+            original.selectedQuantity-moved,request,&nativeOK);
+        moved+=actual;
+        if (!actual || !nativeOK || !price.accepted()) break;
+    }
+    return moved;
+}
+
+#ifdef KENSHICOOP_HARNESS
+bool exerciseHiddenNativePlayerTrade(Inventory* source,Inventory* destination,
+    Item* item,bool sourceMerchant,bool destinationMerchant) {
+    NativeTradeContext context(sourceMerchant,destinationMerchant);
+    return context.prepare(source,destination) && context.run(item);
+}
+#endif
+}
+
+bool exerciseNativeTransaction(GameWorld* gw,const unsigned int source[5],
+    const unsigned int destination[5],const InvItemEntry& item,bool commerce) {
+    __try {
+        Inventory* from=transactionInventory(source),*to=transactionInventory(destination);
+        if (!gw || !from || !to || from==to || !to->owner ||
+            !inventoryCheckpointReady(from) || !inventoryCheckpointReady(to)) {
+#ifdef KENSHICOOP_HARNESS
+            coop::logLine("[test] NATIVE_TRADE_REFUSE inventory/checkpoint");
+#endif
+            return false;
+        }
+        static InvItemEntry rows[INV_SNAPSHOT_ITEMS_MAX];
+        static Item* physical[INV_SNAPSHOT_ITEMS_MAX]; bool truncated=false;
+        unsigned int count=readInvItems(from,rows,physical,INV_SNAPSHOT_ITEMS_MAX,&truncated,true);
+        if (truncated) return false;
+        for (unsigned int i=0;i<count;++i) {
+            if (!physical[i] || rows[i].parentIdx || (!commerce && rows[i].equipped) ||
+                (commerce ? !inventory_transaction::nativeQuantitySupported(1,item.quantity,rows[i].quantity) :
+                    rows[i].quantity!=item.quantity) || rows[i].itemType!=item.itemType ||
+                rows[i].quality!=item.quality || rows[i].level!=item.level ||
+                strcmp(rows[i].stringID,item.stringID) ||
+                strcmp(rows[i].manufacturer,item.manufacturer) ||
+                strcmp(rows[i].material,item.material)) continue;
+            if (!commerce)
+                return moveItemBetweenContainers(gw,source,destination,item.stringID,
+                    item.itemType,item.quantity,false,0,0,physical[i],true)==item.quantity;
+#ifdef KENSHICOOP_HARNESS
+            if (transactionHost)
+                return exerciseHiddenNativePlayerTrade(from,to,physical[i],
+                    isMerchantInventory(source),isMerchantInventory(destination));
+#endif
+            // Player right-click commerce has a different native implementation
+            // from Inventory::buyItem (called by NPC shopping AI).
+            struct PlayerTradeAccess : InventoryGUI {
+                using InventoryGUI::RClickAutoTrade;
+            };
+            typedef InventoryGUI::TradeResult (InventoryGUI::*PlayerTradeFn)(
+                const std::string&,int,int,InventoryGUI*,bool,bool);
+            static PlayerTradeFn playerTrade=static_cast<PlayerTradeFn>(&PlayerTradeAccess::RClickAutoTrade);
+            const intptr_t entry=KenshiLib::GetRealAddress(playerTrade);
+            InventoryGUI* sourceWindow=from->getInventoryGUI();
+            InventoryGUI* destinationWindow=to->getInventoryGUI();
+            if (!entry || !sourceWindow || !destinationWindow) return false;
+            const unsigned int queuedBefore=shopIntentCount;
+            InventoryGUI::TradeResult result=(sourceWindow->*playerTrade)(
+                physical[i]->inventorySection,physical[i]->inventoryPos.x,
+                physical[i]->inventoryPos.y,destinationWindow,true,true);
+            char trace[192];_snprintf(trace,sizeof(trace)-1,
+                "[test] NATIVE_PLAYER_TRADE entry=%p result=%d source=%p destination=%p",
+                (void*)entry,(int)result.value,sourceWindow,destinationWindow);
+            trace[sizeof(trace)-1]=0;coop::logLine(trace);
+            // An intercepted JOIN call deliberately refuses local mutation.
+            // Submission only starts the observation leg; the scenario still
+            // requires authoritative stock, actor contents and money to change.
+            return result.value==InventoryGUI::TradeResult::OK ||
+                shopIntentCount==queuedBefore+1;
+        }
+#ifdef KENSHICOOP_HARNESS
+        coop::logLine("[test] NATIVE_TRADE_REFUSE exact item absent");
+#endif
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[native-tx] real native action unavailable/faulted");
+    }
+    return false;
 }
 
 // SEH-guarded DIAGNOSTIC: log the full inventory of the object at cHand - every loose
@@ -1856,6 +2727,19 @@ unsigned int dumpWorldItemsOfType(GameWorld* gw, const Ogre::Vector3& center,
             gd ? (unsigned int)gd->type : 0u,
             hd[0], hd[1], hd[2], hd[3], hd[4], p.x, p.y, p.z);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // A screenshot cannot distinguish a loose Item from a held/equipped
+        // visual. Report the actual native inventory flags alongside its hand.
+        int inInventory=-1,equipped=-1,quantity=-1;
+        __try {
+            Item* item=reinterpret_cast<Item*>(o);
+            inInventory=item->isInInventory ? 1 : 0;
+            equipped=item->isEquipped ? 1 : 0;
+            quantity=item->quantity;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        char identity[192]; _snprintf(identity,sizeof(identity)-1,
+            "WORLDITEM IDENTITY hand=%u,%u,%u,%u,%u inventory=%d equipped=%d qty=%d",
+            hd[0],hd[1],hd[2],hd[3],hd[4],inInventory,equipped,quantity);
+        identity[sizeof(identity)-1]='\0'; coop::logLine(identity);
     }
     return n;
 }
@@ -1925,38 +2809,32 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
         Character* ld = gw->player->playerCharacters[0];
         if (!ld) return 0;
         Ogre::Vector3 center = ld->getPosition();
-        // A dropped item enumerates under multiple category queries (W0 finding), so
-        // scan WEAPON/ARMOUR/ITEM and DEDUPE by hand (index+serial) to avoid triples.
+        // Category queries overlap. Accept only real free-floor Items and
+        // deduplicate their complete registered native hands.
         const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
         for (int k = 0; k < 3 && n < maxOut; ++k) {
             g_npcQuery.clear();
             g_getObjsFn(gw, &g_npcQuery, &center, radius, kinds[k], 256, 0);
             unsigned int total = g_npcQuery.size();
             for (unsigned int i = 0; i < total && n < maxOut; ++i) {
-                RootObject* o = g_npcQuery[i]; if (!o) continue;
+                RootObject* o = g_npcQuery[i];
+                if (!o || !o->typeIsAnItem()) continue;
+                Item* it = static_cast<Item*>(o);
+                if (!physicalItemIsOnGround(it)) continue;
+                InvItemEntry metadata;
                 unsigned int hd[5] = {0,0,0,0,0};
-                if (!readObjectHand(o, hd)) continue;
-                // Dedupe by (index, serial) against what we've already collected.
+                if (!readPhysicalItemMetadata(it,&metadata,hd)) continue;
                 bool dup = false;
                 for (unsigned int j = 0; j < n; ++j)
-                    if (out[j].hand[3] == hd[3] && out[j].hand[4] == hd[4]) { dup = true; break; }
+                    if (memcmp(out[j].hand,hd,sizeof(hd))==0) { dup=true; break; }
                 if (dup) continue;
-                GameData* gd = 0;
-                __try { gd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
-                if (!gd) continue;
-                Ogre::Vector3 p(0,0,0);
-                __try { p = o->getPosition(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-                Item* it = reinterpret_cast<Item*>(o);
-                int qty = 1; float ql = 0.0f;
-                __try { qty = it->quantity; ql = it->quality; } __except (EXCEPTION_EXECUTE_HANDLER) { qty = 1; ql = 0.0f; }
-                if (qty < 1) qty = 1;
+                Ogre::Vector3 p = it->getPosition();
                 WorldItemRaw& w = out[n];
-                for (int t = 0; t < 5; ++t) w.hand[t] = hd[t];
-                strncpy(w.stringID, gd->stringID.c_str(), sizeof(w.stringID) - 1);
-                w.stringID[sizeof(w.stringID) - 1] = '\0';
-                w.itemType = (unsigned int)gd->type;
-                w.quantity = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);
-                w.quality  = qualityBucketOf(ql);
+                memcpy(w.hand,hd,sizeof(hd));
+                memcpy(w.stringID,metadata.stringID,sizeof(w.stringID));
+                w.itemType = metadata.itemType;
+                w.quantity = metadata.quantity;
+                w.quality = metadata.quality;
                 w.x = p.x; w.y = p.y; w.z = p.z;
                 w.hash = worldItemHash(w.stringID, w.itemType, w.quantity, w.quality);
                 ++n;
@@ -2244,7 +3122,8 @@ int groundObjectLiveness(RootObject* ro, float out[3], bool* outPickedUp) {
     if (!ro) return 0;
     int live = 0;
     __try {
-        Item* it = reinterpret_cast<Item*>(ro);
+        if (!ro->typeIsAnItem()) return 0;
+        Item* it = static_cast<Item*>(ro);
         if (it->isInInventory) {
             // Distinguishable from "destroyed": the object still reads, it has just
             // entered a bag. Only THIS case licenses a W1 claim - claiming on a
@@ -2265,6 +3144,143 @@ int groundItemLiveness(const unsigned int itemHand[5], float out[3]) {
     return groundObjectLiveness(ro, out, 0);
 }
 
+namespace {
+bool physicalItemOnGround(Item* item) {
+    typedef bool (__fastcall* OnGroundFn)(const InventoryItemBase*);
+    static OnGroundFn onGround=(OnGroundFn)KenshiLib::GetRealAddress(
+        &InventoryItemBase::onGround);
+    return onGround && item && !item->isInInventory && !item->isEquipped && onGround(item);
+}
+bool inventoryContainsPhysicalItem(Inventory* inventory,Item* item) {
+    if (!inventory || !item) return false;
+    lektor<Item*>& all=inventory->_allItems;
+    for (unsigned int i=0;i<all.size();++i) if (all[i]==item) return true;
+    lektor<InventorySection*>* sections=g_getSectionsFn ? g_getSectionsFn(inventory) : 0;
+    for (unsigned int s=0;sections && s<sections->size();++s) {
+        InventorySection* section=(*sections)[s];
+        if (!section) continue;
+        const Ogre::vector<InventorySection::SectionItem>::type& entries=section->items;
+        for (unsigned int i=0;i<entries.size();++i) if (entries[i].item==item) return true;
+    }
+    return (g_getPrimaryWeaponFn && g_getPrimaryWeaponFn(inventory)==item) ||
+           (g_getSecondaryWeaponFn && g_getSecondaryWeaponFn(inventory)==item);
+}
+}
+
+bool physicalItemIsOnGround(Item* item) {
+    if (!item) return false;
+    __try {
+        unsigned int hand[5];
+        RootObject* object=static_cast<RootObject*>(item);
+        return object->typeIsAnItem() && readObjectHand(object,hand) &&
+            resolveObjectByHand(hand)==object && physicalItemOnGround(item);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool readPhysicalItemMetadata(Item* item,InvItemEntry* out,unsigned int outHand[5]) {
+    if (!item || !out || !outHand) return false;
+    memset(out,0,sizeof(*out));
+    memset(outHand,0,5*sizeof(unsigned int));
+    __try {
+        RootObject* object=static_cast<RootObject*>(item);
+        if (!object->typeIsAnItem() || !readObjectHand(object,outHand) ||
+            resolveObjectByHand(outHand)!=object) return false;
+        GameData* data=item->getGameData();
+        if (!data || data->stringID.empty() ||
+            data->stringID.size()>=sizeof(out->stringID) ||
+            item->quantity<1 || item->quantity>65535) return false;
+        strcpy(out->stringID,data->stringID.c_str());
+        out->itemType=(unsigned int)data->type;
+        out->quantity=(unsigned short)item->quantity;
+        out->quality=qualityBucketOf(item->quality);
+        out->level=gradeLevelOf(item);
+        out->equipped=item->isEquipped ? 1 : 0;
+        out->slot=(unsigned char)((unsigned int)item->slotType&0xffu);
+        if (out->equipped) out->section=sectionNameHash(item->inventorySection.c_str());
+        GameData* maker=item->manufacturerData;
+        GameData* material=item->materialData;
+        if ((maker && maker->stringID.size()>=sizeof(out->manufacturer)) ||
+            (material && material->stringID.size()>=sizeof(out->material))) return false;
+        if (maker) strcpy(out->manufacturer,maker->stringID.c_str());
+        if (material) strcpy(out->material,material->stringID.c_str());
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool readPhysicalInventoryRootOwner(RootObject* inventoryOwner,unsigned int out[5]) {
+    if (!inventoryOwner || !out) return false;
+    memset(out,0,5*sizeof(unsigned int));
+    __try {
+        RootObject* visited[8];
+        unsigned int count=0;
+        RootObject* owner=inventoryOwner;
+        while (owner && count<8) {
+            for (unsigned int i=0;i<count;++i) if (visited[i]==owner) return false;
+            visited[count++]=owner;
+            unsigned int key[5];
+            if (!readObjectHand(owner,key) || resolveObjectByHand(key)!=owner) return false;
+            if (!owner->typeIsAnItem()) {
+                if (!invOf(owner)) return false;
+                memcpy(out,key,sizeof(key));
+                return true;
+            }
+            Item* bag=static_cast<Item*>(owner);
+            if (!bag->isInInventory) return false;
+            const hand& parent=bag->_whosInventoryWeAreIn;
+            unsigned int parentHand[5]={(unsigned int)parent.type,parent.container,
+                parent.containerSerial,parent.index,parent.serial};
+            owner=resolveObjectByHand(parentHand);
+        }
+        return false; // no guessed ancestor, cycle, or unbounded container traversal
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool readPhysicalItemLocation(const unsigned int itemHand[5],unsigned int inventoryOwner[5],
+                              bool* inInventory,void** outItem) {
+    if (inventoryOwner) memset(inventoryOwner,0,5*sizeof(unsigned int));
+    if (inInventory) *inInventory=false;
+    if (outItem) *outItem=0;
+    if (!itemHand || !inventoryOwner || !inInventory || !outItem) return false;
+    RootObject* object=resolveObjectByHand(itemHand);
+    if (!object) return false; // unloading/unreadable is never a destruction verdict
+    __try {
+        if (!object->typeIsAnItem()) return false;
+        unsigned int actual[5];
+        if (!readObjectHand(object,actual) || memcmp(actual,itemHand,sizeof(actual))!=0) return false;
+        Item* item=static_cast<Item*>(object);
+        if (item->isInInventory) {
+            const hand& owner=item->_whosInventoryWeAreIn;
+            inventoryOwner[0]=(unsigned int)owner.type;
+            inventoryOwner[1]=owner.container; inventoryOwner[2]=owner.containerSerial;
+            inventoryOwner[3]=owner.index; inventoryOwner[4]=owner.serial;
+            RootObject* container=resolveObjectByHand(inventoryOwner);
+            Inventory* inventory=container ? invOf(container) : 0;
+            if (!inventory) return false;
+            // The native owner hand can remain stale during detachment. Only
+            // actual membership licenses a positive pickup transition.
+            if (!inventoryContainsPhysicalItem(inventory,item) ||
+                !readPhysicalInventoryRootOwner(container,inventoryOwner)) return false;
+            *inInventory=true;
+        } else if (!physicalItemOnGround(item)) return false;
+        *outItem=item;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool describeGroundItem(const unsigned int itemHand[5], InvItemEntry* out, void** outItem) {
+    if (outItem) *outItem=0;
+    if (!out || !itemHand) return false;
+    RootObject* object=resolveObjectByHand(itemHand);
+    if (!object) return false;
+    Item* item=static_cast<Item*>(object);
+    unsigned int actual[5];
+    if (!readPhysicalItemMetadata(item,out,actual) ||
+        memcmp(actual,itemHand,sizeof(actual))!=0 ||
+        !isConservedItemType(out->itemType) || !physicalItemIsOnGround(item)) return false;
+    if (outItem) *outItem=item;
+    return true;
+}
+
 // SEH-guarded (Phase W3): world position of a tracked Item* (as void*). The drop detector
 // reads this off the REAL just-dropped object to author the exact cursor-drop location -
 // far more accurate than the owner's feet, and it never relies on the (town-unreliable)
@@ -2273,106 +3289,92 @@ int itemWorldPos(void* item, float out[3]) {
     if (!out || !item) return 0;
     int ok = 0;
     __try {
-        Ogre::Vector3 p = reinterpret_cast<RootObject*>(item)->getPosition();
+        Ogre::Vector3 p = reinterpret_cast<Item*>(item)->getPosition();
         out[0] = p.x; out[1] = p.y; out[2] = p.z; ok = 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
     return ok;
 }
 
-// SEH-guarded CONSERVATION primitive (Phase W2): relocate the owner's OWN copy of a weapon
-// from its bag to the GROUND at (x,y,z) - the mirror of a drop performed on another client.
-// Never fabricates: it finds the real item the peer already owns (shared save) and moves it
-// (Inventory::dropItem). If only an EQUIPPED copy exists, it is unequipped to loose first
-// (dropItem acts on loose items). Returns the number relocated (0 if the peer had no copy).
-int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
-                           const char* sid, unsigned int typeCat,
-                           float x, float y, float z, void** outDropped) {
-    if (outDropped) *outDropped = 0;
-    if (!gw || !sid || !sid[0]) return 0;
-    RootObject* ro = resolveObjectByHand(ownerHand);
-    if (!ro) return 0;
-    // 1) Move a real copy to the ground. Try a loose copy first; if none, unequip a worn
-    //    one to loose and drop that. dropItemFromInventory drops loose items only. Capture
-    //    the dropped Item* so the conservation channel can re-home this exact object later
-    //    (the spatial query can't re-find it in towns).
-    void* droppedItem = 0;
-    int dropped = dropItemFromInventory(gw, ownerHand, sid, typeCat, 1, &droppedItem);
-    if (dropped == 0) {
-        int un = unequipItemToLoose(gw, ownerHand, sid, typeCat, 1);
-        if (un > 0) dropped = dropItemFromInventory(gw, ownerHand, sid, typeCat, 1, &droppedItem);
-        // Last resort: drop it straight out of its equip slot. A worn CONTAINER can be
-        // staged NO other way - no loose section has room for the bag, so the unequip's
-        // fallback add silently re-equips it and the loose-only drop then finds nothing.
-        // Without this the peer's own copy is unreachable, the caller gives up, and (since
-        // a container must never be fabricated) the backpack is simply lost.
-        if (dropped == 0)
-            dropped = dropItemFromInventory(gw, ownerHand, sid, typeCat, 1, &droppedItem,
-                                            /*allowEquipped*/ true);
-        // Still nothing at top level: the item may be INSIDE a carried container. A peer that
-        // loots a pile into one character overflows the grid and the engine stows the tail in
-        // the worn backpack, so this is the ordinary state after a bulk pickup - not an edge
-        // case. Without this reach the caller concludes it has no copy and FABRICATES one,
-        // which leaves the real item in the bag and a duplicate on the ground.
-        if (dropped == 0) {
-            dropped = dropItemFromNestedContainer(gw, ownerHand, sid, typeCat, 1, &droppedItem);
-            // Unconditional: this is the difference between conserving the object and minting a
-            // duplicate, and it was invisible while the mirror simply reported "no local copy".
-            if (dropped > 0) {
-                char b[200]; _snprintf(b, sizeof(b) - 1,
-                    "[wd] RELOCATE-NESTED sid='%s' type=%u (found inside a carried container, "
-                    "not at top level)", sid, typeCat);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            }
-        }
-    }
-    if (dropped == 0) return 0;
-    if (outDropped) *outDropped = droppedItem;
-    // 2) Reposition the just-dropped object to the mirrored world position so it lands in the
-    //    same spot the dropping client placed it. We move the EXACT dropped Item* by handle
-    //    (no spatial query - that fails in towns and would leave the item at the owner's feet).
-    __try {
-        if (droppedItem) {
-            Ogre::Vector3 pos(x, y, z);
-            Ogre::Quaternion rot = Ogre::Quaternion::IDENTITY;
-            reinterpret_cast<Item*>(droppedItem)->setPositionRotation(pos, rot, /*fixedPosition*/true);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    return dropped;
+namespace {
+void rememberScenarioPickup(GameWorld*,void*,const unsigned int before[5],const unsigned int after[5]);
+bool samePhysicalItemIdentity(const InvItemEntry& a,const InvItemEntry& b) {
+    return a.itemType==b.itemType && a.quality==b.quality && a.level==b.level &&
+        strcmp(a.stringID,b.stringID)==0 && strcmp(a.manufacturer,b.manufacturer)==0 &&
+        strcmp(a.material,b.material)==0;
+}
 }
 
-// SEH-guarded CONSERVATION BACKSTOP (Phase W2): the drop intent could not be satisfied by
-// relocating a real copy, because this client no longer HAS one - the classic cause is a
-// bag snapshot that reached us before the intent and whose reconcile destroyed it. The
-// intent is self-sufficient (WorldDropPacket carries quality + manufacturer + material), so
-// rebuild the item from the packet's own provenance directly into the owner's bag and then
-// relocate that to the ground, reproducing the drop.
-//
-// This is a HEAL, not the primary path: publishInventories holds a container's snapshot
-// while a drop is being adjudicated (Replicator::wdPendingDrop) so the race should not
-// happen at all. It exists because losing a weapon is unrecoverable for the player while a
-// rare duplicate is not, and because a peer that never had the item (mod/save skew) is
-// better served with a copy than with silence. Callers MUST first confirm the owner
-// resolves locally - fabricating for an unresolved/not-yet-loaded container would mint
-// items for a bag we simply cannot see yet.
-// Weapon fabrication remains subject to KENSHICOOP_WEAPON_FAB (checked inside
-// createItemAndAdd), so the escape hatch back to conservation-only gear sync still works.
-// Returns the number relocated (0 if the fabricate or the drop failed).
-int fabricateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
-                            const char* sid, unsigned int typeCat, int qualityBucket,
-                            const char* manufacturer, const char* material,
-                            float x, float y, float z, void** outDropped) {
-    if (outDropped) *outDropped = 0;
-    if (!gw || !sid || !sid[0]) return 0;
-    RootObject* ro = resolveObjectByHand(ownerHand);
-    if (!ro) return 0;
-    Inventory* inv = invOf(ro);
-    if (!inv) return 0;
-    // Create LOOSE (equip state is irrelevant - it is about to be dropped anyway).
-    if (!createItemAndAdd(gw, inv, sid, typeCat, 1, qualityBucket, false,
-                          manufacturer, material))
-        return 0;
-    // Now the normal conservation path has a real copy to move.
-    return relocateWeaponToGround(gw, ownerHand, sid, typeCat, x, y, z, outDropped);
+// Relocate only a uniquely identified EXISTING physical item. SID alone must
+// never select a spare of another grade, maker, material, or condition.
+int relocateWeaponToGround(GameWorld* gw,const unsigned int ownerHand[5],
+                           const InvItemEntry& identity,float x,float y,float z,void** outDropped) {
+    if (outDropped) *outDropped=0;
+    if (!gw || !identity.stringID[0] || !isConservedItemType(identity.itemType)) return 0;
+    RootObject* owner=resolveObjectByHand(ownerHand);
+    Inventory* inventory=owner ? invOf(owner) : 0;
+    if (!inventory) return 0;
+    InvItemEntry entries[INV_ITEMS_MAX];
+    Item* items[INV_ITEMS_MAX];
+    bool truncated=false;
+    unsigned int count=readInvItems(inventory,entries,items,INV_ITEMS_MAX,&truncated,true);
+    if (truncated || count>=INV_ITEMS_MAX) return 0; // a capped read cannot prove uniqueness
+    int chosen=-1;
+    unsigned int matches=0;
+    for (unsigned int i=0;i<count;++i) {
+        if (!items[i] || !samePhysicalItemIdentity(entries[i],identity)) continue;
+        if (entries[i].equipped!=identity.equipped ||
+            (identity.equipped &&
+             (entries[i].slot!=identity.slot || entries[i].section!=identity.section))) continue;
+        bool duplicate=false;
+        for (unsigned int prior=0;prior<i;++prior)
+            if (items[prior]==items[i]) { duplicate=true; break; }
+        if (duplicate) continue;
+        ++matches; chosen=(int)i;
+    }
+    if (matches!=1) return 0; // exact source context and physical uniqueness, even for one candidate
+    if (chosen<0) return 0;
+    Item* victim=items[chosen];
+    Inventory* actualInventory=inventory;
+    bool nested=entries[chosen].parentIdx!=0;
+    int moved=0;
+    bool vetoSaved=g_invVetoSuspend; g_invVetoSuspend=true;
+    __try {
+        if (nested) {
+            unsigned int parent=entries[chosen].parentIdx-1;
+            if (parent>=count || !items[parent]) actualInventory=0;
+            else actualInventory=items[parent]->getInventory();
+        }
+        InvItemEntry actual;
+        unsigned int actualHand[5];
+        if (actualInventory && readPhysicalItemMetadata(victim,&actual,actualHand) &&
+            samePhysicalItemIdentity(actual,identity)) {
+            // Inventory::dropItem accepts the exact loose OR equipped Item*.
+            // Do not detach an arbitrary same-SID item through unequip helpers.
+            actualInventory->dropItem(victim);
+            if (physicalItemOnGround(victim)) {
+                unsigned int afterHand[5];
+                if (readObjectHand(victim,afterHand) && resolveObjectByHand(afterHand)==victim)
+                    rememberScenarioPickup(gw,victim,actualHand,afterHand);
+                // Preserve this pointer even if positioning fails. The caller
+                // retains the physical track and retries, never drops a second copy.
+                if (outDropped) *outDropped=victim;
+                Ogre::Vector3 position(x,y,z);
+                Ogre::Quaternion rotation=Ogre::Quaternion::IDENTITY;
+                victim->setPositionRotation(position,rotation,true);
+                Ogre::Vector3 observed=victim->getPosition();
+                float dx=observed.x-x,dy=observed.y-y,dz=observed.z-z;
+                if (dx*dx+dy*dy+dz*dz<=0.25f) moved=1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { moved=0; }
+    g_invVetoSuspend=vetoSaved;
+    if (moved && nested) {
+        char line[200]; _snprintf(line,sizeof(line)-1,
+            "[wd] RELOCATE-NESTED sid='%s' type=%u (found inside a carried container, "
+            "not at top level)",identity.stringID,identity.itemType);
+        line[sizeof(line)-1]='\0'; coop::logLine(line);
+    }
+    return moved;
 }
 
 // SEH-guarded (Phase W3): capture the WEAPON items the object at cHand currently holds, with
@@ -2408,6 +3410,38 @@ unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
 // is the pickup mirror of relocateWeaponToGround. Returns 1 on success. The caller guarantees
 // `item` is a real, still-live object it dropped earlier (conservation); SEH guards a stale
 // handle from crashing, but a destroyed object should never be passed.
+namespace {
+struct ScenarioPickupTransition {
+    GameWorld* world; void* item; unsigned int generation,before[5],after[5];
+};
+ScenarioPickupTransition scenarioPickups[64];
+unsigned int scenarioPickupCursor=0;
+void rememberScenarioPickup(GameWorld* gw,void* item,const unsigned int before[5],
+                            const unsigned int after[5]) {
+    ScenarioPickupTransition& row=scenarioPickups[scenarioPickupCursor++%64];
+    row.world=gw; row.item=item; row.generation=groundItemIdentityGeneration();
+    memcpy(row.before,before,sizeof(row.before)); memcpy(row.after,after,sizeof(row.after));
+}
+}
+bool readScenarioItemAfter(GameWorld* gw,const unsigned int before[5],unsigned int after[5]) {
+    unsigned int generation=groundItemIdentityGeneration();
+    for (unsigned int n=0;n<64 && n<scenarioPickupCursor;++n) {
+        const ScenarioPickupTransition& first=scenarioPickups[(scenarioPickupCursor-1-n)%64];
+        if (first.world!=gw || first.generation!=generation ||
+            memcmp(before,first.before,sizeof(first.before))!=0) continue;
+        unsigned int current[5]; memcpy(current,first.after,sizeof(current));
+        for (unsigned int newer=n;newer>0;--newer) {
+            const ScenarioPickupTransition& next=scenarioPickups[(scenarioPickupCursor-newer)%64];
+            if (next.world!=gw || next.generation!=generation || next.item!=first.item) continue;
+            if (memcmp(current,next.before,sizeof(current))!=0) return false;
+            memcpy(current,next.after,sizeof(current));
+        }
+        if (resolveObjectByHand(current)!=first.item) return false;
+        memcpy(after,current,sizeof(current)); return true;
+    }
+    return false;
+}
+
 int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void* item) {
     if (!gw || !item) return 0;
     RootObject* ro = resolveObjectByHand(targetHand);
@@ -2420,10 +3454,262 @@ int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void*
     // trade veto. Suspend it so the sanctioned relocation is never refused.
     bool vetoSav = g_invVetoSuspend; g_invVetoSuspend = true;
     __try {
-        ok = inv->tryAddItem(reinterpret_cast<Item*>(item), 1) ? 1 : 0; // virtual: ground -> bag
+        Item* physical=reinterpret_cast<Item*>(item);
+        InvItemEntry metadata; unsigned int before[5],expectedRoot[5];
+        if (readPhysicalItemMetadata(physical,&metadata,before) &&
+            physicalItemIsOnGround(physical) && readPhysicalInventoryRootOwner(ro,expectedRoot) &&
+            inv->tryAddItem(physical,1)) {
+            unsigned int after[5],actualRoot[5]; bool inBag=false; void* actual=0;
+            if (readObjectHand(physical,after) &&
+                readPhysicalItemLocation(after,actualRoot,&inBag,&actual) && inBag &&
+                actual==physical && memcmp(expectedRoot,actualRoot,sizeof(actualRoot))==0) {
+                rememberScenarioPickup(gw,physical,before,after);
+                ok=1;
+            }
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
     g_invVetoSuspend = vetoSav;
     return ok;
+}
+
+// Actual-engine scenario fixture only: one explicit additional loose native
+// object. Production DROP application never calls the factory.
+bool seedGearIdentityVariant(GameWorld* gw,const unsigned int ownerHand[5],
+                              const InvItemEntry& identity,void** outItem) {
+    if (outItem) *outItem=0;
+    if (!gw || !outItem || identity.quantity!=1 || identity.equipped ||
+        !isConservedItemType(identity.itemType)) return false;
+    RootObject* owner=resolveObjectByHand(ownerHand);
+    Inventory* inventory=owner ? invOf(owner) : 0;
+    unsigned int expectedRoot[5];
+    if (!inventory || !readPhysicalInventoryRootOwner(owner,expectedRoot)) return false;
+    Item* fixture=fabricateItem(gw,identity.stringID,identity.itemType,identity.quality,
+                               identity.manufacturer,identity.material,identity.level);
+    if (!fixture) return false;
+    bool valid=false;
+    __try {
+        if (inventory->tryAddItem(fixture,1)) {
+            // tryAddItem may choose a spare weapon slot. Stage this fixture
+            // through the native loose-section path, never forge worn flags.
+            if (fixture->isEquipped) unequipToLoose(inventory,fixture);
+            InvItemEntry actual; memset(&actual,0,sizeof(actual));
+            unsigned int hand[5]={0},root[5]={0}; bool inBag=false; void* physical=0;
+            bool metadataRead=readPhysicalItemMetadata(fixture,&actual,hand);
+            valid=metadataRead &&
+                samePhysicalItemIdentity(actual,identity) && actual.quantity==1 && !actual.equipped &&
+                readPhysicalItemLocation(hand,root,&inBag,&physical) && inBag && physical==fixture &&
+                memcmp(expectedRoot,root,sizeof(root))==0;
+            if (!valid) {
+                char b[360]; _snprintf(b,sizeof(b)-1,
+                    "[scenario] WIDENT fixture-detail metadata=%d expectedLevel=%u actualLevel=%u "
+                    "expectedQuality=%u actualQuality=%u equipped=%u inBag=%d sameObject=%d "
+                    "sameIdentity=%d expectedRoot=%u,%u,%u,%u,%u actualRoot=%u,%u,%u,%u,%u",
+                    metadataRead ? 1 : 0,(unsigned)identity.level,(unsigned)actual.level,
+                    (unsigned)identity.quality,(unsigned)actual.quality,(unsigned)actual.equipped,
+                    inBag ? 1 : 0,physical==fixture ? 1 : 0,
+                    metadataRead && samePhysicalItemIdentity(actual,identity) ? 1 : 0,
+                    expectedRoot[0],expectedRoot[1],expectedRoot[2],expectedRoot[3],expectedRoot[4],
+                    root[0],root[1],root[2],root[3],root[4]);
+                b[sizeof(b)-1]='\0'; coop::logLine(b);
+            }
+        }
+        if (!valid && fixture->isInInventory) {
+            const hand& holder=fixture->_whosInventoryWeAreIn;
+            unsigned int key[5]={(unsigned int)holder.type,holder.container,
+                holder.containerSerial,holder.index,holder.serial};
+            RootObject* actualOwner=resolveObjectByHand(key);
+            Inventory* actualInventory=actualOwner ? invOf(actualOwner) : 0;
+            if (inventoryContainsPhysicalItem(actualInventory,fixture))
+                actualInventory->removeItemAutoDestroy(fixture,1);
+        } else if (!valid) removeWorldItemProxy(gw,fixture);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { valid=false; }
+    if (!valid) {
+        coop::logLine("[scenario] WIDENT fixture rejected (actual native grade/provenance/hand/membership not exact)");
+        return false;
+    }
+    *outItem=fixture;
+    return true;
+}
+
+bool pickScenarioPhysicalItem(GameWorld* gw,const unsigned int owner[5],const char* sid,
+                              unsigned int type,unsigned int outHand[5],InvItemEntry* out) {
+    if (!gw || !out || !outHand || !containerInventoryAvailable(owner)) return false;
+    Inventory* inv=invOf(resolveObjectByHand(owner));
+    InvItemEntry rows[INV_ITEMS_MAX]; Item* items[INV_ITEMS_MAX]; bool truncated=false;
+    unsigned int n=readInvItems(inv,rows,items,INV_ITEMS_MAX,&truncated,true);
+    if (truncated || n>=INV_ITEMS_MAX) return false;
+    unsigned int matches=0;
+    for (unsigned int i=0;i<n;++i) {
+        if (type ? rows[i].itemType!=type : !isConservedItemType(rows[i].itemType)) continue;
+        if (sid && sid[0] && strcmp(sid,rows[i].stringID)!=0) continue;
+        InvItemEntry actual; unsigned int key[5],root[5]; bool inBag=false; void* physical=0;
+        if (!readPhysicalItemMetadata(items[i],&actual,key) ||
+            !readPhysicalItemLocation(key,root,&inBag,&physical) || !inBag ||
+            physical!=items[i] || memcmp(root,owner,sizeof(root))!=0) return false;
+        if (actual.quantity!=1) return false; // never call a whole-stack drop one unit
+        if (++matches>1) return false;
+        *out=actual; memcpy(outHand,key,sizeof(key));
+    }
+    return matches==1;
+}
+
+namespace {
+bool scenarioBagUnits(GameWorld* gw,const unsigned int owner[5],const char* sid,
+                       unsigned int type,int* units) {
+    *units=0;
+    if (!containerInventoryAvailable(owner)) return false;
+    InvItemEntry rows[INV_ITEMS_MAX]; Item* items[INV_ITEMS_MAX]; bool truncated=false;
+    unsigned int n=readInvItems(invOf(resolveObjectByHand(owner)),rows,items,INV_ITEMS_MAX,&truncated,true);
+    if (truncated || n>=INV_ITEMS_MAX) return false;
+    for (unsigned int i=0;i<n;++i) {
+        InvItemEntry row; unsigned int key[5],root[5]; bool inBag=false; void* physical=0;
+        if (!readPhysicalItemMetadata(items[i],&row,key) ||
+            !readPhysicalItemLocation(key,root,&inBag,&physical) || !inBag ||
+            physical!=items[i] || memcmp(root,owner,sizeof(root))!=0) return false;
+        if (row.itemType==type && strcmp(row.stringID,sid)==0) *units+=row.quantity;
+    }
+    return true;
+}
+}
+bool sampleScenarioItem(GameWorld* gw,const unsigned int bag[5],
+                        const unsigned int source[5],const char* sid,unsigned int type,
+                        const unsigned int itemHand[5],ScenarioItemSample* out) {
+    if (!gw || !sid || !sid[0] || !out) return false;
+    memset(out,0,sizeof(*out));
+    if (!scenarioBagUnits(gw,bag,sid,type,&out->bag)) return false;
+    if (source && !scenarioBagUnits(gw,source,sid,type,&out->source)) return false;
+    // Game-thread only; retain a reusable census buffer instead of a large stack allocation.
+    static GroundItemRow ground[4096];
+    GroundItemCensusStatus status;
+    unsigned int n=captureLoadedGroundItems(gw,ground,4096,&status);
+    if (!status.complete) return false;
+    for (unsigned int i=0;i<n;++i) {
+        bool duplicate=false;
+        for (unsigned int j=0;j<i;++j)
+            if (memcmp(ground[j].hand,ground[i].hand,sizeof(ground[i].hand))==0) {
+                duplicate=true; break;
+            }
+        if (duplicate) continue;
+        InvItemEntry row; unsigned int key[5];
+        Item* physical=reinterpret_cast<Item*>(resolveObjectByHand(ground[i].hand));
+        if (!readPhysicalItemMetadata(physical,&row,key) ||
+            memcmp(key,ground[i].hand,sizeof(key))!=0 || !physicalItemIsOnGround(physical))
+            return false; // unclassified floor object is not proven irrelevant
+        if (row.itemType==type && strcmp(row.stringID,sid)==0) out->ground+=row.quantity;
+    }
+    if (itemHand && (itemHand[3] || itemHand[4])) {
+        unsigned int root[5],actual[5]; bool inBag=false; void* physical=0; InvItemEntry row;
+        if (!readPhysicalItemLocation(itemHand,root,&inBag,&physical) ||
+            !readPhysicalItemMetadata(reinterpret_cast<Item*>(physical),&row,actual) ||
+            memcmp(actual,itemHand,sizeof(actual))!=0 || row.quantity!=1 ||
+            row.itemType!=type || strcmp(row.stringID,sid)!=0) return false;
+        memcpy(out->itemHand,actual,sizeof(actual));
+        out->metadataHash=invEntryHash(row);
+        if (!inBag) out->location=1;
+        else if (memcmp(root,bag,sizeof(root))==0) out->location=2;
+        else if (source && memcmp(root,source,sizeof(root))==0) out->location=3;
+        else return false;
+    }
+    return true;
+}
+
+// Use the original native user mutation path, not the mirror's veto suspension.
+int dropPhysicalItemByHand(GameWorld* gw,const unsigned int itemHand[5],
+                           unsigned int outAfterItemHand[5]) {
+    if (!gw || !itemHand || !outAfterItemHand) return 0;
+    unsigned int root[5]; bool inBag=false; void* physical=0;
+    if (!readPhysicalItemLocation(itemHand,root,&inBag,&physical) || !inBag) return 0;
+    Item* item=reinterpret_cast<Item*>(physical);
+    int dropped=0;
+    __try {
+        const hand& holder=item->_whosInventoryWeAreIn;
+        unsigned int key[5]={(unsigned int)holder.type,holder.container,
+            holder.containerSerial,holder.index,holder.serial};
+        RootObject* actualOwner=resolveObjectByHand(key);
+        Inventory* inventory=actualOwner ? invOf(actualOwner) : 0;
+        if (inventoryContainsPhysicalItem(inventory,item)) {
+            inventory->dropItem(item);
+            unsigned int after[5];
+            if (physicalItemIsOnGround(item) && readObjectHand(item,after)) {
+                rememberScenarioPickup(gw,physical,itemHand,after);
+                memcpy(outAfterItemHand,after,sizeof(after));
+                dropped=1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { dropped=0; }
+    return dropped;
+}
+
+int pickupPhysicalItemByHand(GameWorld* gw,const unsigned int ownerHand[5],
+                            const unsigned int itemHand[5],unsigned int outAfterItemHand[5]) {
+    if (!gw || !ownerHand || !itemHand || !outAfterItemHand) return 0;
+    RootObject* owner=resolveObjectByHand(ownerHand);
+    Inventory* inventory=owner ? invOf(owner) : 0;
+    unsigned int expectedRoot[5],unused[5]; bool inBag=false; void* physical=0;
+    if (!inventory || !readPhysicalInventoryRootOwner(owner,expectedRoot) ||
+        !readPhysicalItemLocation(itemHand,unused,&inBag,&physical) || inBag) return 0;
+    Item* item=reinterpret_cast<Item*>(physical);
+    int moved=0;
+    __try {
+        if (inventory->tryAddItem(item,1)) {
+            unsigned int after[5],actualRoot[5]; void* actual=0;
+            if (readObjectHand(item,after) &&
+                readPhysicalItemLocation(after,actualRoot,&inBag,&actual) && inBag &&
+                actual==physical && memcmp(actualRoot,expectedRoot,sizeof(actualRoot))==0) {
+                rememberScenarioPickup(gw,physical,itemHand,after);
+                memcpy(outAfterItemHand,after,sizeof(after));
+                moved=1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { moved=0; }
+    return moved;
+}
+
+bool equipPhysicalItemByHand(GameWorld* gw,const unsigned int ownerHand[5],
+                             const unsigned int itemHand[5]) {
+    if (!gw || !ownerHand || !itemHand || !g_equipItemFn) return false;
+    RootObject* owner=resolveObjectByHand(ownerHand);
+    Inventory* inventory=owner ? invOf(owner) : 0;
+    unsigned int expected[5],root[5]; bool inBag=false; void* physical=0;
+    if (!inventory || !readPhysicalInventoryRootOwner(owner,expected) ||
+        !readPhysicalItemLocation(itemHand,root,&inBag,&physical) || !inBag ||
+        memcmp(root,expected,sizeof(root))!=0) return false;
+    __try {
+        Item* item=reinterpret_cast<Item*>(physical);
+        if (!g_equipItemFn(inventory,item)) return false;
+        InvItemEntry row; unsigned int after[5]; void* actual=0;
+        return readPhysicalItemMetadata(item,&row,after) && row.equipped &&
+            readPhysicalItemLocation(after,root,&inBag,&actual) && inBag && actual==physical &&
+            memcmp(root,expected,sizeof(root))==0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool physicalWeaponIsDrawn(GameWorld* gw,const unsigned int ownerHand[5],
+                           const unsigned int itemHand[5]) {
+    if (!gw || !ownerHand || !itemHand || !g_getSectionsFn) return false;
+    RootObject* owner=resolveObjectByHand(ownerHand);
+    Inventory* inventory=owner ? invOf(owner) : 0;
+    unsigned int expected[5],root[5]; bool inBag=false; void* physical=0;
+    if (!inventory || !readPhysicalInventoryRootOwner(owner,expected) ||
+        !readPhysicalItemLocation(itemHand,root,&inBag,&physical) || !inBag ||
+        memcmp(root,expected,sizeof(root))!=0) return false;
+    __try {
+        Item* item=reinterpret_cast<Item*>(physical);
+        InvItemEntry row; unsigned int actual[5];
+        if (!readPhysicalItemMetadata(item,&row,actual) || row.itemType!=2 || !row.equipped) return false;
+        bool held=(g_getPrimaryWeaponFn && g_getPrimaryWeaponFn(inventory)==item) ||
+                  (g_getSecondaryWeaponFn && g_getSecondaryWeaponFn(inventory)==item);
+        if (!held) return false;
+        lektor<InventorySection*>* sections=g_getSectionsFn(inventory);
+        if (!sections) return false;
+        for (unsigned int s=0;s<sections->size();++s) {
+            InventorySection* section=(*sections)[s];
+            if (!section) continue;
+            const Ogre::vector<InventorySection::SectionItem>::type& entries=section->items;
+            for (unsigned int i=0;i<entries.size();++i) if (entries[i].item==item) return false;
+        }
+        return true; // actual held getter AND absent from all native sections
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 // SEH-guarded: report the first EQUIPPED item worn by the object at cHand. Writes its
@@ -3121,6 +4407,268 @@ Character* spawnCharInFaction(GameWorld* gw, float fwd, float side, Faction* fac
     }
 }
 
+
+namespace {
+struct SavedGroundKey {
+    unsigned int hand[5];
+    bool operator<(const SavedGroundKey& other) const {
+        return memcmp(hand,other.hand,sizeof(hand))<0;
+    }
+};
+struct SavedGroundInput {
+    std::string instanceID,sourceName,instanceRef,baseSID;
+    bool firstTime; unsigned int generation;
+    SavedGroundInput() : firstTime(false),generation(0) {}
+};
+typedef void (__fastcall* ItemSavedLoadFn)(Item*,GameSaveState*);
+typedef void (__fastcall* ContainerSavedLoadFn)(ContainerItem*,GameSaveState*);
+ItemSavedLoadFn savedItemLoadOriginal=0;
+ContainerSavedLoadFn savedContainerLoadOriginal=0;
+typedef RootObjectBase* (__fastcall* SavedFactoryProcessFn)(RootObjectFactory*,RootObjectFactory::CreatelistItem*);
+SavedFactoryProcessFn savedFactoryProcessOriginal=0;
+bool savedFactoryProcessInstalled=false;
+volatile LONG savedGroundGeneration=0;
+bool savedItemLoadInstalled=false;
+bool savedContainerLoadInstalled=false;
+CRITICAL_SECTION savedGroundLock;
+bool savedGroundLockReady=false;
+std::map<SavedGroundKey,SavedGroundInput> savedGroundInputs;
+
+struct SavedGroundLockGuard {
+    SavedGroundLockGuard() { EnterCriticalSection(&savedGroundLock); }
+    ~SavedGroundLockGuard() { LeaveCriticalSection(&savedGroundLock); }
+};
+
+void copySavedGroundInput(GameSaveState* state,SavedGroundInput* out) {
+    out->instanceID=state->instanceID;
+    if (state->dataSource) out->sourceName=state->dataSource->name;
+    if (state->instance) out->instanceRef=state->instance->refID;
+    if (state->baseData) out->baseSID=state->baseData->stringID;
+    out->firstTime=state->firstTime;
+}
+bool readSavedGroundInput(GameSaveState* state,SavedGroundInput* out) {
+    if (!state || !out) return false;
+    out->generation=groundItemIdentityGeneration();
+    // Keep STL unwinding outside the SEH frame on the v100 toolchain.
+    __try {
+        copySavedGroundInput(state,out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool rememberSavedGroundInput(Item* item,SavedGroundInput& input) {
+    SavedGroundKey key;
+    RootObject* object=static_cast<RootObject*>(item);
+    if (!readObjectHand(object,key.hand) || resolveObjectByHand(key.hand)!=object) return false;
+    SavedGroundLockGuard guard;
+    if (input.generation!=groundItemIdentityGeneration()) return false;
+    SavedGroundInput& stored=savedGroundInputs[key];
+    stored.generation=input.generation;
+    stored.instanceID.swap(input.instanceID);
+    stored.sourceName.swap(input.sourceName);
+    stored.instanceRef.swap(input.instanceRef);
+    stored.baseSID.swap(input.baseSID);
+    stored.firstTime=input.firstTime;
+    return true;
+}
+void logSavedGroundBoundary(const char* boundary,RootObject* object,bool statePresent,
+                            bool captured,bool registered,const SavedGroundInput& input) {
+    unsigned int hand[5]={0,0,0,0,0};
+    if (registered) readObjectHand(object,hand);
+    char b[1024]; _snprintf(b,sizeof(b)-1,
+        "[wi] SAVE-IDENTITY-BOUNDARY phase=%s generation=%u state=%d captured=%d registered=%d "
+        "itemhand=%u,%u,%u,%u,%u instance='%s' source='%s' ref='%s' base='%s' firstTime=%d",
+        boundary,groundItemIdentityGeneration(),statePresent ? 1 : 0,captured ? 1 : 0,
+        registered ? 1 : 0,hand[0],hand[1],hand[2],hand[3],hand[4],
+        input.instanceID.c_str(),input.sourceName.c_str(),input.instanceRef.c_str(),input.baseSID.c_str(),
+        input.firstTime ? 1 : 0);
+    b[sizeof(b)-1]='\0'; coop::logLine(b);
+}
+bool savedGroundRegistered(RootObject* object) {
+    unsigned int hand[5]; InvItemEntry metadata;
+    return object && readPhysicalItemMetadata(reinterpret_cast<Item*>(object),&metadata,hand) &&
+        resolveObjectByHand(hand)==object;
+}
+void savedItemLoadScoped(Item* item,GameSaveState* state) {
+    const bool environment=environmentItemHooksReady();
+    if (environment) environmentSavedLoadEnter();
+    __try { savedItemLoadOriginal(item,state); }
+    __finally { if (environment) environmentSavedLoadLeave(); }
+}
+void savedContainerLoadScoped(ContainerItem* item,GameSaveState* state) {
+    const bool environment=environmentItemHooksReady();
+    if (environment) environmentSavedLoadEnter();
+    __try { savedContainerLoadOriginal(item,state); }
+    __finally { if (environment) environmentSavedLoadLeave(); }
+}
+void __fastcall savedItemLoadHook(Item* item,GameSaveState* state) {
+    SavedGroundInput input;
+    bool captured=readSavedGroundInput(state,&input);
+    savedItemLoadScoped(item,state);
+    bool registered=savedGroundRegistered(static_cast<RootObject*>(item));
+    logSavedGroundBoundary("item-load",static_cast<RootObject*>(item),state!=0,captured,registered,input);
+    if (captured && registered) rememberSavedGroundInput(item,input);
+    if (environmentItemHooksReady()) environmentSavedItemLoaded(item,captured,input.firstTime);
+}
+void __fastcall savedContainerLoadHook(ContainerItem* item,GameSaveState* state) {
+    SavedGroundInput input;
+    bool captured=readSavedGroundInput(state,&input);
+    savedContainerLoadScoped(item,state);
+    bool registered=savedGroundRegistered(static_cast<RootObject*>(item));
+    logSavedGroundBoundary("container-load",static_cast<RootObject*>(item),state!=0,captured,registered,input);
+    if (captured && registered) rememberSavedGroundInput(item,input);
+    if (environmentItemHooksReady()) environmentSavedItemLoaded(item,captured,input.firstTime);
+}
+bool readFactorySavedInput(RootObjectFactory::CreatelistItem* work,SavedGroundInput* input,
+                           bool* statePresent,bool* itemWork) {
+    *statePresent=false; *itemWork=false;
+    __try {
+        if (!work) return false;
+        *statePresent=work->saveState!=0;
+        *itemWork=work->data && (work->data->type==ITEM || work->data->type==WEAPON ||
+            work->data->type==ARMOUR || work->data->type==CONTAINER);
+        return readSavedGroundInput(work->saveState,input);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+RootObjectBase* processFactoryWithProceduralOrigin(RootObjectFactory* factory,
+        RootObjectFactory::CreatelistItem* work) {
+    proceduralFactoryWorkEnter(work);
+    RootObjectBase* result=0;
+    const u32 environmentOrigin=environmentFactoryWorkBegin(work);
+    __try {
+        result=savedFactoryProcessOriginal(factory,work);
+        environmentFactoryProcessed(result,environmentOrigin);
+    }
+    __finally { proceduralFactoryWorkLeave(); }
+    return result;
+}
+RootObjectBase* __fastcall savedFactoryProcessHook(RootObjectFactory* factory,RootObjectFactory::CreatelistItem* work) {
+    SavedGroundInput input; bool statePresent=false,itemWork=false;
+    bool captured=readFactorySavedInput(work,&input,&statePresent,&itemWork);
+    // Observe the exact consumed queue occurrence, preserving native call count and return.
+    RootObjectBase* result=processFactoryWithProceduralOrigin(factory,work);
+    RootObject* object=reinterpret_cast<RootObject*>(result);
+    bool registered=savedGroundRegistered(object);
+    if (itemWork || registered) {
+        logSavedGroundBoundary("factory-process",object,statePresent,captured,registered,input);
+        if (captured && registered) rememberSavedGroundInput(reinterpret_cast<Item*>(object),input);
+        // UNKNOWN remains UNKNOWN when registration/input is absent. Never guess a saved id.
+    }
+    return result;
+}
+void copyGroundIdentityText(char* dst,unsigned int capacity,
+                           const std::string& text,bool* truncated) {
+    if (text.size()>=capacity) *truncated=true;
+    strncpy(dst,text.c_str(),capacity-1);
+    dst[capacity-1]='\0';
+}
+bool readGroundItemPhysicalIdentity(const unsigned int hand[5],GroundItemIdentityRow* out) {
+    RootObject* ro=resolveObjectByHand(hand);
+    if (!ro) return false;
+    __try {
+        if (!ro->typeIsAnItem()) return false;
+        if (!readObjectHand(ro,out->hand) ||
+            memcmp(hand,out->hand,sizeof(out->hand))!=0) return false;
+        Item* item=static_cast<Item*>(ro);
+        GameData* gd=item->getGameData();
+        if (!gd) return false;
+        if (gd->stringID.size()>=sizeof(out->item.stringID)) out->identityTruncated=true;
+        strncpy(out->item.stringID,gd->stringID.c_str(),sizeof(out->item.stringID)-1);
+        out->item.itemType=(unsigned int)gd->type;
+        int quantity=item->quantity;
+        if (quantity<0 || quantity>65535) out->identityTruncated=true;
+        out->item.quantity=(unsigned short)(quantity<0 ? 0 : (quantity>65535 ? 65535 : quantity));
+        out->item.quality=qualityBucketOf(item->quality);
+        out->item.level=gradeLevelOf(item);
+        out->item.equipped=item->isEquipped ? 1 : 0;
+        fillItemProvenance(item,out->item);
+        if ((item->manufacturerData &&
+             item->manufacturerData->stringID.size()>=sizeof(out->item.manufacturer)) ||
+            (item->materialData &&
+             item->materialData->stringID.size()>=sizeof(out->item.material)))
+            out->identityTruncated=true;
+        const ::hand& owner=item->properOwner;
+        out->properOwner[0]=(unsigned int)owner.type;
+        out->properOwner[1]=owner.container; out->properOwner[2]=owner.containerSerial;
+        out->properOwner[3]=owner.index; out->properOwner[4]=owner.serial;
+        const ::hand& inventory=item->_whosInventoryWeAreIn;
+        out->inventoryOwner[0]=(unsigned int)inventory.type;
+        out->inventoryOwner[1]=inventory.container; out->inventoryOwner[2]=inventory.containerSerial;
+        out->inventoryOwner[3]=inventory.index; out->inventoryOwner[4]=inventory.serial;
+        const ::hand& inside=item->isInsideBuilding;
+        out->insideBuilding[0]=(unsigned int)inside.type;
+        out->insideBuilding[1]=inside.container; out->insideBuilding[2]=inside.containerSerial;
+        out->insideBuilding[3]=inside.index; out->insideBuilding[4]=inside.serial;
+        out->condition=item->quality;
+        out->charges=item->chargesLeft;
+        out->fullCharge=item->originalFullChargeAmount;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+} // namespace
+
+bool installGroundItemIdentityHooks() {
+    if (!savedGroundLockReady) {
+        InitializeCriticalSection(&savedGroundLock);
+        savedGroundLockReady=true;
+    }
+    if (!savedItemLoadInstalled) {
+        intptr_t address=KenshiLib::GetRealAddress(&Item::_NV_loadFromSerialise);
+        if (address)
+            savedItemLoadInstalled=KenshiLib::AddHook(address,(void*)&savedItemLoadHook,
+                (void**)&savedItemLoadOriginal)==KenshiLib::SUCCESS;
+    }
+    if (!savedContainerLoadInstalled) {
+        intptr_t address=KenshiLib::GetRealAddress(&ContainerItem::_NV_loadFromSerialise);
+        if (address)
+            savedContainerLoadInstalled=KenshiLib::AddHook(address,(void*)&savedContainerLoadHook,
+                (void**)&savedContainerLoadOriginal)==KenshiLib::SUCCESS;
+    }
+    if (!savedFactoryProcessInstalled) {
+        intptr_t address=KenshiLib::GetRealAddress(&RootObjectFactory::process);
+        if (address)
+            savedFactoryProcessInstalled=KenshiLib::AddHook(address,(void*)&savedFactoryProcessHook,
+                (void**)&savedFactoryProcessOriginal)==KenshiLib::SUCCESS;
+    }
+    proceduralFactoryProcessSeamReady(savedFactoryProcessInstalled);
+    char line[128]; _snprintf(line,sizeof(line)-1,
+        "[wi] SAVE-IDENTITY-HOOK item=%d container=%d factoryProcess=%d generation=%u",
+        savedItemLoadInstalled ? 1 : 0,savedContainerLoadInstalled ? 1 : 0,
+        savedFactoryProcessInstalled ? 1 : 0,groundItemIdentityGeneration());
+    line[sizeof(line)-1]='\0'; coop::logLine(line);
+    return savedItemLoadInstalled && savedContainerLoadInstalled;
+}
+
+void clearGroundItemIdentityRecords() {
+    scenarioPickupCursor=0;
+    InterlockedIncrement(&savedGroundGeneration);
+    if (!savedGroundLockReady) return;
+    SavedGroundLockGuard guard;
+    savedGroundInputs.clear();
+}
+
+unsigned int groundItemIdentityGeneration() {
+    return (unsigned int)InterlockedCompareExchange(&savedGroundGeneration,0,0);
+}
+
+bool readGroundItemIdentity(const unsigned int hand[5],GroundItemIdentityRow* out) {
+    if (!hand || !out) return false;
+    memset(out,0,sizeof(*out));
+    if (!readGroundItemPhysicalIdentity(hand,out)) return false;
+    if (!savedGroundLockReady) return true;
+    SavedGroundKey key;
+    memcpy(key.hand,hand,sizeof(key.hand));
+    SavedGroundLockGuard guard;
+    std::map<SavedGroundKey,SavedGroundInput>::const_iterator it=savedGroundInputs.find(key);
+    if (it==savedGroundInputs.end()) return true;
+    const SavedGroundInput& input=it->second;
+    if (input.generation!=groundItemIdentityGeneration()) return true;
+    out->savedInput=true; out->firstTime=input.firstTime;
+    copyGroundIdentityText(out->instanceID,sizeof(out->instanceID),input.instanceID,&out->identityTruncated);
+    copyGroundIdentityText(out->sourceName,sizeof(out->sourceName),input.sourceName,&out->identityTruncated);
+    copyGroundIdentityText(out->instanceRef,sizeof(out->instanceRef),input.instanceRef,&out->identityTruncated);
+    copyGroundIdentityText(out->baseSID,sizeof(out->baseSID),input.baseSID,&out->identityTruncated);
+    return true;
+}
 
 } // namespace engine
 } // namespace coop

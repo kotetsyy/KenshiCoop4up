@@ -2,6 +2,7 @@
 #define KENSHICOOP_UI_PRIVACY_H
 #include "CoopUiApi.h"
 #include "../plugin/core/SteamId.h"
+#include "../plugin/core/UdpEndpoint.h"
 #include <string>
 
 namespace coopui {
@@ -37,13 +38,12 @@ inline std::string steam(unsigned long long id, bool report) {
     return report ? std::string("[Steam ID]") : coop::maskSteamId64(id);
 }
 inline std::string line(std::string s, const CoopUiSnapshot& st, bool report) {
-    // The raw resolver error can end halfway through a hostname: redact the
-    // argument by its grammar, not by a full-known-value match.
-    const std::string resolver("enet_address_set_host('");
-    size_t at = s.find(resolver);
-    if (at != std::string::npos) {
-        at += resolver.size(); size_t end = s.find('\'', at);
-        s.replace(at, end == std::string::npos ? s.size() - at : end - at, "[address]");
+    // Defense in depth: native credentials are opaque and consume their token.
+    size_t secret = 0;
+    while ((secret = s.find("KCU1", secret)) != std::string::npos) {
+        size_t end = s.find_first_of(" \t\r\n'\"", secret);
+        s.replace(secret, end == std::string::npos ? s.size() - secret : end - secret, "[invitation]");
+        secret += 12;
     }
     const size_t colon = s.find(": ");
     const std::string key = colon == std::string::npos ? std::string() : s.substr(0, colon);
@@ -51,7 +51,11 @@ inline std::string line(std::string s, const CoopUiSnapshot& st, bool report) {
     // by grammar, independently of the current snapshot, retaining its port.
     if (key == "Host" || key == "Host address" ||
         key == "\xD0\x90\xD0\xB4\xD1\x80\xD0\xB5\xD1\x81 \xD1\x85\xD0\xBE\xD1\x81\xD1\x82\xD0\xB0") {
-        const size_t start = colon + 2, port = s.find(':', start);
+        const size_t start = colon + 2;
+        const size_t close = s.find(']', start);
+        const size_t port = start < s.size() && s[start] == '['
+            ? (close == std::string::npos ? std::string::npos : s.find(':', close))
+            : s.find(':', start);
         if (start < s.size() && s[start] != '-')
             s.replace(start, (port == std::string::npos ? s.size() : port) - start, "[address]");
     }
@@ -82,6 +86,25 @@ inline std::string line(std::string s, const CoopUiSnapshot& st, bool report) {
     const bool versionLine = s.compare(0, 10, "KenshiCoop ") == 0 || key == "Version" ||
                              key == "version" || key == "Build";
     for (size_t p = 0; p < s.size();) {
+        if ((s[p] == '[' || s[p] == ':' || digit(s[p]) ||
+            (s[p] >= 'a' && s[p] <= 'f') || (s[p] >= 'A' && s[p] <= 'F')) &&
+            (!p || !word(s[p - 1]))) {
+            size_t end = s.find_first_of(" \t\r\n,()'\"", p);
+            if (end == std::string::npos) end = s.size();
+            const size_t firstColon = s.find(':', p);
+            if (firstColon < end && s.find(':', firstColon + 1) < end) {
+                const std::string token = s.substr(p, end - p);
+                std::string ip; int port = -1;
+                if (coop::parseUdpEndpoint(token, ip, port)) {
+                    out += "[address]";
+                    if (token[0] == '[') {
+                        const size_t close = token.find(']');
+                        if (close != std::string::npos && close + 1 < token.size()) out += token.substr(close + 1);
+                    }
+                    p = end; continue;
+                }
+            }
+        }
         if (!numericAddress && addressLen > 1 && s.compare(p, addressLen, address) == 0 && boundary(s, p, addressLen)) {
             out += "[address]"; p += addressLen; continue;
         }

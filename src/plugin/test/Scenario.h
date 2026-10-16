@@ -16,11 +16,16 @@
 class GameWorld;
 
 namespace coop {
+namespace engine { struct ScenarioItemWitness; }
+struct ProceduralBedBinding;
+
 
 struct ScenarioContext {
     GameWorld*    gw;
     bool          isHost;
     u32           localId;
+    u64           worldToken;
+    u32           loadId;
     unsigned long elapsedMs; // since onStart
     unsigned int  tick;      // scenario tick counter
     // True once this client has received an owned-entity batch from a peer. On the
@@ -37,6 +42,19 @@ struct ScenarioContext {
     bool        (*pickMintedProxy)(const unsigned int refHand[5],
                                    unsigned int outLocal[5],
                                    unsigned int outCanon[5], float* outDist);
+    bool        (*queryItemWitness)(GameWorld*, unsigned int channel,
+                                    const char* sid, unsigned int type,
+                                    const unsigned int sourceHand[5],
+                                    engine::ScenarioItemWitness* out);
+    bool        (*queryProceduralBed)(const unsigned int localHand[5], ProceduralBedBinding*);
+    bool        (*queryProceduralRegion)(i32 x, i32 z, ProceduralBedBinding*);
+    bool        (*queryEnvironmentRegion)(i32,i32,u32*,u32*,unsigned*);
+    bool        (*queryEnvironmentItem)(const unsigned int[5],u64*,u32*,u32*);
+    bool        (*queryEnvironmentScope)(i32,i32,u64*,u32*,u32*);
+    bool        (*queryClaimedActor)(const unsigned int[5],u32*,unsigned int[5]);
+    bool        (*queryInventoryRoot)(const unsigned int local[5],unsigned int canonical[5]);
+    // Harness-only adapter to the real UI disconnect/connect lifecycle.
+    bool        (*reconnectSession)();
 };
 
 class Scenario {

@@ -502,6 +502,10 @@ bool tickSend(NetLink& net, u32 localId) {
     for (unsigned int c = 0; c < SEND_CHUNKS_PER_BURST; ++c) {
         if (g_sendFileIdx >= g_sendFiles.size()) break;
         const XferFile& xf = g_sendFiles[g_sendFileIdx];
+        // Pause before reading or advancing offsets: retained native bulk
+        // backpressure must never turn a file chunk into a skipped chunk.
+        if (!net.canQueueSaveBytes(sizeof(SaveFileHeader) + xf.rel.size() + SAVE_CHUNK_MAX))
+            break;
 
         if (g_sendHandle == INVALID_HANDLE_VALUE) {
             g_sendHandle = CreateFileW(widePath(pathJoin(g_sendFolder, xf.rel)).c_str(),

@@ -11,6 +11,7 @@
 // (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include <mygui/MyGUI_InputManager.h>
 
 namespace coop {
 namespace engine {
@@ -191,7 +192,9 @@ bool applyPickup(GameWorld* gw, Character* carrier, const unsigned int carriedHa
         // carrying something ELSE -> refuse (never stack / steal a carry).
         if (carrier->isCarryingSomething) {
             const hand& h = carrier->carryingObject;
-            return (h.index == carriedHand[3] && h.serial == carriedHand[4]);
+            return ((unsigned int)h.type == carriedHand[0] &&
+                    h.container == carriedHand[1] && h.containerSerial == carriedHand[2] &&
+                    h.index == carriedHand[3] && h.serial == carriedHand[4]);
         }
         // The body is already on someone's shoulder locally (e.g. the real
         // carry raced the event on the owner side) - treat as done.
@@ -365,7 +368,7 @@ void shackleDbgTick(GameWorld* gw, bool isHost) {
 }
 
 bool applyFurniture(GameWorld* gw, Character* occupant,
-                    const unsigned int furnHand[5], int kind, bool on) {
+                    const unsigned int furnHand[5], int kind, bool on, bool restOrder) {
     (void)gw;
     if (!occupant || (kind != 1 && kind != 2 && kind != 3)) return false;
     // Chained/pole prisoner (protocol 41): a separate engine system from cages
@@ -400,6 +403,7 @@ bool applyFurniture(GameWorld* gw, Character* occupant,
         }
     }
     SetFurnModeFn fn = (kind == 1) ? g_setBedModeFn : g_setPrisonModeFn;
+    if (on && kind == 1 && restOrder && !g_addOrderFn && !g_addJobFn) return false;
     if (!fn) return false;
     // Resolve the furniture OUTSIDE the SEH frame (resolveObjectByHand guards
     // itself). A null is only fatal for ENTER; an EXIT can fall back to the
@@ -410,8 +414,22 @@ bool applyFurniture(GameWorld* gw, Character* occupant,
         int cur = 0;
         if (occupant->inSomething == IN_BED)         cur = 1;
         else if (occupant->inSomething == IN_PRISON) cur = 2;
-        if (cur == desired) return true;         // idempotent no-op
+        if (cur == desired) {
+            if (!on) return true;
+            if (!furnHand) return false;
+            const hand& h = occupant->inWhat;
+            return (h.type == (itemType)furnHand[0] && h.container == furnHand[1] &&
+                    h.containerSerial == furnHand[2] &&
+                    h.index == furnHand[3] && h.serial == furnHand[4]);
+        }
         if (on && cur != 0) return false;        // already in OTHER furniture: refuse
+        // An old fixture's delayed EXIT must not release a new occupancy.
+        if (!on && (cur != kind || (furnHand &&
+            ((unsigned int)occupant->inWhat.type != furnHand[0] ||
+             occupant->inWhat.container != furnHand[1] ||
+             occupant->inWhat.containerSerial != furnHand[2] ||
+             occupant->inWhat.index != furnHand[3] ||
+             occupant->inWhat.serial != furnHand[4])))) return false;
         // UseableStuff's first base chain starts at RootObject (offset 0), the
         // same address-preserving reinterpret the Building spawns use.
         UseableStuff* us = reinterpret_cast<UseableStuff*>(ro);
@@ -424,8 +442,29 @@ bool applyFurniture(GameWorld* gw, Character* occupant,
             us = reinterpret_cast<UseableStuff*>(resolveObjectByHand(own));
         }
         if (on && !us) return false;             // enter needs the real fixture
+        if (on) {
+            // Cancel the passenger's previous local job once, BEFORE attaching.
+            // Doing this after setBedMode can terminate the new bed action.
+            clearGoals(occupant);
+            endAction(occupant);
+            if (kind == 1 && restOrder) {
+                // setBedMode alone is a pose, not a persistent player intent.
+                // Without this one order the owner's idle AI immediately exits.
+                Ogre::Vector3 position = ro->getPosition();
+                if (g_addOrderFn)
+                    g_addOrderFn(occupant, reinterpret_cast<Building*>(ro),
+                        USE_BED_ORDER, ro, false, true, &position);
+                else
+                    g_addJobFn(occupant, USE_BED_ORDER, ro, false, false, &position);
+            }
+        }
         fn(occupant, on, us);
-        return true;
+        if (!on) return occupant->inSomething != (kind == 1 ? IN_BED : IN_PRISON);
+        if (occupant->inSomething != (kind == 1 ? IN_BED : IN_PRISON)) return false;
+        const hand& attached = occupant->inWhat;
+        return furnHand && (unsigned int)attached.type == furnHand[0] &&
+               attached.container == furnHand[1] && attached.containerSerial == furnHand[2] &&
+               attached.index == furnHand[3] && attached.serial == furnHand[4];
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -693,6 +732,13 @@ bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused, int* kind) {
             if (!ep && em > 0.0f) g_quietMult = em;
         }
         if (kind) *kind = knd;
+        if (speedDbgOn()) {
+            char b[192]; _snprintf(b, sizeof(b)-1,
+                "[speeddbg] intent captured mult=%.4f paused=%d kind=%d em=%.4f ep=%d qMult=%.4f qPaused=%d",
+                *mult, *paused ? 1 : 0, knd, em, ep ? 1 : 0,
+                g_quietMult, g_quietPaused ? 1 : 0);
+            b[sizeof(b)-1] = '\0'; coop::logLine(b);
+        }
         snapshotVoteButtons();
         return true;
     }
@@ -816,6 +862,25 @@ bool installSpeedIntentHooks(GameWorld* gw) {
                            (void**)&g_togglePauseOrig) != KenshiLib::SUCCESS)
         return false;
     return true;
+}
+
+bool readPauseControls(int* x, int* y, int* width, int* height, int* mouseX, int* mouseY) {
+    if (!x || !y || !width || !height || !mouseX || !mouseY) return false;
+    __try {
+        if (!gui || !gui->mainbar || gui->mainbar->speedButtons.empty()) return false;
+        MyGUI::Button* button = gui->mainbar->speedButtons[0];
+        if (!button || !button->getVisible()) return false;
+        const MyGUI::IntCoord rect = button->getAbsoluteCoord();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        MyGUI::InputManager* input=MyGUI::InputManager::getInstancePtr();
+        if (!input) return false;
+        const MyGUI::IntPoint& cursor=input->getMousePosition();
+        *mouseX=cursor.left; *mouseY=cursor.top;
+        *x = rect.left; *y = rect.top; *width = rect.width; *height = rect.height;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 int readSpeedButtons(char* out, int n) {

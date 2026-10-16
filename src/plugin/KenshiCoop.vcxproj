@@ -60,8 +60,8 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
-    <IncludePath>$(KENSHILIB_DIR)\Include;$(KENSHILIB_DIR)\Include\ogre;$(BOOST_INCLUDE_PATH);$(ProjectDir)..\..\third_party\enet\enet\include;$(IncludePath)</IncludePath>
-    <LibraryPath>$(KENSHILIB_DIR)\Libraries\;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(KENSHILIB_DIR)\Include;$(KENSHILIB_DIR)\Include\kenshi;$(KENSHILIB_DIR)\Include\ogre;$(BOOST_INCLUDE_PATH);$(IncludePath)</IncludePath>
+    <LibraryPath>$(KENSHILIB_DIR)\Libraries\;$(BOOST_INCLUDE_PATH)\stage\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -128,9 +128,9 @@
     <ClCompile Include="core\CrashDump.cpp" />
     <ClCompile Include="core\UiModule.cpp" />
     <ClCompile Include="net\NetLink.cpp" />
-    <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="net\SteamInvite.cpp" />
     <ClCompile Include="net\Updater.cpp" />
+    <ClCompile Include="net\UpdatePackage.cpp" />
     <ClCompile Include="game\EngineInternal.cpp" />
     <ClCompile Include="game\EngineEntity.cpp" />
     <ClCompile Include="game\EngineUi.cpp" />
@@ -138,6 +138,7 @@
     <ClCompile Include="game\EngineSpawnCombat.cpp" />
     <ClCompile Include="game\EngineCharState.cpp" />
     <ClCompile Include="game\EngineWorld.cpp" />
+    <ClCompile Include="game\EngineProcedural.cpp" />
     <!-- Diagnostic probes (spike 401/451/402): HARNESS-ONLY, excluded from the
          shipped Release DLL like the Scenario*.cpp harness (Phase 5e). Its only
          callers are the probe scenarios, which are themselves Release-excluded. -->
@@ -146,6 +147,9 @@
     </ClCompile>
     <ClCompile Include="game\ZoneQuery.cpp" />
     <ClCompile Include="sync\Interp.cpp" />
+    <ClCompile Include="sync\ProceduralWorldSync.cpp" />
+    <ClCompile Include="sync\EnvironmentItemsSync.cpp" />
+    <ClCompile Include="game\EngineEnvironmentItems.cpp" />
     <ClCompile Include="sync\ReplicatorCore.cpp" />
     <ClCompile Include="sync\ReplicatorPublish.cpp" />
     <ClCompile Include="sync\ReplicatorDrive.cpp" />
@@ -193,15 +197,12 @@
     <ClCompile Include="test\ScenarioSession.cpp">
       <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
     </ClCompile>
-    <!-- ENet (Windows source set). unix.c is intentionally excluded. -->
-    <ClCompile Include="..\..\third_party\enet\enet\callbacks.c" />
-    <ClCompile Include="..\..\third_party\enet\enet\compress.c" />
-    <ClCompile Include="..\..\third_party\enet\enet\host.c" />
-    <ClCompile Include="..\..\third_party\enet\enet\list.c" />
-    <ClCompile Include="..\..\third_party\enet\enet\packet.c" />
-    <ClCompile Include="..\..\third_party\enet\enet\peer.c" />
-    <ClCompile Include="..\..\third_party\enet\enet\protocol.c" />
-    <ClCompile Include="..\..\third_party\enet\enet\win32.c" />
+    <ClCompile Include="test\ScenarioProcedural.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioEnvironmentItems.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CoopLog.h" />
@@ -209,8 +210,12 @@
     <ClInclude Include="core\UiModule.h" />
     <ClInclude Include="core\Inbound.h" />
     <ClInclude Include="net\NetLink.h" />
-    <ClInclude Include="net\SteamP2P.h" />
+    <ClInclude Include="..\transport\TransportApi.h" />
+    <ClInclude Include="net\UpdatePackage.h" />
     <ClInclude Include="game\Engine.h" />
+    <ClInclude Include="game\EngineProcedural.h" />
+    <ClInclude Include="core\ProceduralWorldState.h" />
+    <ClInclude Include="sync\ProceduralWorldSync.h" />
     <ClInclude Include="sync\Interp.h" />
     <ClInclude Include="sync\Replicator.h" />
     <ClInclude Include="sync\SaveXfer.h" />

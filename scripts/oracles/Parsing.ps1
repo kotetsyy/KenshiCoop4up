@@ -45,8 +45,41 @@ function Get-ClockSyncStats {
 # the log's clock offset so all returned times are in the HOST clock frame.
 function Convert-StampToMs {
     param($Groups, [int]$OffsetMs)
+    if ([int]$Groups[1].Value -gt 23 -or [int]$Groups[2].Value -gt 59 -or
+        [int]$Groups[3].Value -gt 59 -or [int]$Groups[4].Value -gt 999) { throw 'Invalid wall-clock timestamp' }
     $t = ([int]$Groups[1].Value * 3600 + [int]$Groups[2].Value * 60 + [int]$Groups[3].Value) * 1000 + [int]$Groups[4].Value
     return $t + $OffsetMs
+}
+
+# Index timestamps once in file order, then apply CLOCKSYNC. The first log
+# anchors the run's day; subsequent logs use the nearest aligned day. An extra
+# day keeps marker thresholds with a zero default before every real sample.
+function Get-LogTimeMs {
+    param([Parameter(Mandatory = $true)]$Match)
+    $file = $Match.Path
+    if (-not $script:LogTimelineCache.ContainsKey($file)) {
+        $times = @{}
+        $offset = Get-LogClockOffsetMs -File $file
+        [long]$day = 0; $previous = $null; $lineNumber = 0
+        foreach ($line in (Get-Content -LiteralPath $file -Encoding UTF8)) {
+            $lineNumber++
+            $stamp = [regex]::Match($line, '^\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]')
+            if (-not $stamp.Success) { continue }
+            $raw = [long](Convert-StampToMs -Groups $stamp.Groups -OffsetMs 0)
+            if ($null -eq $previous) {
+                $day = 86400000 - [long]([Math]::Floor(($raw + $offset) / 86400000.0)) * 86400000
+                $first = $raw + $day + $offset
+                if ($null -eq $script:LogTimelineAnchor) { $script:LogTimelineAnchor = $first }
+                else { $day += [long]([Math]::Floor(($script:LogTimelineAnchor - $first + 43200000.0) / 86400000.0)) * 86400000 }
+            } elseif ($raw -lt ($previous - 43200000)) {
+                $day += 86400000
+            }
+            $times[[long]$lineNumber] = $raw + $day + $offset
+            $previous = $raw
+        }
+        $script:LogTimelineCache[$file] = $times
+    }
+    return $script:LogTimelineCache[$file][[long]$Match.LineNumber]
 }
 
 # ---- Log parsing helpers ------------------------------------------------------
@@ -57,9 +90,12 @@ function Get-ScenarioLines {
     param([string]$File, [string]$Kind)
     $map = @{}
     if (-not (Test-Path $File)) { return $map }
-    $pat = "SCENARIO $Kind hand=([\d,]+) pos=([\-\d\.,]+)"
-    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
-        $g = $m.Matches[0].Groups
+    $number = '[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
+    $pat = "SCENARIO $Kind hand=(\d+(?:,\d+){4}) pos=($number,$number,$number)(?: |$)"
+    foreach ($m in (Select-String -Path $File -Pattern "SCENARIO $Kind hand=" -Encoding UTF8)) {
+        $record = [regex]::Match($m.Line, $pat)
+        if (-not $record.Success) { throw "Malformed full-identity $Kind row at ${File}:$($m.LineNumber)" }
+        $g = $record.Groups
         $map[$g[1].Value] = $g[2].Value
     }
     return $map
@@ -73,13 +109,18 @@ function Get-ScenarioSeries {
     param([string]$File, [string]$Kind)
     $map = @{}
     if (-not (Test-Path $File)) { return $map }
-    $off = Get-LogClockOffsetMs -File $File
-    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO $Kind hand=([\d,]+) pos=([\-\d\.,]+)(?: task=(\d+))?(?: pelvis=(-?[\d\.]+))?(?: crouch=(-?\d+))?(?: idle=(-?\d+))?(?: bs=(\d+))?"
-    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
-        $g = $m.Matches[0].Groups
-        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+    $number = '[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO $Kind hand=(\d+(?:,\d+){4}) pos=($number,$number,$number)(?= |$)(?: task=(\d+))?(?: pelvis=($number))?(?: crouch=(-?\d+))?(?: idle=(-?\d+))?(?: bs=(\d+))?"
+    foreach ($m in (Select-String -Path $File -Pattern "SCENARIO $Kind hand=" -Encoding UTF8)) {
+        $record = [regex]::Match($m.Line, $pat)
+        if (-not $record.Success) { throw "Malformed timestamped full-identity $Kind row at ${File}:$($m.LineNumber)" }
+        $g = $record.Groups
+        $t = Get-LogTimeMs -Match $m
         $hand = $g[5].Value
-        $pos  = $g[6].Value.Split(',') | ForEach-Object { [double]$_ }
+        $pos  = @($g[6].Value.Split(',') | ForEach-Object { [double]::Parse($_, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture) })
+        if (@($pos | Where-Object { [double]::IsNaN($_) -or [double]::IsInfinity($_) }).Count) {
+            throw "Non-finite position at ${File}:$($m.LineNumber)"
+        }
         $task = if ($g[7].Success) { [int]$g[7].Value } else { 65535 }
         $pelvis = if ($g[8].Success) { [double]$g[8].Value } else { -1.0 }
         $crouch = if ($g[9].Success) { [int]$g[9].Value } else { -1 }
@@ -115,6 +156,62 @@ function Get-MarkerTimeMs {
     $om = Select-String -Path $File -Pattern ("\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*" + $Pattern) -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $om) { return $null }
     $off = Get-LogClockOffsetMs -File $File
-    return (Convert-StampToMs -Groups $om.Matches[0].Groups -OffsetMs $off)
+    return (Get-LogTimeMs -Match $om)
 }
 
+
+# Reliable delivery is keyed by occurrence and the full wire identity. Local
+# rekeys do not alter the packet hand, so SEND/RECV never need fuzzy matching.
+function Get-ReliableEventRows {
+    param([string]$File, [ValidateSet('SEND','RECV')][string]$Direction)
+    if ($File -eq '' -or -not (Test-Path -LiteralPath $File)) { return }
+    $pattern = "\[event\] $Direction id=(?<id>\d+) ev=(?<event>\d+).*?hand=(?<hand>\d+(?:,\d+){4}) actor=(?<actor>\d+,\d+)(?: |$)"
+    foreach ($line in (Select-String -LiteralPath $File -Pattern "\[event\] $Direction " -Encoding UTF8)) {
+        $record = [regex]::Match($line.Line, $pattern)
+        if (-not $record.Success) { throw "Malformed reliable $Direction record at ${File}:$($line.LineNumber)" }
+        $g = $record.Groups
+        $owner = [regex]::Match($line.Line, '\bowner=(\d+)(?: |$)')
+        $session = [regex]::Match($line.Line, '\bsession=(\d+)(?: |$)')
+        $actorFull = [regex]::Match($line.Line, '\bactor5=(\d+(?:,\d+){4})(?: |$)')
+        [pscustomobject]@{
+            Id=$g['id'].Value; Event=[int]$g['event'].Value; Hand=$g['hand'].Value
+            Actor=$g['actor'].Value; Owner=$(if ($owner.Success) { $owner.Groups[1].Value } else { '' })
+            Session=$(if ($session.Success) { $session.Groups[1].Value } else { '' })
+            ActorFull=$(if ($actorFull.Success) { $actorFull.Groups[1].Value } else { '' })
+            Time=(Get-LogTimeMs -Match $line); Line=$line.LineNumber
+        }
+    }
+}
+
+function Find-ReliableReceipt {
+    param($Send, $Receipts)
+    if ($null -eq $Send -or $Send.Owner -eq '' -or $null -eq $Send.Time) { return }
+    if ($Send.Actor -ne '0,0' -and ($Send.ActorFull -eq '' -or -not $Send.ActorFull.EndsWith(','+$Send.Actor))) { return }
+    $Receipts | Where-Object {
+        $_.Id -eq $Send.Id -and $_.Event -eq $Send.Event -and $_.Hand -eq $Send.Hand -and
+        $_.Actor -eq $Send.Actor -and $_.ActorFull -eq $Send.ActorFull -and $_.Owner -eq $Send.Owner -and $_.Session -eq $Send.Session -and
+        $null -ne $_.Time -and $_.Time -ge $Send.Time
+    } | Sort-Object -Property @('Time','Line') | Select-Object -First 1
+}
+
+# Scenario rows use i,s,type,container,containerSerial; events use the wire
+# tuple in type,container,containerSerial,i,s order. Only a logged rekey may
+# translate it, and the translated body's samples must follow that rekey.
+function Get-MappedScenarioSamples {
+    param($Map, [string]$WireHand, [string]$File)
+    if ($Map.ContainsKey($WireHand)) { $Map[$WireHand] }
+    $parts = $WireHand.Split(',')
+    if ($parts.Count -ne 5) { return }
+    $wireShort = [regex]::Escape("$($parts[0]),$($parts[1])")
+    $pattern = "\[rekey\] wire=$wireShort local=(\d+),(\d+) localc=(\d+),(\d+)(?: |$)"
+    $seen = @{}
+    foreach ($line in (Select-String -LiteralPath $File -Pattern $pattern -Encoding UTF8)) {
+        $g = $line.Matches[0].Groups
+        $key = "$($g[1].Value),$($g[2].Value),$($parts[2]),$($g[3].Value),$($g[4].Value)"
+        if ($key -eq $WireHand -or $seen.ContainsKey($key) -or -not $Map.ContainsKey($key)) { continue }
+        $since = Get-LogTimeMs -Match $line
+        if ($null -eq $since) { continue }
+        $seen[$key] = $true
+        $Map[$key] | Where-Object { $_.t -ge $since }
+    }
+}

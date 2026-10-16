@@ -30,12 +30,17 @@
 > рассинхроны и вылеты. Два игрока — проверенный случай; три и четыре
 > реализованы, но в реальных сессиях не валидированы.
 
+> **Публичный v0.2.0 — протокол 80.** Steam и прямой IP используют
+> GameNetworkingSockets (GNS), без ENet и автоматического переключения транспорта.
+> Переход с 0.1.x требует ручной установки полного комплекта.
+> Steam P2P между двумя реальными аккаунтами ещё не сертифицирован;
+> реальные сессии на 3–4 игроков и устранение всех рассинхронов не подтверждены.
+
 ## Разработка KenshiCoop4up
 
-- **Автообновление.** Все игроки обязаны запускать *одну и ту же* DLL: версия
-  протокола жёстко проверяется при рукопожатии, поэтому одна устаревшая копия
-  выглядит просто как «не коннектится». Теперь мод при старте проверяет манифест
-  на GitHub — в отдельном потоке — и ставит новую сборку, если она есть.
+- **Автообновление.** Все игроки обязаны использовать одну версию. После ручного
+  перехода на v0.2.0 мод проверяет манифест GitHub в отдельном потоке и обновляет
+  все четыре DLL одной сборки, включая UI, для следующего запуска.
 - **Фикс вылета на луте.** Удаление предмета при открытом окне инвентаря
   освобождало память, на которую окно продолжало ссылаться, и игра падала на
   своём рендер-потоке. Теперь применение откладывается, пока окно открыто.
@@ -67,9 +72,9 @@
   не проверено — считайте непротестированным.
 
 Потеря предметов при прямом обмене, разные товары торговцев, рассинхроны
-времени и координат, кровати на втором этаже и боевых анимаций остаются
-открытыми по новым отчётам. `v0.1.31` исправляет отдельную блокировку
-инвентаря, а не все эти случаи.
+времени и координат, кровати на втором этаже и боевых анимаций не следует
+считать полностью устранёнными в v0.2.0. Также остаются проблемы окружения,
+экипировки и NPC; исправление торговли не означает исправление всех рассинхронов.
 
 Направления разработки — устранение этих рассинхронов и потерь предметов,
 улучшение диагностики и проверка сценариев подключения, загрузки и передачи
@@ -80,42 +85,46 @@
 ## Установка
 
 Нужны Kenshi 1.0.65, [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847) и —
-для Steam-транспорта — запущенный Steam в сети на каждой машине. Это вся
-сетевая настройка: без проброса портов, без настройки роутера, без IP-адресов.
+для Steam-транспорта — запущенный Steam в сети на каждой машине и поддерживаемые
+интерфейсы игры. Ручной список разрешённых SteamID не нужен. Реальный
+двухаккаунтный P2P ещё не сертифицирован; ошибка Steam не включает UDP автоматически.
 
-**Первая установка:** из
-[последнего релиза](https://github.com/kotetsyy/KenshiCoop4up/releases/latest)
-скачайте `KenshiCoop-kit.zip` и скопируйте папку `KenshiCoop` в `<Kenshi>\mods\`.
-В архиве только четыре файла для `<Kenshi>\mods\KenshiCoop\`:
+**Публичная установка v0.2.0 (протокол 80):** скачайте **`KenshiCoop-kit.zip`**
+из [последнего релиза](https://github.com/kotetsyy/KenshiCoop4up/releases/latest).
+При закрытой игре распакуйте папку `KenshiCoop` в `<Kenshi>\mods\` с заменой файлов.
+Комплект содержит ровно шесть файлов для `<Kenshi>\mods\KenshiCoop\`:
 
 - `KenshiCoop.dll` — сам плагин
 - `KenshiCoopUI.dll` — нативное окно F2, шрифты и статус сессии
+- `KenshiCoopNetSteam.dll` — native Steamworks P2P, без скрытого UDP fallback
+- `KenshiCoopNetUDP.dll` — authenticated direct UDP, без Steam API/relay
 - `RE_Kenshi.json` — говорит RE_Kenshi загрузить эту DLL (без него мод не стартует)
 - `KenshiCoop.mod` — чтобы Kenshi показал мод в меню Mods
 
 Запустите Kenshi и включите **KenshiCoop** в меню модов.
 `coop_config.json` создаётся при сохранении настроек F2; при обновлении оставьте
-свой конфиг на месте. `PROVENANCE.json` и лаунчеры не нужны для запуска.
+свой конфиг и сейвы на месте.
 Исходники доступны в этом репозитории по тегу соответствующего релиза;
 инструкции сборки — в [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 
 
-**Потом, при обновлении:** заменяйте **обе DLL из одной сборки** при закрытой
-игре. Внутриигровой апдейтер проверяет SHA-256 обеих DLL и устанавливает пару
-для следующего запуска. `.mod` и `RE_Kenshi.json` почти не меняются.
-В `v0.1.28` сокращено описание мода в лаунчере. Чтобы получить его, замените
-`KenshiCoop.mod` из полного комплекта; апдейтер скачивает только DLL.
+**Первый переход с 0.1.x на v0.2.0 — только вручную:** установите полный
+шестифайловый комплект при закрытой игре, сохранив конфиг и сейвы. Старый updater
+не поддерживает новую схему. Затем новый updater обновляет все **четыре DLL
+одной сборки**, включая `KenshiCoopUI.dll`, транзакционно для следующего запуска.
+`KenshiCoop.mod` и `RE_Kenshi.json` устанавливаются из полного комплекта.
 
-**Рекомендуем всем одну и ту же сборку.** Разные версии протокола не соединяются.
-
-В сборке Release `v0.1.31` используется протокол **70**. Хост держит симуляцию на паузе
-до загрузки мира всеми подключёнными клиентами: каждый подтверждает READY
-именно для текущего `LOAD_GO`, а не просто окончание передачи файлов.
+**У всех игроков должна быть одна версия.** v0.2.0 несовместим с 0.1.x.
+Публичный Release использует протокол **80**, отдельный приватный Harness —
+**81**, с отключённым автообновлением; эти сборки не соединяются друг с другом.
+Хост держит симуляцию на паузе до загрузки мира всеми подключёнными клиентами:
+READY подтверждает текущий `LOAD_GO` и полное согласование проверяемых участков,
+а не просто окончание передачи файлов.
 Пауза не заменяет выбранную игроками скорость или пользовательскую паузу.
 Завершение сохранения мира для подключения больше не сбрасывает паузу хоста:
 после READY игра продолжится только если пользовательская пауза снята.
 Этот барьер работает при включённой синхронизации сейвов, загрузки, скорости
-и времени. Максимальное ожидание ENet в простое — **1 мс**; целевая частота
+и времени. Сеть работает в отдельном native worker; целевая частота
 снимков сущностей — **100 Гц** (10 мс, монотонный QPC-таймер). Свежие состояния
 по-прежнему захватываются игровым потоком, поэтому их частота зависит от FPS.
 Ротация дальних NPC остаётся на 50 мс; остальные каналы не переводятся на 100 Гц.
@@ -126,7 +135,7 @@
 временную клиентскую копию. Передача рюкзака включает его содержимое.
 Загрузка уже лежащих в мире вещей больше не объявляется новым выбрасыванием.
 Товар торговца синхронизируется из полок его магазина, включая разные чертежи,
-а не только из инвентаря NPC. Всем участникам нужно обновить обе DLL.
+а не только из инвентаря NPC. Для текущей версии всем нужен полный комплект v0.2.0.
 
 ## Подключение в игре (F2)
 
@@ -137,15 +146,16 @@
 2. **Введите ник** в поле. Поддерживаются кириллица, выделение, редактирование
    и **Ctrl+V**. Поле ника занимает всю ширину строки, отдельной кнопки вставки нет.
 3. Выберите **Хост** или **Клиент**, затем **Steam** или **Прямой IP (UDP)**.
-4. **Steam, хост:** скопируйте свой Steam ID кнопкой окна и передайте клиенту.
-   У хоста нет поля для чужого ID.
-5. **Steam, клиент:** введите или вставьте Steam ID хоста, затем нажмите
-   **«Подключиться»**. Хост нажимает **«Создать сессию»** и загружает свой мир.
-6. **UDP, хост:** при необходимости введите номер порта
-   (по умолчанию `27800`), затем создайте сессию.
-7. **UDP, клиент:** введите или вставьте адрес хоста `ip:port`, например
-   `192.168.1.10:27800`, затем подключитесь. Для подключения через интернет
-   нужен доступный UDP-порт хоста; Steam-проброс здесь не используется.
+4. **Steam, хост:** создайте сессию и поделитесь своим SteamID64 с гостями.
+   Ручное добавление SteamID гостей в список разрешённых не требуется.
+5. **Steam, клиент:** введите SteamID64 хоста и подключитесь; хост создаёт сессию
+   и загружает свой мир. Native-допуск не равен завершённой загрузке/READY.
+6. **UDP, хост:** выберите порт (по умолчанию `27800`), создайте сессию и отдельное
+   приглашение каждому гостю. Copy копирует чувствительное приглашение явно.
+7. **UDP, клиент:** введите числовой IPv4/IPv6 endpoint и вставьте приглашение
+   в маскированное поле. Через интернет нужен доступный порт хоста; Steam/NAT
+   сервис здесь не используется. Приглашения не сохраняются в обычный конфиг,
+   логи или отчёты; приватный профиль хоста нельзя пересылать клиентам.
 
 **Tab** переключает поля; **Enter** в поле запускает выбранное подключение.
 Пустой или неверный ник/адрес/порт блокирует запуск и показывает причину.
@@ -183,20 +193,20 @@
 `scripts\build_plugin.cmd Harness` собирает согласованную пару
 `KenshiCoop.dll` и `KenshiCoopUI.dll`. Это оптимизированная сборка с
 `KENSHICOOP_NET_DIAG`, а не конфигурация VS Debug с отладочной CRT.
-Release использует протокол **70**, Harness — диагностический протокол **71**.
-Все участники должны использовать одну и ту же пару из одной сборки;
+Публичный Release v0.2.0 использует протокол **80**, приватный Harness — **81**.
+Все участники должны использовать все четыре DLL из одной сборки;
 Release и Harness не соединяются друг с другом. Harness принудительно отключает
 публичный апдейтер, даже если в `coop_config.json` стоит `"updateEnabled": true`.
 Инструкции сборки и проверок — в [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 
 Статистика находится в отдельном перемещаемом окне **«Диагностика»**
 со своей прокруткой и в **«Копировать отчёт»**; Harness пишет строки
-`[net-diag]` раз в секунду. Байты/пакеты — локальный трафик ENet с повторами,
+`[net-diag]` раз в секунду. Байты/пакеты — локальный native-трафик,
 не доказательство совпадения миров. Неизвестная готовность мира и
 отсутствующие измерения не выдаются за успешную синхронизацию.
 
 После WELCOME Harness передаёт локальный лог клиента хосту по существующему
-соединению ENet, на канале массовых данных. Хост сохраняет его в
+native-соединению, на канале массовых данных. Хост сохраняет его в
 `KenshiCoop_join_N_mirror.log`, отдельно от своего `KenshiCoop_host.log`;
 клиент сохраняет `KenshiCoop_join.log`. Передача ограничена восемью порциями
 до 960 байт в секунду; оставшиеся байты хранятся на диске, а передача сейва
@@ -218,7 +228,7 @@ Release и Harness не соединяются друг с другом. Harness
   производного проекта KenshiCoop4up
 - [BFrizzleFoShizzle](https://github.com/BFrizzleFoShizzle) — RE_Kenshi и
   KenshiLib, без которых такие плагины невозможны
-- [lsalzman/enet](https://github.com/lsalzman/enet) — сетевая библиотека UDP
+- [ValveSoftware/GameNetworkingSockets](https://github.com/ValveSoftware/GameNetworkingSockets) — native transport
 - [zeroit789](https://github.com/zeroit789) — кооп-старт «Multiplayer
   (Wanderer x2)» ([#15](https://github.com/nhoral/KenshiCoop/pull/15))
 - Lo-Fi Games — Kenshi
@@ -264,12 +274,17 @@ shared save, streamed to both machines automatically.
 > rough edges, desyncs, and crashes. Two players is the tested case; three
 > and four are implemented but not validated in real sessions.
 
+> **Public v0.2.0 — protocol 80.** Steam and direct IP use
+> GameNetworkingSockets (GNS), without ENet or automatic transport fallback.
+> Migrating from 0.1.x requires manual installation of the complete kit.
+> Actual two-account Steam P2P is not yet certified; real 3–4-player sessions
+> and resolution of all desynchronization reports remain unverified.
+
 ## KenshiCoop4up development
 
-- **Self-update.** Every player must run the *same* DLL — the protocol version is
-  a hard gate at handshake, so a single stale copy just reads as "it will not
-  connect". The mod now checks a manifest on GitHub at startup, on its own
-  thread, and installs a newer build if one exists.
+- **Self-update.** All players must use the same version. After the manual
+  v0.2.0 migration, the mod checks GitHub's manifest on a separate thread and
+  updates all four DLLs from one build, including the UI, for the next launch.
 - **Loot crash fix.** Destroying an item while an inventory panel had it open
   freed memory the open window still pointed at, and the game died on its render
   thread. The reconcile now defers while a panel is open instead.
@@ -301,8 +316,9 @@ shared save, streamed to both machines automatically.
   real sessions yet — treat it as untested.
 
 New reports of direct-trade item loss, differing merchant stock, time and position
-desynchronization, upstairs beds and combat animations remain open. `v0.1.31`
-fixes a separate inventory-update blockage, not all of those cases.
+desynchronization, upstairs beds and combat animations should not be considered
+fully resolved in v0.2.0. Environment, outfit and NPC issues also remain;
+the merchant fix does not resolve every desynchronization.
 
 Development focuses on resolving these desyncs and item losses, improving
 diagnostics, and checking connection, world-loading and character-handoff
@@ -313,34 +329,38 @@ The manual build, checks and release preparation process is documented in
 ## Install
 
 You need Kenshi 1.0.65, [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847),
-and — for the Steam transport — Steam running and online on every machine. That
-is the whole network setup: no port forwarding, no router configuration, no IP
-addresses.
+and — for Steam — online Steam on each machine and supported game interfaces.
+No manual SteamID allow-list is required. Actual two-account P2P is not yet
+certified; Steam failures do not automatically select UDP.
 
-**First install:** from the
-[latest release](https://github.com/kotetsyy/KenshiCoop4up/releases/latest),
-download `KenshiCoop-kit.zip` and copy its `KenshiCoop` folder into `<Kenshi>\mods\`.
-The archive contains only four files for `<Kenshi>\mods\KenshiCoop\`:
+**Public v0.2.0 installation (protocol 80):** download **`KenshiCoop-kit.zip`**
+from the [latest release](https://github.com/kotetsyy/KenshiCoop4up/releases/latest).
+With the game closed, extract its `KenshiCoop` folder into `<Kenshi>\mods\`,
+replacing files. The kit contains exactly six files for `<Kenshi>\mods\KenshiCoop\`:
 
 - `KenshiCoop.dll` — the plugin
 - `KenshiCoopUI.dll` — the native F2 window, fonts and session status
+- `KenshiCoopNetSteam.dll` — native Steamworks P2P, no hidden UDP fallback
+- `KenshiCoopNetUDP.dll` — authenticated direct UDP, no Steam API/relay
 - `RE_Kenshi.json` — tells RE_Kenshi to load that DLL (without it the mod never starts)
 - `KenshiCoop.mod` — so Kenshi lists it in the Mods menu
 
 Launch Kenshi and enable **KenshiCoop** in the Mods menu.
-F2 creates `coop_config.json` when saving settings; preserve your config on
-updates. Neither `PROVENANCE.json` nor a launcher is required at runtime.
+F2 creates `coop_config.json` when saving settings; preserve your config and
+saves when updating.
 Sources are available in this repository at the matching release tag;
 build instructions are in [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md).
 
 
-**Later updates:** replace **both DLLs from the same build**, with the game
-closed. The in-game updater verifies both SHA-256 hashes and installs the pair
-for the next launch. `.mod` and `RE_Kenshi.json` almost never change.
-In `v0.1.28`, the launcher description is shorter. Replace `KenshiCoop.mod`
-from the full kit to get it; the updater downloads only the DLL pair.
+**First migration from 0.1.x to v0.2.0 is manual only:** install the complete
+six-file kit with the game closed, preserving config and saves. Legacy updaters
+do not support the new manifest. Thereafter the new updater transactionally
+replaces all **four DLLs from one build**, including `KenshiCoopUI.dll`, for the
+next launch. Install `KenshiCoop.mod` and `RE_Kenshi.json` from the complete kit.
 
-**The same build is recommended for everyone.** Mismatched protocol versions do not connect.
+**All players must use the same version.** v0.2.0 is incompatible with 0.1.x.
+Public Release uses protocol **80**; the separate private Harness uses **81**
+with updates disabled. Release and Harness cannot connect to each other.
 
 ## Connect in-game (F2)
 
@@ -351,15 +371,16 @@ player does not need to load anything first.
 2. **Type your nick** in the field. Cyrillic, selection, editing and **Ctrl+V**
    are supported. The nickname field uses the full row width, without a Paste button.
 3. Choose **Host** or **Client**, then **Steam** or **Direct IP (UDP)**.
-4. **Steam host:** copy your Steam ID using the window's button and send it to
-   the client. The host has no field for a friend's ID.
-5. **Steam client:** type or paste the host's Steam ID and click **Connect**.
-   The host clicks **Create session** and loads their world.
-6. **UDP host:** optionally enter a port number (default `27800`), then create
-   the session.
-7. **UDP client:** type or paste the host's `ip:port`, for example
-   `192.168.1.10:27800`, then connect. Internet UDP requires a reachable host
-   port; Steam's NAT traversal is not used for this transport.
+4. **Steam host:** create the session and share your SteamID64 with guests.
+   No manual guest SteamID allow-list is required.
+5. **Steam client:** enter the host SteamID64 and connect; host creates the session
+   and loads its world. Native admission is not gameplay handshake/world READY.
+6. **UDP host:** select port (default `27800`), create the session, then generate
+   one sensitive invitation per guest. Copy is an explicit clipboard action.
+7. **UDP client:** enter a numeric IPv4/IPv6 endpoint and paste the invitation into
+   the masked field. Internet UDP needs a reachable host port; no Steam/NAT
+   service is used. Invitations never belong in normal config/logs/reports;
+   never send the host's private profile to a client.
 
 **Tab** moves between fields; **Enter** starts the selected connection.
 Empty or invalid fields prevent a start and show the reason. Game controls
@@ -395,9 +416,10 @@ some units into another squad tab in-game.
 The public sources include the Harness configuration:
 `scripts\build_plugin.cmd Harness` builds a matching `KenshiCoop.dll` and
 `KenshiCoopUI.dll` pair. It is an optimized build with `KENSHICOOP_NET_DIAG`,
-not VS Debug with the debug CRT. Release uses protocol **70**; Harness uses
-diagnostic protocol **71**. Every participant must use the same pair from the
-same build; Release and Harness cannot connect to each other. Harness forcibly
+not VS Debug with the debug CRT. Public Release v0.2.0 uses protocol **80**;
+the private diagnostic Harness uses protocol **81**.
+Every participant must use all four DLLs from the same build;
+Release and Harness cannot connect to each other. Harness forcibly
 disables the public updater even if `coop_config.json` has `"updateEnabled": true`.
 See [docs/BUILD_SETUP.md](docs/BUILD_SETUP.md) for build and check instructions.
 
@@ -405,7 +427,7 @@ Both configurations pause the host simulation until every connected join reports
 the READY id for its current `LOAD_GO` after the new world becomes live, including
 a join connecting from the title screen. The temporary hold does not replace the
 speed/pause vote and requires save, load, speed and time sync to remain enabled.
-Both configurations use a 1 ms maximum idle ENet wait and target 100 Hz entity
+Both configurations use a dedicated native network worker and target 100 Hz entity
 snapshots (10 ms, paced by the monotonic QPC clock). Fresh captures still come
 from the game thread and depend on its frame rate. The 50 ms distant-NPC slice
 rotation and other channel budgets are unchanged. This is not a 1 ms ping
@@ -416,15 +438,15 @@ acknowledged only for the quantity actually removed, and rejection rolls back
 the provisional client copy. Backpack transfers include their contents.
 Streaming an existing ground item no longer announces a fresh drop. Merchant
 stock comes from the actual shop furniture, including distinct blueprints,
-not just the NPC's character inventory. All peers must update both DLLs.
+not just the NPC's character inventory. All peers now need the complete v0.2.0 kit.
 
-Local ENet rates appear in the separate movable **Diagnostics** window with
+Local native transport rates appear in the separate movable **Diagnostics** window with
 its own scrolling and in **Copy report**. Harness logs `[net-diag]` lines once
-per second. Rates include ENet retransmissions, not proof that worlds match;
+per second. Rates are not proof that worlds match;
 unknown world readiness and missing measurements are not reported as success.
 
 Once a JOIN completes WELCOME, Harness mirrors its full local log over the
-existing ENet connection, on the bulk channel. The host writes it to
+existing native connection, on the bulk channel. The host writes it to
 `KenshiCoop_join_N_mirror.log` separately from its own `KenshiCoop_host.log`;
 the join retains `KenshiCoop_join.log`. Forwarding is bounded to eight chunks
 of up to 960 bytes per second; pending bytes stay on disk. Save transfer can
@@ -445,7 +467,7 @@ its matching source under AGPL-3.0, including any changes from the public tag.
   of the derivative KenshiCoop4up project
 - [BFrizzleFoShizzle](https://github.com/BFrizzleFoShizzle) — RE_Kenshi and
   KenshiLib, which make plugins like this possible
-- [lsalzman/enet](https://github.com/lsalzman/enet) — UDP networking library
+- [ValveSoftware/GameNetworkingSockets](https://github.com/ValveSoftware/GameNetworkingSockets) — native networking
 - [zeroit789](https://github.com/zeroit789) — the "Multiplayer (Wanderer x2)"
   co-op game start ([#15](https://github.com/nhoral/KenshiCoop/pull/15))
 - Lo-Fi Games — Kenshi

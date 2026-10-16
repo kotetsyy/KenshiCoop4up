@@ -13,6 +13,8 @@
 // (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include <float.h>
+#include "EngineLockScenario.h"
 
 namespace coop {
 namespace engine {
@@ -476,9 +478,22 @@ static void fillDoorRead(Building* b, DoorRead* r, DoorLock* containerLock = 0) 
     }
 }
 
+static void appendDoorRead(Building* b, bool doorsOnly, DoorRead* out,
+                           unsigned int maxOut, unsigned int* count) {
+    if (!b || *count >= maxOut || (doorsOnly && !b->imADoor)) return;
+    DoorLock* lock = b->imADoor ? 0 : containerDoorLock(b);
+    if (!b->imADoor && !lock) return;
+    unsigned int h[5];
+    if (!readObjectHand(static_cast<RootObject*>(b), h)) return;
+    for (unsigned int k = 0; k < *count; ++k)
+        if (memcmp(out[k].hand, h, sizeof(h)) == 0) return;
+    fillDoorRead(b, &out[*count], lock);
+    ++*count;
+}
+
 unsigned int enumDoorsNear(GameWorld* gw, float radius, DoorRead* out, unsigned int maxOut,
                            bool doorsOnly) {
-    if (!gw || !out || maxOut == 0 || !g_getObjsFn || !g_doorIsOpenFn) return 0;
+    if (!gw || !out || maxOut == 0 || !g_getObjsFn || !g_doorIsLockedFn) return 0;
     unsigned int n = 0;
     __try {
         Ogre::Vector3 centers[4];
@@ -492,18 +507,14 @@ unsigned int enumDoorsNear(GameWorld* gw, float radius, DoorRead* out, unsigned 
                 RootObject* o = g_npcQuery[i];
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
-                if (doorsOnly && !b->imADoor) continue;
-                DoorLock* lock = b->imADoor ? 0 : containerDoorLock(b);
-                if (!b->imADoor && !lock) continue;
-                unsigned int h[5];
-                if (!readObjectHand(o, h)) continue;
-                bool dup = false; // the two interest spheres can overlap
-                for (unsigned int k = 0; k < n; ++k)
-                    if (out[k].hand[3] == h[3] && out[k].hand[4] == h[4] &&
-                        out[k].hand[1] == h[1]) { dup = true; break; }
-                if (dup) continue;
-                fillDoorRead(b, &out[n], lock);
-                ++n;
+                appendDoorRead(b, doorsOnly, out, maxOut, &n);
+                // Native doors are children of the queried building and need
+                // not themselves be returned by the spatial BUILDING query.
+                if (!b->imADoor) {
+                    unsigned int nd = b->doors.size();
+                    for (unsigned int di = 0; di < nd && n < maxOut; ++di)
+                        appendDoorRead(b->doors[di], doorsOnly, out, maxOut, &n);
+                }
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
@@ -540,6 +551,12 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
         }
         if (!g_doorOpenFn || !g_doorCloseFn) return false;
         DoorStuff* d = static_cast<DoorStuff*>(b);
+        if (wantLocked >= 0 && d->doorLock && g_doorLockFn && g_doorUnlockFn) {
+            int curLocked = (g_doorIsLockedFn && g_doorIsLockedFn(d)) ? 1 : 0;
+            if (wantLocked != curLocked) {
+                if (wantLocked) g_doorLockFn(d); else g_doorUnlockFn(d);
+            }
+        }
         DoorState st = d->state;
         int curOpen = (st == DOORSTATE_OPEN || st == DOORSTATE_OPENING) ? 1 : 0;
         if (wantOpen >= 0 && wantOpen != curOpen) {
@@ -551,12 +568,6 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
                 else if (!wantOpen && g_doorForceCloseFn) g_doorForceCloseFn(d);
             }
         }
-        if (wantLocked >= 0 && d->doorLock && g_doorLockFn && g_doorUnlockFn) {
-            int curLocked = (g_doorIsLockedFn && g_doorIsLockedFn(d)) ? 1 : 0;
-            if (wantLocked != curLocked) {
-                if (wantLocked) g_doorLockFn(d); else g_doorUnlockFn(d);
-            }
-        }
         if (outAfter) fillDoorRead(d, outAfter);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -564,6 +575,75 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
         return false;
     }
 }
+
+#ifdef KENSHICOOP_HARNESS
+bool prepareNativeLockpickFixture(GameWorld* gw, Character* actor,
+    const unsigned int target[5], unsigned int parent[5], bool stageActor) {
+    if (parent) memset(parent, 0, sizeof(unsigned int) * 5);
+    if (!gw || !actor || !target || target[0] != (unsigned int)BUILDING) return false;
+    RootObject* object = resolveObjectByHand(target);
+    if (!object) return false;
+    __try {
+        Building* chest = static_cast<Building*>(object);
+        if (!containerDoorLock(chest)) return false;
+        Faction* player = gw->player ? gw->player->getFaction() : 0;
+        if (!player) return false;
+        // Both ownership boundaries matter: an owned chest inside an NPC home
+        // still makes the actor trespass. No relations or NPC AI are changed.
+        const hand& inside = chest->isIndoors();
+        unsigned int insideHand[5] = { (unsigned int)inside.type, inside.container,
+            inside.containerSerial, inside.index, inside.serial };
+        if (inside.index || inside.serial) {
+            RootObject* enclosing = resolveObjectByHand(insideHand);
+            if (!enclosing || inside.type != BUILDING) return false;
+            DeedRead deed;
+            if (!writeDeedByHand(gw, insideHand, 1, "", &deed) || !deed.owned ||
+                static_cast<Building*>(enclosing)->owner != player) return false;
+            if (parent) memcpy(parent, insideHand, sizeof(insideHand));
+        }
+        DeedRead deed;
+        if (!writeDeedByHand(gw, target, 1, "", &deed) || !deed.owned ||
+            chest->owner != player) return false;
+        if (stageActor) {
+            if (!actor->body) return false;
+            const u16 state = readBodyState(actor);
+            if (bodyDownNotCrawling(state) || bodyIsCarried(state) ||
+                bodyInFurniture(state) || bodyProne(state) == PRONE_PLAYING_DEAD ||
+                bodyProne(state) == PRONE_KO) return false;
+            Ogre::Vector3 position = chest->getPosition();
+            clearGoals(actor);
+            if (!park(actor, position.x + 3.0f, position.y, position.z + 3.0f, 0.0f))
+                return false;
+        }
+        cameraFocusOn(gw, actor);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Character::getLockpickChance is a zero-returning stub in native 1.0.65,
+// despite its SDK name. It cannot certify or reject a real PICK_LOCK order.
+bool orderNativeLockpick(Character* actor, const unsigned int target[5]) {
+    if (!actor || !target || !g_addOrderFn) return false;
+    RootObject* object = resolveObjectByHand(target);
+    if (!object || target[0] != (unsigned int)BUILDING) return false;
+    __try {
+        if (!actor->body) return false;
+        const u16 state = readBodyState(actor);
+        if (bodyDownNotCrawling(state) || bodyIsCarried(state) ||
+            bodyInFurniture(state) || bodyProne(state) == PRONE_PLAYING_DEAD ||
+            bodyProne(state) == PRONE_KO) return false;
+        Building* b = static_cast<Building*>(object);
+        DoorLock* lock = b->getDoorLock();
+        if (!lock) return false;
+        DoorRead before;
+        if (!readDoorByHand(target, &before) || !before.hasLock || before.locked != 1)
+            return false;
+        Ogre::Vector3 position = b->getPosition();
+        g_addOrderFn(actor, b, PICK_LOCK, object, false, true, &position);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+#endif
 
 // ---- Protocol 54: property-deed (building ownership) sync -----------------
 
@@ -1647,7 +1727,7 @@ static void fillInvSummary(RootObject* ro, ContRead* r) {
 
 // Fill a ContRead from a live container-bearing Building. Callers hold the
 // SEH frame and have already verified isContainerClassType(b->classType).
-static void fillContRead(Building* b, ContRead* r) {
+static GameData* fillContRead(Building* b, ContRead* r) {
     memset(r, 0, sizeof(*r));
     RootObject* ro = static_cast<RootObject*>(b);
     readObjectHand(ro, r->hand);
@@ -1663,6 +1743,7 @@ static void fillContRead(Building* b, ContRead* r) {
         strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
         r->name[sizeof(r->name) - 1] = '\0';
     }
+    return gd;
 }
 
 static void fillContReadFromChar(Character* ch, ContRead* r) {
@@ -1683,8 +1764,9 @@ static void fillContReadFromChar(Character* ch, ContRead* r) {
     }
 }
 
-unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
-                                unsigned int maxOut) {
+static unsigned int enumFixturesOrContainersNear(GameWorld* gw, float radius,
+                                                ContRead* out, unsigned int maxOut,
+                                                bool includeInventoryless) {
     if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
     static ContCand cand[256]; // main-thread only
     unsigned int nCand = 0;
@@ -1701,7 +1783,8 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
                 if (!isContainerClassType((int)b->classType)) continue;
-                if (b->classType == BCTYPE_USABLE && !invOf(o)) continue;
+                if (!includeInventoryless && b->classType == BCTYPE_USABLE && !invOf(o))
+                    continue;
                 if (!b->_buildState.isComplete) continue;
                 unsigned int h[5];
                 if (!readObjectHand(o, h)) continue;
@@ -1723,6 +1806,15 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
     return n;
 }
 
+unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
+                                unsigned int maxOut) {
+    return enumFixturesOrContainersNear(gw, radius, out, maxOut, false);
+}
+
+unsigned int enumFixturesNear(GameWorld* gw, float radius, ContRead* out,
+                              unsigned int maxOut) {
+    return enumFixturesOrContainersNear(gw, radius, out, maxOut, true);
+}
 static bool initializeLootTrader(Character* ch, bool initializeStock) {
     typedef bool (__fastcall* IsTraderFn)(const Character*);
     typedef bool (__fastcall* IsUnsetFn)(const TimeOfDay*);
@@ -1794,6 +1886,379 @@ bool readContainerByHand(const unsigned int cHand[5], ContRead* out) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+namespace {
+bool poseHandSet(const unsigned int h[5]) { return h[3] != 0 || h[4] != 0; }
+
+void copyPoseHand(const hand& h, unsigned int out[5]) {
+    out[0] = (unsigned int)h.type; out[1] = h.container;
+    out[2] = h.containerSerial; out[3] = h.index; out[4] = h.serial;
+}
+
+bool poseAnchorMatches(RootObject* o, unsigned int type, const char* sid,
+                       float x, float y, float z) {
+    if (!o || !sid || !sid[0]) return false;
+    unsigned int h[5];
+    if (!readObjectHand(o, h) || h[0] != type) return false;
+    GameData* gd = o->getGameData();
+    if (!gd || strcmp(gd->stringID.c_str(), sid) != 0) return false;
+    Ogre::Vector3 p = o->getPosition();
+    float dx = p.x - x, dy = p.y - y, dz = p.z - z;
+    return dx * dx + dy * dy + dz * dz <= 25.0f;
+}
+
+bool readPoseAnchor(RootObject* o, char sid[48], float* x, float* y, float* z) {
+    if (!o) return false;
+    GameData* gd = o->getGameData();
+    if (!gd || gd->stringID.empty() || gd->stringID.size() >= 48) return false;
+    strcpy(sid, gd->stringID.c_str());
+    Ogre::Vector3 p = o->getPosition();
+    *x = p.x; *y = p.y; *z = p.z;
+    return true;
+}
+
+struct PoseMint {
+    GameWorld* world;
+    RootObject* object;
+    u32 sourceOwner;
+    unsigned int wire[5], local[5];
+    char sid[48];
+};
+std::vector<PoseMint> poseMints;
+
+bool poseMintStillOurs(const PoseMint& m) {
+    __try {
+        RootObject* o = resolveObjectByHand(m.local);
+        if (!o || o != m.object) return false;
+        unsigned int h[5];
+        if (!readObjectHand(o, h) || memcmp(h, m.local, sizeof(h)) != 0) return false;
+        GameData* gd = o->getGameData();
+        return gd && strcmp(gd->stringID.c_str(), m.sid) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool queuePoseMintRemoval(const PoseMint& m) {
+    if (!poseMintStillOurs(m)) return true; // gone/replaced: never remove the replacement
+    __try {
+        // destroy schedules native kill-list removal. Already queued is safe;
+        // attempting it again must not turn a false return into a new deletion.
+        if (m.world->getIsInKillList(m.object)) return true;
+        if (destroyBuildingByHand(m.world, m.local)) return true;
+        return m.world->getIsInKillList(m.object);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool poseMintReusable(const PoseMint& m, const PoseFixtureRead& want) {
+    if (!poseMintStillOurs(m)) return false;
+    __try {
+        return !m.world->getIsInKillList(m.object) && poseFixtureMatches(m.local, want);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+int findPoseParent(GameWorld* gw, unsigned int type, const char* sid,
+                   float x, float y, float z, const unsigned int preferred[5],
+                   RootObject** out) {
+    *out = 0;
+    unsigned int hands[256][5];
+    bool complete = false;
+    unsigned int n = listLoadedObjectHands(gw, type, x, y, z, 5.0f,
+                                           hands, 256, &complete);
+    if (!complete) return -1;
+    __try {
+        RootObject* unique = 0;
+        bool ambiguous = false;
+        for (unsigned int i = 0; i < n; ++i) {
+            RootObject* o = resolveObjectByHand(hands[i]);
+            if (!o) return -1;
+            if (gw->getIsInKillList(o) || !poseAnchorMatches(o, type, sid, x, y, z))
+                continue;
+            // A verified full native/build mapping is stronger than geometry.
+            if (preferred && memcmp(preferred, hands[i], sizeof(hands[i])) == 0) {
+                *out = o; return 1;
+            }
+            if (unique && unique != o) ambiguous = true;
+            unique = o;
+        }
+        if (ambiguous) return -1;
+        *out = unique;
+        return unique ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+} // namespace
+
+// -1 unreadable metadata, 0 known-ineligible root, 1 complete usable descriptor.
+// A metadata fault must not become "absent" in the creation census.
+static int readPoseFixtureState(const unsigned int h[5], PoseFixtureRead* out) {
+    if (!h || !out) return -1;
+    if (h[0] != (unsigned int)BUILDING) return 0;
+    memset(out, 0, sizeof(*out));
+    RootObject* ro = resolveObjectByHand(h);
+    if (!ro) return -1;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        // A missing ambient usable can be reproduced without duplicating any
+        // inventory. Containers and production machines use their existing paths.
+        if (b->classType != BCTYPE_USABLE || !b->_buildState.isComplete ||
+            b->getInventory()) return 0;
+        GameData* gd = fillContRead(b, &out->fixture);
+        if (!gd || gd->stringID.empty()) return -1;
+        // Only a fully representable template id can describe a real fixture;
+        // truncation must never mint a different template sharing its prefix.
+        if (gd->stringID.size() >= sizeof(out->fixture.sid)) return 0;
+        out->heading = b->getOrientation().getYaw().valueRadians();
+        if (!_finite(out->fixture.x) || !_finite(out->fixture.y) ||
+            !_finite(out->fixture.z) || !_finite(out->heading)) return -1;
+        out->floor = b->floorNum;
+        out->ownerPresent = b->owner != 0;
+        out->outsideFurniture = b->isOutsideFurniture;
+        facSidOf(b->owner, out->ownerSid, sizeof(out->ownerSid));
+        if (out->ownerPresent && !out->ownerSid[0]) return -1;
+        if (handSet(b->_town)) {
+            copyPoseHand(b->_town, out->town);
+            if (out->town[0] != (unsigned int)TOWN ||
+                !readPoseAnchor(b->getTown(), out->townSid,
+                    &out->townX, &out->townY, &out->townZ)) return -1;
+        }
+        if (handSet(b->isInsideBuilding)) {
+            copyPoseHand(b->isInsideBuilding, out->inside);
+            if (out->inside[0] != (unsigned int)BUILDING ||
+                !readPoseAnchor(resolveObjectByHand(out->inside), out->insideSid,
+                    &out->insideX, &out->insideY, &out->insideZ)) return -1;
+        }
+        return out->fixture.sid[0] ? 1 : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+bool readPoseFixtureByHand(const unsigned int h[5], PoseFixtureRead* out) {
+    return readPoseFixtureState(h, out) == 1;
+}
+
+static bool poseDescriptorsMatch(const PoseFixtureRead& got, const PoseFixtureRead& want) {
+    if (!_finite(want.fixture.x) || !_finite(want.fixture.y) ||
+        !_finite(want.fixture.z) || !_finite(want.heading) ||
+        fabs((double)want.heading) > 3.141593) return false;
+    if (!_finite(got.fixture.x) || !_finite(got.fixture.y) ||
+        !_finite(got.fixture.z) || !_finite(got.heading)) return false;
+    float dx = got.fixture.x - want.fixture.x, dy = got.fixture.y - want.fixture.y;
+    float dz = got.fixture.z - want.fixture.z;
+    float yaw = got.heading - want.heading;
+    if (yaw > 3.14159265f) yaw -= 6.28318531f;
+    else if (yaw < -3.14159265f) yaw += 6.28318531f;
+    if (got.fixture.classType != want.fixture.classType ||
+        strcmp(got.fixture.sid, want.fixture.sid) != 0 ||
+        dx * dx + dy * dy + dz * dz > 25.0f ||
+        fabs((double)yaw) > 0.05 || got.floor != want.floor ||
+        got.outsideFurniture != want.outsideFurniture ||
+        got.ownerPresent != want.ownerPresent ||
+        strcmp(got.ownerSid, want.ownerSid) != 0 ||
+        poseHandSet(got.town) != poseHandSet(want.town) ||
+        poseHandSet(got.inside) != poseHandSet(want.inside)) return false;
+    if (poseHandSet(want.town)) {
+        dx = got.townX - want.townX; dy = got.townY - want.townY; dz = got.townZ - want.townZ;
+        if (strcmp(got.townSid, want.townSid) != 0 ||
+            dx * dx + dy * dy + dz * dz > 25.0f) return false;
+    }
+    if (poseHandSet(want.inside)) {
+        dx = got.insideX - want.insideX; dy = got.insideY - want.insideY;
+        dz = got.insideZ - want.insideZ;
+        if (strcmp(got.insideSid, want.insideSid) != 0 ||
+            dx * dx + dy * dy + dz * dz > 25.0f) return false;
+    }
+    return true;
+}
+
+bool poseFixtureMatches(const unsigned int local[5], const PoseFixtureRead& want) {
+    PoseFixtureRead got;
+    return readPoseFixtureState(local, &got) == 1 && poseDescriptorsMatch(got, want);
+}
+
+// Rejections must expose the exact compared metadata before the owned mint is
+// destroyed. A partial native read is diagnostic only, never a usable descriptor.
+static void logPoseMintDescriptor(const char* side, const PoseFixtureRead& d) {
+    char line[1024];
+    _snprintf(line, sizeof(line) - 1,
+        "[posefixture] mint-descriptor side=%s hand=%u.%u.%u.%u.%u sid='%s' pos=%.3f,%.3f,%.3f yaw=%.6f class=%d inv=%d complete=%d ownerSet=%d owner='%s' floor=%d outside=%d town=%u.%u.%u.%u.%u townSid='%s' townPos=%.3f,%.3f,%.3f inside=%u.%u.%u.%u.%u insideSid='%s' insidePos=%.3f,%.3f,%.3f",
+        side, d.fixture.hand[0], d.fixture.hand[1], d.fixture.hand[2],
+        d.fixture.hand[3], d.fixture.hand[4], d.fixture.sid,
+        d.fixture.x, d.fixture.y, d.fixture.z, d.heading, d.fixture.classType,
+        d.fixture.hasInv, d.fixture.complete, d.ownerPresent ? 1 : 0,
+        d.ownerSid, d.floor, d.outsideFurniture ? 1 : 0,
+        d.town[0], d.town[1], d.town[2], d.town[3], d.town[4], d.townSid,
+        d.townX, d.townY, d.townZ,
+        d.inside[0], d.inside[1], d.inside[2], d.inside[3], d.inside[4], d.insideSid,
+        d.insideX, d.insideY, d.insideZ);
+    line[sizeof(line) - 1] = '\0'; coop::logLine(line);
+}
+
+int findPoseFixtureByDescriptor(GameWorld* gw, const PoseFixtureRead& want,
+                                unsigned int out[5]) {
+    if (!gw || !out) return -1;
+    memset(out, 0, 5 * sizeof(unsigned int));
+    unsigned int hands[256][5];
+    bool complete = false;
+    unsigned int n = listLoadedObjectHands(gw, (unsigned int)BUILDING,
+        want.fixture.x, want.fixture.y, want.fixture.z, 5.0f, hands, 256, &complete);
+    if (!complete) return -1; // a partial registry proves neither absence nor uniqueness
+    __try {
+        bool found = false;
+        for (unsigned int i = 0; i < n; ++i) {
+            RootObject* o = resolveObjectByHand(hands[i]);
+            if (!o) return -1;
+            if (gw->getIsInKillList(o)) continue;
+            PoseFixtureRead got;
+            int state = readPoseFixtureState(hands[i], &got);
+            if (state < 0) return -1;
+            if (state == 0 || !poseDescriptorsMatch(got, want)) continue;
+            if (found && memcmp(out, hands[i], sizeof(hands[i])) != 0) return -1;
+            memcpy(out, hands[i], sizeof(hands[i])); found = true;
+        }
+        return found ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int materializePoseFixture(GameWorld* gw, const PoseFixtureRead& want,
+                           const unsigned int localInside[5], unsigned int out[5]) {
+    if (out) memset(out, 0, 5 * sizeof(unsigned int));
+    if (!gw || !out || !gw->theFactory || !g_createBldgFn || !g_terrainHeightFn ||
+        !g_destroyObjFn || !want.fixture.complete || want.fixture.hasInv ||
+        want.fixture.classType != (int)BCTYPE_USABLE || !want.fixture.sid[0] ||
+        (want.ownerPresent && !want.ownerSid[0]) ||
+        !_finite(want.fixture.x) || !_finite(want.fixture.y) ||
+        !_finite(want.fixture.z) || !_finite(want.heading) ||
+        fabs((double)want.heading) > 3.141593) return 0;
+    // Only the same authenticated origin/wire subject can reuse our creation.
+    unsigned int replacement = (unsigned int)poseMints.size();
+    for (unsigned int i = 0; i < poseMints.size(); ++i) {
+        if (poseMints[i].world != gw || poseMints[i].sourceOwner != want.sourceOwner ||
+            memcmp(poseMints[i].wire, want.fixture.hand, sizeof(poseMints[i].wire)) != 0)
+            continue;
+        if (poseMintReusable(poseMints[i], want)) {
+            memcpy(out, poseMints[i].local, sizeof(poseMints[i].local));
+            return 1;
+        }
+        replacement = i;
+        break;
+    }
+    Faction* owner = want.ownerPresent ? factionBySidC(gw, want.ownerSid) : 0;
+    if (want.ownerPresent && !owner) return 0; // unknown != player/default ownership
+    GameData* tmpl = findItemTemplateImpl(gw, want.fixture.sid, (unsigned int)BUILDING);
+    if (!tmpl) return 0;
+    Building* created = 0;
+    int suppression = g_buildCaptureSuppress;
+    __try {
+        TownBase* town = 0;
+        if (poseHandSet(want.town)) {
+            if (want.town[0] != (unsigned int)TOWN) return 0;
+            RootObject* parent = 0;
+            if (findPoseParent(gw, TOWN, want.townSid, want.townX, want.townY,
+                               want.townZ, 0, &parent) != 1) return 0;
+            town = static_cast<TownBase*>(parent);
+        }
+        Building* inside = 0;
+        if (poseHandSet(want.inside)) {
+            if (want.inside[0] != (unsigned int)BUILDING) return 0;
+            RootObject* parent = 0;
+            if (findPoseParent(gw, BUILDING, want.insideSid, want.insideX, want.insideY,
+                               want.insideZ, localInside, &parent) != 1) return 0;
+            inside = static_cast<Building*>(parent);
+        }
+        // Proof immediately before creation: a failed, partial, ambiguous or
+        // now-matching registry is never permission to duplicate a native root.
+        unsigned int present[5];
+        if (findPoseFixtureByDescriptor(gw, want, present) != 0) return 0;
+        if (replacement < poseMints.size()) {
+            if (!queuePoseMintRemoval(poseMints[replacement])) {
+                coop::logLine("[posefixture] replacement refused: owned removal enqueue failed");
+                return 0;
+            }
+            poseMints.erase(poseMints.begin() + replacement);
+        }
+        float ground = g_terrainHeightFn(want.fixture.x, want.fixture.z);
+        // An interior-linked prop is based on its native parent's elevation,
+        // not terrain. Subtracting terrain applied the foundation twice.
+        float baseY = inside ? inside->getPosition().y : ground;
+        Ogre::Vector3 pos(want.fixture.x, want.fixture.y - baseY, want.fixture.z);
+        Ogre::Quaternion rot(Ogre::Radian(want.heading), Ogre::Vector3::UNIT_Y);
+        ++g_buildCaptureSuppress;
+        created = g_createBldgFn(gw->theFactory, tmpl, pos, town, owner, rot,
+            /*callback*/0, /*layout: never guessed*/0, /*doorOf*/0, /*state*/0,
+            inside, /*invisible*/false, /*complete*/true, /*foliage*/false,
+            want.floor, want.outsideFurniture);
+        g_buildCaptureSuppress = suppression;
+        if (!created) return 0;
+        unsigned int h[5] = { 0 };
+        bool handRead = readObjectHand(static_cast<RootObject*>(created), h);
+        PoseFixtureRead got; memset(&got, 0, sizeof(got));
+        int nativeState = handRead ? readPoseFixtureState(h, &got) : -1;
+        if (nativeState != 1 || !poseDescriptorsMatch(got, want)) {
+            __try {
+                char rejection[640];
+                _snprintf(rejection, sizeof(rejection) - 1,
+                    "[posefixture] mint rejected native descriptor mismatch author=%u wire=%u.%u.%u.%u.%u local=%u.%u.%u.%u.%u handRead=%d nativeState=%d ground=%.3f rawClass=%d rawInv=%d rawComplete=%d rawTown=%u.%u.%u.%u.%u rawInside=%u.%u.%u.%u.%u",
+                    want.sourceOwner, want.fixture.hand[0], want.fixture.hand[1],
+                    want.fixture.hand[2], want.fixture.hand[3], want.fixture.hand[4],
+                    h[0], h[1], h[2], h[3], h[4], handRead ? 1 : 0, nativeState, ground,
+                    (int)created->classType, created->getInventory() ? 1 : 0,
+                    created->_buildState.isComplete ? 1 : 0,
+                    (u32)created->_town.type, created->_town.container, created->_town.containerSerial,
+                    created->_town.index, created->_town.serial,
+                    (u32)created->isInsideBuilding.type, created->isInsideBuilding.container,
+                    created->isInsideBuilding.containerSerial, created->isInsideBuilding.index,
+                    created->isInsideBuilding.serial);
+                rejection[sizeof(rejection) - 1] = '\0'; coop::logLine(rejection);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                coop::logLine("[posefixture] mint rejected native descriptor mismatch: raw metadata unreadable");
+            }
+            logPoseMintDescriptor("WANT", want);
+            logPoseMintDescriptor("NATIVE", got);
+            if (g_destroyObjFn)
+                g_destroyObjFn(gw, static_cast<RootObject*>(created), false, "coop-pose-reject");
+            return 0;
+        }
+        PoseMint m;
+        m.world = gw; m.object = static_cast<RootObject*>(created);
+        m.sourceOwner = want.sourceOwner;
+        memcpy(m.wire, want.fixture.hand, sizeof(m.wire));
+        memcpy(m.local, h, sizeof(m.local));
+        strncpy(m.sid, want.fixture.sid, sizeof(m.sid) - 1); m.sid[sizeof(m.sid) - 1] = '\0';
+        poseMints.push_back(m);
+        memcpy(out, h, sizeof(h));
+        char line[320];
+        _snprintf(line, sizeof(line) - 1,
+            "[posefixture] mint wire=%u.%u.%u.%u.%u local=%u.%u.%u.%u.%u sid='%s' owner='%s' pos=%.2f,%.2f,%.2f yaw=%.4f floor=%d outside=%d",
+            m.wire[0], m.wire[1], m.wire[2], m.wire[3], m.wire[4],
+            h[0], h[1], h[2], h[3], h[4], m.sid, want.ownerSid,
+            want.fixture.x, want.fixture.y, want.fixture.z, want.heading,
+            want.floor, want.outsideFurniture ? 1 : 0);
+        line[sizeof(line) - 1] = '\0'; coop::logLine(line);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_buildCaptureSuppress = suppression;
+        coop::logLine("[posefixture] native mint faulted");
+        return -1;
+    }
+}
+
+void clearMaterializedPoseFixtures() {
+    unsigned int owned = 0, queued = 0, failed = 0, lostIdentity = 0;
+    for (unsigned int i = 0; i < poseMints.size(); ++i) {
+        if (!poseMintStillOurs(poseMints[i])) { ++lostIdentity; continue; }
+        ++owned;
+        if (queuePoseMintRemoval(poseMints[i])) ++queued;
+        else ++failed;
+    }
+    // Called BEFORE admitted native loads while the old world is alive.
+    // Never carry pointer-derived ownership into the next world's allocations,
+    // even when an enqueue failed: native teardown owns that old-world object.
+    poseMints.clear();
+    if (owned || lostIdentity) {
+        char line[160];
+        _snprintf(line, sizeof(line) - 1,
+            "[posefixture] clear owned=%u queued=%u failed=%u lostIdentity=%u",
+            owned, queued, failed, lostIdentity);
+        line[sizeof(line) - 1] = '\0'; coop::logLine(line);
+    }
+}
+
 // Find the resource MINE nearest the leader. Matched on CLASS, not template
 // name the way findWorkFixtureNear matches a bench: a mine is named for the ore
 // it yields ('Copper Resource', 'Iron Resource', ...), so there is no shared
@@ -1851,32 +2316,26 @@ static const float FIXTURE_MATCH_DIST = 5.0f;
 // classes this channel announces.
 bool findFixtureByPosSid(GameWorld* gw, float x, float y, float z,
                          const char* sid, int classType, unsigned int out[5]) {
-    if (!gw || !out || !sid || !sid[0] || !g_getObjsFn) return false;
-    (void)y; // horizontal match: a building's origin Y varies with terrain fit
-    bool found = false;
+    if (!gw || !out || !sid || !sid[0]) return false;
+    unsigned int hands[256][5]; bool complete=false;
+    unsigned int count=listLoadedObjectHands(gw,BUILDING,x,y,z,FIXTURE_MATCH_DIST,hands,256,&complete);
+    if (!complete) return false;
+    bool found=false;
     __try {
-        Ogre::Vector3 center(x, y, z);
-        g_npcQuery.clear();
-        g_getObjsFn(gw, &g_npcQuery, &center, FIXTURE_MATCH_DIST, BUILDING, 256, 0);
-        float best = FIXTURE_MATCH_DIST * FIXTURE_MATCH_DIST;
-        unsigned int total = g_npcQuery.size();
-        for (unsigned int i = 0; i < total; ++i) {
-            RootObject* o = g_npcQuery[i];
-            if (!o) continue;
-            Building* b = static_cast<Building*>(o);
-            if (classType >= 0 && (int)b->classType != classType) continue;
-            GameData* gd = o->getGameData();
-            if (!gd) continue;
-            if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
-            Ogre::Vector3 p = o->getPosition();
-            float dx = p.x - x, dz = p.z - z;
-            float d2 = dx * dx + dz * dz;
-            if (d2 > best) continue;
-            unsigned int h[5];
-            if (!readObjectHand(o, h)) continue;
-            memcpy(out, h, sizeof(unsigned int) * 5);
-            best = d2;
-            found = true;
+        for (unsigned int i=0;i<count;++i) {
+            RootObject* root=resolveObjectByHand(hands[i]);
+            if (!root) return false;
+            Building* building=static_cast<Building*>(root);
+            if (classType>=0 && (int)building->classType!=classType) continue;
+            GameData* data=root->getGameData();
+            if (!data) return false;
+            if (strcmp(data->stringID.c_str(),sid)!=0) continue;
+            if (!building->_buildState.isComplete) return false;
+            Ogre::Vector3 position=root->getPosition();
+            const float dx=position.x-x,dy=position.y-y,dz=position.z-z;
+            if (dx*dx+dz*dz>FIXTURE_MATCH_DIST*FIXTURE_MATCH_DIST || fabs((double)dy)>0.5) continue;
+            if (found) return false; // no nearest-node alias across adjacent or stacked fixtures
+            memcpy(out,hands[i],sizeof(hands[i])); found=true;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return found;

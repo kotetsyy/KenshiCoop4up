@@ -1,422 +1,65 @@
 <#
 .SYNOPSIS
-  Zero-game contract + drift fixtures for the KenshiCoop harness (Phase 0 safety
-  net). Runs in milliseconds with NO game launch and NO built DLL - it only reads
-  the manifest, the oracle library and the C++ scenario factory, so it can gate
-  every commit and every later refactor phase.
-
-.DESCRIPTION
-  Asserts the harness contracts the refactor must not silently break:
-    * manifest schema   - every scenario declares the required fields with sane
-                          types / enum values
-    * scenario drift    - the manifest scenario set and the C++ makeScenario
-                          factory agree (a manifest name with no maker would
-                          load nothing; a maker with no manifest entry would run
-                          under the generic cross-check with no real gate)
-    * oracle registry   - every oracle id referenced by the manifest resolves in
-                          CoopOracles.psm1's dispatch, and an unknown id is
-                          rejected (never silently passed)
-    * verdict rule      - the no-signal guard (a SKIP of the PRIMARY gate fails
-                          the run) and verdict.json serialization round-trip
-  Also includes NEGATIVE fixtures that prove each checker actually fires on bad
-  input (a malformed manifest entry, an unknown oracle id, a drifted scenario
-  name, a primary-gate SKIP), so a green run means the guards work - not that
-  they were skipped.
-
-  Exit code = number of failed assertions (0 = PASS), matching prototest so
-  verify.ps1 can sum them.
+  Game-independent behavioral checks of oracle dispatch, configured thresholds
+  and fail-closed scenario verdicts. Does not inspect source text or duplicate
+  the manifest/schema implementation. Diagnostic capture is covered by the
+  complete-participant cases in OracleRegression.Tests.ps1.
 #>
 [CmdletBinding()]
 param()
-
-$ErrorActionPreference = "Stop"
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path      # scripts\tests
-$scriptsRoot = Split-Path -Parent $scriptDir                       # scripts
-$repoRoot  = Split-Path -Parent $scriptsRoot                       # repo root
-
-Import-Module (Join-Path $scriptsRoot "CoopOracles.psm1") -Force
-Import-Module (Join-Path $scriptsRoot "CoopHarness.psm1") -Force
-
-# ---- tiny assert harness ------------------------------------------------------
+$ErrorActionPreference = 'Stop'
+$scriptsRoot = Split-Path -Parent $PSScriptRoot
+Import-Module (Join-Path $scriptsRoot 'CoopOracles.psm1') -Force
 $script:Pass = 0
 $script:Fail = 0
 function Check {
-    param([string]$Name, [bool]$Cond)
-    if ($Cond) { $script:Pass++; Write-Host "  ok   $Name" }
-    else       { $script:Fail++; Write-Host "  FAIL $Name" }
+    param([string]$Name, [bool]$Condition)
+    if ($Condition) { $script:Pass++; Write-Host "  ok   $Name" }
+    else { $script:Fail++; Write-Host "  FAIL $Name" }
 }
-
-# ---- shared inputs ------------------------------------------------------------
-$manifest = Get-ScenarioManifest
-$scenarios = $manifest.Scenarios
-
-# The oracle registry = the dispatch case ids in CoopOracles.psm1's
-# Invoke-OneOracle switch (Phase 0 stand-in for the Phase 2 registry hashtable),
-# plus the pre-run gates, which are resolvable ids that simply resolve somewhere
-# other than the switch. Taken from the module rather than restated here, so a
-# gate cannot be dispatchable at run time and dangling at check time.
-function Get-OracleRegistry {
-    $psm = Join-Path $scriptsRoot "CoopOracles.psm1"
-    $ids = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($m in (Select-String -Path $psm -Pattern '^\s*"([a-z0-9_]+)"\s*\{\s*return')) {
-        [void]$ids.Add($m.Matches[0].Groups[1].Value)
-    }
-    foreach ($g in (Get-PreRunGates)) { [void]$ids.Add($g) }
-    return $ids
-}
-
-# The set of scenario names the C++ factory can actually construct, parsed from
-# the `if (name == "...")` makers in src/plugin/test/*.cpp.
-function Get-CppScenarioNames {
-    $names = New-Object System.Collections.Generic.HashSet[string]
-    $files = Get-ChildItem -Path (Join-Path $repoRoot "src\plugin\test") -Filter *.cpp
-    foreach ($f in $files) {
-        foreach ($m in (Select-String -Path $f.FullName -Pattern 'name\s*==\s*"([^"]+)"')) {
-            foreach ($mm in $m.Matches) { [void]$names.Add($mm.Groups[1].Value) }
-        }
-    }
-    return $names
-}
-
-# Scenario names that exist in the C++ factory but INTENTIONALLY have no manifest
-# entry (pure diagnostics driven outside the tiered matrix). Documented here so
-# the drift check stays a hard gate for everything else. (xfer_block moved INTO
-# the manifest in Phase 2 so it can carry its own DiagEnv instead of a Config
-# name-check, so it is no longer allowlisted.)
-$manifestlessCpp = @('world_item_drop')
-
-# The reverse allowlist: manifest scenarios that are RUNNER-ONLY - judged by a
-# gate but driven by a bespoke script (a normal co-op tick, NOT a compiled
-# KENSHICOOP_SCENARIO), so they intentionally have no C++ maker. bootstrap_stream
-# is the missing-save streaming proof, run by scripts\stream_test.ps1.
-$manifestRunnerOnly = @('bootstrap_stream')
-
-# Return a list of schema problems for one scenario entry (empty = valid).
-function Get-SchemaProblems {
-    param([string]$Name, $Entry)
-    $problems = @()
-    $validTiers = @('smoke', 'full', 'probe', 'none')
-    foreach ($k in @('Save', 'PrimaryGate', 'Gating', 'Advisory', 'Tier')) {
-        if (-not $Entry.ContainsKey($k)) { $problems += "$Name missing '$k'" }
-    }
-    if ($Entry.ContainsKey('Tier') -and ($validTiers -notcontains $Entry.Tier)) {
-        $problems += "$Name Tier '$($Entry.Tier)' not in {$($validTiers -join ',')}"
-    }
-    if ($Entry.ContainsKey('Gating')  -and $Entry.Gating  -isnot [array] -and $null -ne $Entry.Gating -and $Entry.Gating.Count -eq $null) {
-        # a single-element @('x') is [object[]]; a bare string is the bug we guard
-        if ($Entry.Gating -is [string]) { $problems += "$Name Gating is a bare string, not an array" }
-    }
-    if ($Entry.ContainsKey('PrimaryGate') -and $Entry.PrimaryGate -isnot [string]) {
-        $problems += "$Name PrimaryGate is not a string"
-    }
-    return $problems
-}
-
-# ---- 1. manifest schema -------------------------------------------------------
-Write-Host "== manifest schema =="
-Check "manifest has Scenarios"   ($null -ne $scenarios -and $scenarios.Keys.Count -gt 0)
-Check "manifest has Profiles"    ($null -ne $manifest.Profiles)
-Check "manifest has WanProfiles" ($null -ne $manifest.WanProfiles)
-
-$schemaProblems = @()
-foreach ($name in $scenarios.Keys) {
-    $schemaProblems += Get-SchemaProblems -Name $name -Entry $scenarios[$name]
-}
-if ($schemaProblems.Count -gt 0) { $schemaProblems | ForEach-Object { Write-Host "      $_" } }
-Check "every scenario satisfies the schema" ($schemaProblems.Count -eq 0)
-
-# NEGATIVE: a synthetic entry missing PrimaryGate must be flagged.
-$badEntry = @{ Save = 'x'; Gating = @(); Advisory = @(); Tier = 'full' }
-Check "schema checker flags a missing PrimaryGate" ((Get-SchemaProblems -Name 'bad' -Entry $badEntry).Count -gt 0)
-# NEGATIVE: an invalid Tier must be flagged.
-$badTier = @{ Save = 'x'; PrimaryGate = 'crosscheck'; Gating = @(); Advisory = @(); Tier = 'weekly' }
-Check "schema checker flags an invalid Tier" ((Get-SchemaProblems -Name 'bad' -Entry $badTier).Count -gt 0)
-
-# ---- 2. oracle registry -------------------------------------------------------
-Write-Host "== oracle registry =="
-$registry = Get-OracleRegistry
-Check "oracle registry is non-empty" ($registry.Count -gt 0)
-Check "registry contains a known oracle (crosscheck)" ($registry.Contains('crosscheck'))
-
-$unknownRefs = @()
-foreach ($name in $scenarios.Keys) {
-    $e = $scenarios[$name]
-    $ids = @()
-    if ($e.PrimaryGate -ne "") { $ids += $e.PrimaryGate }
-    $ids += @($e.Gating)
-    $ids += @($e.Advisory)
-    foreach ($id in $ids) {
-        if ($id -ne "" -and -not $registry.Contains($id)) { $unknownRefs += "$name -> '$id'" }
-    }
-}
-if ($unknownRefs.Count -gt 0) { $unknownRefs | ForEach-Object { Write-Host "      unknown oracle: $_" } }
-Check "every manifest oracle id resolves in the registry" ($unknownRefs.Count -eq 0)
-
-# NEGATIVE: Invoke-OneOracle must reject an unknown id (never silently pass).
-$tmpH = [System.IO.Path]::GetTempFileName()
-$tmpJ = [System.IO.Path]::GetTempFileName()
-Reset-GateResults
-$st = Invoke-OneOracle -Id 'definitely_not_an_oracle' -HostLog $tmpH -JoinLog $tmpJ -Tolerance 3.0 -ExpectedSkewMs $null
-Check "unknown oracle id returns FAIL" ($st -eq 'FAIL')
-$g = Get-GateResults | Where-Object { $_.gate -eq 'definitely_not_an_oracle' } | Select-Object -First 1
-Check "unknown oracle id records 'unknown oracle id'" ($null -ne $g -and $g.detail -eq 'unknown oracle id')
-
-# ---- 2b. per-scenario Bounds contract -----------------------------------------
-# A threshold that looks configured but is not is worse than no knob: the run
-# reports the default and the manifest says otherwise. So every Bounds/WanBounds
-# entry must name an oracle that accepts overrides AND a parameter that oracle
-# really has, checked against the live function signature.
-Write-Host "== per-scenario bounds contract =="
-$spec = Get-OracleBoundSpec
-$badBounds = @()
-foreach ($name in $scenarios.Keys) {
-    $e = $scenarios[$name]
-    foreach ($field in @("Bounds", "WanBounds")) {
-        if (-not $e.ContainsKey($field)) { continue }
-        foreach ($id in $e[$field].Keys) {
-            if (-not $spec.ContainsKey($id)) { $badBounds += "$name.$field -> '$id' takes no bounds"; continue }
-            foreach ($p in $e[$field][$id].Keys) {
-                if ($spec[$id] -notcontains $p) { $badBounds += "$name.$field.$id -> unknown param '$p'" }
-            }
-        }
-    }
-}
-if ($badBounds.Count -gt 0) { $badBounds | ForEach-Object { Write-Host "      bad bound: $_" } }
-Check "every manifest bound names a real oracle + parameter" ($badBounds.Count -eq 0)
-
-# The spec must not drift from the oracles themselves: every declared parameter
-# has to exist on the function the dispatch actually calls.
-$boundFn = @{ smoothness = "Test-Smoothness"; march = "Test-MarchInPlace"
-              dual_drive = "Test-DualDrive"; lockpick_escape = "Test-LockpickEscape"
-              pc_dupes = "Test-PcDuplicates" }
-$specDrift = @()
-foreach ($id in $spec.Keys) {
-    if (-not $boundFn.ContainsKey($id)) { $specDrift += "no function mapped for spec id '$id'"; continue }
-    $cmd = Get-Command $boundFn[$id] -ErrorAction SilentlyContinue
-    if ($null -eq $cmd) { $specDrift += "spec names missing function $($boundFn[$id])"; continue }
-    foreach ($p in $spec[$id]) {
-        if (-not $cmd.Parameters.ContainsKey($p)) { $specDrift += "$($boundFn[$id]) has no parameter '$p'" }
-    }
-}
-if ($specDrift.Count -gt 0) { $specDrift | ForEach-Object { Write-Host "      spec drift: $_" } }
-Check "bound spec matches the oracle signatures" ($specDrift.Count -eq 0)
-
-# NEGATIVE: a bound must actually reach the oracle. Drive smoothness at a
-# ceiling the fixture exceeds and confirm the verdict follows the override.
-$tmpS = [System.IO.Path]::GetTempFileName()
-Set-Content -Path $tmpS -Value "[00:00:01.000] [JOIN] INFO: SCENARIO SMOOTH active=5000 zeroFrac=0.500 maxStep=10.0 slewSkip=0"
-Reset-GateResults
-$stLoose = Invoke-OneOracle -Id 'smoothness' -HostLog $tmpS -JoinLog $tmpS -Tolerance 0 -ExpectedSkewMs $null -Bounds @{ MaxZeroFrac = 0.60 }
-Reset-GateResults
-$stTight = Invoke-OneOracle -Id 'smoothness' -HostLog $tmpS -JoinLog $tmpS -Tolerance 0 -ExpectedSkewMs $null -Bounds @{ MaxZeroFrac = 0.40 }
-Remove-Item $tmpS -ErrorAction SilentlyContinue
-Check "a manifest bound changes the smoothness verdict" ($stLoose -eq 'PASS' -and $stTight -eq 'FAIL')
-
-# ---- 3. scenario drift (manifest <-> C++ factory) -----------------------------
-Write-Host "== scenario name drift =="
-$cppNames = Get-CppScenarioNames
-Check "parsed C++ scenario names" ($cppNames.Count -gt 0)
-
-# 3a. Every manifest scenario MUST be constructible by the factory.
-$manifestNoMaker = @()
-foreach ($name in $scenarios.Keys) {
-    if ($manifestRunnerOnly -contains $name) { continue } # bespoke-runner, no maker
-    if (-not $cppNames.Contains($name)) { $manifestNoMaker += $name }
-}
-if ($manifestNoMaker.Count -gt 0) { Write-Host ("      manifest names with no C++ maker: " + ($manifestNoMaker -join ', ')) }
-Check "every manifest scenario has a C++ maker" ($manifestNoMaker.Count -eq 0)
-
-# 3b. Every C++ maker MUST have a manifest entry (or be an allowlisted diagnostic).
-$cppNoManifest = @()
-foreach ($n in $cppNames) {
-    if (-not $scenarios.ContainsKey($n) -and ($manifestlessCpp -notcontains $n)) { $cppNoManifest += $n }
-}
-if ($cppNoManifest.Count -gt 0) { Write-Host ("      C++ makers with no manifest entry: " + ($cppNoManifest -join ', ')) }
-Check "every C++ maker has a manifest entry (or is allowlisted)" ($cppNoManifest.Count -eq 0)
-
-# NEGATIVE: a fabricated manifest name absent from the factory must be detected.
-$fakeMissing = 'scenario_that_cannot_exist'
-Check "drift checker detects a manifest name with no maker" (-not $cppNames.Contains($fakeMissing))
-
-# ---- 4. verdict rule + serialization ------------------------------------------
-Write-Host "== verdict rule + serialization =="
-$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("kc_contract_" + [System.Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-$hostLog = Join-Path $tmpDir "host.log"
-$joinLog = Join-Path $tmpDir "join.log"
-# Clean logs: reached gameplay, clean scenario exit, >=3 CLOCKSYNC samples, but
-# NO MEMBER/RECV series (so any position oracle legitimately SKIPs = no signal).
-@(
-    "[10:00:00.000] HOST KenshiCoop: gameplay started",
-    "[10:00:02.000] HOST SCENARIO RESULT PASS"
-) | Set-Content -Path $hostLog -Encoding UTF8
-@(
-    "[10:00:00.000] JOIN KenshiCoop: gameplay started",
-    "[10:00:00.100] JOIN CLOCKSYNC offset=5 rtt=10 n=1",
-    "[10:00:00.600] JOIN CLOCKSYNC offset=4 rtt=8 n=2",
-    "[10:00:01.100] JOIN CLOCKSYNC offset=4 rtt=8 n=3",
-    "[10:00:02.000] JOIN SCENARIO RESULT PASS"
-) | Set-Content -Path $joinLog -Encoding UTF8
-
-# 4a. POSITIVE: a diagnostic scenario with no primary/gating passes on clean logs
-#     and serializes a round-trippable verdict.json.
-$okJson = Join-Path $tmpDir "verdict_ok.json"
-$vOk = Invoke-RunAnalysis -HostLog $hostLog -JoinLog $joinLog -Scenario 'spike' -OutJson $okJson 2>&1 |
-       Select-Object -Last 1
-# Invoke-RunAnalysis returns the verdict object as the last pipeline item.
-$vOk = & {
-    Invoke-RunAnalysis -HostLog $hostLog -JoinLog $joinLog -Scenario 'spike' -OutJson $okJson | Out-Null
-    Get-Content $okJson -Raw | ConvertFrom-Json
-}
-Check "clean no-gate scenario verdict.json written" (Test-Path $okJson)
-Check "verdict.json round-trips (has pass/primary/gates)" ($null -ne $vOk -and $null -ne $vOk.gates -and $vOk.PSObject.Properties.Name -contains 'pass')
-Check "clean no-gate scenario PASSES" ($vOk.pass -eq $true)
-
-# 4b. NEGATIVE (no-signal guard): a scenario whose PRIMARY gate cannot be judged
-#     on these logs must FAIL, citing the primary gate (as a FAIL or a SKIP -
-#     either way the mechanism proof drives the verdict).
-$skipJson = Join-Path $tmpDir "verdict_skip.json"
-$vSkip = & {
-    Invoke-RunAnalysis -HostLog $hostLog -JoinLog $joinLog -Scenario 'leader_move' -OutJson $skipJson | Out-Null
-    Get-Content $skipJson -Raw | ConvertFrom-Json
-}
-Check "primary-gate no-signal run FAILS" ($vSkip.pass -eq $false)
-$primaryReason = @($vSkip.reasons) -join '; '
-Check "failure reason names the primary gate" ($primaryReason -match 'crosscheck')
-
-# 4c. unknown-scenario handling: does not throw, falls back to generic
-#     cross-check, and (with no signal) fails rather than silently passing.
-$unkJson = Join-Path $tmpDir "verdict_unknown.json"
-$threw = $false
+$tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('kc_contract_' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpDir)
 try {
-    $vUnk = & {
-        Invoke-RunAnalysis -HostLog $hostLog -JoinLog $joinLog -Scenario 'no_such_scenario_xyz' -OutJson $unkJson | Out-Null
-        Get-Content $unkJson -Raw | ConvertFrom-Json
+    $hostLog = Join-Path $tmpDir 'host.log'
+    $joinLog = Join-Path $tmpDir 'join.log'
+    [IO.File]::WriteAllText($hostLog, '')
+    [IO.File]::WriteAllText($joinLog, '')
+    Reset-GateResults
+    $unknown = Invoke-OneOracle -Id 'definitely_not_an_oracle' -HostLog $hostLog -JoinLog $joinLog -Tolerance 3.0 -ExpectedSkewMs $null
+    Check 'unknown oracle cannot certify a run' ($unknown -eq 'FAIL')
+
+    $smooth = Join-Path $tmpDir 'smooth.log'
+    Set-Content -LiteralPath $smooth -Encoding UTF8 -Value '[00:00:01.000] [JOIN] INFO: SCENARIO SMOOTH active=5000 zeroFrac=0.500 stallFrac=0.000 maxStep=10.0 slewSkip=0'
+    Reset-GateResults
+    $loose = Invoke-OneOracle -Id 'smoothness' -HostLog $hostLog -JoinLog $smooth -Tolerance 0 -ExpectedSkewMs $null -Bounds @{ MaxZeroFrac = 0.60 }
+    Reset-GateResults
+    $tight = Invoke-OneOracle -Id 'smoothness' -HostLog $hostLog -JoinLog $smooth -Tolerance 0 -ExpectedSkewMs $null -Bounds @{ MaxZeroFrac = 0.40 }
+    Check 'configured threshold changes the same movement evidence verdict' ($loose -eq 'PASS' -and $tight -eq 'FAIL')
+
+    foreach ($scenario in @('leader_move', 'no_such_scenario_xyz')) {
+        @(
+            '[10:00:00.000] [HOST] INFO: gameplay started',
+            "[10:00:00.500] [HOST] INFO: SCENARIO $scenario start",
+            '[10:00:02.000] [HOST] INFO: SCENARIO RESULT PASS'
+        ) | Set-Content -LiteralPath $hostLog -Encoding UTF8
+        @(
+            '[10:00:00.000] [JOIN] INFO: gameplay started',
+            "[10:00:00.500] [JOIN] INFO: SCENARIO $scenario start",
+            '[10:00:00.600] [JOIN] INFO: CLOCKSYNC offset=4 rtt=8 n=1',
+            '[10:00:01.100] [JOIN] INFO: CLOCKSYNC offset=4 rtt=8 n=2',
+            '[10:00:01.600] [JOIN] INFO: CLOCKSYNC offset=4 rtt=8 n=3',
+            '[10:00:02.000] [JOIN] INFO: SCENARIO RESULT PASS'
+        ) | Set-Content -LiteralPath $joinLog -Encoding UTF8
+        $jsonPath = Join-Path $tmpDir ($scenario + '.json')
+        Invoke-RunAnalysis -HostLog $hostLog -JoinLog $joinLog -Scenario $scenario -OutJson $jsonPath | Out-Null
+        $verdict = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json
+        $prerequisites = @($verdict.gates | Where-Object { $_.gate -in @('health_host','health_join','result_host','result_join') })
+        Check "${scenario}: participant completion is valid before testing missing movement" ($prerequisites.Count -eq 4 -and @($prerequisites | Where-Object { $_.status -ne 'PASS' }).Count -eq 0)
+        $primary = @($verdict.gates | Where-Object { $_.gate -eq 'crosscheck' })
+        Check "${scenario}: missing required movement evidence cannot certify gameplay" (-not $verdict.pass -and $verdict.primary -eq 'crosscheck' -and $primary.Count -eq 1 -and $primary[0].status -eq 'FAIL')
     }
-} catch { $threw = $true }
-Check "unknown scenario does not throw" (-not $threw)
-Check "unknown scenario falls back to crosscheck primary" ($vUnk.primary -eq 'crosscheck')
-
-# ---- 5. manifest DiagEnv contract (Phase 2) -----------------------------------
-# The per-scenario channel A/B knobs + log-only diagnostic traces moved OUT of
-# the plugin's Config.cpp (which used to hard-code scenario names) and INTO the
-# manifest DiagEnv, applied by CoopHarness. These fixtures guard that migration:
-#   5a. every DiagEnv key is a known harness knob (no typos leak silently)
-#   5b. the channel deltas Config.cpp used to encode are present in the manifest
-#       (a deliberate two-source cross-check for the probe/inv/world scenarios
-#       that the tiered matrix does not run live)
-#   5c. Config.cpp no longer names scenarios for channel toggles (only the two
-#       real-session `scenario == ""` defaults remain)
-Write-Host "== manifest DiagEnv contract =="
-$diagKeys = @(Get-CoopDiagEnvKeys)
-Check "CoopHarness exposes a non-empty DiagEnv keyset" ($diagKeys.Count -gt 0)
-
-$badDiag = @()
-# Every knob is a 0/1 gate EXCEPT the few that carry a magnitude (a batch cap, say). Those are
-# named here rather than loosening the rule, so a typo in a real gate still fails loudly.
-$numericDiagKeys = @('KENSHICOOP_WI_BATCH_MAX', 'KENSHICOOP_WD_TRANSIENT_DEAD',
-                     'KENSHICOOP_ADOPT_RADIUS')
-foreach ($name in $scenarios.Keys) {
-    $e = $scenarios[$name]
-    if (-not $e.ContainsKey('DiagEnv')) { continue }
-    foreach ($k in $e.DiagEnv.Keys) {
-        if ($diagKeys -notcontains $k) { $badDiag += "$name -> unknown key '$k'" }
-        elseif ($numericDiagKeys -contains $k) {
-            if ("$($e.DiagEnv[$k])" -notmatch '^\d+$') { $badDiag += "$name -> '$k' value '$($e.DiagEnv[$k])' not a number" }
-        }
-        elseif ("$($e.DiagEnv[$k])" -notin @('0', '1')) { $badDiag += "$name -> '$k' value '$($e.DiagEnv[$k])' not 0/1" }
-    }
+} finally {
+    Remove-Item -LiteralPath $tmpDir -Recurse -Force
 }
-if ($badDiag.Count -gt 0) { $badDiag | ForEach-Object { Write-Host "      $_" } }
-Check "every DiagEnv key is known + valued 0/1 (or numeric where declared)" ($badDiag.Count -eq 0)
-
-# 5b. Spec table = the exact channel deltas Config.cpp USED to hard-code. If this
-#     drifts from the manifest, a probe would silently run with the wrong channel
-#     state (its baseline invalidated). Kept here on purpose as the second source.
-$diagSpec = @{
-    speed_probe    = @{ KENSHICOOP_SPEED_SYNC = '0' }
-    shop_probe     = @{ KENSHICOOP_MONEY_SYNC = '0' }
-    spawn_probe    = @{ KENSHICOOP_SPAWN_SYNC = '0' }
-    recruit_probe  = @{ KENSHICOOP_RECRUIT_SYNC = '0' }
-    faction_probe  = @{ KENSHICOOP_FACTION_SYNC = '0' }
-    time_probe     = @{ KENSHICOOP_TIME_SYNC = '0'; KENSHICOOP_SPEED_SYNC = '0' }
-    door_probe     = @{ KENSHICOOP_DOOR_SYNC = '0' }
-    build_probe    = @{ KENSHICOOP_BUILD_SYNC = '0' }
-    bdoor_probe    = @{ KENSHICOOP_BDOOR_SYNC = '0' }
-    hunger_probe   = @{ KENSHICOOP_HUNGER_SYNC = '0' }
-    save_probe     = @{ KENSHICOOP_SAVE_SYNC = '0' }
-    load_probe     = @{ KENSHICOOP_LOAD_SYNC = '0' }
-    prod_probe     = @{ KENSHICOOP_PROD_SYNC = '0' }
-    research_probe = @{ KENSHICOOP_RESEARCH_SYNC = '0' }
-    deed_probe     = @{ KENSHICOOP_DEED_SYNC = '0' }
-    store_probe    = @{ KENSHICOOP_STORE_SYNC = '0' }
-    squad_probe    = @{ KENSHICOOP_SQUAD_SYNC = '0' }
-    latejoin_probe = @{ KENSHICOOP_LATEJOIN_SYNC = '0' }
-    speed_sync     = @{ KENSHICOOP_TIME_SYNC = '0' }
-    trade_probe    = @{ KENSHICOOP_XFER_SYNC = '0'; KENSHICOOP_INV_SYNC = '1' }
-    xfer_block     = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_BLOCK_XFER = '1' }
-    inv_order      = @{ KENSHICOOP_INV_SYNC = '1' }
-    inv_bidir      = @{ KENSHICOOP_INV_SYNC = '1' }
-    inv_equip      = @{ KENSHICOOP_INV_SYNC = '1' }
-    inv_reequip    = @{ KENSHICOOP_INV_SYNC = '1' }
-    vendor_trade   = @{ KENSHICOOP_INV_SYNC = '1' }
-    store_sync     = @{ KENSHICOOP_INV_SYNC = '1' }
-    trade_peer     = @{ KENSHICOOP_INV_SYNC = '1' }
-    weapon_loot    = @{ KENSHICOOP_INV_SYNC = '1' }
-    world_weapon_drop = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    world_armor_drop  = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    inv_backpack_drop = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    world_pickup_mirror = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    inv_regear     = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    inv_regear_refuse = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    inv_regear_refuse_all = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    inv_regear_forget = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    world_item_burst = @{ KENSHICOOP_WORLD_SYNC = '1' }
-    inv_nested_bag  = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    inv_dump_all    = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    inv_dump_all_forget = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    inv_dump_all_transient = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
-    world_item_sync = @{ KENSHICOOP_WORLD_SYNC = '1' }
-    world_item_join = @{ KENSHICOOP_WORLD_SYNC = '1' }
-    limb_loss       = @{ KENSHICOOP_WORLD_SYNC = '1' }
-}
-$specMiss = @()
-foreach ($name in $diagSpec.Keys) {
-    if (-not $scenarios.ContainsKey($name)) { $specMiss += "$name absent from manifest"; continue }
-    $e = $scenarios[$name]
-    $diag = if ($e.ContainsKey('DiagEnv')) { $e.DiagEnv } else { @{} }
-    foreach ($k in $diagSpec[$name].Keys) {
-        if ("$($diag[$k])" -ne "$($diagSpec[$name][$k])") {
-            $specMiss += "$name -> $k expected '$($diagSpec[$name][$k])' got '$($diag[$k])'"
-        }
-    }
-}
-if ($specMiss.Count -gt 0) { $specMiss | ForEach-Object { Write-Host "      $_" } }
-Check "manifest DiagEnv matches the Config channel spec" ($specMiss.Count -eq 0)
-
-# 5c. Config.cpp must not reintroduce per-scenario channel names: the only
-#     `c.scenario == "..."` allowed is the empty real-session default.
-$configCpp = Join-Path $repoRoot "src\plugin\core\Config.cpp"
-$scenarioNameHits = @()
-foreach ($m in (Select-String -Path $configCpp -Pattern 'c\.scenario\s*==\s*"([^"]*)"')) {
-    foreach ($mm in $m.Matches) {
-        if ($mm.Groups[1].Value -ne "") { $scenarioNameHits += "line $($m.LineNumber): $($mm.Value)" }
-    }
-}
-# scenario.compare(...) prefix-matching is likewise a hard-coded name test.
-foreach ($m in (Select-String -Path $configCpp -Pattern 'scenario\.compare')) {
-    $scenarioNameHits += "line $($m.LineNumber): scenario.compare(...)"
-}
-if ($scenarioNameHits.Count -gt 0) { $scenarioNameHits | ForEach-Object { Write-Host "      $_" } }
-Check "Config.cpp has no per-scenario channel name-checks" ($scenarioNameHits.Count -eq 0)
-
-
-# ---- cleanup ------------------------------------------------------------------
-Remove-Item -Path $tmpH, $tmpJ -Force -ErrorAction SilentlyContinue
-Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
-
-# ---- summary ------------------------------------------------------------------
-Write-Host ""
-Write-Host ("contract fixtures: {0}/{1} checks passed{2}" -f `
-    $script:Pass, ($script:Pass + $script:Fail), $(if ($script:Fail) { " - FAIL" } else { " - PASS" }))
+Write-Host ('contract fixtures: {0}/{1} checks passed - {2}' -f $script:Pass, ($script:Pass + $script:Fail), $(if ($script:Fail) {'FAIL'} else {'PASS'}))
 exit $script:Fail

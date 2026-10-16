@@ -24,7 +24,7 @@ function Get-VitalsSeries {
            '(?: pfl=(-?[\d\.]+) pst=(-?[\d\.]+) ls=(\d+),(\d+),(\d+),(\d+))?'
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
-        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+        $t = Get-LogTimeMs -Match $m
         # PSCustomObject, NOT a hashtable: Measure-Object -Property only sees real
         # properties (a hashtable 'blood' KEY measures as null -> silent nonsense).
         $e = [pscustomobject]@{ t = $t; blood = [double]$g[5].Value; fleshMin = $null; bandSum = $null; unc = 0; dead = 0; pfl = $null; pst = $null; ls = $null }
@@ -182,7 +182,7 @@ function Get-CrawlSeries {
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
         [void]$list.Add([pscustomobject]@{
-            t     = (Convert-StampToMs -Groups $g -OffsetMs $off)
+            t     = (Get-LogTimeMs -Match $m)
             rawT  = [long]$g[5].Value
             prone = [int]$g[6].Value
             crip  = [int]$g[7].Value
@@ -215,7 +215,7 @@ function Get-CrawlProbeSeries {
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
         [void]$list.Add([pscustomobject]@{
-            t    = (Convert-StampToMs -Groups $g -OffsetMs $off)
+            t    = (Get-LogTimeMs -Match $m)
             rawT = [long]$g[5].Value
             mvx  = [double]$g[6].Value
             mvz  = [double]$g[8].Value
@@ -294,7 +294,7 @@ function Test-CrawlMove {
                 $tail = @($C | Where-Object { $_.t -ge ($hit[0].t + $SettleMs) })
                 if ($tail.Count -ge 4) {
                     $held = @($tail | Where-Object { $_.prone -eq $want }).Count
-                    $ratio = [Math]::Round($held / $tail.Count, 3)
+                    $ratio = $held / $tail.Count
                     $m["${t}ProneHoldRatio"] = $ratio
                     if ($ratio -lt 0.8) { $bad += "${t}: copy held prone=$want for only $ratio of the settled tail" }
                 }
@@ -343,8 +343,8 @@ function Test-CrawlMove {
             continue
         }
         $sorted = @($gaps | Sort-Object)
-        $med = [Math]::Round($sorted[[int]([Math]::Floor($sorted.Count / 2))], 2)
-        $m["${t}GapMed"] = $med
+        $med = [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
+        $m["${t}GapMed"] = [Math]::Round($med, 2)
         $m["${t}GapPairs"] = $gaps.Count
         if ($med -gt $MaxGap) { $bad += "${t}: median crawl gap ${med}u > $MaxGap" }
 
@@ -368,10 +368,10 @@ function Test-CrawlMove {
             }
             return $mx
         }
-        $oSpan = [Math]::Round((& $span $oPost), 2)
-        $cSpan = [Math]::Round((& $span $cPost), 2)
-        $m["${t}OwnerSpan"] = $oSpan
-        $m["${t}CopySpan"]  = $cSpan
+        $oSpan = & $span $oPost
+        $cSpan = & $span $cPost
+        $m["${t}OwnerSpan"] = [Math]::Round($oSpan, 2)
+        $m["${t}CopySpan"]  = [Math]::Round($cSpan, 2)
         if ($oSpan -lt $MinSpan) {
             # The owner never crawled anywhere, so the copy standing still proves
             # nothing. Report it rather than passing on an unexercised check.
@@ -399,7 +399,7 @@ function Test-CrawlMove {
                 $noSignal += "${t}: only $($win.Count) CRAWLPROBE sample(s) in the move window"
             } else {
                 $have = @($win | Where-Object { $_.hk -eq 1 }).Count
-                $frac = [Math]::Round($have / $win.Count, 3)
+                $frac = $have / $win.Count
                 $m["${t}PhysFrac"] = $frac
                 if ($frac -lt $MinPhysFrac) {
                     $bad += ("${t}: copy had no physics body for $(1 - $frac) of the move " +
@@ -413,11 +413,10 @@ function Test-CrawlMove {
         Write-Host ("  CRAWL-MOVE FAIL - " + ($bad -join "; "))
         return (Add-GateResult -Name "crawl_move" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
     }
-    if ($noSignal.Count -gt 0 -and $m.Count -eq 0) {
-        Write-Host ("  CRAWL-MOVE SKIP - " + ($noSignal -join "; "))
-        return (Add-GateResult -Name "crawl_move" -Status SKIP -Metrics $m -Detail ($noSignal -join "; "))
+    if ($noSignal.Count -gt 0) {
+        Write-Host ("  CRAWL-MOVE FAIL - required evidence missing: " + ($noSignal -join "; "))
+        return (Add-GateResult -Name "crawl_move" -Status FAIL -Metrics $m -Detail ($noSignal -join "; "))
     }
-    foreach ($n in $noSignal) { Write-Host "    FINDING: $n" }
     Write-Host ("  CRAWL-MOVE PASS - A: prone=$($m.AOwnerProne) crossed in $($m.AProneLatMs)ms, crippled in $($m.ACripLatMs)ms, gap=$($m.AGapMed)u, travel=$($m.ACopySpan)/$($m.AOwnerSpan)u, phys=$($m.APhysFrac); " +
                 "B: prone=$($m.BOwnerProne) crossed in $($m.BProneLatMs)ms, crippled in $($m.BCripLatMs)ms, gap=$($m.BGapMed)u, travel=$($m.BCopySpan)/$($m.BOwnerSpan)u, phys=$($m.BPhysFrac)")
     return (Add-GateResult -Name "crawl_move" -Status PASS -Metrics $m)
@@ -437,7 +436,7 @@ function Get-StatsSeries {
            ' tough=(-?[\d\.]+) xp=(-?[\d\.]+)'
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
-        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+        $t = Get-LogTimeMs -Match $m
         $e = [pscustomobject]@{
             t = $t
             str     = [double]$g[5].Value

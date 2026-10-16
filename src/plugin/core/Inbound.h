@@ -13,6 +13,9 @@
 #include <deque>
 #include <vector>
 #include "../../netproto/Wire.h"
+#include "../net/NativeLock.h"
+#include "InventorySnapshotAssembler.h"
+#include "../../netproto/EnvironmentItems.h"
 
 namespace coop {
 
@@ -43,6 +46,7 @@ struct InboundInv {
     u32                       ownerId;
     u8                        keyKind;
     u8                        flags;   // protocol 46: INV_FLAG_TRUNCATED (additive-only)
+    u32                       revision;
     u32                       cKey[5]; // type, container, containerSerial, index, serial
     std::vector<InvItemEntry> items;
 };
@@ -81,20 +85,15 @@ struct InboundNpcCensus {
     std::vector<float> pos;   // count*3, host position per row (v38 parking)
 };
 
-// One received conservation DROP intent (Phase W2): the owning character + item identity +
-// ground position. The receiver relocates ITS OWN copy of the weapon from that character's
-// bag to the ground (no fabrication). Owner-tagged so the non-owner is the one that acts.
-struct InboundWorldDrop {
-    u32             ownerId;
-    WorldDropPacket pkt;
-};
-
-// One received conservation PICKUP intent (Phase W3): the picking character + item identity.
-// The receiver re-homes ITS OWN tracked ground copy of that weapon back into the character's
-// bag (world -> bag, no fabrication). Owner-tagged so the non-owner is the one that acts.
-struct InboundWorldPickup {
-    u32               ownerId;
-    WorldPickupPacket pkt;
+// DROP and PICKUP share one reliable queue: splitting packet families would
+// reorder DROP -> PICKUP -> DROP before the native conservation consumer.
+struct InboundGroundGear {
+    u32 ownerId;
+    u8 type;
+    union {
+        WorldDropPacket drop;
+        WorldPickupPacket pickup;
+    };
 };
 
 // One received cross-owner TRANSFER intent (protocol 37): a peer performed a
@@ -222,6 +221,11 @@ struct InboundBuildDoor {
 struct InboundBuildRemove {
     u32               ownerId;
     BuildRemovePacket pkt;
+};
+
+struct InboundProcedural {
+    u32 ownerId;
+    ProceduralPacket pkt;
 };
 
 // One received machine state row (protocol 33): the HOST's authoritative
@@ -372,8 +376,26 @@ struct InboundCellClaim {
 // clear (flush) - so the push/drain methods below are unchanged.
 struct IClearableQueue {
     virtual void clearQueue() = 0;
+    virtual void clearOwner(u32 ownerId) = 0;
+    virtual bool hasCapacity() const = 0;
     virtual ~IClearableQueue() {}
 };
+class WorldInventoryFrames : public IClearableQueue {
+    InventorySnapshotAssembler assembly_;
+public:
+    explicit WorldInventoryFrames(std::vector<IClearableQueue*>& registry) {
+        registry.push_back(this);
+    }
+    int put(const InvSnapshotHeader& h,const InvItemEntry* rows,
+            std::vector<InvItemEntry>& complete) { return assembly_.put(h,rows,complete); }
+    virtual void clearQueue() { assembly_.clear(); }
+    virtual void clearOwner(u32 owner) { assembly_.retire(owner); }
+    virtual bool hasCapacity() const { return assembly_.hasCapacity(); }
+private:
+    WorldInventoryFrames(const WorldInventoryFrames&);
+    WorldInventoryFrames& operator=(const WorldInventoryFrames&);
+};
+
 
 template<class T>
 class WorldQ : public IClearableQueue {
@@ -384,8 +406,8 @@ public:
     // stalled main thread would otherwise let the queue grow without limit; on
     // overflow the OLDEST entry is dropped, which is exactly "newest wins" for
     // continuous state (Phase 4d bounded mailboxes).
-    explicit WorldQ(std::vector<IClearableQueue*>& reg, size_t cap = 0)
-      : cap_(cap) { reg.push_back(this); }
+    explicit WorldQ(std::vector<IClearableQueue*>& reg, size_t cap = 0, size_t reliableLimit = 128)
+      : cap_(cap), reliableLimit_(reliableLimit) { reg.push_back(this); }
     T& push_back(const T& v) {
         if (cap_ && q_.size() >= cap_) q_.pop_front();
         q_.push_back(v);
@@ -393,9 +415,16 @@ public:
     }
     operator std::deque<T>&() { return q_; }
     virtual void clearQueue() { q_.clear(); }
+    virtual void clearOwner(u32 ownerId) {
+        for (typename std::deque<T>::iterator i = q_.begin(); i != q_.end();) {
+            if (i->ownerId == ownerId) i = q_.erase(i); else ++i;
+        }
+    }
+    virtual bool hasCapacity() const { return cap_ || q_.size() < reliableLimit_; }
 private:
     std::deque<T> q_;
     size_t        cap_;
+    size_t        reliableLimit_;
     WorldQ(const WorldQ&);
     WorldQ& operator=(const WorldQ&);
 };
@@ -406,6 +435,7 @@ public:
     SessionQ() {}
     void push_back(const T& v) { q_.push_back(v); }
     operator std::deque<T>&() { return q_; }
+    bool hasCapacity() const { return q_.size() < 512; }
 private:
     std::deque<T> q_;
     SessionQ(const SessionQ&);
@@ -423,10 +453,10 @@ public:
         // without bound. ent_ = ~12 s of a 20 Hz * 17-entity stream; stealth/cam
         // are ~1 Hz refreshes. Every other queue is reliable and stays unbounded.
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
+        invFrames_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        wic_(worldReset_),
         npcCensus_(worldReset_),
-        wd_(worldReset_),         invXfer_(worldReset_),    invXferAck_(worldReset_),
-        wp_(worldReset_),
+        groundGear_(worldReset_), invXfer_(worldReset_), invXferAck_(worldReset_),
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
@@ -434,7 +464,9 @@ public:
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
-        buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
+        buildDoor_(worldReset_),  buildRemove_(worldReset_),
+        procedural_(worldReset_, 0, 4096), stealth_(worldReset_, 512),
+        environment_(worldReset_, 0, 4096),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
         cellClaim_(worldReset_, 64) {
         InitializeCriticalSection(&cs_);
@@ -443,16 +475,16 @@ public:
 
     // NET thread: a peer joined (id) / a peer left (id, or OWNER_ID_ALL).
     void pushConnect(u32 id) {
-        EnterCriticalSection(&cs_); conn_.push_back(id); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock456(&cs_); conn_.push_back(id); nativeLock456.unlock();
     }
     void pushLeave(u32 id) {
-        EnterCriticalSection(&cs_); leave_.push_back(id); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock459(&cs_); leave_.push_back(id); nativeLock459.unlock();
     }
     // NET thread: one received entity transform, owner-tagged + send-stamped.
     void pushEntity(u32 ownerId, u32 sendMs, const EntityState& e) {
         InboundEntity ie; ie.ownerId = ownerId; ie.sendMs = sendMs; ie.e = e;
-        EnterCriticalSection(&cs_); ent_.push_back(ie); sawRemote_ = true;
-        LeaveCriticalSection(&cs_);
+        NativeLock nativeLock464(&cs_); ent_.push_back(ie); sawRemote_ = true;
+        nativeLock464.unlock();
     }
 
     // MAIN thread: has this client EVER received an owned-entity batch from a peer?
@@ -460,54 +492,94 @@ public:
     // host this flips true exactly when the JOIN is loaded + streaming (the reliable
     // "peer is in-game" gate for time-sensitive host actions like a live spawn).
     bool sawRemoteEntity() {
-        EnterCriticalSection(&cs_); bool v = sawRemote_; LeaveCriticalSection(&cs_);
+        NativeLock nativeLock473(&cs_); bool v = sawRemote_; nativeLock473.unlock();
         return v;
     }
     // MAIN thread: the current session generation. Bumped by flushWorldState()
     // on every world-state reset edge (reload / reconnect / disconnect). A
     // reference or index captured under an older generation is known-stale.
-    // Phase 0 seed for the Phase 4 wire epoch - cheap now, consumed later by
-    // the SessionController + stale-generation packet rejection.
+    // Native dispatch and delayed publication hold the generation fence through
+    // enqueue, so a concurrent flush cannot republish an old-world packet.
     u32 sessionGeneration() {
-        EnterCriticalSection(&cs_); u32 g = generation_; LeaveCriticalSection(&cs_);
+        NativeLock nativeLock482(&cs_); u32 g = generation_; nativeLock482.unlock();
         return g;
     }
+
+    // NET thread holds this recursive Win32 lock through a validated world
+    // dispatch. A simultaneous main-thread flush cannot republish old packets.
+    bool beginWorldEnqueue(u32 expectedGeneration) {
+        EnterCriticalSection(&cs_);
+        if (generation_ == expectedGeneration) return true;
+        LeaveCriticalSection(&cs_);
+        return false;
+    }
+    void endWorldEnqueue() { LeaveCriticalSection(&cs_); }
+    class WorldEnqueueLock {
+    public:
+        WorldEnqueueLock(Inbound* owner,u32 generation,bool enabled):owner_(0) {
+            if(enabled && owner && owner->beginWorldEnqueue(generation))owner_=owner;
+        }
+        ~WorldEnqueueLock() {unlock();}
+        bool locked() const {return owner_!=0;}
+        void unlock() {if(owner_){owner_->endWorldEnqueue();owner_=0;}}
+    private:
+        Inbound* owner_;
+        WorldEnqueueLock(const WorldEnqueueLock&);
+        WorldEnqueueLock& operator=(const WorldEnqueueLock&);
+    };
     // NET thread: one received reliable event, owner-tagged.
     void pushEvent(u32 ownerId, const EventPacket& ev) {
         InboundEvent ievt; ievt.ownerId = ownerId; ievt.ev = ev;
-        EnterCriticalSection(&cs_); evt_.push_back(ievt); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock511(&cs_); evt_.push_back(ievt); nativeLock511.unlock();
     }
     // NET thread: one received container-contents snapshot, owner-tagged.
     void pushInv(u32 ownerId, u8 keyKind, const u32 cKey[5],
-                 const InvItemEntry* items, unsigned int count, u8 flags = 0) {
+                 const InvItemEntry* items, unsigned int count, u8 flags = 0, u32 revision = 0) {
         InboundInv ii;
         ii.ownerId = ownerId;
         ii.keyKind = keyKind;
         ii.flags   = flags;
+        ii.revision = revision;
         for (int k = 0; k < 5; ++k) ii.cKey[k] = cKey[k];
         if (items && count > 0) ii.items.assign(items, items + count);
-        EnterCriticalSection(&cs_); inv_.push_back(ii); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock522(&cs_); inv_.push_back(ii); nativeLock522.unlock();
+    }
+    bool pushInvFrame(const InvSnapshotHeader& h,const InvItemEntry* rows) {
+        NativeLock lock(&cs_);
+        std::vector<InvItemEntry> complete;
+        if (!(h.flags & INV_FLAG_CHECKPOINT_ACK)) {
+            const int result=invFrames_.put(h,rows,complete);
+            if (result<0) return false;
+            if (!result) return true;
+        }
+        InboundInv& item=inv_.push_back(InboundInv());
+        item.ownerId=h.ownerId; item.keyKind=h.keyKind;
+        item.flags=h.flags & ~INV_FLAG_COMPLETE; item.revision=h.revision;
+        item.cKey[0]=h.cType; item.cKey[1]=h.cContainer;
+        item.cKey[2]=h.cContainerSerial; item.cKey[3]=h.cIndex; item.cKey[4]=h.cSerial;
+        item.items.swap(complete);
+        return true;
     }
     // NET thread: one received world-item snapshot, owner-tagged.
     void pushWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count) {
         InboundWorldItems wi;
         wi.ownerId = ownerId;
         if (items && count > 0) wi.items.assign(items, items + count);
-        EnterCriticalSection(&cs_); wi_.push_back(wi); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock529(&cs_); wi_.push_back(wi); nativeLock529.unlock();
     }
     // NET thread: one received world-item cull (list of netIds), owner-tagged.
     void pushWorldRemove(u32 ownerId, const u32* netIds, unsigned int count) {
         InboundWorldRemove wr;
         wr.ownerId = ownerId;
         if (netIds && count > 0) wr.netIds.assign(netIds, netIds + count);
-        EnterCriticalSection(&cs_); wir_.push_back(wr); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock536(&cs_); wir_.push_back(wr); nativeLock536.unlock();
     }
     // NET thread: one received world-item claim (protocol 47), owner-tagged.
     void pushWorldClaim(u32 ownerId, u32 authorId, const u32* netIds, unsigned int count) {
         InboundWorldClaim wc;
         wc.ownerId = ownerId; wc.authorId = authorId;
         if (netIds && count > 0) wc.netIds.assign(netIds, netIds + count);
-        EnterCriticalSection(&cs_); wic_.push_back(wc); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock543(&cs_); wic_.push_back(wc); nativeLock543.unlock();
     }
     // NET thread: one received NPC existence census (protocol 36), owner-tagged.
     void pushNpcCensus(u32 ownerId, const u32* hands, const float* pos,
@@ -516,149 +588,158 @@ public:
         nc.ownerId = ownerId;
         if (hands && count > 0) nc.hands.assign(hands, hands + count * 5);
         if (pos && count > 0) nc.pos.assign(pos, pos + count * 3);
-        EnterCriticalSection(&cs_); npcCensus_.push_back(nc); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock552(&cs_); npcCensus_.push_back(nc); nativeLock552.unlock();
     }
     // NET thread: one received conservation DROP intent, owner-tagged.
     void pushWorldDrop(u32 ownerId, const WorldDropPacket& pkt) {
-        InboundWorldDrop wd; wd.ownerId = ownerId; wd.pkt = pkt;
-        EnterCriticalSection(&cs_); wd_.push_back(wd); LeaveCriticalSection(&cs_);
+        InboundGroundGear edge; edge.ownerId=ownerId; edge.type=PKT_WORLD_DROP; edge.drop=pkt;
+        NativeLock lock(&cs_); groundGear_.push_back(edge);
     }
     // NET thread: one received conservation PICKUP intent, owner-tagged.
     void pushWorldPickup(u32 ownerId, const WorldPickupPacket& pkt) {
-        InboundWorldPickup wp; wp.ownerId = ownerId; wp.pkt = pkt;
-        EnterCriticalSection(&cs_); wp_.push_back(wp); LeaveCriticalSection(&cs_);
+        InboundGroundGear edge; edge.ownerId=ownerId; edge.type=PKT_WORLD_PICKUP; edge.pickup=pkt;
+        NativeLock lock(&cs_); groundGear_.push_back(edge);
     }
     // NET thread: one received cross-owner transfer intent (protocol 37), owner-tagged.
     void pushInvXfer(u32 ownerId, const InvXferPacket& pkt,
                       const InvItemEntry* contents, unsigned int count) {
-        EnterCriticalSection(&cs_);
+        NativeLock nativeLock567(&cs_);
         InboundInvXfer& ix = invXfer_.push_back(InboundInvXfer());
         ix.ownerId = ownerId; ix.pkt = pkt;
         if (count) ix.contents.assign(contents, contents + count);
-        LeaveCriticalSection(&cs_);
+        nativeLock567.unlock();
     }
     // NET thread: one received authority verdict and optional complete bag contents.
     void pushInvXferAck(u32 ownerId, const InvXferAckPacket& pkt,
                          const InvItemEntry* contents, unsigned int count) {
-        EnterCriticalSection(&cs_);
+        NativeLock nativeLock576(&cs_);
         InboundInvXferAck& ia = invXferAck_.push_back(InboundInvXferAck());
         ia.ownerId = ownerId; ia.pkt = pkt;
         if (count) ia.contents.assign(contents, contents + count);
-        LeaveCriticalSection(&cs_);
+        nativeLock576.unlock();
     }
     // NET thread: one received medical snapshot, owner-tagged.
     void pushMedical(u32 ownerId, const MedicalPacket& pkt) {
         InboundMedical im; im.ownerId = ownerId; im.pkt = pkt;
-        EnterCriticalSection(&cs_); med_.push_back(im); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock585(&cs_); med_.push_back(im); nativeLock585.unlock();
     }
     // NET thread: one received treatment delta, owner-tagged.
     void pushTreatment(u32 ownerId, const TreatmentPacket& pkt) {
         InboundTreatment it; it.ownerId = ownerId; it.pkt = pkt;
-        EnterCriticalSection(&cs_); treat_.push_back(it); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock590(&cs_); treat_.push_back(it); nativeLock590.unlock();
     }
     // NET thread: one received join-dealt damage report, owner-tagged.
     void pushCombatHit(u32 ownerId, const CombatHitPacket& pkt) {
         InboundCombatHit it; it.ownerId = ownerId; it.pkt = pkt;
-        EnterCriticalSection(&cs_); combatHit_.push_back(it); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock595(&cs_); combatHit_.push_back(it); nativeLock595.unlock();
     }
     // NET thread: one received game-speed request/set, owner-tagged.
     void pushSpeed(u32 ownerId, const SpeedPacket& pkt) {
         InboundSpeed is; is.ownerId = ownerId; is.pkt = pkt;
-        EnterCriticalSection(&cs_); speed_.push_back(is); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock600(&cs_); speed_.push_back(is); nativeLock600.unlock();
     }
     // NET thread: one received character-stats snapshot, owner-tagged.
     void pushStats(u32 ownerId, const StatsPacket& pkt) {
         InboundStats ist; ist.ownerId = ownerId; ist.pkt = pkt;
-        EnterCriticalSection(&cs_); stats_.push_back(ist); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock605(&cs_); stats_.push_back(ist); nativeLock605.unlock();
     }
     // NET thread: one received shared-pool total (protocol 52), owner-tagged.
     void pushMoney(u32 ownerId, const MoneyPacket& pkt) {
         InboundMoney imo; imo.ownerId = ownerId; imo.pkt = pkt;
-        EnterCriticalSection(&cs_); money_.push_back(imo); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock610(&cs_); money_.push_back(imo); nativeLock610.unlock();
     }
     // NET thread: one received pool delta (protocol 52), owner-tagged.
     void pushMoneyDelta(u32 ownerId, const MoneyDeltaPacket& pkt) {
         InboundMoneyDelta imd; imd.ownerId = ownerId; imd.pkt = pkt;
-        EnterCriticalSection(&cs_); moneyDelta_.push_back(imd); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock615(&cs_); moneyDelta_.push_back(imd); nativeLock615.unlock();
     }
     // NET thread: one received faction-relation row (protocol 24), owner-tagged.
     void pushFaction(u32 ownerId, const FactionPacket& pkt) {
         InboundFaction ifa; ifa.ownerId = ownerId; ifa.pkt = pkt;
-        EnterCriticalSection(&cs_); faction_.push_back(ifa); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock620(&cs_); faction_.push_back(ifa); nativeLock620.unlock();
     }
     // NET thread: one received game-clock sample (protocol 25), owner-tagged.
     void pushTime(u32 ownerId, const TimePacket& pkt) {
         InboundTime iti; iti.ownerId = ownerId; iti.pkt = pkt;
-        EnterCriticalSection(&cs_); time_.push_back(iti); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock625(&cs_); time_.push_back(iti); nativeLock625.unlock();
     }
     // NET thread: one received baked-door state row (protocol 26), owner-tagged.
     void pushDoor(u32 ownerId, const DoorPacket& pkt) {
         InboundDoor ido; ido.ownerId = ownerId; ido.pkt = pkt;
-        EnterCriticalSection(&cs_); door_.push_back(ido); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock630(&cs_); door_.push_back(ido); nativeLock630.unlock();
     }
     // NET thread: one received machine state row (protocol 33), owner-tagged.
     void pushProd(u32 ownerId, const ProdPacket& pkt) {
         InboundProd ip; ip.ownerId = ownerId; ip.pkt = pkt;
-        EnterCriticalSection(&cs_); prod_.push_back(ip); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock635(&cs_); prod_.push_back(ip); nativeLock635.unlock();
     }
     // NET thread: one received known-research row (protocol 38), owner-tagged.
     void pushResearch(u32 ownerId, const ResearchPacket& pkt) {
         InboundResearch ir; ir.ownerId = ownerId; ir.pkt = pkt;
-        EnterCriticalSection(&cs_); research_.push_back(ir); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock640(&cs_); research_.push_back(ir); nativeLock640.unlock();
     }
     // NET thread: one received property-deed row (protocol 54), owner-tagged.
     void pushDeed(u32 ownerId, const DeedPacket& pkt) {
         InboundDeed id; id.ownerId = ownerId; id.pkt = pkt;
-        EnterCriticalSection(&cs_); deed_.push_back(id); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock645(&cs_); deed_.push_back(id); nativeLock645.unlock();
     }
     // NET thread: one received fixture identity row (protocol 55), owner-tagged.
     void pushFixture(u32 ownerId, const FixturePacket& pkt) {
         InboundFixture ifx; ifx.ownerId = ownerId; ifx.pkt = pkt;
-        EnterCriticalSection(&cs_); fixture_.push_back(ifx); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock650(&cs_); fixture_.push_back(ifx); nativeLock650.unlock();
     }
     // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
     void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
         InboundBuildPlace ibp; ibp.ownerId = ownerId; ibp.pkt = pkt;
-        EnterCriticalSection(&cs_); buildPlace_.push_back(ibp); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock655(&cs_); buildPlace_.push_back(ibp); nativeLock655.unlock();
     }
     // NET thread: one received construction-progress row (protocol 27), owner-tagged.
     void pushBuildState(u32 ownerId, const BuildStatePacket& pkt) {
         InboundBuildState ibs; ibs.ownerId = ownerId; ibs.pkt = pkt;
-        EnterCriticalSection(&cs_); buildState_.push_back(ibs); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock660(&cs_); buildState_.push_back(ibs); nativeLock660.unlock();
     }
     // NET thread: one received placed-building door row (protocol 28), owner-tagged.
     void pushBuildDoor(u32 ownerId, const BuildDoorPacket& pkt) {
         InboundBuildDoor ibd; ibd.ownerId = ownerId; ibd.pkt = pkt;
-        EnterCriticalSection(&cs_); buildDoor_.push_back(ibd); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock665(&cs_); buildDoor_.push_back(ibd); nativeLock665.unlock();
     }
     // NET thread: one received building removal (protocol 28), owner-tagged.
     void pushBuildRemove(u32 ownerId, const BuildRemovePacket& pkt) {
         InboundBuildRemove ibr; ibr.ownerId = ownerId; ibr.pkt = pkt;
-        EnterCriticalSection(&cs_); buildRemove_.push_back(ibr); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock670(&cs_); buildRemove_.push_back(ibr); nativeLock670.unlock();
+    }
+    // Session-framed ingress, but world-scoped lifetime and reset semantics.
+    void pushProcedural(u32 ownerId, const ProceduralPacket& pkt) {
+        InboundProcedural p;p.ownerId=ownerId;p.pkt=pkt;
+        NativeLock lock(&cs_);procedural_.push_back(p);
+    }
+    void pushEnvironment(u32 owner,const EnvironmentItemPacket& packet) {
+        NativeLock lock(&cs_);
+        EnvironmentItemPacket p=packet;p.ownerId=owner;environment_.push_back(p);
     }
     // NET thread: one received stealth detection-map snapshot, owner-tagged.
     void pushStealth(u32 ownerId, const StealthPacket& pkt) {
         InboundStealth isl; isl.ownerId = ownerId; isl.pkt = pkt;
-        EnterCriticalSection(&cs_); stealth_.push_back(isl); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock675(&cs_); stealth_.push_back(isl); nativeLock675.unlock();
     }
     // NET thread: one received runtime-spawn query (protocol 21), owner-tagged.
     void pushSpawnReq(u32 ownerId, const SpawnReqPacket& pkt) {
         InboundSpawnReq sr; sr.ownerId = ownerId; sr.pkt = pkt;
-        EnterCriticalSection(&cs_); spawnReq_.push_back(sr); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock680(&cs_); spawnReq_.push_back(sr); nativeLock680.unlock();
     }
     // NET thread: one received runtime-spawn description (protocol 21), owner-tagged.
     void pushSpawnInfo(u32 ownerId, const SpawnInfoPacket& pkt) {
         InboundSpawnInfo si; si.ownerId = ownerId; si.pkt = pkt;
-        EnterCriticalSection(&cs_); spawnInfo_.push_back(si); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock685(&cs_); spawnInfo_.push_back(si); nativeLock685.unlock();
     }
     // NET thread: coordinated-save packets (protocol 31), owner-tagged.
     void pushSaveReq(u32 ownerId, const SaveReqPacket& pkt) {
         InboundSaveReq sr; sr.ownerId = ownerId; sr.pkt = pkt;
-        EnterCriticalSection(&cs_); saveReq_.push_back(sr); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock690(&cs_); saveReq_.push_back(sr); nativeLock690.unlock();
     }
     void pushSaveBegin(u32 ownerId, const SaveBeginPacket& pkt) {
         InboundSaveBegin sb; sb.ownerId = ownerId; sb.pkt = pkt;
-        EnterCriticalSection(&cs_); saveBegin_.push_back(sb); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock694(&cs_); saveBegin_.push_back(sb); nativeLock694.unlock();
     }
     void pushSaveFile(u32 ownerId, const SaveFileHeader& hdr,
                       const char* path, const u8* data) {
@@ -667,178 +748,181 @@ public:
         sf.hdr     = hdr;
         sf.path.assign(path, path + hdr.pathLen);
         if (data && hdr.dataLen > 0) sf.data.assign(data, data + hdr.dataLen);
-        EnterCriticalSection(&cs_); saveFile_.push_back(sf); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock703(&cs_); saveFile_.push_back(sf); nativeLock703.unlock();
     }
     void pushSaveDone(u32 ownerId, const SaveDoneHeader& hdr, const u32* crcs) {
         InboundSaveDone sd;
         sd.ownerId = ownerId;
         sd.hdr     = hdr;
         if (crcs && hdr.fileCount > 0) sd.crcs.assign(crcs, crcs + hdr.fileCount);
-        EnterCriticalSection(&cs_); saveDone_.push_back(sd); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock710(&cs_); saveDone_.push_back(sd); nativeLock710.unlock();
     }
     void pushSaveAck(u32 ownerId, const SaveAckPacket& pkt) {
         InboundSaveAck sa; sa.ownerId = ownerId; sa.pkt = pkt;
-        EnterCriticalSection(&cs_); saveAck_.push_back(sa); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock714(&cs_); saveAck_.push_back(sa); nativeLock714.unlock();
     }
     // NET thread: coordinated-load packets (protocol 32), owner-tagged.
     void pushLoadGo(u32 ownerId, const LoadGoPacket& pkt) {
         InboundLoadGo lg; lg.ownerId = ownerId; lg.pkt = pkt;
-        EnterCriticalSection(&cs_); loadGo_.push_back(lg); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock719(&cs_); loadGo_.push_back(lg); nativeLock719.unlock();
     }
     void pushLoadReq(u32 ownerId, const LoadReqPacket& pkt) {
         InboundLoadReq lr; lr.ownerId = ownerId; lr.pkt = pkt;
-        EnterCriticalSection(&cs_); loadReq_.push_back(lr); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock723(&cs_); loadReq_.push_back(lr); nativeLock723.unlock();
     }
     void pushLoadNack(u32 ownerId, const LoadNackPacket& pkt) {
         InboundLoadNack ln; ln.ownerId = ownerId; ln.pkt = pkt;
-        EnterCriticalSection(&cs_); loadNack_.push_back(ln); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock727(&cs_); loadNack_.push_back(ln); nativeLock727.unlock();
     }
     // NET thread: one received camera hint (protocol 43), owner-tagged.
     void pushCamHint(u32 ownerId, const CamHintPacket& pkt) {
         InboundCamHint ch; ch.ownerId = ownerId; ch.pkt = pkt;
-        EnterCriticalSection(&cs_); camHint_.push_back(ch); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock732(&cs_); camHint_.push_back(ch); nativeLock732.unlock();
     }
     // NET thread: one received cell claim (protocol 49), owner-tagged.
     void pushCellClaim(u32 ownerId, const CellClaimPacket& pkt) {
         InboundCellClaim cc; cc.ownerId = ownerId; cc.pkt = pkt;
-        EnterCriticalSection(&cs_); cellClaim_.push_back(cc); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock737(&cs_); cellClaim_.push_back(cc); nativeLock737.unlock();
     }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
     void drainConnects(std::deque<u32>& out) {
-        EnterCriticalSection(&cs_); out.swap(conn_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock742(&cs_); out.swap(conn_); nativeLock742.unlock();
     }
     void drainLeaves(std::deque<u32>& out) {
-        EnterCriticalSection(&cs_); out.swap(leave_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock745(&cs_); out.swap(leave_); nativeLock745.unlock();
     }
     void drainEntities(std::deque<InboundEntity>& out) {
-        EnterCriticalSection(&cs_); out.swap(ent_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock748(&cs_); out.swap(ent_); nativeLock748.unlock();
     }
     void drainEvents(std::deque<InboundEvent>& out) {
-        EnterCriticalSection(&cs_); out.swap(evt_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock751(&cs_); out.swap(evt_); nativeLock751.unlock();
     }
     // A verdict cannot overtake the preceding reliable canonical snapshot.
     void drainInventory(std::deque<InboundInv>& out,
                         std::deque<InboundInvXferAck>& verdicts) {
-        EnterCriticalSection(&cs_);
+        NativeLock nativeLock756(&cs_);
         out.swap(inv_); verdicts.swap(invXferAck_);
-        LeaveCriticalSection(&cs_);
+        nativeLock756.unlock();
     }
     void drainWorldItems(std::deque<InboundWorldItems>& out) {
-        EnterCriticalSection(&cs_); out.swap(wi_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock761(&cs_); out.swap(wi_); nativeLock761.unlock();
     }
     void drainWorldRemove(std::deque<InboundWorldRemove>& out) {
-        EnterCriticalSection(&cs_); out.swap(wir_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock764(&cs_); out.swap(wir_); nativeLock764.unlock();
     }
     void drainWorldClaim(std::deque<InboundWorldClaim>& out) {
-        EnterCriticalSection(&cs_); out.swap(wic_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock767(&cs_); out.swap(wic_); nativeLock767.unlock();
     }
     void drainNpcCensus(std::deque<InboundNpcCensus>& out) {
-        EnterCriticalSection(&cs_); out.swap(npcCensus_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock770(&cs_); out.swap(npcCensus_); nativeLock770.unlock();
     }
-    void drainWorldDrops(std::deque<InboundWorldDrop>& out) {
-        EnterCriticalSection(&cs_); out.swap(wd_); LeaveCriticalSection(&cs_);
-    }
-    void drainWorldPickups(std::deque<InboundWorldPickup>& out) {
-        EnterCriticalSection(&cs_); out.swap(wp_); LeaveCriticalSection(&cs_);
+    void drainGroundGear(std::deque<InboundGroundGear>& out) {
+        NativeLock lock(&cs_); out.swap(groundGear_);
     }
     void drainInvXfers(std::deque<InboundInvXfer>& out) {
-        EnterCriticalSection(&cs_); out.swap(invXfer_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock779(&cs_); out.swap(invXfer_); nativeLock779.unlock();
     }
     void drainMedical(std::deque<InboundMedical>& out) {
-        EnterCriticalSection(&cs_); out.swap(med_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock782(&cs_); out.swap(med_); nativeLock782.unlock();
     }
     void drainTreatments(std::deque<InboundTreatment>& out) {
-        EnterCriticalSection(&cs_); out.swap(treat_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock785(&cs_); out.swap(treat_); nativeLock785.unlock();
     }
     void drainCombatHits(std::deque<InboundCombatHit>& out) {
-        EnterCriticalSection(&cs_); out.swap(combatHit_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock788(&cs_); out.swap(combatHit_); nativeLock788.unlock();
     }
     void drainSpeed(std::deque<InboundSpeed>& out) {
-        EnterCriticalSection(&cs_); out.swap(speed_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock791(&cs_); out.swap(speed_); nativeLock791.unlock();
     }
     void drainStats(std::deque<InboundStats>& out) {
-        EnterCriticalSection(&cs_); out.swap(stats_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock794(&cs_); out.swap(stats_); nativeLock794.unlock();
     }
     void drainFaction(std::deque<InboundFaction>& out) {
-        EnterCriticalSection(&cs_); out.swap(faction_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock797(&cs_); out.swap(faction_); nativeLock797.unlock();
     }
     void drainTime(std::deque<InboundTime>& out) {
-        EnterCriticalSection(&cs_); out.swap(time_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock800(&cs_); out.swap(time_); nativeLock800.unlock();
     }
     void drainDoor(std::deque<InboundDoor>& out) {
-        EnterCriticalSection(&cs_); out.swap(door_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock803(&cs_); out.swap(door_); nativeLock803.unlock();
     }
     void drainProd(std::deque<InboundProd>& out) {
-        EnterCriticalSection(&cs_); out.swap(prod_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock806(&cs_); out.swap(prod_); nativeLock806.unlock();
     }
     void drainResearch(std::deque<InboundResearch>& out) {
-        EnterCriticalSection(&cs_); out.swap(research_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock809(&cs_); out.swap(research_); nativeLock809.unlock();
     }
     void drainDeed(std::deque<InboundDeed>& out) {
-        EnterCriticalSection(&cs_); out.swap(deed_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock812(&cs_); out.swap(deed_); nativeLock812.unlock();
     }
     void drainFixture(std::deque<InboundFixture>& out) {
-        EnterCriticalSection(&cs_); out.swap(fixture_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock815(&cs_); out.swap(fixture_); nativeLock815.unlock();
     }
     void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
-        EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock818(&cs_); out.swap(buildPlace_); nativeLock818.unlock();
     }
     void drainBuildState(std::deque<InboundBuildState>& out) {
-        EnterCriticalSection(&cs_); out.swap(buildState_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock821(&cs_); out.swap(buildState_); nativeLock821.unlock();
     }
     void drainBuildDoor(std::deque<InboundBuildDoor>& out) {
-        EnterCriticalSection(&cs_); out.swap(buildDoor_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock824(&cs_); out.swap(buildDoor_); nativeLock824.unlock();
     }
     void drainBuildRemove(std::deque<InboundBuildRemove>& out) {
-        EnterCriticalSection(&cs_); out.swap(buildRemove_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock827(&cs_); out.swap(buildRemove_); nativeLock827.unlock();
+    }
+    void drainProcedural(std::deque<InboundProcedural>& out) {
+        NativeLock lock(&cs_);out.swap(procedural_);
+    }
+    void drainEnvironment(std::deque<EnvironmentItemPacket>& out) {
+        NativeLock lock(&cs_);out.swap(environment_);
     }
     void drainMoney(std::deque<InboundMoney>& out) {
-        EnterCriticalSection(&cs_); out.swap(money_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock830(&cs_); out.swap(money_); nativeLock830.unlock();
     }
     void drainMoneyDeltas(std::deque<InboundMoneyDelta>& out) {
-        EnterCriticalSection(&cs_); out.swap(moneyDelta_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock833(&cs_); out.swap(moneyDelta_); nativeLock833.unlock();
     }
     void drainStealth(std::deque<InboundStealth>& out) {
-        EnterCriticalSection(&cs_); out.swap(stealth_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock836(&cs_); out.swap(stealth_); nativeLock836.unlock();
     }
     void drainSpawnReqs(std::deque<InboundSpawnReq>& out) {
-        EnterCriticalSection(&cs_); out.swap(spawnReq_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock839(&cs_); out.swap(spawnReq_); nativeLock839.unlock();
     }
     void drainSpawnInfos(std::deque<InboundSpawnInfo>& out) {
-        EnterCriticalSection(&cs_); out.swap(spawnInfo_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock842(&cs_); out.swap(spawnInfo_); nativeLock842.unlock();
     }
     void drainSaveReqs(std::deque<InboundSaveReq>& out) {
-        EnterCriticalSection(&cs_); out.swap(saveReq_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock845(&cs_); out.swap(saveReq_); nativeLock845.unlock();
     }
-    // BEGIN/FILE/DONE share one ordered ENet channel. Drain under one lock:
+    // BEGIN/FILE/DONE share one ordered native bulk lane. Drain under one lock:
     // DONE must not overtake FILEs arriving between separate drains.
     void drainSaveTransfer(std::deque<InboundSaveBegin>& begins,
                            std::deque<InboundSaveFile>& files,
                            std::deque<InboundSaveDone>& dones) {
-        EnterCriticalSection(&cs_);
+        NativeLock nativeLock852(&cs_);
         begins.swap(saveBegin_);
         files.swap(saveFile_);
         dones.swap(saveDone_);
-        LeaveCriticalSection(&cs_);
+        nativeLock852.unlock();
     }
     void drainSaveAcks(std::deque<InboundSaveAck>& out) {
-        EnterCriticalSection(&cs_); out.swap(saveAck_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock859(&cs_); out.swap(saveAck_); nativeLock859.unlock();
     }
     void drainLoadGos(std::deque<InboundLoadGo>& out) {
-        EnterCriticalSection(&cs_); out.swap(loadGo_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock862(&cs_); out.swap(loadGo_); nativeLock862.unlock();
     }
     void drainLoadReqs(std::deque<InboundLoadReq>& out) {
-        EnterCriticalSection(&cs_); out.swap(loadReq_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock865(&cs_); out.swap(loadReq_); nativeLock865.unlock();
     }
     void drainLoadNacks(std::deque<InboundLoadNack>& out) {
-        EnterCriticalSection(&cs_); out.swap(loadNack_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock868(&cs_); out.swap(loadNack_); nativeLock868.unlock();
     }
     void drainCamHints(std::deque<InboundCamHint>& out) {
-        EnterCriticalSection(&cs_); out.swap(camHint_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock871(&cs_); out.swap(camHint_); nativeLock871.unlock();
     }
     void drainCellClaims(std::deque<InboundCellClaim>& out) {
-        EnterCriticalSection(&cs_); out.swap(cellClaim_); LeaveCriticalSection(&cs_);
+        NativeLock nativeLock874(&cs_); out.swap(cellClaim_); nativeLock874.unlock();
     }
 
     // MAIN thread, session reset (protocol 32): drop every queued packet that
@@ -853,7 +937,7 @@ public:
     // register, so they survive by construction - a NACK/GO arriving mid-swap
     // must not be dropped.
     void flushWorldState() {
-        EnterCriticalSection(&cs_);
+        NativeLock nativeLock889(&cs_);
         for (size_t i = 0; i < worldReset_.size(); ++i)
             worldReset_[i]->clearQueue();
         // Peer-readiness is world-scoped: the owned-entity batch that set
@@ -862,7 +946,30 @@ public:
         // spawn) or a scenario may arm again.
         sawRemote_ = false;
         ++generation_;
-        LeaveCriticalSection(&cs_);
+        nativeLock889.unlock();
+    }
+
+    // NET thread, authenticated incarnation departure/replacement. Only this
+    // owner's queued world packets disappear; session controls survive.
+    void flushOwnerWorld(u32 ownerId) {
+        NativeLock nativeLock904(&cs_);
+        for (size_t i = 0; i < worldReset_.size(); ++i)
+            worldReset_[i]->clearOwner(ownerId);
+        nativeLock904.unlock();
+    }
+
+    // Checked while beginWorldEnqueue holds cs_ (or under the outer recursive
+    // native dispatch lock), so reliable ingress cannot grow without a limit.
+    bool canAcceptNative() {
+        NativeLock nativeLock913(&cs_);
+        bool ok = true;
+        for (size_t i = 0; i < worldReset_.size(); ++i)
+            if (!worldReset_[i]->hasCapacity()) { ok = false; break; }
+        ok = ok && conn_.hasCapacity() && leave_.hasCapacity() && saveReq_.hasCapacity() && saveBegin_.hasCapacity() &&
+            saveFile_.hasCapacity() && saveDone_.hasCapacity() && saveAck_.hasCapacity() &&
+            loadGo_.hasCapacity() && loadReq_.hasCapacity() && loadNack_.hasCapacity();
+        nativeLock913.unlock();
+        return ok;
     }
 
 private:
@@ -882,14 +989,14 @@ private:
     WorldQ<InboundEntity>          ent_;
     WorldQ<InboundEvent>           evt_;
     WorldQ<InboundInv>             inv_;
+    WorldInventoryFrames          invFrames_;
     WorldQ<InboundWorldItems>      wi_;
     WorldQ<InboundWorldRemove>     wir_;
     WorldQ<InboundWorldClaim>      wic_;
     WorldQ<InboundNpcCensus>       npcCensus_;
-    WorldQ<InboundWorldDrop>       wd_;
+    WorldQ<InboundGroundGear>      groundGear_;
     WorldQ<InboundInvXfer>         invXfer_;
     WorldQ<InboundInvXferAck>      invXferAck_;
-    WorldQ<InboundWorldPickup>     wp_;
     WorldQ<InboundMedical>         med_;
     WorldQ<InboundTreatment>       treat_;
     WorldQ<InboundCombatHit>       combatHit_;
@@ -908,6 +1015,8 @@ private:
     WorldQ<InboundBuildState>      buildState_;
     WorldQ<InboundBuildDoor>       buildDoor_;
     WorldQ<InboundBuildRemove>     buildRemove_;
+    WorldQ<InboundProcedural>      procedural_;
+    WorldQ<EnvironmentItemPacket> environment_;
     WorldQ<InboundStealth>         stealth_;
     WorldQ<InboundSpawnReq>        spawnReq_;
     WorldQ<InboundSpawnInfo>       spawnInfo_;

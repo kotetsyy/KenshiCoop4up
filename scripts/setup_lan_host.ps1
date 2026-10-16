@@ -32,12 +32,17 @@ param(
     # Fixture saves to push (defaults to every save the tiered manifest uses).
     [string[]]$Saves = @(),
     [int]$Port = 27800,
+    [string]$NativeBin = "",
     [switch]$SkipSaves
 )
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
+. (Join-Path $scriptDir 'NativeBuild.ps1')
+. (Join-Path $scriptDir 'kit_preflight.ps1')
+$runtime = Get-CoopHarnessRuntime -RepoRoot $repoRoot -NativeBin $NativeBin
+$native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
 
 Import-Module (Join-Path $scriptDir "CoopOracles.psm1") -Force
 
@@ -56,6 +61,7 @@ function Invoke-LanSsh {
     # Also tolerate stderr noise: under ErrorActionPreference=Stop a mere ssh
     # WARNING on stderr becomes a terminating NativeCommandError via 2>&1.
     $escaped = $Cmd -replace '"', '\"'
+    $PSNativeCommandArgumentPassing = 'Legacy'
     $prev = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try { $out = & ssh -o BatchMode=yes -o ConnectTimeout=10 $target $escaped 2>&1 }
@@ -77,75 +83,105 @@ Write-Host "  kenshi: OK"
 # RE_Kenshi presence (best-effort: its loader DLL in the install root).
 $r = Invoke-LanSsh "if exist `"$($cfg.kenshiDir)\RE_Kenshi*`" (echo REK-OK) else (if exist `"$($cfg.kenshiDir)\dinput8.dll`" (echo REK-OK) else (echo REK-UNKNOWN))"
 Write-Host ("  re_kenshi: " + $(if ("$($r.out)" -match "REK-OK") { "detected" } else { "NOT detected - verify manually (Nexus mod 847)" }))
+if ("$($r.out)" -notmatch 'REK-OK') { throw 'RE_Kenshi must be installed before remote mutation.' }
+$r = Invoke-LanSsh 'powershell -NoProfile -Command "if(Get-Process kenshi_x64 -ErrorAction SilentlyContinue){exit 1}; if(Get-ScheduledTask -TaskName KenshiCoopHost -ErrorAction SilentlyContinue | Where-Object {$_.State -eq ''Running''}){exit 1}; Add-Type -AssemblyName System.Windows.Forms; if(-not ([Windows.Forms.Screen]::AllScreens | Where-Object {-not $_.Primary})){exit 1}; Write-Output SAFE"'
+if ($r.exit -ne 0 -or "$($r.out)" -notmatch 'SAFE') { throw 'Remote preflight requires no active scheduled owner, no user-owned game, and a non-primary monitor.' }
 
+if (-not $SkipSaves) {
+    if ($Saves.Count -eq 0) {
+        $manifest = Get-ScenarioManifest
+        $Saves = @($manifest.Scenarios.Values | Where-Object { $_.Tier -ne 'none' -and $_.Save } | ForEach-Object { $_.Save } | Sort-Object -Unique)
+    }
+    $saveRoot = Join-Path $env:LOCALAPPDATA 'kenshi\save'
+    foreach ($s in $Saves) {
+        if (-not $s -or $s -match '[\\/:]' -or $s -eq '.' -or $s -eq '..' -or -not (Test-Path -LiteralPath (Join-Path $saveRoot "$s\quick.save"))) {
+            throw 'Every requested named fixture must be complete before remote mutation.'
+        }
+    }
+}
 # ---- 2. Drop dir + runner scripts ---------------------------------------------------
 [void](Invoke-LanSsh "mkdir `"$($cfg.dropDir)`" 2>nul & mkdir `"$($cfg.dropDir)\results`" 2>nul & echo DIR-OK")
+$setupToken = [Guid]::NewGuid().ToString('N')
+$r = Invoke-LanSsh "mkdir `"$($cfg.dropDir)\owner.lock`" && > `"$($cfg.dropDir)\owner.lock\token.txt`" echo $setupToken && echo RESERVED"
+if ($r.exit -ne 0 -or "$($r.out)" -notmatch 'RESERVED') { throw 'An active remote run owns this drop; provisioning must not overwrite its inputs.' }
+try {
 & scp -o BatchMode=yes `
     (Join-Path $scriptDir "lan_host_run.ps1") `
     (Join-Path $scriptDir "start_kenshi.ps1") `
     (Join-Path $scriptDir "screenshot.ps1") `
+    (Join-Path $scriptDir "kit_preflight.ps1") `
+    (Join-Path $scriptDir "CoopHarness.psm1") `
+    (Join-Path $scriptDir "CoopOracles.psm1") `
+    (Join-Path $scriptDir "set_video_mode.ps1") `
     "${target}:$dropFwd/"
 if ($LASTEXITCODE -ne 0) { throw "scp of runner scripts failed" }
+& scp -o BatchMode=yes -r (Join-Path $scriptDir 'oracles') "${target}:$dropFwd/"
+if ($LASTEXITCODE -ne 0) { throw 'scp of native terminal oracle closure failed.' }
 Write-Host "  runner scripts: pushed -> $($cfg.dropDir)"
 
 # ---- 3. Mod deploy --------------------------------------------------------------------
-$dll  = Join-Path $repoRoot "src\plugin\x64\Harness\KenshiCoop.dll"
-$json = Join-Path $repoRoot "dist\mods\KenshiCoop\RE_Kenshi.json"
-$mod  = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\KenshiCoop\KenshiCoop.mod"
-if (-not (Test-Path $dll)) { throw "Build the plugin first (scripts\build_plugin.cmd): $dll" }
-$modDirFwd = "$($cfg.kenshiDir -replace '\\', '/')/mods/KenshiCoop"
-[void](Invoke-LanSsh "mkdir `"$($cfg.kenshiDir)\mods\KenshiCoop`" 2>nul & echo OK")
-$push = @($dll, $json)
-if (Test-Path $mod) { $push += $mod }
-& scp -o BatchMode=yes @push "${target}:$modDirFwd/"
-if ($LASTEXITCODE -ne 0) { throw "scp of mod failed (is Kenshi running on $($cfg.host)?)" }
-Write-Host "  mod: pushed -> $($cfg.kenshiDir)\mods\KenshiCoop"
+$modDirFwd = "$dropFwd/mod"
+[void](Invoke-LanSsh "mkdir `"$($cfg.dropDir)\mod`" 2>nul & echo OK")
+& scp -o BatchMode=yes @runtime "${target}:$modDirFwd/"
+if ($LASTEXITCODE -ne 0) { throw "scp of staged mod failed" }
+Write-Host "  mod: staged -> $($cfg.dropDir)\mod (installed/restored only by the owner)"
+# Private provision tool is a developer drop asset, not part of the six-file mod.
+& scp -o BatchMode=yes $native.Files['transport_credentials.exe'] "${target}:$dropFwd/"
+if ($LASTEXITCODE -ne 0) { throw 'Private credential tool push failed.' }
 
-# ---- 4. Fixture saves -------------------------------------------------------------------
+# Stage named fixtures outside the game/user save roots. Only the interactive
+# owned runner copies a selected fixture, with encompassing snapshot/restoration.
 if (-not $SkipSaves) {
-    if ($Saves.Count -eq 0) {
-        # Every save the tiered manifest references.
-        $manifest = Get-ScenarioManifest
-        $Saves = @($manifest.Scenarios.Keys | ForEach-Object { $manifest.Scenarios[$_] } |
-                   Where-Object { $_.Tier -ne "none" } | ForEach-Object { $_.Save } | Sort-Object -Unique)
-    }
-    $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
+    [void](Invoke-LanSsh "mkdir `"$($cfg.dropDir)\save`" 2>nul & echo OK")
     foreach ($s in $Saves) {
-        $src = Join-Path $saveRoot $s
-        if (-not (Test-Path $src)) { Write-Warning "save '$s' not found locally; skipped"; continue }
-        # Push to BOTH candidate save locations (per-user + install), mirroring
-        # friend_join.ps1 - which one Kenshi reads depends on its settings.cfg.
-        foreach ($remoteBase in @("%LOCALAPPDATA%\kenshi\save", "$($cfg.kenshiDir)\save")) {
-            $r = Invoke-LanSsh "mkdir `"$remoteBase\$s`" 2>nul & echo OK"
-        }
-        $r = Invoke-LanSsh "echo %LOCALAPPDATA%"
-        $remoteLocal = ("" + (@($r.out) | Select-Object -Last 1)).Trim()
-        foreach ($destBase in @("$remoteLocal\kenshi\save", "$($cfg.kenshiDir)\save")) {
-            $destFwd = ($destBase -replace '\\', '/')
-            & scp -o BatchMode=yes -r "$src" "${target}:$destFwd/"
-            if ($LASTEXITCODE -ne 0) { Write-Warning "scp of save '$s' to $destBase failed" }
-        }
-        Write-Host "  save '$s': pushed"
+        $r = Invoke-LanSsh "if exist `"$($cfg.dropDir)\save\$s`" rmdir /S /Q `"$($cfg.dropDir)\save\$s`""
+        if ($r.exit -ne 0) { throw "Old staged fixture could not be removed: $s" }
+        & scp -o BatchMode=yes -r (Join-Path $saveRoot $s) "${target}:$dropFwd/save/"
+        if ($LASTEXITCODE -ne 0) { throw "Named fixture staging failed: $s" }
     }
 }
 
-# ---- 5. Firewall rule ---------------------------------------------------------------------
-$r = Invoke-LanSsh "netsh advfirewall firewall show rule name=KenshiCoop >nul 2>&1 && echo RULE-EXISTS || (netsh advfirewall firewall add rule name=KenshiCoop dir=in action=allow protocol=UDP localport=$Port && echo RULE-ADDED)"
-if ("$($r.out)" -match "RULE-(EXISTS|ADDED)") { Write-Host "  firewall: UDP $Port allowed ($($Matches[1]))" }
-else { Write-Warning "firewall rule could not be verified/added: $($r.out) (admin SSH required)" }
-
-# ---- 6. Scheduled task -----------------------------------------------------------------------
-$taskCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File $($cfg.dropDir)\lan_host_run.ps1"
+# Firewall provisioning is permanent, but READY requires the actual admission.
+$firewallScript = @"
+`$ErrorActionPreference='Stop'
+function Test-Admission {
+    foreach(`$rule in @(Get-NetFirewallRule -DisplayName KenshiCoop -ErrorAction SilentlyContinue | Where-Object {`$_.Enabled -eq 'True' -and `$_.Direction -eq 'Inbound' -and `$_.Action -eq 'Allow'})){
+        foreach(`$filter in @(`$rule | Get-NetFirewallPortFilter)){
+            if("`$(`$filter.Protocol)" -in @('UDP','17') -and "`$(`$filter.LocalPort)" -eq '$Port'){return `$true}
+        }
+    }
+    return `$false
+}
+if(-not (Test-Admission)){
+    & netsh advfirewall firewall add rule name=KenshiCoop dir=in action=allow protocol=UDP localport=$Port | Out-Null
+    if(`$LASTEXITCODE -ne 0){throw 'Firewall provisioning failed.'}
+}
+if(-not (Test-Admission)){throw 'Required enabled inbound UDP rule not verified.'}
+Write-Output 'FIREWALL-READY'
+"@
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($firewallScript))
+$r = Invoke-LanSsh "powershell -NoProfile -EncodedCommand $encoded"
+if ($r.exit -ne 0 -or "$($r.out)" -notmatch 'FIREWALL-READY') { throw "Firewall admission failed: $($r.out)" }
+# Encode the action to avoid nested /tr and -File path quotation across shells.
+$action = "& '$($cfg.dropDir.Replace("'","''"))\lan_host_run.ps1'"
+$actionEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($action))
+$taskCmd = "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $actionEncoded"
 $r = Invoke-LanSsh "schtasks /create /tn KenshiCoopHost /tr `"$taskCmd`" /sc once /st 00:00 /it /f"
 if ($r.exit -ne 0) { throw "scheduled task registration failed: $($r.out)" }
 Write-Host "  scheduled task: KenshiCoopHost registered (interactive)"
 
+} finally {
+    $release = "`$ErrorActionPreference='Stop'; if((Get-Content -LiteralPath '$($cfg.dropDir.Replace("'","''"))\owner.lock\token.txt' -Raw).Trim() -cne '$setupToken'){throw 'Provisioning admission ownership changed.'}; Remove-Item -LiteralPath '$($cfg.dropDir.Replace("'","''"))\owner.lock' -Recurse -Force"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($release))
+    $r = Invoke-LanSsh "powershell -NoProfile -EncodedCommand $encoded"
+    if ($r.exit -ne 0) { throw "Remote provisioning admission cleanup failed: $($r.out)" }
+}
 Write-Host ""
 Write-Host "== Provisioning complete =="
 Write-Host "Reminders for $($cfg.host):"
 Write-Host "  * Keep a user logged into the desktop (the task launches interactively)."
 Write-Host "  * Windowed mode must be on (Full Screen=No)."
 Write-Host "  * Same Steam account on both machines: keep ONE client in OFFLINE mode."
-Write-Host "  * Enable the KenshiCoop mod once in Kenshi's Mods tab if this is the first install."
+Write-Host "  * Runtime and selected fixtures are staged, then restored by each owner."
 Write-Host ""
 Write-Host "Next: powershell -ExecutionPolicy Bypass -File scripts\run_lan_test.ps1 -Scenario coop_presence"

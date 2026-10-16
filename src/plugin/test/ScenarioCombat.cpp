@@ -2054,9 +2054,15 @@ private:
         engine::CombatRead cr;
         bool ok = engine::readCombatByHand(localHand, &cr);
         bool fight = ok && (cr.inCombat || cr.modeActive);
-        char b[176]; _snprintf(b, sizeof(b) - 1,
-            "SCENARIO TRAVELFIGHT enemystate canon=%u,%u fight=%d read=%d tgt=%u,%u",
+        char b[320]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO TRAVELFIGHT enemystate canon=%u,%u fight=%d read=%d tgt=%u,%u canon5=%u,%u,%u,%u,%u target5=%u,%u,%u,%u,%u",
             canonHand[3], canonHand[4], fight ? 1 : 0, ok ? 1 : 0,
+            (ok && cr.hasTarget) ? cr.target[3] : 0,
+            (ok && cr.hasTarget) ? cr.target[4] : 0,
+            canonHand[0], canonHand[1], canonHand[2], canonHand[3], canonHand[4],
+            (ok && cr.hasTarget) ? cr.target[0] : 0,
+            (ok && cr.hasTarget) ? cr.target[1] : 0,
+            (ok && cr.hasTarget) ? cr.target[2] : 0,
             (ok && cr.hasTarget) ? cr.target[3] : 0,
             (ok && cr.hasTarget) ? cr.target[4] : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);

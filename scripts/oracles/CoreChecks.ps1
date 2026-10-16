@@ -13,7 +13,7 @@
 function Test-LogHealth {
     param([string]$File, [string]$Label, [bool]$Required, [string]$CleanPattern)
     $gate = "health_$Label"
-    if (-not (Test-Path $File)) {
+    if ([string]::IsNullOrWhiteSpace($File) -or -not (Test-Path -LiteralPath $File)) {
         if ($Required) {
             Write-Host "  [$Label] FAIL - no log produced"
             return (Add-GateResult -Name $gate -Status FAIL -Detail "no log produced")
@@ -21,14 +21,16 @@ function Test-LogHealth {
         Write-Host "  [$Label] skipped (not launched)"
         return (Add-GateResult -Name $gate -Status SKIP -Detail "not launched")
     }
-    $text     = Get-Content $File -Raw
+    $text     = Get-Content $File -Raw -Encoding UTF8
     $errs     = @(Select-String -Path $File -Pattern "\] ERROR:" -ErrorAction SilentlyContinue)
     $reached  = $text -match "gameplay started"
-    $cleanEnd = $text -match $CleanPattern
+    $cleanEnd = if ($CleanPattern -eq 'SCENARIO RESULT') {
+        @(Select-String -Path $File -Pattern '^\[\d\d:\d\d:\d\d\.\d\d\d\](?: \[(?:HOST|JOIN)\])?(?: INFO:)? SCENARIO RESULT (?:PASS|FAIL)\s*$' -Encoding UTF8).Count -eq 1
+    } else { $text -match $CleanPattern }
     $ok = ($reached -and $cleanEnd -and $errs.Count -eq 0)
     $why = @()
     if (-not $reached)  { $why += "never reached gameplay" }
-    if (-not $cleanEnd) { $why += "no clean exit (likely crashed)" }
+    if (-not $cleanEnd) { $why += "no clean exit" }
     if ($errs.Count -gt 0) { $why += "$($errs.Count) error line(s)" }
     $verdict = if ($ok) { "PASS" } else { "FAIL - " + ($why -join "; ") }
     Write-Host "  [$Label] $verdict"
@@ -45,17 +47,13 @@ function Test-LogHealth {
 #                                             a pointer to it (a dangling entry)
 #   "alredy has destroy reason <a> (<b>)"   - destroyed twice; the engine's typo
 #
-# The second names both destroy reasons, so a line mentioning "coop-" is one WE
-# caused - that is the tripwire, and it is what the 2026-08-03 join crash left
-# behind (a world-item proxy culled after its block had already unloaded).
-# Unattributed lines are reported but not judged: Kenshi does this on its own
-# too, and we have no baseline for how often.
-#
-# ADVISORY for now (not in the always-on gate list) precisely because that
-# baseline is missing. Promote it to gating once a full tier run shows the
-# coop-attributed count is reliably zero.
+# A coop-tagged reason provides direct attribution. Absence of that tag does not
+# establish an engine-only fault: a duplicate native addItem issued by the mod
+# still reports just "addItem". Any lifetime error prevents a clean integrity
+# result; attribution remains separate in the metrics and archived native logs.
+# Scenarios choose whether this result is gating or advisory.
 function Test-EngineIntegrity {
-    param([string]$OutDir)
+    param([string]$OutDir, [bool]$JoinExpected = $true)
     $gate  = "engine_integrity"
     $dblRe = "al(?:ready|redy) has destroy reason"
     $zoneRe = "was not removed from any zones"
@@ -63,7 +61,8 @@ function Test-EngineIntegrity {
     if ($OutDir -eq "" -or -not (Test-Path $OutDir)) {
         return (Add-GateResult -Name $gate -Status SKIP -Detail "no run dir")
     }
-    foreach ($label in @("host", "join")) {
+    $labels = @('host'); if ($JoinExpected) { $labels += 'join' }
+    foreach ($label in $labels) {
         $f = Join-Path $OutDir "${label}_engine.log"
         if (-not (Test-Path $f)) { continue }
         $seen++
@@ -73,9 +72,6 @@ function Test-EngineIntegrity {
         }
         $zone += @(Select-String -Path $f -Pattern $zoneRe -ErrorAction SilentlyContinue).Count
     }
-    if ($seen -eq 0) {
-        return (Add-GateResult -Name $gate -Status SKIP -Detail "no engine log archived")
-    }
     $m = @{ doubleDestroy = $dbl; coopAttributed = $ours.Count; zoneLeak = $zone }
     if ($ours.Count -gt 0) {
         Write-Host "  ENGINE-INTEGRITY FAIL - $($ours.Count) object(s) destroyed twice with a coop reason"
@@ -83,10 +79,15 @@ function Test-EngineIntegrity {
         return (Add-GateResult -Name $gate -Status FAIL -Metrics $m `
                     -Detail "coop-attributed double destroy")
     }
-    Write-Host "  ENGINE-INTEGRITY PASS - no coop-attributed double destroy (engine's own: doubleDestroy=$dbl, zoneLeak=$zone)"
     if ($dbl -gt 0 -or $zone -gt 0) {
-        Write-Host "  FINDING: engine reported $dbl double-destroy and $zone zone-leak line(s) with no coop reason attached"
+        Write-Host "  ENGINE-INTEGRITY FAIL - doubleDestroy=$dbl zoneLeak=$zone (cause not established)"
+        return (Add-GateResult -Name $gate -Status FAIL -Metrics $m `
+                    -Detail "native lifetime errors; lack of a coop tag does not establish attribution")
     }
+    if ($seen -lt $labels.Count) {
+        return (Add-GateResult -Name $gate -Status SKIP -Detail "incomplete engine archives ($seen/$($labels.Count) required logs)")
+    }
+    Write-Host "  ENGINE-INTEGRITY PASS - complete archives contain no double-destroy or dangling-zone errors"
     return (Add-GateResult -Name $gate -Status PASS -Metrics $m)
 }
 
@@ -106,16 +107,29 @@ function Test-NoCheckFail {
 
 # The in-plugin scenario verdict ("SCENARIO RESULT PASS") for one client.
 function Test-ScenarioResultPass {
-    param([string]$File, [string]$Label, [bool]$Required)
+    param([string]$File, [string]$Label, [bool]$Required, [string]$Scenario = '')
     $gate = "result_$Label"
     if ($File -eq "" -or -not (Test-Path $File)) {
         if (-not $Required) { return (Add-GateResult -Name $gate -Status SKIP -Detail "not launched") }
         Write-Host "  $Label SCENARIO RESULT missing (no log)"
         return (Add-GateResult -Name $gate -Status FAIL -Detail "no log")
     }
-    $ok = ((Get-Content $File -Raw) -match "SCENARIO RESULT PASS")
-    if (-not $ok) { Write-Host "  $Label SCENARIO RESULT is not PASS" }
-    return (Add-GateResult -Name $gate -Status $(if ($ok) { "PASS" } else { "FAIL" }))
+    $records = @(Select-String -Path $File -Pattern '^\[\d\d:\d\d:\d\d\.\d\d\d\](?: \[(HOST|JOIN)\])?(?: INFO:)? SCENARIO RESULT (PASS|FAIL)\s*$' -Encoding UTF8)
+    $ok = $records.Count -eq 1
+    if ($ok) {
+        $g = $records[0].Matches[0].Groups
+        $ok = $g[2].Value -eq 'PASS' -and (-not $g[1].Success -or $g[1].Value -eq $Label.ToUpperInvariant())
+    }
+    # The producer binds the scenario in its separate start record.
+    if ($Scenario -ne '') {
+        $starts = @(Select-String -Path $File -Pattern '^\[\d\d:\d\d:\d\d\.\d\d\d\](?: \[(?:HOST|JOIN)\])?(?: INFO:)? SCENARIO (\S+) start\s*$' -Encoding UTF8)
+        $ok = $ok -and $starts.Count -eq 1
+        if ($starts.Count -eq 1 -and $records.Count -eq 1) {
+            $ok = $ok -and $starts[0].Matches[0].Groups[1].Value -eq $Scenario -and $starts[0].LineNumber -lt $records[0].LineNumber
+        }
+    }
+    return (Add-GateResult -Name $gate -Status $(if ($ok) { 'PASS' } else { 'FAIL' }) `
+        -Metrics @{ terminalRecords = $records.Count } -Detail $(if ($ok) { '' } else { 'missing, conflicting, wrong-role or unsuccessful terminal result' }))
 }
 
 # ---- Clock-sync gate ------------------------------------------------------------

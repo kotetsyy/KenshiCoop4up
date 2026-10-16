@@ -76,13 +76,13 @@
     }
 
     # WAN proxy profiles (one-way delay / jitter / loss both directions, applied
-    # BELOW ENet by the netsim UDP relay so retransmission is really exercised).
+    # BELOW native GNS by the Winsock UDP relay so retransmission is really exercised).
     WanProfiles = @{
         regional = @{ DelayMs = 60;  JitterMs = 10; LossPct = 1  }
         bad      = @{ DelayMs = 120; JitterMs = 40; LossPct = 5  }
         awful    = @{ DelayMs = 200; JitterMs = 80; LossPct = 15 }
         # Starved-replica validation: regional conditions plus one scripted
-        # TOTAL outage (both directions, below ENet) 30 s after the join's
+        # TOTAL outage (both directions, below native GNS) 30 s after the join's
         # first datagram (mid-scenario for the 24 s windows: connect precedes
         # gameplay by ~15 s), lasting 4 s - past interp staleMs (2 s), inside
         # the guard hold (KENSHICOOP_STARVE_HOLD_MS, 10 s). Driven bodies must
@@ -740,17 +740,16 @@
         # join mints it from the census, the host sets it down beside the join's
         # characters, and the fight is the enemy's to start. Whoever does not own
         # that body must not be running a fight for it.
-        # The GATE here is proxy_drift, not the fight parity. Whether a given
-        # sample catches both copies mid-swing is a sampling race - measured
-        # across four runs the fight-parity fraction swung from 0.045 to 0.354
-        # in both directions with no code change - whereas the distance between
-        # a proxy and the body it stands for either stays bounded or does not.
-        # Parity stays on as a finding because it is what the player SEES.
+        # Position bounds alone do not certify combat: native03 stayed in bounds
+        # while native fight parity failed. Require readable full-identity combat
+        # observations as well as distance, clock, and native lifetime integrity.
+        # Sampling tolerance remains in the oracle; a failed fight gate is not an
+        # advisory success.
         mint_aggro = @{
             Save = 'sync'; Setup = ''; Tolerance = 18.0
             PrimaryGate = 'proxy_drift'
-            Gating   = @('proxy_drift', 'clock_sync')
-            Advisory = @('mint_aggro', 'smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
+            Gating   = @('proxy_drift', 'clock_sync', 'mint_aggro', 'engine_integrity')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
             Tier = 'full'; WanVariant = $false
         }
         # player_ko: players as VICTIMS both directions - scaffold KO + revive on
@@ -840,6 +839,98 @@
             Gating   = @('npc_carry', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
+        }
+
+        # Native procedural Hub fixture from the local user-report save.
+        procedural_beds = @{
+            Save = 'bedreport20261015'; Setup = ''; Tolerance = 0.01
+            PrimaryGate = 'procedural_beds'
+            Gating = @('procedural_beds', 'clock_sync')
+            Advisory = @()
+            Tier = 'none'; WanVariant = $false
+            Seconds = 150
+            ShotAnchorHost = 'SCENARIO PROCBEDUSE .*ok=1'
+            ShotAnchorJoin = 'SCENARIO PROCBEDUSE .*ok=1'
+            ShotDelaySec = 1; ShotWaitSec = 90
+        }
+        procedural_beds_lifecycle = @{
+            Save = 'bedreport20261015'; Setup = ''; Tolerance = 0.01
+            PrimaryGate = 'procedural_beds'
+            Gating = @('procedural_beds', 'clock_sync')
+            Advisory = @()
+            Tier = 'none'; WanVariant = $false
+            Seconds = 460
+            ShotAnchorHost = 'SCENARIO PROCLIFE .*phase=post_reconnect_use .*ok=1'
+            ShotAnchorJoin = 'SCENARIO PROCLIFE .*phase=post_reconnect_use .*ok=1'
+            ShotDelaySec = 1; ShotWaitSec = 420
+        }
+        procedural_beds_outside_lifecycle = @{
+            Save = 'bedreport20261015'; Setup = ''; Tolerance = 0.01
+            PrimaryGate = 'procedural_beds_outside_lifecycle'; Gating = @('procedural_beds_outside_lifecycle','clock_sync')
+            Advisory = @(); Tier = 'none'; WanVariant = $false; Seconds = 460
+            ShotAnchorHost = 'SCENARIO PROCLIFE .*phase=post_reconnect_use .*ok=1'
+            ShotAnchorJoin = 'SCENARIO PROCLIFE .*phase=post_reconnect_use .*ok=1'
+            ShotDelaySec = 1; ShotWaitSec = 420
+        }
+        carry_bed = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 0.05
+            PrimaryGate = 'carry_bed'; Gating = @('carry_bed','clock_sync')
+            Advisory = @(); Tier = 'none'; WanVariant = $false; Seconds = 90
+            ShotAnchorHost = 'SCENARIO CARRYBED side=owner ms=2[5-9][0-9]{3} .*kind=1 .*failed=0'
+            ShotAnchorJoin = 'SCENARIO CARRYBED side=carrier ms=2[5-9][0-9]{3} .*kind=1 .*failed=0'
+            ShotDelaySec = 1; ShotWaitSec = 75
+        }
+        # Real native endpoint/payment arcs on both peers; no replay/atomicity proof inferred.
+        native_trade_watch = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_XFER_SYNC = '1' }
+            Save = 'bedreport20261015'; Setup = ''; Tolerance = 0.01
+            ShotAnchorHost = 'NATIVE_TX WATCH real native subject selected'
+            ShotAnchorJoin = 'NATIVE_TX WATCH real native subject selected'
+            ShotDelaySec = 8; ShotWaitSec = 180
+            PrimaryGate = 'native_trade_watch'; Gating = @('native_trade_watch','engine_integrity')
+            Advisory = @(); Tier = 'probe'; WanVariant = $false; Seconds = 110
+        }
+        native_trade_stack_watch = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_XFER_SYNC = '1' }
+            Save = 'bedreport20261015'; Setup = ''; Tolerance = 0.01
+            ShotAnchorHost = 'NATIVE_TX WATCH real native subject selected'
+            ShotAnchorJoin = 'NATIVE_TX WATCH real native subject selected'
+            ShotDelaySec = 8; ShotWaitSec = 180
+            PrimaryGate = 'native_trade_watch'; Gating = @('native_trade_watch','engine_integrity')
+            Advisory = @(); Tier = 'probe'; WanVariant = $false; Seconds = 110
+        }
+        native_extraction_watch = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_XFER_SYNC = '1' }
+            Save = 'mine1'; Setup = ''; Tolerance = 0.01
+            ShotAnchorHost = 'NATIVE_TX WATCH real native subject selected'
+            ShotAnchorJoin = 'NATIVE_TX WATCH real native subject selected'
+            ShotDelaySec = 8; ShotWaitSec = 240
+            PrimaryGate = 'native_extraction_watch'; Gating = @('native_extraction_watch','engine_integrity')
+            Advisory = @(); Tier = 'probe'; WanVariant = $false; Seconds = 250
+        }
+        # Supply one unique local path prefix in KENSHICOOP_NATIVE_TAKE_BARRIER.
+        native_extraction_race_watch = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_XFER_SYNC = '1' }
+            Save = 'mine1'; Setup = ''; Tolerance = 0.01
+            ShotAnchorHost = 'NATIVE_TX WATCH real native subject selected'
+            ShotAnchorJoin = 'NATIVE_TX WATCH real native subject selected'
+            ShotDelaySec = 8; ShotWaitSec = 240
+            PrimaryGate = 'native_extraction_race_watch'; Gating = @('native_extraction_race_watch','engine_integrity')
+            Advisory = @(); Tier = 'probe'; WanVariant = $false; Seconds = 360
+        }
+        # Requires real native category provenance plus a saved unknown ground sentinel.
+        # The saved ItemGroup fixture is unverified; missing provenance MUST fail.
+        environment_items = @{
+            DiagEnv = @{ KENSHICOOP_ENVIRONMENT_ITEMS = '1' }
+            Save = 'bedreport20261015'; Setup = ''; Tolerance = 0.01
+            PrimaryGate = 'environment_items'; Gating = @('environment_items')
+            Advisory = @(); Tier = 'none'; WanVariant = $false; Seconds = 90
+        }
+        environment_items_lifecycle = @{
+            DiagEnv = @{ KENSHICOOP_ENVIRONMENT_ITEMS = '1' }
+            Save = 'bedreport20261015'; Setup = ''; Tolerance = 0.01
+            PrimaryGate = 'environment_items_lifecycle'; Gating = @('environment_items_lifecycle')
+            Advisory = @(); Tier = 'none'; WanVariant = $false; Seconds = 230
         }
 
         # bed_pose: conscious bed use (protocol 19 phase 1). The host orders its
@@ -1264,9 +1355,11 @@
         }
         chest_lock = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_XFER_SYNC = '1' }
-            Save = 'squad2'; Setup = ''; Tolerance = 3.0
-            PrimaryGate = 'critical_inventory'; Gating = @('critical_inventory')
-            Advisory = @(); Tier = 'full'; WanVariant = $false; Seconds = 100
+            Save = 'sync'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'chest_lock_native'; Gating = @('chest_lock_native', 'engine_integrity')
+            Advisory = @(); Tier = 'none'; WanVariant = $false; Seconds = 150
+            ShotAnchorHost = 'CRIT LOCK host=1 t='; ShotAnchorJoin = 'CRIT LOCK host=0 t='
+            ShotDelaySec = 10
         }
 
         # build_probe: placed-building phase-0 diagnostic (protocol 27 -
@@ -1941,12 +2034,7 @@
             Tier = 'probe'; WanVariant = $false
         }
 
-        # speed_sync: consensus game-speed (pause/1x/2x/3x). Scenario-simulated
-        # clicks (host 3x -> join 1x -> join 3x) exercise min-arbitration both
-        # ways, then a bar NPC on the host leader trips the combat 1x cap. Gates
-        # on the two SPEED series matching (time-aligned), each transition's
-        # follow latency, and the combat demotion. WanVariant: the SET/REQ
-        # channel is reliable and must converge under loss.
+        # Native setter-intent LWW regression; not a real MainBar input test.
         speed_sync = @{
             DiagEnv = @{ KENSHICOOP_TIME_SYNC = '0'; KENSHICOOP_DEBUG_SPEED = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
@@ -1954,6 +2042,32 @@
             Gating   = @('speed_sync', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
+        }
+        speed_pause_ui = @{
+            DiagEnv = @{ KENSHICOOP_TIME_SYNC = '1'; KENSHICOOP_DEBUG_SPEED = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'speed_pause_ui'
+            Gating = @('speed_pause_ui', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+            ShotAnchorHost = 'PAUSE_UI EXPECT'; ShotAnchorJoin = 'PAUSE_UI EXPECT'
+            KillGraceSec = 240
+        }
+        # Passive camp NPCs only: no scripted work order or actor teleport.
+        # Both windows must observe a genuine native task-221 usable-fixture pose.
+        # For a current live camp save: -Save autosave0 -UseSessionSave -Sync.
+        # Keep both cameras/squad anchors at the same populated work area and let
+        # the source NPC AI operate naturally; absent/invalid pelvis never passes.
+        ambient_pose = @{
+            DiagEnv = @{ KENSHICOOP_INV_DUMP = '1' }
+            Save = 'camp'; Setup = ''; Tolerance = 3.0
+            Seconds = 220
+            PrimaryGate = 'ambient_pose'
+            Gating = @('ambient_pose', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth')
+            Tier = 'none'; WanVariant = $false
+            ShotAnchorHost = 'poseobserve'; ShotAnchorJoin = 'poseobserve'
+            KillGraceSec = 190
         }
 
         # Waiting-attacker stance conformance (protocol 15): the host piles ~5
@@ -2284,6 +2398,50 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $true
         }
+        world_npc_gear_drop = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'duel1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'npc_gear_drop'
+            Gating = @('npc_gear_drop', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+        world_gear_identity = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'; KENSHICOOP_WEAPON_FAB = '1' }
+            Save = 'duel1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_identity'
+            Gating = @('gear_identity', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth')
+            ShotAnchorHost = 'WIDENT native-source'; ShotAnchorJoin = '\[wd\] APPLY .* moved=1'
+            Tier = 'none'; WanVariant = $false
+        }
+        world_gear_fast_pickup = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'; KENSHICOOP_WEAPON_FAB = '1' }
+            Save = 'duel1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_fast_pickup'
+            Gating = @('gear_fast_pickup', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth')
+            ShotAnchorHost = 'WIDENT native-source'; ShotAnchorJoin = '\[wd\] PICKUP-APPLY .* moved=1'
+            Tier = 'none'; WanVariant = $false
+        }
+        world_gear_fast_cycle = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'; KENSHICOOP_WEAPON_FAB = '1' }
+            Save = 'duel1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_fast_cycle'
+            Gating = @('gear_fast_cycle', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth')
+            ShotAnchorHost = 'WIDENT native-source mode=2 phase=pickup-drop'; ShotAnchorJoin = 'WIDENT verdict'
+            Tier = 'none'; WanVariant = $false
+        }
+        world_gear_drawn_identity = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'; KENSHICOOP_WEAPON_FAB = '1' }
+            Save = 'duel1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_drawn_identity'
+            Gating = @('gear_drawn_identity', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth')
+            ShotAnchorHost = 'WIDENT drawn-proof'; ShotAnchorJoin = '\[wd\] APPLY .* moved=1'
+            Tier = 'none'; WanVariant = $false
+        }
         world_armor_drop = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
@@ -2314,6 +2472,8 @@
         world_pickup_mirror = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            ShotAnchorHost = 'WPMIRROR start role=host'; ShotAnchorJoin = 'WPMIRROR start role=join'
+            ShotDelaySec = 8
             PrimaryGate = 'pickup_mirror'
             Gating   = @('pickup_mirror', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
@@ -2329,6 +2489,8 @@
         inv_regear = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            ShotAnchorHost = 'WGRP start role=host'; ShotAnchorJoin = 'WGRP start role=join'
+            ShotDelaySec = 9
             PrimaryGate = 'gear_repickup'
             Gating   = @('gear_repickup', 'no_phantom_pickups', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
@@ -2344,6 +2506,8 @@
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
                          KENSHICOOP_WD_REFUSE_REHOME = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            ShotAnchorHost = 'WGRP start role=host'; ShotAnchorJoin = 'WGRP start role=join'
+            ShotDelaySec = 9
             PrimaryGate = 'gear_repickup_retry'
             Gating   = @('gear_repickup_retry', 'no_phantom_pickups', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
@@ -2358,6 +2522,8 @@
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
                          KENSHICOOP_WD_REFUSE_REHOME_ALL = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            ShotAnchorHost = 'WGRP start role=host'; ShotAnchorJoin = 'WGRP start role=join'
+            ShotDelaySec = 9
             PrimaryGate = 'gear_repickup_dedupe'
             Gating   = @('gear_repickup_dedupe', 'no_phantom_pickups', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
@@ -2455,6 +2621,8 @@
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
                          KENSHICOOP_WD_FORGET_TRACK = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            ShotAnchorHost = 'WGRP start role=host'; ShotAnchorJoin = 'WGRP start role=join'
+            ShotDelaySec = 9
             PrimaryGate = 'gear_repickup_recover'
             Gating   = @('gear_repickup_recover', 'no_phantom_pickups', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')

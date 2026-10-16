@@ -34,6 +34,9 @@ param(
     [ValidateSet("smoke", "full")]
     [string]$Tier = "smoke",
     [int]$Port = 27800,
+    [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi",
+    [string]$JoinDir = "$env:USERPROFILE\Kenshi-Join",
+    [string]$NativeBin = "",
     # Reuse the currently deployed DLL (skip the build + deploy step).
     [switch]$SkipBuild,
     # Stop at the first scenario failure (after its retry).
@@ -82,13 +85,21 @@ $ordered = @()
 foreach ($n in $preferredOrder) { if ($tierNames -contains $n) { $ordered += $n } }
 foreach ($n in ($tierNames | Sort-Object)) { if ($ordered -notcontains $n) { $ordered += $n } }
 if ($Only -ne "") {
-    $onlySet = $Only.Split(',') | ForEach-Object { $_.Trim() }
+    $onlySet = @($Only.Split(',') | ForEach-Object { $_.Trim() })
+    $missing = @($onlySet | Where-Object { $_ -notin $ordered })
+    if ($missing.Count) { throw "Requested scenarios are not in tier '$Tier': $($missing -join ', ')" }
     $ordered = @($ordered | Where-Object { $onlySet -contains $_ })
 }
+if (-not $ordered.Count) { throw "No scenarios selected for tier '$Tier'." }
 
 # Expand into (scenario, variant) run entries.
 $forcedVariants = @()
-if ($Variants -ne "") { $forcedVariants = $Variants.Split(',') | ForEach-Object { $_.Trim().ToLower() } }
+if ($Variants -ne "") {
+    $forcedVariants = @($Variants.Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() })
+    if (@($forcedVariants | Where-Object { $_ -notin @('clean','wan','skew','wanskew') }).Count) {
+        throw 'Variants must contain only clean, wan, skew or wanskew.'
+    }
+}
 $runsPlanned = @()
 foreach ($name in $ordered) {
     $e = $manifest.Scenarios[$name]
@@ -106,24 +117,25 @@ foreach ($name in $ordered) {
         }
     }
 }
+if (-not $runsPlanned.Count) { throw 'Requested variants select no runnable scenarios.' }
 
 Write-Host "=== KenshiCoop regression: tier=$Tier ($($runsPlanned.Count) run(s)) ==="
 foreach ($r in $runsPlanned) { Write-Host ("  - {0} [{1}]" -f $r.scenario, $r.variant) }
 
+. (Join-Path $scriptDir 'kit_preflight.ps1')
+$runState = New-CoopRunState -GameDirs @($HostDir,$JoinDir)
+try {
 # ---- 2. Build + deploy once ----------------------------------------------------
 if (-not $SkipBuild) {
     Write-Host ""
-    Write-Host "=== kill stale Kenshi ==="
-    $stale = @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue)
-    if ($stale.Count -gt 0) { $stale | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
+    if (@(Get-Process -Name kenshi_x64 -ErrorAction SilentlyContinue).Count) { throw 'Close your user-owned Kenshi session before running regression.' }
 
     Write-Host "=== build plugin ==="
     & cmd.exe /c "`"$scriptDir\build_plugin.cmd`""
     if ($LASTEXITCODE -ne 0) { Write-Host "RESULT: FAIL (build failed, exit $LASTEXITCODE)"; exit 1 }
 
     Write-Host "=== deploy ==="
-    & cmd.exe /c "`"$scriptDir\deploy.cmd`""
-    if ($LASTEXITCODE -ne 0) { Write-Host "RESULT: FAIL (deploy failed, exit $LASTEXITCODE)"; exit 1 }
+    Install-CoopHarnessRuntime -RepoRoot $repoRoot -GameDirs @($HostDir,$JoinDir) -NativeBin $NativeBin
 
     Write-Host "=== build prototest (unit layer) ==="
     & cmd.exe /c "`"$scriptDir\build_prototest.cmd`""
@@ -147,12 +159,21 @@ Write-Host "############################################################"
 Write-Host "# UNIT LAYER: prototest (protocol round-trip / fuzz / hash)"
 Write-Host "############################################################"
 if (Test-Path $prototest) {
-    & $prototest
-    $unitOk = ($LASTEXITCODE -eq 0)
-    Write-Host ("UNIT LAYER: " + $(if ($unitOk) { "PASS" } else { "FAIL (exit $LASTEXITCODE)" }))
+    $unitOutput = @(& $prototest 2>&1)
+    $unitExit = $LASTEXITCODE
+    $unitOutput | ForEach-Object { Write-Host $_ }
+    $summaries = @($unitOutput | Where-Object { "$_" -match '^prototest: (\d+)/(\d+) checks passed - PASS$' })
+    $unitOk = $false
+    if ($unitExit -eq 0 -and $summaries.Count -eq 1 -and @($unitOutput | Where-Object { "$_" -match '^prototest: \d+/\d+ checks passed' }).Count -eq 1) {
+        [void]("$($summaries[0])" -match '^prototest: (\d+)/(\d+) checks passed - PASS$')
+        $unitOk = [long]$Matches[2] -gt 0 -and [long]$Matches[1] -eq [long]$Matches[2]
+    }
+    Write-Host ("UNIT LAYER: " + $(if ($unitOk) { "PASS" } else { "FAIL (exit $unitExit or missing/invalid terminal proof)" }))
     if (-not $unitOk -and $FailFast) { Write-Host "OVERALL: FAIL (unit layer)"; exit 1 }
 } else {
-    Write-Host "UNIT LAYER: SKIP - dist\prototest.exe not built (cmd /c scripts\build_prototest.cmd)"
+    $unitOk = $false
+    Write-Host "UNIT LAYER: FAIL - dist\prototest.exe not built (cmd /c scripts\build_prototest.cmd)"
+    if ($FailFast) { exit 1 }
 }
 
 # ---- 4. Run the matrix ----------------------------------------------------------
@@ -165,6 +186,9 @@ function Invoke-OneRun {
     $args = @("-NoProfile", "-ExecutionPolicy", "Bypass",
               "-File", (Join-Path $scriptDir $runner),
               "-Scenario", $Scenario, "-Port", "$Port")
+    $args += @('-JoinDir',$JoinDir)
+    if (-not $Lan) { $args += @('-HostDir',$HostDir) }
+    if ($NativeBin) { $args += @('-NativeBin',$NativeBin) }
     if ($Lan) { $args += "-SkipBuild" }   # regress already built+deployed; the DLL push still happens per run
     if ($Variant -eq "wan"     -or $Variant -eq "wanskew") { $args += @("-Wan", $WanProfile) }
     if ($Variant -eq "skew"    -or $Variant -eq "wanskew") { $args += @("-FakeClockSkewMs", "$SkewMs") }
@@ -192,6 +216,11 @@ function Invoke-OneRun {
     foreach ($line in $out) {
         if ("$line" -match "out dir:\s+(.+)$") { $outDir = $Matches[1].Trim() }
     }
+    $receipt = $null
+    if ($outDir -ne '' -and (Test-Path -LiteralPath (Join-Path $outDir 'verdict.json'))) {
+        try { $receipt = Get-Content -LiteralPath (Join-Path $outDir 'verdict.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    }
+    if ($null -eq $receipt -or $receipt.scenario -ne $Scenario -or $receipt.pass -ne $true) { $exit = 1 }
     return @{ exit = $exit; outDir = $outDir }
 }
 
@@ -242,7 +271,12 @@ foreach ($r in $runsPlanned) {
         outDir    = $attempt.outDir
         gates     = $(if ($null -ne $verdict) { $verdict.gates } else { @() })
     }
-    Add-Content -Path $historyFile -Value ($hist | ConvertTo-Json -Depth 6 -Compress)
+    $utf8 = New-Object System.Text.UTF8Encoding($false,$true)
+    if (Test-Path -LiteralPath $historyFile) {
+        # Reject legacy ANSI instead of mixing encodings in one JSONL stream.
+        [void]$utf8.GetString([IO.File]::ReadAllBytes($historyFile))
+    }
+    [IO.File]::AppendAllText($historyFile,($hist | ConvertTo-Json -Depth 6 -Compress) + [Environment]::NewLine,$utf8)
 
     if (-not $pass -and $FailFast) { break }
 }
@@ -273,3 +307,6 @@ Write-Host ""
 Write-Host ("history: $historyFile")
 Write-Host ("OVERALL: " + $(if ($allPass) { "PASS" } else { "FAIL" }))
 if ($allPass) { exit 0 } else { exit 1 }
+} finally {
+    Restore-CoopRunState $runState
+}

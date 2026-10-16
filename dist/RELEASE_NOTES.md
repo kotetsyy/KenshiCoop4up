@@ -1,29 +1,31 @@
 ## Изменения
 
-- Исправлена блокировка обновления инвентаря после синхронизированного перемещения экипировки: служебное перемещение больше не считается предметом, удерживаемым курсором для обмена.
+- Исправлено перетаскивание товаров при покупке и продаже у торговца: передаётся выбранное количество, а итог сделки определяет **HOST**. Защита штатного списания/зачисления денег и предмета на курсоре предотвращает повторную оплату и потерю остатка стопки при подтверждении сделки.
+- Steam и прямой IP переведены на **GameNetworkingSockets (GNS)** вместо ENet. Транспорт выбирается явно; ошибка Steam не включает UDP автоматически. Ручной список разрешённых SteamID больше не нужен.
+- Автообновление больше не пересекается с загрузкой UI и сетевых DLL. После установки обновления новое подключение требует перезапуска Kenshi.
 
-## Известные проблемы
+## Совместимость и ограничения
 
-Новые сообщения о пропаже предметов при прямом обмене, разных товарах торговцев, рассинхронах времени и координат, кроватях на втором этаже и боевых анимациях остаются открытыми. Этот релиз не объявляет их исправленными. До отдельного исправления прямого обмена используйте передачу через пол.
+Публичная сборка использует **протокол 80** и несовместима с **0.1.x**. Всем игрокам нужна одна версия. Приватный Harness использует **протокол 81**, не соединяется с публичной сборкой и не получает автообновления.
 
-## Совместимость
-
-Обновите мод до **v0.1.31 у всех участников сессии**, включая хоста. Формат сетевых пакетов не изменён; старые сборки не содержат этого исправления.
+Это не исправление всех рассинхронов: остаются проблемы окружения, экипировки, NPC, времени/координат и других игровых состояний. Steam P2P между двумя реальными аккаунтами и реальные сессии на 3–4 игроков ещё не сертифицированы.
 
 ## Установка и обновление
 
-Скачайте **`KenshiCoop-kit.zip`**. Полностью закройте Kenshi и скопируйте папку `KenshiCoop` в `<Kenshi>\mods\` с заменой файлов. RE_Kenshi должен быть установлен. Существующий `coop_config.json` сохраните.
+Скачайте **`KenshiCoop-kit.zip`** из [последнего релиза](https://github.com/kotetsyy/KenshiCoop4up/releases/latest). Полностью закройте Kenshi и скопируйте папку `KenshiCoop` в `<Kenshi>\mods\` с заменой файлов. RE_Kenshi должен быть установлен. Сохраните свой `coop_config.json` и сейвы.
 
-В архиве только `KenshiCoop.dll`, `KenshiCoopUI.dll`, `KenshiCoop.mod` и `RE_Kenshi.json`. Отдельные DLL нужны для автообновления; для ручной установки достаточно архива. Автообновление заменяет обе DLL, включая UI. После обновления перезапустите игру.
+**Первый переход с 0.1.x обязателен вручную, полным комплектом:** старый updater не поддерживает новую схему. В комплекте ровно шесть файлов: `KenshiCoop.dll`, `KenshiCoopUI.dll`, `KenshiCoopNetSteam.dll`, `KenshiCoopNetUDP.dll`, `KenshiCoop.mod` и `RE_Kenshi.json`.
+
+После перехода новый updater заменяет **все четыре DLL одной сборки**, включая UI, для следующего запуска. `KenshiCoop.mod` и `RE_Kenshi.json` устанавливаются из полного комплекта.
 
 <details><summary>English</summary>
 
-Fixed an inventory-update blockage after replicated equipment repositioning: snapshot maintenance no longer looks like an item held by the cursor for a user trade.
+Merchant drag-and-drop purchases and sales now use the selected quantity and the **HOST**'s authoritative result, with native payment and cursor-stack protection against duplicate payment and loss of the remaining stack.
 
-New reports of direct-trade item loss, differing merchant stock, time and position desynchronization, upstairs beds and combat animations remain open. This release does not claim to fix them. Use ground-item transfers instead of direct trading until a separate fix is available.
+Steam and direct IP now use **GameNetworkingSockets (GNS)** instead of ENet, without automatic transport fallback or a manual SteamID allow-list. Public protocol **80** is incompatible with **0.1.x** and private Harness protocol **81**; Harness updates are disabled. All players must use the same version.
 
-Update **every participant, including the Host, to v0.1.31**. Packet format is unchanged; older builds lack this fix.
+The first migration from 0.1.x **must be manual**: close Kenshi and install all six files from **`KenshiCoop-kit.zip`** in the latest release into `<Kenshi>/mods/KenshiCoop/`. RE_Kenshi is required. Preserve config and saves. The new updater subsequently replaces all four DLLs together, including UI; install `.mod` and `RE_Kenshi.json` from the full kit.
 
-With Kenshi closed, copy `KenshiCoop/` from **`KenshiCoop-kit.zip`** into `<Kenshi>/mods/`, replacing the four mod files. RE_Kenshi must already be installed. Keep your `coop_config.json`. The standalone DLL assets support auto-update; the ZIP is sufficient for manual installation. Auto-update replaces both DLLs, including the UI. Restart afterward.
+Environment, outfit, NPC, time/position and other desync issues remain. Actual two-account Steam P2P and real 3–4-player sessions are not yet certified.
 
 </details>

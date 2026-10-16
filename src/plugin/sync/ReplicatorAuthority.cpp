@@ -75,23 +75,45 @@ void Replicator::applyNpcCensus(GameWorld* gw, Inbound& in) {
     std::deque<InboundNpcCensus> got;
     in.drainNpcCensus(got);
     if (got.empty()) return;
-    // Latest wins (reliable-ordered channel, 1 Hz - normally one pending).
-    const InboundNpcCensus& nc = got.back();
-    // Whose existence claim this is. At two players there is exactly one peer,
-    // so a single set IS "the peer's census" - what was missing is the label,
-    // which is what lets enforcement ask whether the sender actually owns the
-    // cell a body stands in.
-    censusOwner_ = nc.ownerId;
+    const unsigned long received = nowMs();
+    for (std::deque<InboundNpcCensus>::const_iterator it = got.begin();
+         it != got.end(); ++it) {
+        if (it->ownerId < MAX_PLAYERS) npcCensusLedger_.put(*it, received);
+    }
+    // Retain the legacy label for diagnostics only. Ownership decisions below
+    // use the sender's own fresh snapshot, not whichever peer arrived last.
+    censusOwner_ = got.back().ownerId;
     censusHands_.clear();
-    // Keep the outgoing rows as the previous sample before they are overwritten:
-    // two consecutive census positions are the only evidence the join has of how
-    // fast the host's copy of an unstreamed body is travelling, and the walk-
-    // converge band has to out-pace exactly that.
-    censusPrev_.swap(censusPos_);
-    censusPrevMs_ = censusRecvMs_;
+    // Rebuild merged views without rotating another author's unchanged sample.
+    censusPrev_.clear();
+    censusSource_.clear();
     censusPos_.clear();
-    unsigned int n = (unsigned int)(nc.hands.size() / 5);
-    bool havePos = nc.pos.size() >= (size_t)n * 3;
+    unsigned int n = 0;
+    unsigned int nOff = 0;
+    typedef NpcCensusLedger<InboundNpcCensus> Ledger;
+    const Ledger::Entries& entries = npcCensusLedger_.entries();
+    for (Ledger::Entries::const_iterator owner = entries.begin();
+         owner != entries.end(); ++owner) {
+        if (!npcCensusLedger_.fresh(owner->first, received)) continue;
+        const InboundNpcCensus& nc = owner->second.snapshot;
+        const Ledger::Entry& sample = owner->second;
+        const InboundNpcCensus& previous = sample.previous;
+        const size_t previousRows = previous.hands.size() / 5;
+        if (sample.havePrevious && previous.pos.size() >= previousRows * 3) {
+            for (size_t p = 0; p < previousRows; ++p) {
+                Key pk;
+                pk.t=previous.hands[p*5]; pk.c=previous.hands[p*5+1];
+                pk.cs=previous.hands[p*5+2]; pk.i=previous.hands[p*5+3];
+                pk.s=previous.hands[p*5+4];
+                CensusPos pp;
+                pp.x=previous.pos[p*3]; pp.y=previous.pos[p*3+1];
+                pp.z=previous.pos[p*3+2];
+                censusPrev_[CensusSourceKey(owner->first, pk)] = pp;
+            }
+        }
+        const unsigned int rows = (unsigned int)(nc.hands.size() / 5);
+        n += rows;
+        bool havePos = nc.pos.size() >= (size_t)rows * 3;
     // PER-ROW ownership check (2026-08-08). censusOwner_ is one label for the
     // whole message, so before this the sender's rows spoke for every cell we
     // happened to resolve to that sender - including cells the sender does not
@@ -111,8 +133,7 @@ void Replicator::applyNpcCensus(GameWorld* gw, Inbound& in) {
     // or hidden - a rejection means we think the cell is ours, and
     // authorHoldsBody already declines to judge anything in a cell we own, so
     // the body stays ours to author and nobody else's to enforce against.
-    unsigned int nOff = 0;
-    for (unsigned int i = 0; i < n; ++i) {
+    for (unsigned int i = 0; i < rows; ++i) {
         Key k;
         k.t  = nc.hands[i * 5 + 0];
         k.c  = nc.hands[i * 5 + 1];
@@ -133,7 +154,13 @@ void Replicator::applyNpcCensus(GameWorld* gw, Inbound& in) {
             continue;
         }
         censusHands_.insert(k);
-        if (havePos) censusPos_[k] = cp;
+        censusSource_[k] = owner->first;
+        if (havePos) {
+            censusPos_[k] = cp;
+        } else {
+            censusPos_.erase(k);
+        }
+    }
     }
     censusOffCell_ += nOff;
     censusRecvMs_ = nowMs();
@@ -147,6 +174,17 @@ void Replicator::applyNpcCensus(GameWorld* gw, Inbound& in) {
                   n, n - nOff, nOff, censusCulls_, censusOffCell_, cellYields_,
                   hostDriveRefusals_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        for (Ledger::Entries::const_iterator it = entries.begin();
+             it != entries.end(); ++it) {
+            char row[192];
+            _snprintf(row,sizeof(row)-1,
+                "[npc-census-owner] owner=%u rows=%u age=%lu fresh=%d merged=%u",
+                it->first,(unsigned)(it->second.snapshot.hands.size()/5),
+                received-it->second.received,
+                npcCensusLedger_.fresh(it->first,received)?1:0,
+                (unsigned)censusHands_.size());
+            row[sizeof(row)-1]=0; coop::logLine(row);
+        }
     }
 }
 
@@ -162,6 +200,35 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     std::set<Key> keep;
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
         if (it->second.fresh) keep.insert(it->first);
+    }
+    // Opt-in paired native-vs-authoritative samples. Full stream/local hands are
+    // distinct: a proxy's engine handle is never a network identity.
+    static unsigned long pairMs = 0;
+    const char* pairEnv = getenv("KENSHICOOP_NPC_PAIR_TRACE");
+    const unsigned long pairNow = nowMs();
+    if (pairEnv && pairEnv[0]=='1' && pairNow-pairMs>=1000) {
+        pairMs=pairNow;
+        for (std::map<Key,Driven>::iterator it=targets_.begin();it!=targets_.end();++it) {
+            EntityState remote, actual;
+            if (!it->second.interp.latest(&remote,0,0,0)) continue;
+            Character* c=resolveEventChar(it->first);
+            unsigned int h[5]={0};
+            if (!c || !engine::readHand(c,h) ||
+                !engine::captureNpcByHand(gw,h[0],h[1],h[2],h[3],h[4],&actual)) continue;
+            char b[1024];
+            _snprintf(b,sizeof(b)-1,
+                "[npc-pair] role=%u owner=%u key=%u,%u,%u,%u,%u local=%u,%u,%u,%u,%u age=%lu fresh=%d proxy=%d cells=%u,%u pos=%.2f,%.2f,%.2f/%.2f,%.2f,%.2f task=%u,%u/%u,%u body=%u/%u target=%u,%u,%u,%u,%u/%u,%u,%u,%u,%u",
+                localId,it->second.streamOwner,it->first.t,it->first.c,it->first.cs,it->first.i,it->first.s,
+                h[0],h[1],h[2],h[3],h[4],pairNow-it->second.lastSeenMs,
+                it->second.fresh?1:0,proxyByKey_.count(it->first)?1:0,
+                authorityFor(gw,remote.x,remote.z),authorityFor(gw,actual.x,actual.z),
+                remote.x,remote.y,remote.z,actual.x,actual.y,actual.z,
+                (unsigned)remote.task,(unsigned)remote.rawTask,(unsigned)actual.task,(unsigned)actual.rawTask,
+                (unsigned)remote.bodyState,(unsigned)actual.bodyState,
+                remote.sType,remote.sContainer,remote.sContainerSerial,remote.sIndex,remote.sSerial,
+                actual.sType,actual.sContainer,actual.sContainerSerial,actual.sIndex,actual.sSerial);
+            b[sizeof(b)-1]=0; coop::logLine(b);
+        }
     }
 
     // Proxy bodies are EXEMPT from authority judgment (2026-07-11 census-mint
@@ -1210,7 +1277,7 @@ bool Replicator::authorHoldsBody(GameWorld* gw, u32 localId, const Key& k,
     // not ours to judge. The second case matters as much as the first - a cell
     // whose owner has sent no census is unspoken-for, not empty, and treating
     // silence as absence is the whole ghost mechanism.
-    if (owner != localId && owner == censusOwner_) return false;
+    if (owner != localId && npcCensusLedger_.fresh(owner, nowMs())) return false;
     // INCUMBENT HOLDS. A body the peer's stream is already writing is the peer's,
     // whatever this cell verdict says, because the verdict is not a shared fact:
     // each side evaluates it against ITS OWN copy's position, and the two copies
@@ -1596,12 +1663,22 @@ float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Ke
         // census rows - the only thing the join can know about an unstreamed
         // body's motion, since the census carries position and nothing else.
         float stepX = 0.0f, stepZ = 0.0f, hostSpd = 0.0f;
-        std::map<Key, CensusPos>::iterator pv = censusPrev_.find(k);
-        if (pv != censusPrev_.end() && censusPrevMs_ &&
-            censusRecvMs_ > censusPrevMs_) {
+        std::map<Key, u32>::const_iterator source = censusSource_.find(k);
+        typedef NpcCensusLedger<InboundNpcCensus> Ledger;
+        const Ledger::Entries& authors = npcCensusLedger_.entries();
+        Ledger::Entries::const_iterator author = source != censusSource_.end()
+            ? authors.find(source->second) : authors.end();
+        std::map<CensusSourceKey, CensusPos>::const_iterator pv =
+            source != censusSource_.end()
+                ? censusPrev_.find(CensusSourceKey(source->second, k)) : censusPrev_.end();
+        if (author != authors.end() && pv != censusPrev_.end() &&
+            author->second.havePrevious &&
+            npcCensusLedger_.fresh(author->first, nowP) &&
+            (unsigned long)(author->second.received - author->second.previousReceived) != 0) {
             stepX = it->second.x - pv->second.x;
             stepZ = it->second.z - pv->second.z;
-            float dt = (float)(censusRecvMs_ - censusPrevMs_) / 1000.0f;
+            float dt = (float)(unsigned long)(author->second.received -
+                author->second.previousReceived) / 1000.0f;
             // Converted OUT of world units per second and INTO the engine's
             // speed scale: the step is real displacement and so already carries
             // the game-speed multiplier, while walkTo commands a speed the

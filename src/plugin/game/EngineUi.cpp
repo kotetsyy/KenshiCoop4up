@@ -184,5 +184,6 @@ void spawnDamageFloater(Character* c, float amount) {
     coop::logLine(b);
 }
 
+
 } // namespace engine
 } // namespace coop

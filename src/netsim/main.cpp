@@ -7,9 +7,9 @@
 // channel, all packet families alike.
 //
 // This is the crucial difference from the in-plugin KENSHICOOP_NETSIM_* sim
-// (which delays/drops only received ENTITY batches, above ENet): here the loss
-// happens BELOW ENet, so ENet's real retransmission/ordering machinery is
-// engaged - a dropped reliable datagram is genuinely re-sent and arrives LATE,
+// (which delays/drops only received ENTITY batches, above native GNS): here loss
+// happens BELOW the Steam-independent UDP provider, so GNS retransmission and
+// ordering are engaged: a dropped reliable datagram is genuinely resent late,
 // which is exactly the behaviour a real internet link produces and the thing
 // loopback runs could never exercise. Jitter naturally reorders datagrams.
 //
@@ -35,19 +35,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
+#include <list>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 
 namespace {
 
-const int MAX_DGRAM = 4096; // ENet datagrams are ~1400 B; leave headroom.
+const int MAX_DGRAM = 65507; // Entire legal IPv4 UDP payload; never truncate GNS datagrams.
 
 struct Held {
     DWORD        releaseTick;
     int          len;
     bool         toHost;             // true: join->host, false: host->join
-    unsigned char data[MAX_DGRAM];
+    std::vector<unsigned char> data;  // Only actual datagram bytes are retained.
 };
 
 unsigned long g_fwdUp = 0, g_fwdDown = 0, g_dropUp = 0, g_dropDown = 0;
@@ -128,7 +129,8 @@ int main(int argc, char** argv) {
     std::printf("\n");
     std::fflush(stdout);
 
-    std::deque<Held> held;
+    std::list<Held> held;
+    unsigned char receiveBytes[MAX_DGRAM];
     DWORD lastStats = GetTickCount();
     DWORD firstClientTick = 0;   // session start = first join datagram
     bool  stallAnnounced = false, stallEnded = false;
@@ -169,9 +171,9 @@ int main(int argc, char** argv) {
         // Ingest from the join side.
         if (FD_ISSET(clientSock, &rd)) {
             for (;;) {
-                Held h;
+                // Receive the entire legal datagram before applying impairment.
                 sockaddr_in from; int flen = sizeof(from);
-                int n = recvfrom(clientSock, (char*)h.data, MAX_DGRAM, 0, (sockaddr*)&from, &flen);
+                int n = recvfrom(clientSock, (char*)receiveBytes, MAX_DGRAM, 0, (sockaddr*)&from, &flen);
                 if (n <= 0) break;
                 clientAddr = from; haveClient = true;
                 if (firstClientTick == 0) firstClientTick = now;
@@ -179,26 +181,30 @@ int main(int argc, char** argv) {
                 if (lossPct > 0 && (std::rand() % 100) < lossPct) { ++g_dropUp; continue; }
                 int d = delayMs + uniformJitter(jitterMs);
                 if (d < 0) d = 0;
+                held.push_back(Held());
+                Held& h = held.back();
                 h.releaseTick = now + (DWORD)d;
                 h.len = n; h.toHost = true;
-                held.push_back(h);
+                h.data.assign(receiveBytes, receiveBytes + n);
             }
         }
 
         // Ingest from the host side.
         if (FD_ISSET(hostSock, &rd)) {
             for (;;) {
-                Held h;
+                // Keep a single reusable receive buffer, not a 65KB queue row.
                 sockaddr_in from; int flen = sizeof(from);
-                int n = recvfrom(hostSock, (char*)h.data, MAX_DGRAM, 0, (sockaddr*)&from, &flen);
+                int n = recvfrom(hostSock, (char*)receiveBytes, MAX_DGRAM, 0, (sockaddr*)&from, &flen);
                 if (n <= 0) break;
                 if (stalled) { ++dropStall; ++g_dropDown; continue; }
                 if (lossPct > 0 && (std::rand() % 100) < lossPct) { ++g_dropDown; continue; }
                 int d = delayMs + uniformJitter(jitterMs);
                 if (d < 0) d = 0;
+                held.push_back(Held());
+                Held& h = held.back();
                 h.releaseTick = now + (DWORD)d;
                 h.len = n; h.toHost = false;
-                held.push_back(h);
+                h.data.assign(receiveBytes, receiveBytes + n);
             }
         }
 
@@ -207,23 +213,22 @@ int main(int argc, char** argv) {
         // Release matured datagrams. Jitter puts release times out of order in
         // the queue; scanning the whole (small) queue each tick both releases
         // on time and produces the natural reordering a real WAN shows.
-        std::deque<Held> keep;
-        for (std::deque<Held>::iterator it = held.begin(); it != held.end(); ++it) {
+        for (std::list<Held>::iterator it = held.begin(); it != held.end();) {
             if ((long)(now - it->releaseTick) >= 0) {
                 if (it->toHost) {
-                    sendto(hostSock, (const char*)it->data, it->len, 0,
+                    sendto(hostSock, (const char*)&it->data[0], it->len, 0,
                            (sockaddr*)&hostAddr, sizeof(hostAddr));
                     ++g_fwdUp;
                 } else if (haveClient) {
-                    sendto(clientSock, (const char*)it->data, it->len, 0,
+                    sendto(clientSock, (const char*)&it->data[0], it->len, 0,
                            (sockaddr*)&clientAddr, sizeof(clientAddr));
                     ++g_fwdDown;
                 }
+                it = held.erase(it);
             } else {
-                keep.push_back(*it);
+                ++it;
             }
         }
-        held.swap(keep);
 
         if (now - lastStats >= 5000) {
             lastStats = now;

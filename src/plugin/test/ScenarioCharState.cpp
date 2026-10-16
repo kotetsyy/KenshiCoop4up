@@ -716,6 +716,195 @@ private:
     unsigned int  l0Hand_[5];
 };
 
+// Cross-owner native carry -> drop -> bed. Never re-seat or re-issue sleep:
+// every sample in the sustained window must remain at the same full fixture.
+class CarryBedScenario : public TimedScenario {
+public:
+    CarryBedScenario() : TimedScenario("carry_bed", 0), latched_(false),
+        picked_(false), placed_(false), exited_(false), failed_(false),
+        samples_(0), carrySamples_(0), exitSamples_(0), lastSample_(0UL - 250UL), haveFixture_(false),
+        exitX_(0), exitY_(0), exitZ_(0), moved_(false) {}
+    virtual void onStart(const ScenarioContext&) {}
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!latched_) {
+            EntityState sq[32];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+            int a = tabLeaderIdx(sq, n, 0), b = tabLeaderIdx(sq, n, 1);
+            if (a >= 0 && b >= 0 && a != b) {
+                handFromEntity(sq[a], passenger_); handFromEntity(sq[b], carrier_);
+                u32 passengerOwner=0,carrierOwner=0;
+                latched_=ctx.worldToken!=0 && ctx.loadId!=0 && ctx.queryClaimedActor &&
+                    ctx.queryClaimedActor(passenger_,&passengerOwner,passengerCanonical_) &&
+                    ctx.queryClaimedActor(carrier_,&carrierOwner,carrierCanonical_) &&
+                    passengerOwner==0 && carrierOwner==1 &&
+                    !same(passengerCanonical_,carrierCanonical_);
+                if (latched_) { world_=ctx.worldToken; load_=ctx.loadId; }
+            }
+        }
+        if (!latched_) {
+            if (ctx.elapsedMs >= 15000) { passed_ = false; return true; }
+            return false;
+        }
+        u32 passengerOwner=0,carrierOwner=0;
+        unsigned int passengerCanonical[5],carrierCanonical[5];
+        if (ctx.worldToken!=world_ || ctx.loadId!=load_ || !ctx.queryClaimedActor ||
+            !ctx.queryClaimedActor(passenger_,&passengerOwner,passengerCanonical) ||
+            !ctx.queryClaimedActor(carrier_,&carrierOwner,carrierCanonical) ||
+            passengerOwner!=0 || carrierOwner!=1 ||
+            !same(passengerCanonical,passengerCanonical_) ||
+            !same(carrierCanonical,carrierCanonical_)) {
+            passed_=false; return true;
+        }
+        Character* passenger = resolve(passenger_);
+        Character* carrier = resolve(carrier_);
+        if (!currentIdentity(passenger, passenger_) || !currentIdentity(carrier, carrier_)) {
+            passed_ = false; return true;
+        }
+        if (!ctx.isHost && !picked_ && ctx.elapsedMs >= 16000) {
+            picked_ = true;
+            if (!engine::carrySubject(ctx.gw, carrier_, passenger_)) failed_ = true;
+            engine::CarryRead cr;
+            if (!engine::readCarry(carrier, &cr) || !cr.valid || !cr.carrying ||
+                !same(cr.carried, passenger_)) failed_ = true;
+            logAction(ctx,"pickup",!failed_,passenger_,carrier_);
+        }
+        if (!ctx.isHost && !placed_ && ctx.elapsedMs >= 20000) {
+            placed_ = true;
+            // Both calls execute the game's real native carry/furniture paths.
+            if (!engine::dropSubject(ctx.gw, carrier_, false) ||
+                !engine::putSubjectInFurniture(ctx.gw, passenger_, 1, true)) failed_ = true;
+            logAction(ctx,"placement",!failed_,passenger_,carrier_);
+        }
+        if (ctx.isHost && !exited_ && ctx.elapsedMs >= 42000) {
+            exited_ = true;
+            engine::FurnitureRead fr;
+            if (!engine::readFurniture(passenger, &fr) || !fr.valid || fr.kind != 1 ||
+                !engine::applyFurniture(ctx.gw, passenger, fr.furn, 1, false)) failed_ = true;
+            float x = 0, y = 0, z = 0;
+            if (!engine::readPos(passenger, &x, &y, &z) ||
+                !engine::orderMoveTo(passenger, x + 25.0f, y, z)) failed_ = true;
+            exitX_=x; exitY_=y; exitZ_=z;
+            logAction(ctx,"exit",!failed_,passenger_,carrier_);
+        }
+        if (ctx.elapsedMs - lastSample_ >= 250) {
+            lastSample_ = ctx.elapsedMs;
+            char claims[384];
+            _snprintf(claims,sizeof(claims)-1,
+                "SCENARIO CARRYBED CLAIM side=%s ms=%lu passengerOwner=%u "
+                "passengerCanonical=%u,%u,%u,%u,%u carrierOwner=%u "
+                "carrierCanonical=%u,%u,%u,%u,%u world=%I64u load=%u",
+                ctx.isHost?"owner":"carrier",ctx.elapsedMs,passengerOwner,
+                passengerCanonical[0],passengerCanonical[1],passengerCanonical[2],
+                passengerCanonical[3],passengerCanonical[4],carrierOwner,
+                carrierCanonical[0],carrierCanonical[1],carrierCanonical[2],
+                carrierCanonical[3],carrierCanonical[4],ctx.worldToken,ctx.loadId);
+            claims[sizeof(claims)-1]='\0'; coop::logLine(claims);
+            engine::FurnitureRead fr; engine::CarryRead cr;
+            memset(&fr,0,sizeof(fr)); memset(&cr,0,sizeof(cr));
+            bool read = engine::readFurniture(passenger, &fr) && fr.valid &&
+                        engine::readCarry(passenger, &cr) && cr.valid;
+            engine::CarryRead held;
+            const bool exactCarry=read && cr.beingCarried &&
+                engine::readCarry(carrier,&held) && held.valid &&
+                held.carrying && same(held.carried,passenger_);
+            if (ctx.elapsedMs >= 18000 && ctx.elapsedMs < 19500) {
+                ++carrySamples_;
+                if (!exactCarry) failed_=true;
+            }
+            if (ctx.elapsedMs >= 25000 && ctx.elapsedMs < 40000) {
+                ++samples_;
+                if (!read || fr.kind != 1 || cr.beingCarried) failed_ = true;
+                if (read && fr.kind == 1) {
+                    if (!haveFixture_) {
+                        for (int i = 0; i < 5; ++i) fixture_[i] = fr.furn[i];
+                        haveFixture_ = true;
+                    } else if (!same(fixture_, fr.furn)) failed_ = true;
+                }
+            }
+            if (ctx.elapsedMs >= 47000) {
+                ++exitSamples_;
+                if (!read || fr.kind != 0 || cr.beingCarried) failed_ = true;
+                if (ctx.isHost) {
+                    float x=0,y=0,z=0;
+                    if (!engine::readPos(passenger,&x,&y,&z)) failed_=true;
+                    else if ((x-exitX_)*(x-exitX_)+(y-exitY_)*(y-exitY_)+
+                             (z-exitZ_)*(z-exitZ_) >= 100.0f) moved_=true;
+                }
+            }
+            if (read && fr.kind==1) {
+                engine::PoseFixtureRead d;
+                const bool descriptor=engine::readPoseFixtureByHand(fr.furn,&d);
+                char fixtureLine[768];
+                _snprintf(fixtureLine,sizeof(fixtureLine)-1,
+                    "SCENARIO CARRYBED FIXTURE side=%s ms=%lu descriptor=%d sid='%s' "
+                    "pos=%.3f,%.3f,%.3f heading=%.3f floor=%d class=%d owner='%s' "
+                    "inside='%s' insidePos=%.3f,%.3f,%.3f town='%s' townPos=%.3f,%.3f,%.3f world=%I64u load=%u",
+                    ctx.isHost?"owner":"carrier",ctx.elapsedMs,descriptor?1:0,
+                    descriptor?d.fixture.sid:"",descriptor?d.fixture.x:0,descriptor?d.fixture.y:0,
+                    descriptor?d.fixture.z:0,descriptor?d.heading:0,descriptor?d.floor:0,
+                    descriptor?d.fixture.classType:0,descriptor?d.ownerSid:"",
+                    descriptor?d.insideSid:"",descriptor?d.insideX:0,descriptor?d.insideY:0,
+                    descriptor?d.insideZ:0,descriptor?d.townSid:"",descriptor?d.townX:0,
+                    descriptor?d.townY:0,descriptor?d.townZ:0,ctx.worldToken,ctx.loadId);
+                fixtureLine[sizeof(fixtureLine)-1]='\0'; coop::logLine(fixtureLine);
+                if (!descriptor && ctx.elapsedMs>=25000 && ctx.elapsedMs<40000) failed_=true;
+            }
+            char line[512];
+            _snprintf(line, sizeof(line)-1,
+                "SCENARIO CARRYBED side=%s ms=%lu passenger=%u,%u,%u,%u,%u "
+                "carrier=%u,%u,%u,%u,%u read=%d kind=%d furn=%u,%u,%u,%u,%u carried=%d failed=%d exactCarry=%d moved=%d world=%I64u load=%u",
+                ctx.isHost ? "owner" : "carrier", ctx.elapsedMs,
+                passenger_[0],passenger_[1],passenger_[2],passenger_[3],passenger_[4],
+                carrier_[0],carrier_[1],carrier_[2],carrier_[3],carrier_[4], read ? 1 : 0,
+                read ? fr.kind : -1, fr.furn[0],fr.furn[1],fr.furn[2],fr.furn[3],fr.furn[4],
+                read && cr.beingCarried ? 1 : 0, failed_ ? 1 : 0,
+                exactCarry?1:0,moved_?1:0,ctx.worldToken,ctx.loadId);
+            line[sizeof(line)-1] = '\0'; coop::logLine(line);
+        }
+        if (ctx.elapsedMs >= 52000) {
+            passed_ = !failed_ && samples_ >= 40 && exitSamples_ >= 10 &&
+                      carrySamples_ >= 4 && haveFixture_ &&
+                      (ctx.isHost ? (exited_ && moved_) : (picked_ && placed_));
+            return true;
+        }
+        return false;
+    }
+private:
+    static void logAction(const ScenarioContext& ctx,const char* action,bool ok,
+                          const unsigned int passenger[5],const unsigned int carrier[5]) {
+        char line[384];
+        _snprintf(line,sizeof(line)-1,
+            "SCENARIO CARRYBED ACTION side=%s ms=%lu action=%s ok=%d "
+            "passenger=%u,%u,%u,%u,%u carrier=%u,%u,%u,%u,%u world=%I64u load=%u",
+            ctx.isHost?"owner":"carrier",ctx.elapsedMs,action,ok?1:0,
+            passenger[0],passenger[1],passenger[2],passenger[3],passenger[4],
+            carrier[0],carrier[1],carrier[2],carrier[3],carrier[4],ctx.worldToken,ctx.loadId);
+        line[sizeof(line)-1]='\0'; coop::logLine(line);
+    }
+    static bool same(const unsigned int a[5], const unsigned int b[5]) {
+        for (int i = 0; i < 5; ++i) if (a[i] != b[i]) return false;
+        return true;
+    }
+    static Character* resolve(const unsigned int h[5]) {
+        return engine::resolveCharByHand(h[3],h[4],h[0],h[1],h[2]);
+    }
+    static bool currentIdentity(Character* c, const unsigned int expected[5]) {
+        ObjectHand h; unsigned int actual[5];
+        if (!c || !engine::charHandOf(c, h)) return false;
+        h.toObjOrder(actual); return same(actual, expected);
+    }
+    bool latched_, picked_, placed_, exited_, failed_;
+    unsigned int samples_, carrySamples_, exitSamples_;
+    unsigned long lastSample_;
+    bool haveFixture_;
+    unsigned int passenger_[5], carrier_[5], fixture_[5];
+    float exitX_, exitY_, exitZ_;
+    bool moved_;
+    unsigned int passengerCanonical_[5],carrierCanonical_[5];
+    u64 world_;
+    u32 load_;
+};
+
 // bed_lay (protocol 19, UNCONSCIOUS place-in-bed LAYING POSE + wake-and-exit):
 // bed_pose validates a CONSCIOUS SLEEP ORDER (task=USE_BED, walk-in + lie down)
 // and bed_put validates UNCONSCIOUS occupancy (BODY_IN_BED bit crossing). Neither
@@ -1632,10 +1821,10 @@ private:
 };
 
 // speed_sync (last-write-wins game-speed validation): both clients run the
-// default-on speed-sync module; the scenario SIMULATES user speed clicks by
-// writing the engine's speed directly (writeGameSpeed is captured as user
-// intent, exactly like a real click). Save 'sync' (the bar with armed NPCs
-// for the combat phase). Timeline (peer-ready armed):
+// default-on speed-sync module; the scenario exercises native SETTER intent
+// by writing the engine speed directly. This is NOT a real MainBar click;
+// speed_pause_ui separately observes actual external UI/keyboard input.
+// Timeline (peer-ready armed):
 //   T+10 s HOST clicks 3x -> LWW, both at 3x (join does not need to agree).
 //   T+22 s JOIN clicks 3x -> already 3x, no SET change.
 //   T+30 s HOST clicks 1x -> LWW, both at 1x.
@@ -1663,10 +1852,8 @@ public:
         const unsigned int ownRank = ctx.isHost ? 0u : 1u;
         if (!haveOwn_) latchLeader(ctx, ownRank);
 
-        // Simulated user clicks. writeGameSpeed goes through the engine's own
-        // (hooked) setters, so each call registers as captured USER INTENT -
-        // the same path a real UI click takes. The middle legs exercise the
-        // previously-impossible case: a click EQUAL to the current effective
+        // Native setter intent, not UI input. Same-value setters exercise the
+        // hook path; the actual MainBar/keyboard path has its own observer.
         // (join lowers its stale 3x vote by clicking 1x while the effective is
         // already 1x), which the old state-diff detector could never see.
         if (ctx.isHost && !hostClicked_ && ctx.elapsedMs >= HOST_3X_AT_MS) {
@@ -1829,6 +2016,92 @@ private:
     unsigned int  striker_[5];
 };
 
+// Read-only real-UI regression. An external controller clicks the actual owned
+// game windows; no setter or fabricated input inside the scenario can pass it.
+class SpeedPauseUiScenario : public TimedScenario {
+public:
+    SpeedPauseUiScenario() : TimedScenario("speed_pause_ui",0), phase_(0),
+        announced_(false), matched_(false), failed_(false), oppositeSeen_(false), phaseMs_(0),
+        matchedMs_(0), lastLogMs_(0), clockStartMs_(0), clockStart_(-1), hourSec_(0) {}
+    virtual void onStart(const ScenarioContext&) {}
+    virtual bool onTick(const ScenarioContext& ctx) {
+        float mult=0; bool paused=false; double hours=-1; float hourSec=0;
+        if (!engine::readGameSpeed(ctx.gw,&mult,&paused) ||
+            !engine::readGameClock(ctx.gw,&hours,&hourSec) || hours<0) {
+            failed_=true; return finish(ctx);
+        }
+        if (phase_>=4) { passed_=!failed_; return finish(ctx); }
+        static const char* const actions[4]={"host_pause","join_resume","join_pause","host_resume"};
+        const bool wantPaused=(phase_==0 || phase_==2);
+        if (!announced_) {
+            announced_=true; phaseMs_=ctx.elapsedMs;
+            oppositeSeen_=paused!=wantPaused;
+            int x=0, y=0, width=0, height=0, mouseX=0, mouseY=0;
+            const bool button=engine::readPauseControls(&x,&y,&width,&height,&mouseX,&mouseY);
+            char b[280]; _snprintf(b,sizeof(b)-1,
+                "SCENARIO PAUSE_UI EXPECT role=%s phase=%u action=%s button=%d x=%d y=%d width=%d height=%d mouseX=%d mouseY=%d",
+                ctx.isHost?"host":"join",phase_,actions[phase_],button?1:0,x,y,width,height,mouseX,mouseY);
+            b[sizeof(b)-1]=0; coop::logLine(b);
+        }
+        if (!lastLogMs_ || ctx.elapsedMs-lastLogMs_>=250) {
+            lastLogMs_=ctx.elapsedMs;
+            int x=0, y=0, width=0, height=0, mouseX=-1, mouseY=-1;
+            engine::readPauseControls(&x,&y,&width,&height,&mouseX,&mouseY);
+            char b[240]; _snprintf(b,sizeof(b)-1,
+                "SCENARIO PAUSE_UI SAMPLE role=%s phase=%u t=%lu paused=%d mult=%.4f hours=%.9f hourSec=%.4f mouseX=%d mouseY=%d",
+                ctx.isHost?"host":"join",phase_,ctx.elapsedMs,paused?1:0,mult,hours,hourSec,mouseX,mouseY);
+            b[sizeof(b)-1]=0; coop::logLine(b);
+        }
+        if (!matched_ && paused!=wantPaused) oppositeSeen_=true;
+        if (oppositeSeen_ && paused==wantPaused && (wantPaused || mult>0)) {
+            if (!matched_) { matched_=true; matchedMs_=ctx.elapsedMs; }
+            // Allow one normal frame/interpolation settle, then require eight
+            // real seconds: spans multiple 3s speed echoes and clock slews.
+            if (ctx.elapsedMs-matchedMs_>=1000 && clockStart_<0) {
+                clockStart_=hours; hourSec_=hourSec; clockStartMs_=ctx.elapsedMs;
+            }
+            if (clockStart_>=0 && ctx.elapsedMs-clockStartMs_>=8000) {
+                double delta=hours-clockStart_;
+                bool ok=wantPaused ? fabs(delta)<=0.00001 :
+                    (hourSec_>0 && delta>0.5*8.0/hourSec_);
+                char b[240]; _snprintf(b,sizeof(b)-1,
+                    "SCENARIO PAUSE_UI HOLD role=%s phase=%u paused=%d duration=%lu clockDelta=%.9f hourSec=%.4f pass=%d",
+                    ctx.isHost?"host":"join",phase_,paused?1:0,
+                    ctx.elapsedMs-clockStartMs_,delta,hourSec_,ok?1:0);
+                b[sizeof(b)-1]=0; coop::logLine(b);
+                if (!ok) { failed_=true; return finish(ctx); }
+                ++phase_; announced_=false; matched_=false; clockStart_=-1;
+            }
+        } else if (matched_) {
+            // UI prediction can revert while the authoritative reply arrives.
+            // Require a continuous settle period before starting the strict hold.
+            if (clockStart_ < 0) {
+                matched_=false;
+            } else {
+                // A heartbeat must never undo an established eight-second hold.
+                failed_=true; return finish(ctx);
+            }
+        }
+        if (ctx.elapsedMs-phaseMs_>45000 && phase_<4) {
+            failed_=true; return finish(ctx);
+        }
+        return false;
+    }
+private:
+    bool finish(const ScenarioContext& ctx) {
+        passed_=!failed_ && phase_==4;
+        char b[128]; _snprintf(b,sizeof(b)-1,
+            "SCENARIO PAUSE_UI RESULT role=%s pass=%d phases=%u",
+            ctx.isHost?"host":"join",passed_?1:0,phase_);
+        b[sizeof(b)-1]=0; coop::logLine(b); return true;
+    }
+    unsigned int phase_;
+    bool announced_, matched_, failed_, oppositeSeen_;
+    unsigned long phaseMs_, matchedMs_, lastLogMs_, clockStartMs_;
+    double clockStart_;
+    float hourSec_;
+};
+
 // speed_probe (vote-decoupling phase-0 spike, HOST-side, log-only): prove the
 // three claims the decoupled design rests on, with speedSync forced OFF so the
 // replicator can't fight the probe:
@@ -1968,13 +2241,15 @@ public:
                 if (!sr.chained && !sr.hasShackleItem) continue;
                 ++shackled;
                 sawShackled_ = true;
-                char b[192];
+                char b[320];
                 _snprintf(b, sizeof(b) - 1,
                           "SCENARIO SHACKLE hand=%u,%u t=%lu chained=%d "
-                          "shackleItem=%d lock=%d owner=%u,%u",
+                          "shackleItem=%d lock=%d owner=%u,%u hand5=%u,%u,%u,%u,%u owner5=%u,%u,%u,%u,%u",
                           st[i].hIndex, st[i].hSerial, ctx.elapsedMs,
                           sr.chained ? 1 : 0, sr.hasShackleItem ? 1 : 0,
-                          sr.lockPresent ? 1 : 0, sr.owner[3], sr.owner[4]);
+                          sr.lockPresent ? 1 : 0, sr.owner[3], sr.owner[4],
+                          st[i].hIndex, st[i].hSerial, st[i].hType, st[i].hContainer, st[i].hContainerSerial,
+                          sr.owner[3], sr.owner[4], sr.owner[0], sr.owner[1], sr.owner[2]);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
             char c[96];
@@ -2413,6 +2688,7 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "bed_pose")     return new BedPoseScenario();
     if (name == "bed_wake")     return new BedWakeScenario();
     if (name == "bed_lay")      return new BedLayScenario();
+    if (name == "carry_bed")    return new CarryBedScenario();
     if (name == "bed_put")      return new FurnPutScenario(1);
     if (name == "cage_put")     return new FurnPutScenario(2);
     if (name == "chain_put")    return new FurnPutScenario(3);
@@ -2422,6 +2698,7 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "sneak_pose")   return new SneakPoseScenario();
     if (name == "sneak_detect") return new SneakDetectScenario();
     if (name == "speed_sync")   return new SpeedSyncScenario();
+    if (name == "speed_pause_ui") return new SpeedPauseUiScenario();
     if (name == "speed_probe")  return new SpeedProbeScenario();
     if (name == "shackle_probe") return new ShackleProbeScenario("shackle_probe");
     if (name == "shackle_sync")  return new ShackleProbeScenario("shackle_sync");

@@ -85,7 +85,7 @@ function Measure-NpcSync {
         }
         if ($dists.Count -eq 0) { continue }
         $sorted = $dists | Sort-Object
-        $rows += @{ hand = $hand; aligned = $dists.Count; med = $sorted[[int]($sorted.Count/2)] }
+        $rows += @{ hand = $hand; aligned = $dists.Count; med = $sorted[[int][Math]::Floor($sorted.Count/2)] }
     }
     if ($rows.Count -eq 0) {
         Write-Host "  CROSSCHECK [$Dir] FAIL - no time-overlapping NPCs"
@@ -111,7 +111,7 @@ function Measure-NpcSync {
     }
     $tracked = @($judged | Where-Object { $_.med -le $Tol }).Count
     $worst = ($judged | ForEach-Object { $_.med } | Measure-Object -Maximum).Maximum
-    $ratio = [Math]::Round($tracked / $judged.Count, 3)
+    $ratio = $tracked / $judged.Count
     $ok = ($ratio -ge $MinRatio)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  CROSSCHECK [$Dir] $v - tracked $tracked/$($judged.Count) continuously-present NPCs within $Tol (ratio=$ratio >= $MinRatio, worstMedian=$([Math]::Round($worst,1)), excluded $($rows.Count - $judged.Count) boundary)"
@@ -183,7 +183,7 @@ function Test-NpcPose {
         Write-Host "  POSE [npc] SKIP - only $judged seated tasked NPC(s) (need >= $MinJudged)"
         return (Add-GateResult -Name "pose" -Status SKIP -Metrics @{ judged = $judged } -Detail "too few seated tasked NPCs")
     }
-    $ratio = [Math]::Round($matched / $judged, 3)
+    $ratio = $matched / $judged
     $ok = ($ratio -ge $MinRatio)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     $detail = if ($mism.Count -gt 0) { " mismatches: $($mism -join ', ')" } else { "" }
@@ -232,7 +232,7 @@ function Test-NpcPoseState {
         Write-Host "  POSE-STATE [npc] SKIP - only $judged valid aligned pelvis pair(s) across $npcJudged NPC(s) (need >= $MinJudged; pelvis read may be failing)"
         return (Add-GateResult -Name "pose_state" -Status SKIP -Metrics @{ pairs = $judged; npcs = $npcJudged } -Detail "too few pelvis pairs")
     }
-    $ratio = [Math]::Round($matched / $judged, 3)
+    $ratio = $matched / $judged
     $ok = ($ratio -ge $MinRatio)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     $detail = if ($mism.Count -gt 0) { " pose-mismatch: $($mism -join ', ')" } else { "" }
@@ -266,14 +266,15 @@ function Test-BedPose {
 
     $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
     $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
-    $hKey = $H.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
-    $jKey = $J.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
-    if ($null -eq $hKey -or $null -eq $jKey) {
-        Write-Host "  BED-POSE FAIL - subject series missing (host=$([bool]$hKey) join=$([bool]$jKey))"
+    $hKeys = @($H.Keys | Where-Object { $_.StartsWith($keyPrefix) })
+    $hKey = if ($hKeys.Count -eq 1) { $hKeys[0] } else { $null }
+    $jRows = @(if ($null -ne $hKey) { Get-MappedScenarioSamples -Map $J -WireHand $hKey -File $JoinFile })
+    if ($null -eq $hKey -or $jRows.Count -eq 0) {
+        Write-Host "  BED-POSE FAIL - unique source or full mapped peer series missing"
         return (Add-GateResult -Name "bed_pose" -Status FAIL -Detail "subject series missing")
     }
     $hPost = @($H[$hKey] | Where-Object { $_.t -ge $t0 })
-    $jPost = @($J[$jKey] | Where-Object { $_.t -ge $t0 })
+    $jPost = @($jRows | Where-Object { $_.t -ge $t0 })
     $hBed  = @($hPost | Where-Object { $accept -contains $_.task })
     $jBed  = @($jPost | Where-Object { $accept -contains $_.task })
 
@@ -298,7 +299,7 @@ function Test-BedPose {
     $medGap = -1.0
     if ($gaps.Count -gt 0) {
         $sorted = @($gaps | Sort-Object)
-        $medGap = [Math]::Round($sorted[[int][Math]::Floor($sorted.Count / 2)], 2)
+        $medGap = [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
     }
 
     $hostCommit = ($hBed.Count -ge $MinCommit)
@@ -352,10 +353,11 @@ function Test-BedWake {
 
     $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
     $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
-    $hKey = $H.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
-    $jKey = $J.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
-    if ($null -eq $hKey -or $null -eq $jKey) {
-        Write-Host "  BED-WAKE FAIL - subject series missing (host=$([bool]$hKey) join=$([bool]$jKey))"
+    $hKeys = @($H.Keys | Where-Object { $_.StartsWith($keyPrefix) })
+    $hKey = if ($hKeys.Count -eq 1) { $hKeys[0] } else { $null }
+    $jRows = @(if ($null -ne $hKey) { Get-MappedScenarioSamples -Map $J -WireHand $hKey -File $JoinFile })
+    if ($null -eq $hKey -or $jRows.Count -eq 0) {
+        Write-Host "  BED-WAKE FAIL - unique source or full mapped peer series missing"
         return (Add-GateResult -Name "bed_wake" -Status FAIL -Detail "subject series missing")
     }
 
@@ -387,9 +389,9 @@ function Test-BedWake {
     $hostMoved = ($hostMaxAway -gt $MoveDist)
 
     # Gate 3 - the join copy LEFT the bed on the settled tail.
-    $jTail  = @($J[$jKey] | Where-Object { $_.t -ge ($tMove + $SettleMs) })
+    $jTail  = @($jRows | Where-Object { $_.t -ge ($tMove + $SettleMs) })
     $jOut   = @($jTail | Where-Object { ($_.bs -band $BED) -eq 0 })
-    $leaveRatioVal = if ($jTail.Count -gt 0) { [Math]::Round($jOut.Count / $jTail.Count, 3) } else { 0.0 }
+    $leaveRatioVal = if ($jTail.Count -gt 0) { $jOut.Count / $jTail.Count } else { 0.0 }
     $joinLeft = ($jTail.Count -ge $MinTail -and $leaveRatioVal -ge $LeaveRatio)
     $fastExit = @(Select-String -Path $JoinFile -Pattern "\[furn\] BED FAST-EXIT" -ErrorAction SilentlyContinue).Count
 
@@ -410,7 +412,7 @@ function Test-BedWake {
     $medGap = -1.0
     if ($gaps.Count -gt 0) {
         $sorted = @($gaps | Sort-Object)
-        $medGap = [Math]::Round($sorted[[int][Math]::Floor($sorted.Count / 2)], 2)
+        $medGap = [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
     }
     $joinFollowed = ($gaps.Count -gt 0 -and $medGap -le $PosTol)
 
@@ -459,7 +461,7 @@ function Test-BedLay {
     function _Med($arr) {
         $a = @($arr | Sort-Object)
         if ($a.Count -eq 0) { return -1.0 }
-        return [Math]::Round([double]$a[[int][Math]::Floor($a.Count / 2)], 2)
+        return [double]$a[[int][Math]::Floor($a.Count / 2)]
     }
     # Median time-aligned distance between a peer sample set and the owner series.
     function _GapMed($peerSamples, $ownerSamples, $maxDt) {
@@ -491,12 +493,13 @@ function Test-BedLay {
 
         $O = Get-ScenarioSeries -File $ownerFile -Kind "MEMBER"
         $P = Get-ScenarioSeries -File $peerFile  -Kind "RECV"
-        $oKey = $O.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
-        $pKey = $P.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
-        if ($null -eq $oKey -or $null -eq $pKey) {
-            return @{ ok = $false; why = "win ${tag}: subject series missing (owner=$([bool]$oKey) peer=$([bool]$pKey))"; hasData = $false }
+        $oKeys = @($O.Keys | Where-Object { $_.StartsWith($keyPrefix) })
+        $oKey = if ($oKeys.Count -eq 1) { $oKeys[0] } else { $null }
+        $pAll = @(if ($null -ne $oKey) { Get-MappedScenarioSamples -Map $P -WireHand $oKey -File $peerFile })
+        if ($null -eq $oKey -or $pAll.Count -eq 0) {
+            return @{ ok = $false; why = "win ${tag}: unique source or full mapped peer series missing"; hasData = $false }
         }
-        $oAll = $O[$oKey]; $pAll = $P[$pKey]
+        $oAll = $O[$oKey]
         $DOWN = 3   # BODY_DOWN | BODY_RAGDOLL (an unconscious body is collapsed)
 
         # Pre-KO STANDING baseline (owner, upright, not down, not in bed).
@@ -533,8 +536,8 @@ function Test-BedLay {
         $pTail = @($pAll | Where-Object { $_.t -ge ($tWake + $SettleMs) })
         $oOut  = @($oTail | Where-Object { ($_.bs -band $BED) -eq 0 })
         $pOut  = @($pTail | Where-Object { ($_.bs -band $BED) -eq 0 })
-        $oOutRatio = if ($oTail.Count -gt 0) { [Math]::Round($oOut.Count / $oTail.Count, 3) } else { 0.0 }
-        $pOutRatio = if ($pTail.Count -gt 0) { [Math]::Round($pOut.Count / $pTail.Count, 3) } else { 0.0 }
+        $oOutRatio = if ($oTail.Count -gt 0) { $oOut.Count / $oTail.Count } else { 0.0 }
+        $pOutRatio = if ($pTail.Count -gt 0) { $pOut.Count / $pTail.Count } else { 0.0 }
         $exitGap = _GapMed $pOut @($oAll | Where-Object { $_.t -ge $tWake }) $MaxDt
         $ownerExit = ($oTail.Count -ge $MinExit -and $oOutRatio -ge $LeaveRatio)
         $peerExit  = ($pTail.Count -ge $MinExit -and $pOutRatio -ge $LeaveRatio)
@@ -612,7 +615,7 @@ function Test-NpcBodyState {
         Write-Host "  BODY-STATE [npc] SKIP - only $judged host-down aligned pair(s) across $npcJudged NPC(s) (need >= $MinJudged)"
         return (Add-GateResult -Name "body_state" -Status SKIP -Metrics @{ pairs = $judged; npcs = $npcJudged } -Detail "no/too few host-down samples")
     }
-    $ratio = [Math]::Round($matched / $judged, 3)
+    $ratio = $matched / $judged
     $ok = ($ratio -ge $MinRatio)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     $detail = if ($mism.Count -gt 0) { " not-down-on-join: $($mism -join ', ')" } else { "" }
@@ -645,8 +648,8 @@ function Test-CraftOrder {
     }
     $preIdle  = @($pre  | Where-Object { $_.task -ne $WorkTask }).Count
     $postWork = @($post | Where-Object { $_.task -eq $WorkTask }).Count
-    $preRatio  = [Math]::Round($preIdle  / $pre.Count, 3)
-    $postRatio = [Math]::Round($postWork / $post.Count, 3)
+    $preRatio  = $preIdle / $pre.Count
+    $postRatio = $postWork / $post.Count
     $ok = ($preRatio -ge $MinRatio -and $postRatio -ge $MinRatio)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  CRAFT-ORDER [join] $v - worker=$worker idle-before $preIdle/$($pre.Count) (ratio=$preRatio), operating-after $postWork/$($post.Count) (ratio=$postRatio), task=$WorkTask"
@@ -889,8 +892,8 @@ function Test-DownOrder {
     }
     $preUp   = @($pre  | Where-Object { -not (& $down $_.bs) }).Count
     $postDn  = @($post | Where-Object {      (& $down $_.bs) }).Count
-    $preRatio  = [Math]::Round($preUp  / $pre.Count, 3)
-    $postRatio = [Math]::Round($postDn / $post.Count, 3)
+    $preRatio  = $preUp / $pre.Count
+    $postRatio = $postDn / $post.Count
     $ok = ($preRatio -ge $MinRatio -and $postRatio -ge $MinRatio)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  DOWN-ORDER [join] $v - subject=$subject upright-before $preUp/$($pre.Count) (ratio=$preRatio), down-after $postDn/$($post.Count) (ratio=$postRatio)"
@@ -902,24 +905,15 @@ function Test-DownOrder {
 # RECV, clock-offset-corrected) - the metric a real WAN run makes meaningful.
 function Test-DeathOrder {
     param([string]$HostFile, [string]$JoinFile)
-    # NB: the SEND line format is "... ev=2 hand=<h> actor=<a> bs <x>-><y>". The
-    # original oracle predated the actor field and anchored 'hand=([\d,]+?) bs',
-    # which stopped matching when combat attribution added ' actor=..' - a silent
-    # oracle rot found by the re-validation audit. Greedy digits/commas is enough.
-    $send = Select-String -Path $HostFile -Pattern '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] SEND id=\d+ ev=2 hand=([\d,]+)' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $send) { Write-Host "  DEATH-ORDER FAIL - host emitted no death event (ev=2)"; return (Add-GateResult -Name "death_order" -Status FAIL -Detail "no EVT_DEATH sent") }
-    $hand = $send.Matches[0].Groups[5].Value
-    $sendT = Convert-StampToMs -Groups $send.Matches[0].Groups -OffsetMs (Get-LogClockOffsetMs -File $HostFile)
-    $pat  = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] RECV id=\d+ ev=2 owner=\d+ hand=' + [regex]::Escape($hand) + '\b'
-    $recv = @(Select-String -Path $JoinFile -Pattern $pat -ErrorAction SilentlyContinue)
-    if ($recv.Count -lt 1) {
-        Write-Host "  DEATH-ORDER FAIL - join never received the reliable death event for hand=$hand"
-        return (Add-GateResult -Name "death_order" -Status FAIL -Detail "EVT_DEATH not received")
+    $send = Get-ReliableEventRows -File $HostFile -Direction SEND |
+        Where-Object { $_.Event -eq 2 } | Select-Object -First 1
+    if ($null -eq $send) { return (Add-GateResult -Name 'death_order' -Status FAIL -Detail 'no EVT_DEATH sent') }
+    $recv = Find-ReliableReceipt -Send $send -Receipts @(Get-ReliableEventRows -File $JoinFile -Direction RECV)
+    if ($null -eq $recv) {
+        return (Add-GateResult -Name 'death_order' -Status FAIL -Detail 'no ordered receipt for this exact event, full victim, actor, owner and session')
     }
-    $recvT = Convert-StampToMs -Groups $recv[0].Matches[0].Groups -OffsetMs (Get-LogClockOffsetMs -File $JoinFile)
-    $latMs = $recvT - $sendT
-    Write-Host "  DEATH-ORDER [join] PASS - reliable EVT_DEATH received for hand=$hand ($($recv.Count) delivery/deliveries, latency=${latMs}ms)"
-    return (Add-GateResult -Name "death_order" -Status PASS -Metrics @{ deliveries = $recv.Count; latencyMs = $latMs })
+    return (Add-GateResult -Name 'death_order' -Status PASS `
+        -Metrics @{ deliveries = 1; latencyMs = $recv.Time - $send.Time; eventId = $send.Id; hand = $send.Hand })
 }
 
 # Parse a "SCENARIO CARRY" series for one hand from a log: the body's LOCAL
@@ -937,7 +931,7 @@ function Get-CarrySeries {
            ' pos=(-?[\d\.]+),(-?[\d\.]+),(-?[\d\.]+) bs=(\d+)'
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
-        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+        $t = Get-LogTimeMs -Match $m
         $e = [pscustomobject]@{
             t = $t
             rawT         = [long]$g[5].Value
@@ -965,7 +959,7 @@ function Get-FurnSeries {
            ' pos=(-?[\d\.]+),(-?[\d\.]+),(-?[\d\.]+) bs=(\d+)'
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
-        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+        $t = Get-LogTimeMs -Match $m
         $e = [pscustomobject]@{
             t    = $t
             rawT = [long]$g[5].Value
@@ -1224,11 +1218,13 @@ function Get-ShackleSeries {
     $rx = 'SCENARIO SHACKLE hand=(\d+),(\d+) t=(\d+) chained=(\d) shackleItem=(\d) lock=(\d) owner=(\d+),(\d+)'
     foreach ($l in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
         $g = $l.Matches[0].Groups
+        $full = [regex]::Match($l.Line, '\bhand5=(\d+(?:,\d+){4})(?: |$)')
         $hand = "$($g[1].Value),$($g[2].Value)"
         if (-not $series.ContainsKey($hand)) { $series[$hand] = New-Object System.Collections.ArrayList }
         [void]$series[$hand].Add([pscustomobject]@{
             T = [long]$g[3].Value; Chained = [int]$g[4].Value
             ShackleItem = [int]$g[5].Value; Lock = [int]$g[6].Value
+            Wall = (Get-LogTimeMs -Match $l); FullHand = $(if ($full.Success) { $full.Groups[1].Value } else { '' })
             Owner = "$($g[7].Value),$($g[8].Value)" })
     }
     return $series
@@ -1292,10 +1288,7 @@ function Test-ShackleProbe {
 # guard shipping, a shared prisoner whose owner reports chained/locked while the
 # peer's driven copy reports it CLEARED (the "other client's PC unlocked the
 # shackle" desync) is now a FAIL. Requires both clients to have observed >= 1
-# shackled body; then FAILs on any shared-hand steady-state chained/lock
-# divergence. The sharedHands=0 case (the camp hand-identity caveat noted in 6a,
-# where prisoners enumerate under different local hands on each client) cannot be
-# asserted here and PASSes with a note - the manual gate is authoritative there.
+# shackled body and at least one shared prisoner; missing identity is no proof.
 function Test-ShackleSync {
     param([string]$HostFile, [string]$JoinFile)
     $hs = Get-ShackleSeries -File $HostFile
@@ -1316,10 +1309,29 @@ function Test-ShackleSync {
     # mismatch is the peer-unlock fingerprint the 6b guard is meant to prevent.
     $shared = @($hostHands | Where-Object { $js.ContainsKey($_) })
     $m.sharedHands = $shared.Count
+    if ($shared.Count -eq 0) { $bad += 'no mapped shared prisoner identity' }
     $divergeHands = @()
     foreach ($h in $shared) {
         $hLast = $hs[$h] | Select-Object -Last 1
         $jLast = $js[$h] | Select-Object -Last 1
+        if ($hLast.FullHand -eq '' -or $hLast.FullHand -ne $jLast.FullHand -or
+            $null -eq $hLast.Wall -or $null -eq $jLast.Wall -or [Math]::Abs($hLast.Wall-$jLast.Wall) -gt 1000) {
+            $bad += "prisoner $h has no aligned full-identity final pair"; continue
+        }
+        $paired = 0
+        foreach ($hostRow in @($hs[$h] | Where-Object { $_.Wall -ge $hLast.Wall - 5000 })) {
+            $joinRow = $js[$h] | Where-Object {
+                $_.FullHand -eq $hostRow.FullHand -and $null -ne $_.Wall -and
+                [Math]::Abs($_.Wall-$hostRow.Wall) -le 1000
+            } | Sort-Object { [Math]::Abs($_.Wall-$hostRow.Wall) } | Select-Object -First 1
+            if ($null -eq $joinRow) { continue }
+            $paired++
+            if ($hostRow.Chained -ne $joinRow.Chained -or $hostRow.Lock -ne $joinRow.Lock -or
+                $hostRow.ShackleItem -ne $joinRow.ShackleItem) {
+                $bad += "prisoner $h diverged in aligned steady-state samples"
+            }
+        }
+        if ($paired -eq 0) { $bad += "prisoner $h has no aligned steady-state samples" }
         if ($hLast.Chained -ne $jLast.Chained -or $hLast.Lock -ne $jLast.Lock) {
             $divergeHands += ("{0} host(ch={1},lk={2}) join(ch={3},lk={4})" -f `
                 $h, $hLast.Chained, $hLast.Lock, $jLast.Chained, $jLast.Lock)
@@ -1329,7 +1341,7 @@ function Test-ShackleSync {
 
     # STRICT: observed on both clients AND no shared-hand divergence.
     $observed = ($hostHands.Count -ge 1 -and $joinHands.Count -ge 1)
-    $ok = ($observed -and $divergeHands.Count -eq 0)
+    $ok = ($observed -and $shared.Count -gt 0 -and $divergeHands.Count -eq 0 -and $bad.Count -eq 0)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     $detail = if ($bad.Count -gt 0) { $bad -join "; " } else { "" }
     if ($divergeHands.Count -gt 0) {
@@ -1337,7 +1349,7 @@ function Test-ShackleSync {
         $detail += "shackle divergence: " + ($divergeHands -join " | ")
     } elseif ($observed -and $shared.Count -eq 0) {
         if ($detail) { $detail += "; " }
-        $detail += "no shared hands (identity caveat) - manual gate authoritative"
+        $detail += "no mapped shared prisoner; parity cannot be judged"
     }
     Write-Host ("  SHACKLE-SYNC $v - hostHands=$($hostHands.Count) joinHands=$($joinHands.Count) " +
                 "shared=$($shared.Count) divergent=$($divergeHands.Count) " +
@@ -1946,7 +1958,7 @@ function Test-SpeedSync {
         $pat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO SPEED t=\d+ mult=([\d\.]+) paused=(\d)(?: nbtn=-?\d+ buttons=([01]*))?'
         foreach ($mi in (Select-String -Path $file -Pattern $pat -ErrorAction SilentlyContinue)) {
             $gg = $mi.Matches[0].Groups
-            $tt = Convert-StampToMs -Groups $gg -OffsetMs $off
+            $tt = Get-LogTimeMs -Match $mi
             $mu = [double]$gg[5].Value
             if ([int]$gg[6].Value -eq 1) { $mu = 0.0 }
             $btn = if ($gg[7].Success) { $gg[7].Value } else { $null }
@@ -1969,7 +1981,7 @@ function Test-SpeedSync {
         $mu = [double]$gg[5].Value
         if ([int]$gg[6].Value -eq 1) { $mu = 0.0 }
         [void]$sets.Add([pscustomobject]@{
-            t = (Convert-StampToMs -Groups $gg -OffsetMs $hoff)
+            t = (Get-LogTimeMs -Match $mi)
             mult = $mu; combat = [int]$gg[7].Value })
     }
     $m = @{ transitions = $sets.Count; hostSamples = $H.Count; joinSamples = $J.Count }
@@ -2004,7 +2016,7 @@ function Test-SpeedSync {
         $gotVote = $false
         $rp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[speed\] REQ RECV owner=\d+ mult=1\.00'
         foreach ($mi in (Select-String -Path $HostFile -Pattern $rp -ErrorAction SilentlyContinue)) {
-            $tt = Convert-StampToMs -Groups $mi.Matches[0].Groups -OffsetMs $hoff
+            $tt = Get-LogTimeMs -Match $mi
             if ($tt -ge ($tSame - 500) -and $tt -le ($tSame + 4000)) { $gotVote = $true; break }
         }
         if (-not $gotVote) { $bad += "same-value 1x click never arrived as a vote (no host REQ RECV mult=1.00 within 4s - stuck-vote bug back)" }
@@ -2268,7 +2280,7 @@ function Test-SplitInterest {
         }
         if ($dists.Count -lt 4) { continue }  # join stopped receiving it post-move
         $sorted = $dists | Sort-Object
-        $med = $sorted[[int]($sorted.Count/2)]
+        $med = $sorted[[int][Math]::Floor($sorted.Count/2)]
         $judged++
         if ($med -le $Tol) { $tracked++ } else { $mism += "$hand(med=$([Math]::Round($med,1)))" }
         if ($med -gt $worst) { $worst = $med }
@@ -2435,7 +2447,7 @@ function Test-SpawnSync {
         }
         if ($dists.Count -lt 5) { continue }
         $sorted = $dists | Sort-Object
-        $med = $sorted[[int]($sorted.Count/2)]
+        $med = $sorted[[int][Math]::Floor($sorted.Count/2)]
         $judged++
         if ($med -le $Tol) { $tracked++ }
         if ($med -gt $worst) { $worst = $med }
@@ -2526,3 +2538,237 @@ function Test-NpcCensus {
                             extraCulls = $extra; sent = $sent; recv = $recv } -Detail $detail)
 }
 
+function Test-SpeedPauseUi {
+    param([string]$HostFile, [string]$JoinFile)
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $holdRx = 'PAUSE_UI HOLD role=(host|join) phase=(\d+) paused=(\d+) duration=(\d+) clockDelta=(-?[\d.]+) hourSec=([\d.]+) pass=(\d+)'
+    foreach ($peer in @(@{ File=$HostFile; Role='host' }, @{ File=$JoinFile; Role='join' })) {
+        if (-not (Test-Path $peer.File)) { $failures.Add("$($peer.Role): missing log"); continue }
+        $holds = @(Select-String -Path $peer.File -Pattern $holdRx)
+        if ($holds.Count -ne 4) { $failures.Add("$($peer.Role): expected four completed holds") }
+        foreach ($phase in 0..3) {
+            $rows = @($holds | Where-Object { $_.Matches[0].Groups[2].Value -eq "$phase" })
+            if ($rows.Count -ne 1) { $failures.Add("$($peer.Role): missing/duplicate phase $phase"); continue }
+            $g = $rows[0].Matches[0].Groups
+            $want = [int]($phase -eq 0 -or $phase -eq 2)
+            $delta = [double]$g[5].Value; $hourSec = [double]$g[6].Value
+            $clockOk = if ($want) { [Math]::Abs($delta) -le 0.00001 } else { $hourSec -gt 0 -and $delta -gt 4.0/$hourSec }
+            if ($g[1].Value -ne $peer.Role -or [int]$g[3].Value -ne $want -or
+                [int]$g[4].Value -lt 8000 -or $g[7].Value -ne '1' -or -not $clockOk) {
+                $failures.Add("$($peer.Role): native pause/clock failed phase $phase")
+            }
+        }
+        if (-not (Select-String -Path $peer.File -Pattern "PAUSE_UI RESULT role=$($peer.Role) pass=1 phases=4" -Quiet)) {
+            $failures.Add("$($peer.Role): no successful observer result")
+        }
+    }
+    $inputFile = Join-Path (Split-Path $HostFile) 'pause_ui_inputs.json'
+    if (-not (Test-Path $inputFile)) { $failures.Add('Missing actual owned-window UI input journal') }
+    else {
+        try {
+            $inputs = @(Get-Content $inputFile -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop)
+            $run=Get-Content (Join-Path (Split-Path $HostFile) 'run.json') -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+            if ($inputs.Count -ne 4) { $failures.Add('Expected four real UI inputs') }
+            $actions = @('host_pause','join_resume','join_pause','host_resume')
+            foreach ($phase in 0..3) {
+                $rows = @($inputs | Where-Object { $_.phase -eq $phase })
+                if ($rows.Count -ne 1) { $failures.Add("Missing/duplicate actual UI input phase $phase"); continue }
+                $row=$rows[0]
+                $role=if ($phase -eq 0 -or $phase -eq 3) { 'host' } else { 'join' }
+                $method=if ($phase -eq 0 -or $phase -eq 2) { 'pause_button' } else { 'space' }
+                $owned=@($run.ownedProcesses | Where-Object { $_.role -eq $role })
+                if ($row.action -ne $actions[$phase] -or $row.role -ne $role -or
+                    $row.pid -le 0 -or -not $row.windowId -or $row.windowId -eq '0' -or
+                    $row.owned -ne $true -or $row.delivered -ne $true -or $row.transport -ne 'SendInput' -or
+                    $row.monitor -ne 'non-primary' -or $row.method -ne $method -or
+                    $owned.Count -ne 1 -or $owned[0].pid -ne $row.pid -or
+                    $owned[0].windowId -ne $row.windowId -or
+                    $owned[0].processStartUtcTicks -ne $row.processStartUtcTicks -or
+                    $row.client.Count -ne 2 -or $row.client[0] -le 0 -or $row.client[1] -le 0) {
+                    $failures.Add("Unverified actual owned-window UI input phase $phase")
+                }
+                if ($method -eq 'pause_button' -and
+                    ($row.nativeButton.Count -ne 4 -or
+                     $row.nativeButton[0] -lt 0 -or $row.nativeButton[1] -lt 0 -or
+                     $row.nativeButton[2] -le 0 -or $row.nativeButton[3] -le 0 -or
+                     ($row.nativeButton[0]+$row.nativeButton[2]) -gt $row.client[0] -or
+                     ($row.nativeButton[1]+$row.nativeButton[3]) -gt $row.client[1])) {
+                    $failures.Add("Native pause button outside actual client phase $phase")
+                }
+                foreach ($shot in @(@{ Path=$row.screenshot; Hash=$row.screenshotSha256; Suffix='before' },
+                                    @{ Path=$row.afterScreenshot; Hash=$row.afterScreenshotSha256; Suffix='after' })) {
+                    if ($shot.Path -ne "pause_phase${phase}_${role}_$($shot.Suffix).png") {
+                        $failures.Add("Missing actual screenshot phase $phase"); continue
+                    }
+                    $shotPath=Join-Path (Split-Path $HostFile) $shot.Path
+                    if (-not (Test-Path -LiteralPath $shotPath) -or -not $shot.Hash -or
+                        (Get-FileHash -LiteralPath $shotPath -Algorithm SHA256).Hash -cne $shot.Hash) {
+                        $failures.Add("Actual screenshot mismatch phase $phase")
+                    }
+                }
+            }
+            foreach ($role in @('host','join')) {
+                if (@($inputs | Where-Object { $_.role -eq $role -and $_.method -eq 'pause_button' }).Count -ne 1) {
+                    $failures.Add("Actual pause button must be exercised once on $role")
+                }
+            }
+        } catch { $failures.Add("Unreadable UI input journal: $($_.Exception.Message)") }
+    }
+    return (Add-GateResult -Name 'speed_pause_ui' -Status $(if ($failures.Count) { 'FAIL' } else { 'PASS' }) `
+        -Detail ($failures -join '; ') -Metrics @{ phases=4; holdMilliseconds=8000 })
+}
+
+function Test-AmbientPose {
+    param([string]$HostFile, [string]$JoinFile)
+    $number = '[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
+    $hand = '\d+(?:\.\d+){4}'
+    $poseRx = "\[poseobserve\] side=(?<side>SRC|DRIVE) wire=(?<wire>$hand) local=(?<local>$hand) raw=(?<raw>\d+) task=(?<task>\d+) native=(?<native>-?\d+) wireSub=(?<wireSub>$hand) localSub=(?<localSub>$hand) subjectRead=(?<subjectRead>\d+) resolved=(?<resolved>\d+) sid='(?<sid>[^']*)' fixture=(?<fx>$number),(?<fy>$number),(?<fz>$number) descriptor=(?<descriptor>\d+) yaw=(?<yaw>$number) owner='(?<owner>[^']*)' pos=(?<x>$number),(?<y>$number),(?<z>$number) actorYaw=(?<actorYaw>$number) positioned=(?<positioned>\d+) rendered=(?<rendered>\d+) pelvis=(?<pelvis>$number) idle=(?<idle>-?\d+) crouch=-?\d+ floor=(?<floor>-?\d+) outside=(?<outside>\d+) insideSid='(?<insideSid>[^']*)' townSid='(?<townSid>[^']*)' class=(?<class>-?\d+) inv=(?<inv>\d+) complete=(?<complete>\d+) ownerPresent=(?<ownerPresent>\d+) inside=(?<inside>$hand) insidePos=(?<ix>$number),(?<iy>$number),(?<iz>$number) town=(?<town>$hand) townPos=(?<tx>$number),(?<ty>$number),(?<tz>$number)(?: |$)"
+    $naturalRx = "SCENARIO AMBIENT NATURAL hand=(?<local>$hand) name='[^']*' t=\d+ task=(?<task>\d+) subject=(?<localSub>$hand) sid='(?<sid>[^']*)' floor=(?<floor>-?\d+) outside=(?<outside>\d+) pelvis=(?<pelvis>$number) heldMs=(?<heldMs>\d+) held=(?<held>[01]) actorYaw=(?<actorYaw>$number) yaw=(?<yaw>$number) fixture=(?<fx>$number),(?<fy>$number),(?<fz>$number) ownerPresent=(?<ownerPresent>\d+) owner='(?<owner>[^']*)' inside=(?<inside>$hand) insideSid='(?<insideSid>[^']*)' insidePos=(?<ix>$number),(?<iy>$number),(?<iz>$number) town=(?<town>$hand) townSid='(?<townSid>[^']*)' townPos=(?<tx>$number),(?<ty>$number),(?<tz>$number)(?: |$)"
+    $read = {
+        param($file, $marker, $pattern)
+        if ([string]::IsNullOrWhiteSpace($file) -or -not (Test-Path -LiteralPath $file)) { return }
+        $regex = [regex]::new($pattern, [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+        foreach ($line in (Select-String -LiteralPath $file -Pattern $marker -Encoding UTF8)) {
+            $match = $regex.Match($line.Line)
+            if (-not $match.Success) { throw "Malformed native pose witness at ${file}:$($line.LineNumber)" }
+            $row = @{ Time=(Get-LogTimeMs -Match $line); Line=$line.LineNumber }
+            if ($null -eq $row.Time) { throw "Untimed native pose witness at ${file}:$($line.LineNumber)" }
+            foreach ($name in @('side','wire','local','wireSub','localSub','sid','owner','insideSid','townSid','inside','town')) {
+                $row[$name] = $match.Groups[$name].Value
+            }
+            foreach ($name in @('raw','task','native','subjectRead','resolved','descriptor','positioned','rendered',
+                'fx','fy','fz','yaw','actorYaw','x','y','z','pelvis','idle','floor','outside','class','inv',
+                'complete','ownerPresent','ix','iy','iz','tx','ty','tz','heldMs','held')) {
+                if (-not $match.Groups[$name].Success) { continue }
+                $row[$name] = [double]::Parse($match.Groups[$name].Value, [Globalization.NumberStyles]::Float,
+                    [Globalization.CultureInfo]::InvariantCulture)
+                if ([double]::IsNaN($row[$name]) -or [double]::IsInfinity($row[$name])) { throw "Non-finite pose witness at ${file}:$($line.LineNumber)" }
+            }
+            $row
+        }
+    }
+    $qualifies = {
+        param($r)
+        return ($null -ne $r -and $r.raw -eq 221 -and $r.task -eq 221 -and $r.native -eq 221 -and
+            $r.wire -ne '0.0.0.0.0' -and $r.local -ne '0.0.0.0.0' -and
+            $r.wireSub -ne '0.0.0.0.0' -and $r.localSub -ne '0.0.0.0.0' -and $r.sid -ne '' -and
+            $r.subjectRead -eq 1 -and $r.resolved -eq 1 -and $r.descriptor -eq 1 -and
+            $r.positioned -eq 1 -and $r.rendered -eq 1 -and $r.pelvis -gt 0 -and
+            $r.inv -eq 0 -and $r.complete -eq 1 -and @(0,1) -contains $r.ownerPresent -and
+            ($r.ownerPresent -eq 0 -or $r.owner -ne '') -and
+            ($r.inside -eq '0.0.0.0.0' -or $r.insideSid -ne '') -and
+            ($r.town -eq '0.0.0.0.0' -or $r.townSid -ne ''))
+    }
+    $contextMatches = {
+        param($a, $b, [bool]$Local)
+        foreach ($field in @('sid','owner','ownerPresent','floor','outside','insideSid','townSid')) {
+            if ($a[$field] -ne $b[$field]) { return $false }
+        }
+        if (($a.inside -eq '0.0.0.0.0') -ne ($b.inside -eq '0.0.0.0.0') -or
+            ($a.town -eq '0.0.0.0.0') -ne ($b.town -eq '0.0.0.0.0')) { return $false }
+        if ($Local) {
+            foreach ($field in @('local','localSub','inside','town')) { if ($a[$field] -ne $b[$field]) { return $false } }
+        }
+        foreach ($field in @('fx','fy','fz','ix','iy','iz','tx','ty','tz')) {
+            if ([Math]::Abs($a[$field]-$b[$field]) -gt 0.25) { return $false }
+        }
+        foreach ($field in @('yaw','actorYaw')) {
+            $angle = [Math]::Abs($a[$field]-$b[$field]) % (2*[Math]::PI)
+            if ([Math]::Min($angle,2*[Math]::PI-$angle) -gt 0.08) { return $false }
+        }
+        return $true
+    }
+    $poseStable = {
+        param($a, $b)
+        return ((& $qualifies $a) -and (& $contextMatches $a $b $true) -and
+            $a.wire -eq $b.wire -and $a.wireSub -eq $b.wireSub -and $a.class -eq $b.class -and
+            $a.idle -eq $b.idle -and [Math]::Abs($a.y-$b.y) -le 0.75 -and
+            (($a.x-$b.x)*($a.x-$b.x)+($a.z-$b.z)*($a.z-$b.z)) -le 4)
+    }
+    $nearestIndex = {
+        param($rows, $time)
+        $lo = 0; $hi = $rows.Count
+        while ($lo -lt $hi) {
+            $mid = [int][Math]::Floor(($lo+$hi)/2)
+            if ($rows[$mid].Time -lt $time) { $lo = $mid+1 } else { $hi = $mid }
+        }
+        if ($lo -eq 0) { return 0 }
+        if ($lo -eq $rows.Count) { return $rows.Count-1 }
+        if ([Math]::Abs($rows[$lo-1].Time-$time) -le [Math]::Abs($rows[$lo].Time-$time)) { return $lo-1 }
+        return $lo
+    }
+    $hostRows = @(& $read $HostFile '\[poseobserve\] side=' $poseRx)
+    $joinRows = @(& $read $JoinFile '\[poseobserve\] side=' $poseRx)
+    $proved = @{}
+    foreach ($pair in @(@{ Src=$hostRows; Dst=$joinRows; File=$HostFile; Direction='host' },
+                        @{ Src=$joinRows; Dst=$hostRows; File=$JoinFile; Direction='join' })) {
+        $natural = @{}
+        foreach ($row in @(& $read $pair.File 'SCENARIO AMBIENT NATURAL hand=' $naturalRx)) {
+            if ($row.task -ne 221 -or $row.held -ne 1 -or $row.heldMs -lt 3000 -or $row.pelvis -le 0) { continue }
+            $key = "$($row.local)/$($row.localSub)/$($row.sid)"
+            if (-not $natural.ContainsKey($key)) { $natural[$key] = [Collections.Generic.List[object]]::new() }
+            $row.Start = $row.Time-$row.heldMs
+            $natural[$key].Add($row)
+        }
+        $driven = @{}
+        foreach ($row in $pair.Dst) {
+            if ($row.side -ne 'DRIVE') { continue }
+            if (-not $driven.ContainsKey($row.wire)) { $driven[$row.wire] = [Collections.Generic.List[object]]::new() }
+            $driven[$row.wire].Add($row)
+        }
+        foreach ($wire in @($driven.Keys)) { $driven[$wire] = @($driven[$wire] | Sort-Object -Property @{Expression={$_.Time}},@{Expression={$_.Line}}) }
+        $held = @{}
+        foreach ($s in @($pair.Src | Where-Object { $_.side -eq 'SRC' } | Sort-Object -Property @{Expression={$_.Time}},@{Expression={$_.Line}})) {
+            $wire = $s.wire; $naturalKey = "$($s.local)/$($s.localSub)/$($s.sid)"
+            if (-not (& $qualifies $s) -or $s.localSub -ne $s.wireSub -or
+                -not $natural.ContainsKey($naturalKey) -or -not $driven.ContainsKey($wire)) { $held.Remove($wire); continue }
+            $rows = $driven[$wire]; $index = & $nearestIndex $rows $s.Time
+            $d = $rows[$index]
+            $ok = (& $qualifies $d) -and [Math]::Abs($d.Time-$s.Time) -le 1000 -and
+                $s.wireSub -eq $d.wireSub -and $s.class -eq $d.class -and $s.idle -eq $d.idle -and
+                (& $contextMatches $s $d $false) -and [Math]::Abs($s.pelvis-$d.pelvis) -le 0.35 -and
+                [Math]::Abs($s.y-$d.y) -le 0.75 -and [Math]::Abs(($s.y-$s.fy)-($d.y-$d.fy)) -le 0.75 -and
+                (($s.x-$d.x)*($s.x-$d.x)+($s.z-$d.z)*($s.z-$d.z)) -le 4
+            if (-not $ok) { $held.Remove($wire); continue }
+            $continuous = $held.ContainsKey($wire)
+            if ($continuous) {
+                $hold = $held[$wire]
+                $continuous = (& $poseStable $s $hold.Source) -and (& $poseStable $d $hold.Driven) -and
+                    $s.Time-$hold.Last -le 1500 -and $d.Time-$hold.LastDriven -le 1500
+                # Every intervening observation counts; nearest-pair selection
+                # may not hide an explicit driven contradiction or sample gap.
+                $lastTime = $hold.LastDriven
+                for ($k = $hold.Index+1; $continuous -and $k -le $index; $k++) {
+                    $row = $rows[$k]
+                    $continuous = (& $poseStable $row $hold.Driven) -and $row.Time-$lastTime -le 1500
+                    $lastTime = $row.Time
+                }
+            }
+            if (-not $continuous) {
+                $held[$wire] = @{ Source=$s; Driven=$d; Start=$s.Time; DriveStart=$d.Time
+                    Last=$s.Time; LastDriven=$d.Time; Samples=1; Index=$index }
+            } elseif ($s.Time -gt $held[$wire].Last -and $d.Time -gt $held[$wire].LastDriven) {
+                $held[$wire].Last=$s.Time; $held[$wire].LastDriven=$d.Time
+                $held[$wire].Samples++; $held[$wire].Index=$index
+            }
+            $hold = $held[$wire]
+            $commonStart = [Math]::Max($hold.Start,$hold.DriveStart)
+            $commonEnd = [Math]::Min($s.Time,$d.Time)
+            $unionStart = [Math]::Min($hold.Start,$hold.DriveStart)
+            $unionEnd = [Math]::Max($s.Time,$d.Time)
+            if ($hold.Samples -lt 5 -or $commonEnd-$commonStart -lt 3000) { continue }
+            foreach ($native in $natural[$naturalKey]) {
+                if ($native.Start -le $unionStart -and $native.Time -ge $unionEnd -and
+                    (& $contextMatches $native $hold.Source $true)) {
+                    $proved["$($pair.Direction)/$wire/$($hold.Start)"] = @{ source=$s; driven=$d
+                        duration=$commonEnd-$commonStart; start=$commonStart; end=$commonEnd
+                        nativeStart=$native.Start; nativeEnd=$native.Time }
+                    break
+                }
+            }
+        }
+    }
+    return (Add-GateResult -Name ambient_pose -Status $(if ($proved.Count) { 'PASS' } else { 'FAIL' }) `
+        -Detail 'Full canonical actor/subject and stable per-side local/parent identities, all native observations continuous, three-second common SRC/DRIVE interval covered independently by real natural hold' `
+        -Metrics @{ nativeNpcProofs=$proved })
+}

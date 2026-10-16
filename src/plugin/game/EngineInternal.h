@@ -28,6 +28,7 @@
 #define BOOST_SYSTEM_NO_DEPRECATED 1
 
 #include "Engine.h"
+#include "EngineProcedural.h"
 // Phase 5a domain split: the adapter re-includes the narrow public headers carved
 // out of Engine.h so the domain TUs (which define these entry points) still see
 // their declarations.
@@ -56,7 +57,7 @@
 #include <kenshi/Inventory.h>       // Inventory (Phase 4a container contents)
 #include <kenshi/Item.h>            // Item / InventoryItemBase (quantity/quality/equipped)
 #include <kenshi/CharBody.h>        // CharBody::currentAction / _NV_setCurrentAction
-#include <kenshi/CombatClass.h>     // CombatClass::combatState (active-vs-waiting stance)
+#include <kenshi/combat/CombatClass.h> // CombatClass::combatState (active-vs-waiting stance)
 #include <kenshi/Damages.h>         // Damages (melee hit floats; protocol 45 join-dealt report)
 #include <kenshi/CharStats.h>       // CharStats (protocol 17 stats sync)
 #include <kenshi/Tasker.h>          // Tasker::key() -> TaskType, Tasker::subject (hand)
@@ -90,6 +91,7 @@
 #include <map>     // squad roster pointer->hand baseline (protocol 35)
 #include <set>
 #include <utility>
+#include <deque>
 #include <vector>
 
 namespace coop {
@@ -515,7 +517,6 @@ extern BldGetRealTownFn     g_bldGetRealTownFn;
 extern TownSetPlayerBldgsFn g_townSetPlayerBldgsFn;
 extern TownRecalcLevelFn    g_townRecalcLevelFn;
 extern TownIsPlayerBldgsFn  g_townIsPlayerBldgsFn;
-extern BuyItemFn g_buyItemOrig;
 
 // Cross-owner trade veto (see Engine.h installXferBlockHook). Sanctioned sync
 // relocations set g_invVetoSuspend around native calls to suspend veto/capture.

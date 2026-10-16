@@ -6,6 +6,9 @@
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
 #include "ScenarioSupport.h"
+#include <kenshi/Building/Building.h>
+#include <cstring>
+#include <float.h>
 
 namespace coop {
 namespace {
@@ -35,7 +38,18 @@ public:
             // correct way to compare autonomous movers across staggered clients;
             // latest-vs-latest measures unrelated moments and post-exit drift.
             const char* kind = ctx.isHost ? "MEMBER" : "RECV";
-            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            for (unsigned int i = 0; i < n; ++i) {
+                logScenarioEntity(kind, npcs[i]);
+                const EntityState& e = npcs[i];
+                char b[512];
+                _snprintf(b,sizeof(b)-1,
+                    "[npc-native] side=%s elapsed=%lu hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f heading=%.3f speed=%.3f moving=%u motion=%.3f,%.3f,%.3f task=%u raw=%u body=%u target=%u,%u,%u,%u,%u",
+                    kind,ctx.elapsedMs,e.hType,e.hContainer,e.hContainerSerial,e.hIndex,e.hSerial,
+                    e.x,e.y,e.z,e.heading,e.cSpeed,(unsigned)e.cMoving,
+                    e.cMotionX,e.cMotionY,e.cMotionZ,(unsigned)e.task,(unsigned)e.rawTask,
+                    (unsigned)e.bodyState,e.sType,e.sContainer,e.sContainerSerial,e.sIndex,e.sSerial);
+                b[sizeof(b)-1]=0; coop::logLine(b);
+            }
             if (!ctx.isHost && n > 0) ++recvCount_;
         }
 
@@ -300,6 +314,153 @@ private:
     unsigned long lastOrderMs_;
     bool          orderOk_;
 };
+
+// Passive natural NPC work observation. Never commandeer a squad leader, park an
+// NPC, or inject/clear a task: source AI must genuinely hold its own usable prop.
+// Cross-client identity, floor, facing and rendered pose are the pair oracle's gate.
+class AmbientPoseScenario : public TimedScenario {
+public:
+    AmbientPoseScenario()
+        : TimedScenario("ambient_pose", 0), held_(false), lastLogMs_(0) {}
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (lastLogMs_ == 0 || ctx.elapsedMs - lastLogMs_ >= 500) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[256];
+            Character* actors[256];
+            // Observe every candidate independently. The pair oracle requires
+            // its actual authored SRC row; the first nearby NPC can instead be
+            // outside peer attention and must not hide the streamed workers.
+            unsigned int n = engine::listNpcsWide(ctx.gw, 2000.0f, actors, npcs, 256);
+            for (unsigned int i = 0; i < n; ++i) {
+                const EntityState& e = npcs[i];
+                unsigned int ah[5]; handFromEntity(e, ah);
+                ObjectHand actorHand = ObjectHand::fromObjOrder(ah);
+                NativeHold* hold = 0;
+                NativeHold* free = 0;
+                for (unsigned int j = 0; j < 256; ++j) {
+                    if (holds_[j].occupied && holds_[j].actor.equals(actorHand)) {
+                        hold = &holds_[j]; break;
+                    }
+                    if (!free && (!holds_[j].occupied ||
+                        ctx.elapsedMs - holds_[j].lastSample > 1500)) free = &holds_[j];
+                }
+                Character* actor = actors[i];
+                ObjectHand nativeSubject;
+                unsigned int sh[5] = { 0 };
+                engine::PoseFixtureRead fixture;
+                float x = 0, y = 0, z = 0, heading = 0, pelvis = -1;
+                int idle = -1, crouched = -1, raw = -1;
+                bool valid = actor && !engine::isLocalPlayerChar(ctx.gw, actor) &&
+                    e.task == PRETEND_TO_OPERATE_MACHINERY &&
+                    e.rawTask == PRETEND_TO_OPERATE_MACHINERY &&
+                    engine::readTaskSubject(actor, nativeSubject);
+                if (valid) {
+                    nativeSubject.toObjOrder(sh);
+                    valid = sh[0] == e.sType && sh[1] == e.sContainer &&
+                        sh[2] == e.sContainerSerial && sh[3] == e.sIndex &&
+                        sh[4] == e.sSerial &&
+                        engine::readPoseFixtureByHand(sh, &fixture) &&
+                        !fixture.fixture.hasInv && fixture.fixture.complete &&
+                        fixture.fixture.classType == BCTYPE_USABLE &&
+                        engine::readPose(actor, &x, &y, &z, &heading) &&
+                        finitePose(x, y, z, heading) &&
+                        finitePose(fixture.fixture.x, fixture.fixture.y, fixture.fixture.z, fixture.heading) &&
+                        engine::readPoseState(actor, &pelvis, &idle, &crouched, &raw) &&
+                        pelvis > 0.0f && pelvis <= FLT_MAX &&
+                        raw == PRETEND_TO_OPERATE_MACHINERY;
+                }
+                if (!valid) {
+                    if (hold) hold->occupied = false;
+                    continue;
+                }
+                if (!hold) hold = free;
+                if (!hold) continue;
+                float dx = x - hold->x, dy = y - hold->y, dz = z - hold->z;
+                if (!hold->occupied || !hold->actor.equals(actorHand) ||
+                    !nativeSubject.equals(hold->subject) ||
+                    ctx.elapsedMs - hold->lastSample > 1500 ||
+                    dx * dx + dy * dy + dz * dz > 4.0f ||
+                    yawDelta(heading, hold->heading) > 0.08f ||
+                    !sameFixture(fixture, hold->fixture)) {
+                    hold->actor = actorHand; hold->subject = nativeSubject;
+                    hold->since = ctx.elapsedMs;
+                    hold->x = x; hold->y = y; hold->z = z; hold->heading = heading;
+                    hold->fixture = fixture;
+                }
+                hold->occupied = true; hold->lastSample = ctx.elapsedMs;
+                const bool heldNow = ctx.elapsedMs - hold->since >= 3000;
+                held_ = held_ || heldNow;
+                char name[40]; engine::charName(actor, name, sizeof(name));
+                char line[1536]; _snprintf(line, sizeof(line) - 1,
+                    "SCENARIO AMBIENT NATURAL hand=%u.%u.%u.%u.%u name='%s' "
+                    "t=%lu task=%d subject=%u.%u.%u.%u.%u sid='%s' "
+                    "floor=%d outside=%d pelvis=%.3f heldMs=%lu held=%d "
+                    "actorYaw=%.4f yaw=%.4f fixture=%.2f,%.2f,%.2f ownerPresent=%d owner='%s' "
+                    "inside=%u.%u.%u.%u.%u insideSid='%s' insidePos=%.2f,%.2f,%.2f "
+                    "town=%u.%u.%u.%u.%u townSid='%s' townPos=%.2f,%.2f,%.2f",
+                    ah[0], ah[1], ah[2], ah[3], ah[4], name, ctx.elapsedMs, raw,
+                    sh[0], sh[1], sh[2], sh[3], sh[4], fixture.fixture.sid,
+                    fixture.floor, fixture.outsideFurniture ? 1 : 0, pelvis,
+                    ctx.elapsedMs - hold->since, heldNow ? 1 : 0,
+                    heading, fixture.heading, fixture.fixture.x, fixture.fixture.y, fixture.fixture.z,
+                    fixture.ownerPresent ? 1 : 0, fixture.ownerSid,
+                    fixture.inside[0], fixture.inside[1], fixture.inside[2], fixture.inside[3], fixture.inside[4],
+                    fixture.insideSid, fixture.insideX, fixture.insideY, fixture.insideZ,
+                    fixture.town[0], fixture.town[1], fixture.town[2], fixture.town[3], fixture.town[4],
+                    fixture.townSid, fixture.townX, fixture.townY, fixture.townZ);
+                line[sizeof(line) - 1] = '\0'; coop::logLine(line);
+            }
+        }
+        if (ctx.elapsedMs < (ctx.isHost ? 180000u : 160000u)) return false;
+        passed_ = held_;
+        if (!held_) coop::logLine("SCENARIO AMBIENT prerequisite missing: no real NPC held native task 221 at a complete inventoryless usable fixture with positive rendered pelvis for 3s");
+        return true;
+    }
+
+private:
+    static bool finitePose(float x, float y, float z, float heading) {
+        return x == x && y == y && z == z && heading == heading &&
+            fabs(x) <= FLT_MAX && fabs(y) <= FLT_MAX &&
+            fabs(z) <= FLT_MAX && fabs(heading) <= FLT_MAX;
+    }
+    static float yawDelta(float a, float b) {
+        float d = (float)fmod(fabs(a - b), 6.28318530718f);
+        return d > 3.14159265359f ? 6.28318530718f - d : d;
+    }
+    static bool sameFixture(const engine::PoseFixtureRead& a, const engine::PoseFixtureRead& b) {
+        return a.floor == b.floor && a.ownerPresent == b.ownerPresent &&
+            a.outsideFurniture == b.outsideFurniture &&
+            strcmp(a.fixture.sid, b.fixture.sid) == 0 &&
+            strcmp(a.ownerSid, b.ownerSid) == 0 &&
+            memcmp(a.town, b.town, sizeof(a.town)) == 0 &&
+            memcmp(a.inside, b.inside, sizeof(a.inside)) == 0 &&
+            strcmp(a.townSid, b.townSid) == 0 && strcmp(a.insideSid, b.insideSid) == 0 &&
+            yawDelta(a.heading, b.heading) <= 0.08f &&
+            fabs(a.fixture.x - b.fixture.x) <= 0.25f &&
+            fabs(a.fixture.y - b.fixture.y) <= 0.25f &&
+            fabs(a.fixture.z - b.fixture.z) <= 0.25f &&
+            fabs(a.townX - b.townX) <= 0.25f && fabs(a.townY - b.townY) <= 0.25f &&
+            fabs(a.townZ - b.townZ) <= 0.25f && fabs(a.insideX - b.insideX) <= 0.25f &&
+            fabs(a.insideY - b.insideY) <= 0.25f && fabs(a.insideZ - b.insideZ) <= 0.25f;
+    }
+    struct NativeHold {
+        ObjectHand actor, subject;
+        engine::PoseFixtureRead fixture;
+        float x, y, z, heading;
+        unsigned long since, lastSample;
+        bool occupied;
+        NativeHold() : x(0), y(0), z(0), heading(0), since(0), lastSample(0), occupied(false) {
+            memset(&fixture, 0, sizeof(fixture));
+        }
+    };
+    NativeHold holds_[256];
+    bool held_;
+    unsigned long lastLogMs_;
+};
+
 
 // down_order (Stage 2, LIVE transition): the body-state analog of craft_order. The
 // subject starts UPRIGHT (down1 loaded WITHOUT host re-arm, so nothing downs it), the
@@ -972,6 +1133,7 @@ Scenario* makeNpcScenario(const std::string& name) {
     if (name == "npc_sync")     return new NpcSyncScenario();
     if (name == "craft_order")  return new CraftOrderScenario();
     if (name == "mine_pose")    return new MinePoseScenario();
+    if (name == "ambient_pose") return new AmbientPoseScenario();
     if (name == "down_order")   return new DownOrderScenario();
     if (name == "death_order")  return new DeathOrderScenario();
     if (name == "spawn_probe")  return new SpawnSyncScenario(/*probe=*/true);

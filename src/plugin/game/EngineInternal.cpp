@@ -11,6 +11,11 @@
 // The include prelude (Boost guards first) rides EngineInternal.h.
 
 #include "EngineInternal.h"
+#include <intrin.h>
+#include "InventoryTransactionBridge.h"
+#include "EngineEnvironmentItems.h"
+#include <kenshi/gui/InventoryGUI.h>
+#include <kenshi/ShopTraderInventory.h>
 
 namespace coop {
 namespace engine {
@@ -186,6 +191,7 @@ static bool loadDetourEdge(const char* nm, const char* via) {
     return !suppress;
 }
 
+static void clearCapturedGroundEdges();
 void __fastcall saveMgrLoad_hook(SaveManager* self, const std::string* name) {
     if (g_inLoadDetour) { g_loadHookOrig(self, name); return; }
     char nm[48];
@@ -197,6 +203,12 @@ void __fastcall saveMgrLoad_hook(SaveManager* self, const std::string* name) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { nm[0] = '\0'; }
     if (loadDetourEdge(nm, "name")) {
+        resetProceduralWorldRecords();
+        resetEnvironmentItemRecords();
+        clearGroundItemIdentityRecords();
+        clearMaterializedPoseFixtures();
+        clearCapturedGroundEdges();
+        clearInventoryTransactionState();
         g_inLoadDetour = true;
         g_loadHookOrig(self, name);
         g_inLoadDetour = false;
@@ -217,6 +229,12 @@ void __fastcall saveMgrLoadInfo_hook(SaveManager* self, const SaveInfo* info,
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { nm[0] = '\0'; }
     if (loadDetourEdge(nm, "menu")) {
+        resetProceduralWorldRecords();
+        resetEnvironmentItemRecords();
+        clearGroundItemIdentityRecords();
+        clearMaterializedPoseFixtures();
+        clearCapturedGroundEdges();
+        clearInventoryTransactionState();
         g_inLoadDetour = true;
         g_loadInfoHookOrig(self, info, resetPos);
         g_inLoadDetour = false;
@@ -543,13 +561,19 @@ void setSpeedCombatHint(bool inCombat) { g_speedCombatHint = inCombat; }
 
 // One-liner used by the speed-setter diagnostics: dumps the current button
 // highlight so the log shows whether the engine moved the indicator.
-static void speedDbgLog(const char* what, float f, int i) {
+static void speedDbgLog(const char* what, float f, int i,
+                        GameWorld* self = 0, const void* caller = 0) {
     char btn[16]; if (readSpeedButtons(btn, sizeof(btn)) <= 0) btn[0] = '\0';
-    char b[160];
+    float mult = 0.0f; bool paused = false;
+    bool have = self && readGameSpeed(self, &mult, &paused);
+    char b[320];
     _snprintf(b, sizeof(b) - 1,
-        "[speeddbg] %s v=%.2f i=%d guard=%d combat=%d btn=%s vote=%.*s",
+        "[speeddbg] %s v=%.2f i=%d guard=%d combat=%d btn=%s vote=%.*s "
+        "live=%d mult=%.4f paused=%d quiet=%d qMult=%.4f qPaused=%d fresh=%d kind=%d caller=%p",
         what, f, i, g_speedGuardWrite ? 1 : 0, g_speedCombatHint ? 1 : 0,
-        btn, g_voteBtnN, g_voteBtn);
+        btn, g_voteBtnN, g_voteBtn, have ? 1 : 0, mult, paused ? 1 : 0,
+        g_quietHave ? 1 : 0, g_quietMult, g_quietPaused ? 1 : 0,
+        g_speedIntentFresh ? 1 : 0, g_speedIntentKind, caller);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
@@ -570,21 +594,24 @@ void snapshotVoteButtons() {
 }
 
 void __fastcall setGameSpeed_hook(GameWorld* self, float speed, bool click) {
-    if (speedDbgOn()) speedDbgLog("setGameSpeed", speed, click ? 1 : 0);
-    if (!g_speedGuardWrite && speed > 0.0f) {
-        g_speedIntentMult   = speed;
-        g_speedIntentPaused = false;
-        g_speedIntentKind   = SPEED_INTENT_LEVEL;
+    if (speedDbgOn()) speedDbgLog("setGameSpeed.before", speed, click ? 1 : 0, self, _ReturnAddress());
+    if (!g_speedGuardWrite && (speed > 0.0f || (click && speed == 0.0f))) {
+        // MainBar pause calls setGameSpeed(0, true), not userPause.
+        // Preserve the requested speed tier while capturing its pause command.
+        if (speed > 0.0f) g_speedIntentMult = speed;
+        g_speedIntentPaused = speed == 0.0f;
+        g_speedIntentKind = g_speedIntentPaused ? SPEED_INTENT_PAUSE : SPEED_INTENT_LEVEL;
         g_speedIntentFresh  = true;
     }
     g_setGameSpeedOrig(self, speed, click);
     // snapshotVoteButtons ignores the blank dehighlight setGameSpeed leaves
     // behind (spike 2026-07-17), so this keeps the last real tier selection.
     if (!g_speedGuardWrite) snapshotVoteButtons();
+    if (speedDbgOn()) speedDbgLog("setGameSpeed.after", speed, click ? 1 : 0, self, _ReturnAddress());
 }
 
 void __fastcall userPause_hook(GameWorld* self, bool p) {
-    if (speedDbgOn()) speedDbgLog("userPause", 0.0f, p ? 1 : 0);
+    if (speedDbgOn()) speedDbgLog("userPause.before", 0.0f, p ? 1 : 0, self, _ReturnAddress());
     if (!g_speedGuardWrite) {
         g_speedIntentPaused = p;
         // A speed-tier click often calls userPause(false) after setGameSpeed.
@@ -597,10 +624,11 @@ void __fastcall userPause_hook(GameWorld* self, bool p) {
     }
     g_userPauseOrig(self, p);
     if (!g_speedGuardWrite) snapshotVoteButtons();
+    if (speedDbgOn()) speedDbgLog("userPause.after", 0.0f, p ? 1 : 0, self, _ReturnAddress());
 }
 
 void __fastcall togglePause_hook(GameWorld* self, bool p) {
-    if (speedDbgOn()) speedDbgLog("togglePause", 0.0f, p ? 1 : 0);
+    if (speedDbgOn()) speedDbgLog("togglePause.before", 0.0f, p ? 1 : 0, self, _ReturnAddress());
     g_togglePauseOrig(self, p);
     // Save completion can release the engine pause without a user action.
     // Explain that change to the poll fallback, retaining any real intent
@@ -611,6 +639,7 @@ void __fastcall togglePause_hook(GameWorld* self, bool p) {
         g_quietPaused = paused;
         if (!paused && mult > 0.0f) g_quietMult = mult;
     }
+    if (speedDbgOn()) speedDbgLog("togglePause.after", 0.0f, p ? 1 : 0, self, _ReturnAddress());
 }
 
 // Re-apply the vote snapshot after a quiet write's userPause disturbed the
@@ -693,41 +722,147 @@ TownSetPlayerBldgsFn g_townSetPlayerBldgsFn = 0;
 TownRecalcLevelFn    g_townRecalcLevelFn    = 0;
 TownIsPlayerBldgsFn  g_townIsPlayerBldgsFn  = 0;
 
-// Purchase observability detour (protocol 22, 1c groundwork). Inventory::
-// buyItem is the engine's ONE real purchase path (a trade-UI drag lands here),
-// but automation cannot reach it in the test save (vendor inventories are lazy
-// and the enumerated SHOP_TRADER_CLASS objects carry no bound trader - shop_
-// probe runs 103018-104036). The detour makes every REAL purchase in a manual
-// field session log a "[shop] BUY-LOCAL" line (seller identity + money, item
-// sid, buyer) - the evidence that gates the eventual vendor-stock mirror. The
-// buyer-side effects (wallet debit, item into the buyer's inventory) already
-// ride the money + inventory channels; only the VENDOR-side mutation stays
-// local, which this line makes measurable.
-BuyItemFn g_buyItemOrig = 0;
-Item* __fastcall buyItem_hook(Inventory* self, Item* itemToBuy, RootObject* sendingTo) {
-    Item* got = g_buyItemOrig(self, itemToBuy, sendingTo);
+// RMB and drag have separate native payment paths. JOIN intercepts both before
+// payment; a drag first returns the cursor's detached stack to its source.
+
+namespace {
+typedef InventoryGUI::TradeResult* (__fastcall *PlayerTradeFn)(
+    InventoryGUI*,InventoryGUI::TradeResult*,const std::string*,int,int,
+    InventoryGUI*,bool,bool);
+typedef int (__fastcall *TradePriceFn)(const InventoryItemBase*,bool);
+typedef int (__fastcall *TradeMoneyFn)(const Inventory*);
+PlayerTradeFn playerTradeOriginal=0;
+TradePriceFn tradePriceOriginal=0;
+TradeMoneyFn tradeMoneyOriginal=0;
+
+// VC10 passes these by-value strings as caller-allocated temporaries owned by
+// the callee. Forward the SAME temporary to a trampoline, or destroy it here
+// on a consumed path; declaring it const std::string& leaks its allocation.
+typedef bool (__fastcall *NativePickupFn)(InventoryGUI*,std::string*);
+typedef bool (__fastcall *NativePlaceFn)(InventoryGUI*,std::string*,
+    const MyGUI::types::TPoint<int>*);
+typedef void (__fastcall *NativeCursorFn)(void*);
+typedef void (__fastcall *MerchantRemoveFn)(ShopTraderInventory*,Item*);
+typedef void (__fastcall *MerchantUpdateFn)(ShopTraderInventory*,Item*,int);
+NativePickupFn nativePickupOriginal=0;
+NativePlaceFn nativePlaceOriginal=0;
+NativeCursorFn nativeReturnOriginal=0,nativeClear=0;
+MerchantRemoveFn merchantRemoveOriginal=0;
+MerchantUpdateFn merchantUpdateOriginal=0;
+void** nativeCursorSlot=0;
+bool* nativeMerchantUpdating=0;
+bool nativeDragReady=false;
+
+struct NativeDragSource {
+    bool valid;
+    InventoryGUI* gui;
+    Inventory* inventory;
+    InventorySection* section;
+    unsigned int originalHand[5],owner[5],root[5];
+    bool ownerKnown,rootKnown;
+    InvItemEntry metadata;
+    int x,y;
+    unsigned __int64 matchingUnits;
+};
+NativeDragSource nativeDrag={0};
+
+void* inventoryCursor() { return nativeCursorSlot ? *nativeCursorSlot : 0; }
+Item* cursorHeld(void* cursor) {
+    return cursor ? *reinterpret_cast<Item**>(static_cast<char*>(cursor)+0x30) : 0;
+}
+InventoryGUI* cursorSource(void* cursor) {
+    return cursor ? *reinterpret_cast<InventoryGUI**>(static_cast<char*>(cursor)+0x68) : 0;
+}
+bool cursorOwnerPending(const unsigned int owner[5]);
+bool __fastcall nativePickupHook(InventoryGUI*,std::string*);
+bool __fastcall nativePlaceHook(InventoryGUI*,std::string*,const MyGUI::types::TPoint<int>*);
+void __fastcall nativeReturnHook(void*);
+void __fastcall merchantRemoveHook(ShopTraderInventory*,Item*);
+void __fastcall merchantUpdateHook(ShopTraderInventory*,Item*,int);
+
+const unsigned char* nativeBranch(const unsigned char* code) {
+    return code && code[0]==0xe9 ?
+        code+5+*reinterpret_cast<const int*>(code+1) : code;
+}
+const unsigned char* nativeCall(const unsigned char* code) {
+    return code && code[0]==0xe8 ?
+        nativeBranch(code+5+*reinterpret_cast<const int*>(code+1)) : 0;
+}
+
+bool resolveNativeDrag(intptr_t pickupAddress,intptr_t placeAddress,
+    intptr_t removeAddress,intptr_t updateAddress) {
     __try {
-        char sid[48]; sid[0] = '\0';
-        if (itemToBuy) {
-            GameData* gd = itemToBuy->getGameData();
-            if (gd) { strncpy(sid, gd->stringID.c_str(), sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0'; }
+        if (sizeof(std::string)!=0x28) return false;
+        const unsigned char* pickup=reinterpret_cast<const unsigned char*>(pickupAddress);
+        const unsigned char* place=reinterpret_cast<const unsigned char*>(placeAddress);
+        const unsigned char* remove=reinterpret_cast<const unsigned char*>(removeAddress);
+        const unsigned char* update=reinterpret_cast<const unsigned char*>(updateAddress);
+        if (!pickup || !place || !remove || !update ||
+            memcmp(pickup,"\x40\x55\x56\x57\x41\x54\x41\x55",8) ||
+            memcmp(place,"\x40\x55\x56\x57\x41\x54\x41\x55",8)) return false;
+        // Derive the cursor global from the real pickup singleton call and
+        // cross-check it against BOTH RIP references in that singleton.
+        const unsigned char* singleton=nativeCall(pickup+0x2c0);
+        if (!singleton || memcmp(singleton+0x3e,"\x48\x89\x05",3) ||
+            memcmp(singleton+0x47,"\x48\x8b\x05",3) ||
+            memcmp(singleton+0x20,"\xb9\xc0\x00\x00\x00",5)) return false;
+        const unsigned char* slot=singleton+0x4e+*reinterpret_cast<const int*>(singleton+0x4a);
+        if (slot!=singleton+0x45+*reinterpret_cast<const int*>(singleton+0x41) ||
+            memcmp(place+0x8a,"\x4c\x8b\x35",3) ||
+            slot!=place+0x91+*reinterpret_cast<const int*>(place+0x8d)) return false;
+        const unsigned char* returning=nativeCall(place+0x139);
+        if (!returning || memcmp(returning+6,"\x48\x83\x79\x68\x00",5) ||
+            memcmp(returning+0x10,"\x48\x83\x79\x30\x00",5) ||
+            nativeCall(returning+0x32)!=reinterpret_cast<const unsigned char*>(
+                KenshiLib::GetRealAddress(&InventoryGUI::returnItem))) return false;
+        const unsigned char* clear=nativeCall(returning+0x3a);
+        if (!clear || memcmp(clear+0xd,"\x48\x8b\x49\x38",4) ||
+            memcmp(clear+0x28,"\x48\x89\x7b\x30\x48\x89\x7b\x68",8)) return false;
+        // ShopTraderInventory::Updating suppresses BACKING stock callbacks,
+        // not the native display section bookkeeping. Verify independent refs.
+        if (memcmp(remove+0x15,"\x80\x3d",2) || remove[0x1b]!=0 ||
+            memcmp(update+0x1d,"\x80\x3d",2) || update[0x23]!=0) return false;
+        const unsigned char* updating=remove+0x1c+*reinterpret_cast<const int*>(remove+0x17);
+        if (updating!=update+0x24+*reinterpret_cast<const int*>(update+0x1f)) return false;
+        nativeCursorSlot=reinterpret_cast<void**>(const_cast<unsigned char*>(slot));
+        nativeMerchantUpdating=reinterpret_cast<bool*>(const_cast<unsigned char*>(updating));
+        nativeClear=reinterpret_cast<NativeCursorFn>(const_cast<unsigned char*>(clear));
+        return KenshiLib::AddHook(reinterpret_cast<intptr_t>(returning),
+            (void*)&nativeReturnHook,(void**)&nativeReturnOriginal)==KenshiLib::SUCCESS;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+InventoryGUI::TradeResult* __fastcall playerTradeHook(InventoryGUI* self,
+    InventoryGUI::TradeResult* result,const std::string* section,int x,int y,
+    InventoryGUI* destination,bool thieveryChecks,bool first) {
+    if (!g_invVetoSuspend && self && destination && section) {
+        Inventory* source=self->getInventory();
+        InventorySection* slots=source ? source->getSection(*section) : 0;
+        Item* item=slots ? slots->getItemAt(x,y) : 0;
+        if (deferNativeShopTransaction(source,item,destination->getInventory(),1)) {
+            result->value=InventoryGUI::TradeResult::ERROR_INVALID;
+            return result;
         }
-        unsigned int sh[5] = { 0, 0, 0, 0, 0 };
-        int sellerMoney = -1;
-        RootObject* seller = self ? self->owner : 0;
-        if (seller) {
-            readObjectHand(seller, sh);
-            __try { sellerMoney = seller->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
-        unsigned int bh[5] = { 0, 0, 0, 0, 0 };
-        if (sendingTo) readObjectHand(sendingTo, bh);
-        char b[224];
-        _snprintf(b, sizeof(b) - 1,
-                  "[shop] BUY-LOCAL ok=%d sid='%s' seller=%u,%u money=%d buyer=%u,%u",
-                  got ? 1 : 0, sid, sh[3], sh[4], sellerMoney, bh[3], bh[4]);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    return got;
+    }
+    return playerTradeOriginal(self,result,section,x,y,destination,thieveryChecks,first);
+}
+
+int __fastcall tradePriceHook(const InventoryItemBase* item,bool player) {
+    return observeNativeTradePrice(tradePriceOriginal(item,player));
+}
+int __fastcall tradeMoneyHook(const Inventory* inventory) {
+    return constrainNativeTradeFunds(const_cast<Inventory*>(inventory),
+        tradeMoneyOriginal(inventory));
+}
+}
+
+bool nativePlayerTradeReady() {
+    return playerTradeOriginal && tradePriceOriginal && tradeMoneyOriginal;
+}
+
+bool nativeInventoryCursorActive() {
+    __try { return cursorHeld(inventoryCursor())!=0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return true; }
 }
 
 // ---- Cross-owner trade veto (block direct squad-to-squad transfers) --------
@@ -765,6 +900,9 @@ struct PendingRemoval {
     unsigned int owner[5],itemHand[5];
     bool hasItemHand;
     bool wasEquipped;
+    InvItemEntry sourceItem;
+    unsigned int sourceRoot[5];
+    bool sourceMetadataValid, sourceRootKnown;
     unsigned __int64 stamp;
 };
 static PendingRemoval g_pendingRemovals[256];
@@ -826,6 +964,7 @@ void finishItemTransfer(unsigned __int64 token) {
 }
 
 
+
 unsigned int drainItemTransfers(ItemTransferEdge* out, unsigned int maxOut) {
     unsigned int n = g_itemTransferCount < maxOut ? g_itemTransferCount : maxOut;
     if (!out) return 0;
@@ -848,6 +987,7 @@ void clearItemTransfers() {
 }
 
 bool itemTransferPending(const unsigned int ownerHand[5]) {
+    if (cursorOwnerPending(ownerHand)) return true;
     for (unsigned int i=0;i<g_pendingRemovalCount;++i)
         if (memcmp(ownerHand,g_pendingRemovals[i].owner,sizeof(g_pendingRemovals[i].owner))==0)
             return true;
@@ -929,15 +1069,272 @@ static bool sourceHandOfItem(Item* item,unsigned int out[5]) {
     return owner && ownerHandOfInventory(invOf(owner),out);
 }
 
+namespace {
+bool sameDragItem(const InvItemEntry& a,const InvItemEntry& b) {
+    return a.itemType==b.itemType && a.quality==b.quality && a.level==b.level &&
+        !strcmp(a.stringID,b.stringID) && !strcmp(a.manufacturer,b.manufacturer) &&
+        !strcmp(a.material,b.material);
+}
+
+bool dragSectionUnits(InventorySection* section,const InvItemEntry& identity,
+    unsigned __int64* total,Item** restored,unsigned int quantity) {
+    *total=0;
+    if (restored) *restored=0;
+    if (!section || section->items.size()>65535) return false;
+    for (size_t i=0;i<section->items.size();++i) {
+        Item* item=section->items[i].item;
+        InvItemEntry row; unsigned int key[5];
+        if (!readPhysicalItemMetadata(item,&row,key)) return false;
+        if (!sameDragItem(row,identity)) continue;
+        *total+=row.quantity;
+        if (restored && !*restored && row.quantity>=quantity) *restored=item;
+    }
+    return true;
+}
+
+bool cursorOwnerPending(const unsigned int owner[5]) {
+    __try {
+        void* cursor=inventoryCursor();
+        if (!cursorHeld(cursor)) return false;
+        if (nativeDrag.valid && cursorSource(cursor)==nativeDrag.gui &&
+            ((nativeDrag.ownerKnown && !memcmp(owner,nativeDrag.owner,sizeof(nativeDrag.owner))) ||
+             (nativeDrag.rootKnown && !memcmp(owner,nativeDrag.root,sizeof(nativeDrag.root)))))
+            return true;
+        // Also protect HOST/non-commerce drags and native cursor entry points
+        // other than pickupItemToMouse. Held does not mean "on the floor".
+        InventoryGUI* source=cursorSource(cursor);
+        Inventory* inventory=source ? source->getInventory() : 0;
+        unsigned int key[5];
+        if (inventory && inventory->owner &&
+            ((readObjectHand(inventory->owner,key) && !memcmp(owner,key,sizeof(key))) ||
+             (readPhysicalInventoryRootOwner(inventory->owner,key) &&
+                !memcmp(owner,key,sizeof(key))))) return true;
+        RootObject* callback=source ? source->getCallbackObject() : 0;
+        if (callback && readObjectHand(callback,key) && !memcmp(owner,key,sizeof(key)))
+            return true;
+        Character* actor=source ? source->getCallbackCharacter() : 0;
+        return actor && readObjectHand(actor,key) && !memcmp(owner,key,sizeof(key));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return true; }
+}
+
+bool captureNativeDrag(InventoryGUI* gui,const std::string* name) {
+    nativeDrag.valid=false;
+    if (!gui || !name || cursorHeld(inventoryCursor())) return false;
+    Inventory* inventory=gui->getInventory();
+    InventorySection* section=inventory ? inventory->getSection(*name) : 0;
+    // HOVER is used only BEFORE pickup. Thereafter only cursor+0x30 owns held.
+    Item* item=gui->getMouseItem();
+    if (!section || !item || !section->hasItem(item) ||
+        !inventoryCheckpointReady(inventory) || transferVerdictPending(inventory,item) ||
+        !readPhysicalItemMetadata(item,&nativeDrag.metadata,nativeDrag.originalHand))
+        return false;
+    nativeDrag.gui=gui; nativeDrag.inventory=inventory; nativeDrag.section=section;
+    nativeDrag.x=item->inventoryPos.x; nativeDrag.y=item->inventoryPos.y;
+    nativeDrag.ownerKnown=inventory->owner &&
+        readObjectHand(inventory->owner,nativeDrag.owner);
+    nativeDrag.rootKnown=inventory->owner &&
+        readPhysicalInventoryRootOwner(inventory->owner,nativeDrag.root);
+    RootObject* callback=gui->getCallbackObject();
+    if (!nativeDrag.rootKnown && callback)
+        nativeDrag.rootKnown=readObjectHand(callback,nativeDrag.root);
+    if (!dragSectionUnits(section,nativeDrag.metadata,&nativeDrag.matchingUnits,0,0))
+        return false;
+    nativeDrag.valid=true;
+    return true;
+}
+
+bool __fastcall nativePickupHook(InventoryGUI* self,std::string* section) {
+    if (g_invVetoSuspend || !nativeShopTransactionsDeferred())
+        return nativePickupOriginal(self,section);
+    if (!nativeDragReady && !InventoryGUI::isTradingForMoney_static())
+        return nativePickupOriginal(self,section);
+    bool captured=false;
+    __try { captured=nativeDragReady && captureNativeDrag(self,section); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (!captured) {
+        if (section) section->~basic_string();
+        return false;
+    }
+    bool ok=nativePickupOriginal(self,section); // native owns the string now
+    if (!cursorHeld(inventoryCursor())) nativeDrag.valid=false;
+    return ok;
+}
+
+// JOIN merchant views are projections, never write-through authorities.
+// Scope every native callback, rather than relying on pickup's duration.
+// Base display bookkeeping still runs; backing stock mutations do not.
+void __fastcall merchantRemoveHook(ShopTraderInventory* self,Item* item) {
+    const bool defer=nativeShopTransactionsDeferred();
+    const bool saved=*nativeMerchantUpdating;
+    if (defer) *nativeMerchantUpdating=true;
+    __try { merchantRemoveOriginal(self,item); }
+    __finally { if (defer) *nativeMerchantUpdating=saved; }
+}
+void __fastcall merchantUpdateHook(ShopTraderInventory* self,Item* item,int previous) {
+    const bool defer=nativeShopTransactionsDeferred();
+    const bool saved=*nativeMerchantUpdating;
+    if (defer) *nativeMerchantUpdating=true;
+    __try { merchantUpdateOriginal(self,item,previous); }
+    __finally { if (defer) *nativeMerchantUpdating=saved; }
+}
+
+Item* restoreNativeDrag(void* cursor,unsigned int* selected) {
+    *selected=0;
+    if (!nativeDrag.valid || cursorSource(cursor)!=nativeDrag.gui ||
+        !nativeClear || !nativeMerchantUpdating) return 0;
+    Item* held=cursorHeld(cursor);
+    InvItemEntry identity; unsigned int heldHand[5];
+    if (!held || !readPhysicalItemMetadata(held,&identity,heldHand) ||
+        !sameDragItem(identity,nativeDrag.metadata)) return 0;
+    const unsigned int quantity=identity.quantity;
+    InventorySection* section=nativeDrag.section;
+    const std::string* sourceName=reinterpret_cast<const std::string*>(
+        static_cast<char*>(cursor)+0x40);
+    if (nativeDrag.gui->getInventory()!=nativeDrag.inventory ||
+        nativeDrag.inventory->getSection(*sourceName)!=section) return 0;
+    unsigned __int64 units=0;
+    if (!dragSectionUnits(section,identity,&units,0,0)) return 0;
+    const bool alreadyReturned=section->hasItem(held);
+    if ((!alreadyReturned && units+quantity!=nativeDrag.matchingUnits) ||
+        (alreadyReturned && units!=nativeDrag.matchingUnits)) return 0;
+    bool added=alreadyReturned,insertionFault=false;
+    const bool saved=g_invVetoSuspend,updating=*nativeMerchantUpdating;
+    g_invVetoSuspend=true; *nativeMerchantUpdating=true;
+    __try {
+        __try {
+            if (!added) {
+                // Exact empty footprint avoids auto-equipping and merging.
+                // Otherwise use native section insertion, never returnItem's
+                // floor-drop fallback. Native false retains any unmerged
+                // quantity in the same held object.
+                if (section->canItemGoHere(held,nativeDrag.x,nativeDrag.y) &&
+                    !section->existsItemInFootprint(held,nativeDrag.x,nativeDrag.y)) {
+                    section->_addItem(held,nativeDrag.x,nativeDrag.y);
+                    added=section->hasItem(held);
+                } else {
+                    added=section->addItem(held,1);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            insertionFault=true;
+            coop::logLine("[shop] REFUSE drag insertion fault");
+        }
+    } __finally {
+        *nativeMerchantUpdating=updating;
+        g_invVetoSuspend=saved;
+    }
+    // Native false positively retains the unmerged remainder. Do not clear
+    // that live cursor or discard its origin, even if its hand is unregistered.
+    if (!added && !insertionFault) return 0;
+    // Successful add owns held, which may already be freed by merging. Clear
+    // the icon before readback can fault; never dereference that old pointer.
+    if (added) nativeClear(cursor);
+    Item* restored=0;
+    const bool complete=dragSectionUnits(section,identity,&units,&restored,quantity) &&
+        units==nativeDrag.matchingUnits;
+    // After an exception, only complete source ownership licenses a clear.
+    // Registry absence is not destruction evidence for native display copies.
+    if (!added && !complete) return 0;
+    if (!added) nativeClear(cursor);
+    for (unsigned int i=0;i<g_pendingRemovalCount;)
+        if (g_pendingRemovals[i].item==held) erasePendingRemoval(i); else ++i;
+    nativeDrag.valid=false;
+    nativeDrag.gui->needItemsUpdate=true;
+    if (!complete) {
+        coop::logLine("[shop] REFUSE drag source readback incomplete");
+        return 0;
+    }
+    // Prefer the original source row when native merging preserved it. Resolve
+    // the saved hand afresh; an old Item* is never a lifetime proof.
+    Item* original=static_cast<Item*>(resolveObjectByHand(nativeDrag.originalHand));
+    InvItemEntry originalMetadata; unsigned int originalHand[5];
+    if (original && section->hasItem(original) &&
+        readPhysicalItemMetadata(original,&originalMetadata,originalHand) &&
+        sameDragItem(originalMetadata,identity) && originalMetadata.quantity>=quantity)
+        restored=original;
+    *selected=quantity;
+    return restored;
+}
+
+void __fastcall nativeReturnHook(void* cursor) {
+    if (!nativeShopTransactionsDeferred()) {
+        nativeReturnOriginal(cursor);
+        return;
+    }
+    __try {
+        if (!nativeDrag.valid || cursorSource(cursor)!=nativeDrag.gui) {
+            InventoryGUI* source=cursorSource(cursor);
+            Inventory* inventory=source ? source->getInventory() : 0;
+            const bool merchant=inventory && inventory->owner &&
+                inventory->owner->getDataType()==SHOP_TRADER_CLASS;
+            if (cursorHeld(cursor) &&
+                (merchant || InventoryGUI::isTradingForMoney_static())) {
+                coop::logLine("[shop] REFUSE untracked cursor return; item retained");
+                return;
+            }
+            nativeReturnOriginal(cursor);
+            return;
+        }
+        unsigned int selected;
+        if (!restoreNativeDrag(cursor,&selected) && cursorHeld(cursor))
+            coop::logLine("[shop] REFUSE cursor return; source unavailable, item retained");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[shop] REFUSE cursor return; item retained");
+    }
+}
+
+bool __fastcall nativePlaceHook(InventoryGUI* self,std::string* section,
+    const MyGUI::types::TPoint<int>* mouse) {
+    if (g_invVetoSuspend || !nativeShopTransactionsDeferred())
+        return nativePlaceOriginal(self,section,mouse);
+    bool consume=false;
+    __try {
+        void* cursor=inventoryCursor();
+        InventoryGUI* source=cursorSource(cursor);
+        const bool paid=self && source && self->isTradingForMoney(source);
+        // Merchant projection drags cannot fall through to an unpriced native
+        // transfer. Ordinary non-commerce inventory rearrangement stays native.
+        Inventory* from=source ? source->getInventory() : 0;
+        Inventory* to=self ? self->getInventory() : 0;
+        const bool merchantSource=from && from->owner &&
+            from->owner->getDataType()==SHOP_TRADER_CLASS;
+        const bool merchantDestination=to && to->owner &&
+            to->owner->getDataType()==SHOP_TRADER_CLASS;
+        consume=paid || merchantSource || merchantDestination;
+        if (consume) {
+            unsigned int quantity=0;
+            Item* restored=restoreNativeDrag(cursor,&quantity);
+            if (paid && restored)
+                deferNativeShopTransaction(from,restored,to,quantity);
+            else if (cursorHeld(cursor))
+                coop::logLine("[shop] REFUSE drag; source unavailable, item retained");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        consume=true; // never retry a possibly paid native drop
+        coop::logLine("[shop] REFUSE invalid drag; cursor retained");
+    }
+    if (!consume) return nativePlaceOriginal(self,section,mouse);
+    if (section) section->~basic_string();
+    return false;
+}
+}
+
 Item* __fastcall removeDontDestroy_hook(Inventory* self,Item* item,int quantity,bool copy) {
+    if (!g_invVetoSuspend && (!inventoryCheckpointReady(self) ||
+        !inventoryTransactionRemovalReady(self))) return 0;
     unsigned int source[5]={0,0,0,0,0};
     bool known=false;
     bool wasEquipped = false;
+    InvItemEntry sourceItem; memset(&sourceItem,0,sizeof(sourceItem));
+    unsigned int sourceRoot[5]={0}; bool sourceMetadataValid=false, sourceRootKnown=false;
     if (!g_invVetoSuspend) {
         __try {
             if (transferVerdictPending(self, item)) return 0;
             wasEquipped = item && item->isEquipped;
             known=sourceHandOfItem(item,source) || ownerHandOfInventory(self,source);
+            unsigned int beforeHand[5];
+            sourceMetadataValid=item && readPhysicalItemMetadata(item,&sourceItem,beforeHand);
+            sourceRootKnown=self && self->owner && readPhysicalInventoryRootOwner(self->owner,sourceRoot);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
         // No silent overflow: a refused native remove leaves the item in its source.
@@ -949,6 +1346,8 @@ Item* __fastcall removeDontDestroy_hook(Inventory* self,Item* item,int quantity,
             PendingRemoval& p=g_pendingRemovals[g_pendingRemovalCount];
             p.item=removed;p.inventory=self;memcpy(p.owner,source,sizeof(source));
             p.wasEquipped = wasEquipped;
+            p.sourceItem=sourceItem; p.sourceMetadataValid=sourceMetadataValid;
+            p.sourceRootKnown=sourceRootKnown; memcpy(p.sourceRoot,sourceRoot,sizeof(sourceRoot));
             p.hasItemHand=readObjectHand(static_cast<RootObject*>(removed),p.itemHand) &&
                           (p.itemHand[3]!=0 || p.itemHand[4]!=0);
             p.stamp=++g_pendingRemovalStamp;
@@ -959,7 +1358,8 @@ Item* __fastcall removeDontDestroy_hook(Inventory* self,Item* item,int quantity,
 }
 
 bool __fastcall removeAutoDestroy_hook(Inventory* self,Item* item,int quantity) {
-    if (!g_invVetoSuspend && transferVerdictPending(self, item)) return false;
+    if (!g_invVetoSuspend && (!inventoryCheckpointReady(self) ||
+        transferVerdictPending(self, item))) return false;
     unsigned __int64 before=g_pendingRemovalStamp;
     bool ok=g_removeAutoDestroyOrig(self,item,quantity);
     for (unsigned int i=0;i<g_pendingRemovalCount;)
@@ -970,13 +1370,31 @@ bool __fastcall removeAutoDestroy_hook(Inventory* self,Item* item,int quantity) 
     return ok;
 }
 
+std::deque<ItemDropEdge> g_dropEdges;
+static void clearCapturedGroundEdges() { g_dropEdges.clear(); }
+static unsigned int g_nativeItemCaptureDepth=0;
+
 static bool addItemWithCapture(Inventory* self, Item* item, int quantity, bool equip) {
     ItemTransferEdge edge;
     bool capture = false;
     bool needsVerdict = false;
+    ItemDropEdge pickup; memset(&pickup,0,sizeof(pickup));
+    bool capturePickup=false;
+    if (!g_invVetoSuspend && self && item && physicalItemIsOnGround(item)) {
+        __try {
+            pickup.kind=2; pickup.physicalItem=item;
+            pickup.metadataValid=readPhysicalItemMetadata(item,&pickup.item,pickup.beforeItemHand);
+            capturePickup=pickup.metadataValid && isConservedItemType(pickup.item.itemType) &&
+                self->owner && readPhysicalInventoryRootOwner(self->owner,pickup.ownerHand);
+            float p[3];
+            pickup.positionValid=itemWorldPos(item,p) &&
+                !(p[0]==0.0f && p[1]==0.0f && p[2]==0.0f);
+            if (pickup.positionValid) { pickup.x=p[0]; pickup.y=p[1]; pickup.z=p[2]; }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { capturePickup=false; }
+    }
     int pending=g_invVetoSuspend ? -1 : pendingRemovalFor(item);
     unsigned __int64 pendingStamp=pending>=0 ? g_pendingRemovals[pending].stamp : 0;
-    if (!g_invVetoSuspend && g_invOwnerClass && self && item) {
+    if (!g_invVetoSuspend && self && item) {
         int decision = 0; // 1 = block
         int srcClass = 0, dstClass = 0;
         bool haveSrc = false, haveDst = false;
@@ -987,7 +1405,7 @@ static bool addItemWithCapture(Inventory* self, Item* item, int quantity, bool e
             if (pending>=0) {
                 memcpy(srcHand,g_pendingRemovals[pending].owner,sizeof(srcHand));haveSrc=true;
             }
-            if (haveDst && haveSrc) {
+            if (haveDst && haveSrc && g_invOwnerClass) {
                 dstClass = g_invOwnerClass(dstHand);
                 srcClass = g_invOwnerClass(srcHand);
                 if ((srcClass == 1 && dstClass == 2) || (srcClass == 2 && dstClass == 1))
@@ -1048,7 +1466,9 @@ static bool addItemWithCapture(Inventory* self, Item* item, int quantity, bool e
             }
         }
         if ((g_blockXfer && decision == 1) || (capture && g_itemTransferCount == 256) ||
-            (needsVerdict && g_pendingVerdictCount == 256) || bagUnavailable) {
+            (needsVerdict && g_pendingVerdictCount == 256) || bagUnavailable ||
+            !inventoryCheckpointReady(self) ||
+            (pending>=0 && !inventoryCheckpointReady(g_pendingRemovals[pending].inventory))) {
             if (capture && edge.contentsSlot < 256) {
                 g_transferContents[edge.contentsSlot].clear();
                 g_transferContentsUsed[edge.contentsSlot] = false;
@@ -1090,10 +1510,14 @@ static bool addItemWithCapture(Inventory* self, Item* item, int quantity, bool e
         }
     }
     bool saved = g_invVetoSuspend;
+    if (!saved) ++g_nativeItemCaptureDepth;
     g_invVetoSuspend = true; // one logical add may recurse into a carried bag
     bool ok = false;
     __try { ok = equip ? g_equipItemOrig(self,item) : g_tryAddItemOrig(self,item,quantity); }
-    __finally { g_invVetoSuspend = saved; }
+    __finally {
+        g_invVetoSuspend=saved;
+        if (!saved) --g_nativeItemCaptureDepth;
+    }
     if (ok && capture) {
         if (needsVerdict) {
             PendingVerdict& p = g_pendingVerdicts[g_pendingVerdictCount++];
@@ -1110,6 +1534,15 @@ static bool addItemWithCapture(Inventory* self, Item* item, int quantity, bool e
         g_transferContentsUsed[edge.contentsSlot] = false;
     }
     if (ok && !saved && pendingStamp) erasePendingStamp(pendingStamp);
+    if (ok && capturePickup) {
+        if (environmentItemHooksReady()) environmentExcludeItem(pickup.beforeItemHand);
+        bool inInventory=false; void* physical=0; unsigned int actualOwner[5];
+        if (readObjectHand(static_cast<RootObject*>(item),pickup.itemHand) &&
+            (pickup.itemHand[3]!=0 || pickup.itemHand[4]!=0) &&
+            readPhysicalItemLocation(pickup.itemHand,actualOwner,&inInventory,&physical) &&
+            inInventory && physical==item &&
+            memcmp(actualOwner,pickup.ownerHand,sizeof(actualOwner))==0) g_dropEdges.push_back(pickup);
+    }
     return ok;
 }
 
@@ -1131,10 +1564,51 @@ bool __fastcall equipItem_hook(Inventory* self, Item* item) {
 // recruit/save detours (engine tick + plugin tick share the thread; no lock).
 typedef void (__fastcall* DropItemFn)(Inventory* self, Item* it);
 DropItemFn g_dropItemOrig = 0;
-std::vector<ItemDropEdge> g_dropEdges;
 
 void __fastcall dropItem_hook(Inventory* self, Item* it) {
-    if (!g_invVetoSuspend && transferVerdictPending(self, it)) return;
+    if (!g_invVetoSuspend && (!inventoryCheckpointReady(self) ||
+        transferVerdictPending(self, it))) return;
+    const bool captureNative=!g_invVetoSuspend || g_nativeItemCaptureDepth!=0;
+    const bool wasOnGround=captureNative && it && physicalItemIsOnGround(it);
+    bool ownerKnown=false;
+    ItemDropEdge e; memset(&e,0,sizeof(e));
+    e.kind=1; e.physicalItem=it;
+    __try {
+        if (captureNative && self && self->owner)
+            ownerKnown=readPhysicalInventoryRootOwner(self->owner,e.ownerHand);
+        if (captureNative && it) {
+            e.metadataValid=readPhysicalItemMetadata(it,&e.item,e.itemHand);
+            memcpy(e.beforeItemHand,e.itemHand,sizeof(e.beforeItemHand));
+            const int pending=pendingRemovalFor(it);
+            if (pending>=0 && g_pendingRemovals[pending].hasItemHand) {
+                const PendingRemoval& removed=g_pendingRemovals[pending];
+                if (removed.sourceMetadataValid) {
+                    if (!e.metadataValid) { e.item=removed.sourceItem; e.metadataValid=true; }
+                    else {
+                        e.item.equipped=removed.sourceItem.equipped;
+                        e.item.slot=removed.sourceItem.slot;
+                        e.item.section=removed.sourceItem.section;
+                    }
+                }
+                if (removed.sourceRootKnown) {
+                    memcpy(e.ownerHand,removed.sourceRoot,sizeof(e.ownerHand)); ownerKnown=true;
+                }
+            }
+            if (e.metadataValid) {
+                memcpy(e.stringID,e.item.stringID,sizeof(e.stringID));
+                e.itemType=e.item.itemType; e.quantity=e.item.quantity; e.quality=e.item.quality;
+            } else {
+                GameData* gd=it->getGameData();
+                if (gd) {
+                    strncpy(e.stringID,gd->stringID.c_str(),sizeof(e.stringID)-1);
+                    e.itemType=(unsigned int)gd->type;
+                }
+                int qty=it->quantity; if (qty<1) qty=1;
+                e.quantity=(unsigned short)(qty>0xFFFF ? 0xFFFF : qty);
+                e.quality=qualityBucketOf(it->quality);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { e.metadataValid=false; }
     unsigned __int64 before=g_pendingRemovalStamp;
     g_dropItemOrig(self, it);
     // Retire only this drop, not another player's item still held on the cursor.
@@ -1143,21 +1617,12 @@ void __fastcall dropItem_hook(Inventory* self, Item* it) {
             (g_pendingRemovals[i].stamp>before && g_pendingRemovals[i].inventory==self))
             erasePendingRemoval(i);
         else ++i;
+    if (!captureNative) return;
     __try {
-        if (it) {
-            ItemDropEdge e;
-            memset(&e, 0, sizeof(e));
-            if (self && self->owner) readObjectHand(self->owner, e.ownerHand);
-            readObjectHand(static_cast<RootObject*>(it), e.itemHand);
-            GameData* gd = it->getGameData();
-            if (gd) {
-                strncpy(e.stringID, gd->stringID.c_str(), sizeof(e.stringID) - 1);
-                e.stringID[sizeof(e.stringID) - 1] = '\0';
-                e.itemType = (unsigned int)gd->type;
-            }
-            int qty = it->quantity; if (qty < 1) qty = 1;
-            e.quantity = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);
-            e.quality = qualityBucketOf(it->quality);
+        if (ownerKnown && !wasOnGround && it &&
+            physicalItemIsOnGround(it) &&
+            readObjectHand(static_cast<RootObject*>(it),e.itemHand) &&
+            (e.itemHand[3]!=0 || e.itemHand[4]!=0)) {
             float p[3] = { 0, 0, 0 };
             bool haveP = itemWorldPos(it, p) &&
                          !(p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f);
@@ -1171,9 +1636,20 @@ void __fastcall dropItem_hook(Inventory* self, Item* it) {
                 haveP = !(p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f);
             }
             if (haveP) { e.x = p[0]; e.y = p[1]; e.z = p[2]; }
-            if (g_dropEdges.size() < 128) g_dropEdges.push_back(e);
+            e.positionValid=haveP;
+            if (environmentItemHooksReady()) {
+                environmentExcludeItem(e.beforeItemHand);
+                environmentExcludeItem(e.itemHand);
+            }
+            g_dropEdges.push_back(e);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+bool hasPendingPhysicalGroundEdges() { return !g_dropEdges.empty(); }
+bool physicalGroundMutationPending(const unsigned int ownerHand[5]) {
+    for (std::deque<ItemDropEdge>::const_iterator it=g_dropEdges.begin();it!=g_dropEdges.end();++it)
+        if (memcmp(it->ownerHand,ownerHand,sizeof(it->ownerHand))==0) return true;
+    return false;
 }
 
 // AI-gating probe lever: PlayerInterface::recruit(Character*, bool) adds an NPC
@@ -1316,6 +1792,7 @@ static void queueLocalBuildEdge(Building* b, int floorNum) {
 // detour, reading PreviewBuilding::justBeenBuilt) read 0 for placements that
 // visibly succeeded on screen, so every real player build was silently dropped
 // and nothing ever streamed - see placeFinal_hook below.
+// Provenance is observed before the unrelated local construction-site filters.
 CreateBuildingFn g_createBldgOrig = 0;
 Building* __fastcall createBuilding_hook(
     RootObjectFactory* self, GameData* data, Ogre::Vector3 position, TownBase* t,
@@ -1323,12 +1800,14 @@ Building* __fastcall createBuilding_hook(
     Layout* furnitureOf, Building* isDoorOf, GameSaveState* saveState,
     Building* isIndoorsOf, bool invisible, bool completed, bool isFoliage,
     int floorNumber, bool isOutsideFurniture) {
+    const ProceduralBedBirth birth=captureProceduralBedBirth(saveState);
     ++g_buildCaptureDepth;
     Building* b = g_createBldgOrig(self, data, position, t, owner, rotation, cb,
                                    furnitureOf, isDoorOf, saveState, isIndoorsOf,
                                    invisible, completed, isFoliage, floorNumber,
                                    isOutsideFurniture);
     --g_buildCaptureDepth;
+    recordProceduralBedBirth(b, birth, cb != 0 || isDoorOf != 0 || furnitureOf != 0);
     __try {
         // A player's build-mode commit is the creation that is a BRAND-NEW
         // VISIBLE construction site: buildings restored from the save carry a
@@ -1419,6 +1898,7 @@ void __fastcall periodicUpdate_hook(Character* self) {
     }
     g_periodicOrig(self);
 }
+
 
 // ---- Task-selection observation spike (KENSHICOOP_TASK_SPIKE) --------------
 // The theoretical AI cut point (design chat 2026-07-18): CharBody::setCurrentAction
@@ -2433,7 +2913,7 @@ bool installAiSuspendHook() {
     intptr_t addr = KenshiLib::GetRealAddress(&Character::_NV_periodicUpdate);
     if (!addr) return false;
     return KenshiLib::AddHook(addr, (void*)&periodicUpdate_hook,
-                              (void**)&g_periodicOrig) == KenshiLib::SUCCESS;
+                             (void**)&g_periodicOrig) == KenshiLib::SUCCESS;
 }
 
 bool installTaskSelectSpikeHook() {
@@ -2460,10 +2940,42 @@ bool installDamageGuardHook() {
 }
 
 bool installShopHook() {
-    intptr_t addr = KenshiLib::GetRealAddress(&Inventory::buyItem);
-    if (!addr) return false;
-    return KenshiLib::AddHook(addr, (void*)&buyItem_hook,
-                              (void**)&g_buyItemOrig) == KenshiLib::SUCCESS;
+    struct TradeAccess : InventoryGUI { using InventoryGUI::RClickAutoTrade; };
+    typedef InventoryGUI::TradeResult (InventoryGUI::*MemberTradeFn)(
+        const std::string&,int,int,InventoryGUI*,bool,bool);
+    MemberTradeFn trade=static_cast<MemberTradeFn>(&TradeAccess::RClickAutoTrade);
+    intptr_t player=KenshiLib::GetRealAddress(trade);
+    intptr_t price=KenshiLib::GetRealAddress(&InventoryItemBase::_NV_getValueAll);
+    intptr_t money=KenshiLib::GetRealAddress(&Inventory::getMoney);
+    if (!player || !price || !money) return false;
+    if (KenshiLib::AddHook(price,(void*)&tradePriceHook,
+            (void**)&tradePriceOriginal)!=KenshiLib::SUCCESS) return false;
+    if (KenshiLib::AddHook(money,(void*)&tradeMoneyHook,
+            (void**)&tradeMoneyOriginal)!=KenshiLib::SUCCESS) return false;
+    if (KenshiLib::AddHook(player,(void*)&playerTradeHook,
+            (void**)&playerTradeOriginal)!=KenshiLib::SUCCESS) return false;
+    // Keep the already-working RMB adapter independent of drag validation.
+    // No address below is a translated SDK/version RVA.
+    intptr_t pickup=KenshiLib::GetRealAddress(&InventoryGUI::pickupItemToMouse);
+    intptr_t place=KenshiLib::GetRealAddress(&InventoryGUI::placeItemFromMouse);
+    intptr_t remove=KenshiLib::GetRealAddress(&ShopTraderInventory::_NV__sectionRemoveItemCallback);
+    intptr_t update=KenshiLib::GetRealAddress(&ShopTraderInventory::_NV__sectionUpdateItemCallback);
+    bool drag=resolveNativeDrag(pickup,place,remove,update);
+    if (drag) drag=KenshiLib::AddHook(remove,(void*)&merchantRemoveHook,
+        (void**)&merchantRemoveOriginal)==KenshiLib::SUCCESS;
+    if (drag) drag=KenshiLib::AddHook(update,(void*)&merchantUpdateHook,
+        (void**)&merchantUpdateOriginal)==KenshiLib::SUCCESS;
+    if (drag) drag=KenshiLib::AddHook(place,(void*)&nativePlaceHook,
+        (void**)&nativePlaceOriginal)==KenshiLib::SUCCESS;
+    // Even an unsupported adapter must refuse merchant pickup before native
+    // source mutation, while leaving RMB and non-commerce management usable.
+    const bool pickupHook=pickup && KenshiLib::AddHook(pickup,(void*)&nativePickupHook,
+        (void**)&nativePickupOriginal)==KenshiLib::SUCCESS;
+    drag=drag && pickupHook;
+    nativeDragReady=drag;
+    coop::logLine(drag ? "[shop] native drag adapter ready" :
+        "[shop] native drag adapter unavailable; RMB adapter retained");
+    return true;
 }
 
 // Cross-owner trade veto: detour the _NV_ twins of the drag primitives (hooking
@@ -2497,6 +3009,7 @@ int inventoryOwnerClass(const unsigned int h[5]) {
 
 // Query-free ground-drop capture: detour the dropItem _NV_ twin.
 bool installItemDropHook() {
+    installGroundItemIdentityHooks(); // identity diagnostics cannot disable real drop capture
     intptr_t addr = KenshiLib::GetRealAddress(&Inventory::_NV_dropItem);
     if (!addr) return false;
     return KenshiLib::AddHook(addr, (void*)&dropItem_hook,
@@ -2505,10 +3018,26 @@ bool installItemDropHook() {
 
 unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut) {
     unsigned int n = 0;
-    for (unsigned int i = 0; i < g_dropEdges.size() && n < maxOut; ++i, ++n)
-        out[n] = g_dropEdges[i];
-    g_dropEdges.clear();
+    while (!g_dropEdges.empty() && n < maxOut) {
+        ItemDropEdge& edge=g_dropEdges.front();
+        if (edge.kind==1 && !edge.positionValid) {
+            RootObject* current=resolveObjectByHand(edge.itemHand);
+            float p[3];
+            if (current==static_cast<RootObject*>(static_cast<Item*>(edge.physicalItem)) &&
+                physicalItemIsOnGround(static_cast<Item*>(edge.physicalItem)) &&
+                itemWorldPos(edge.physicalItem,p) &&
+                !(p[0]==0.0f && p[1]==0.0f && p[2]==0.0f)) {
+                edge.x=p[0]; edge.y=p[1]; edge.z=p[2]; edge.positionValid=true;
+            }
+        }
+        out[n++] = g_dropEdges.front();
+        g_dropEdges.pop_front();
+    }
     return n;
+}
+
+void returnItemDrops(const ItemDropEdge* edges,unsigned int count) {
+    while (count) g_dropEdges.push_front(edges[--count]);
 }
 
 bool installRecruitHook() {

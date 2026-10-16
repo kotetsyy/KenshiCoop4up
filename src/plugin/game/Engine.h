@@ -48,6 +48,8 @@ bool savesReady();
 // same path the in-game save menu takes; autosave=false). Used to BAKE fixture
 // saves without a manual menu round-trip. Main-thread only.
 bool saveGameAs(const std::string& name);
+// Read the native save worker's completion state; never manufactures completion.
+bool readNativeSaveCompletion(const char* expectedName,bool* busy,bool* complete,bool* failed);
 
 // ---- Protocol 31: coordinated save + session resume -------------------------
 
@@ -140,6 +142,8 @@ bool applyRaw(Character* c, const EntityState& e);
 // Visual-only teleport (Character::teleportVisuallyOnly) - ragdoll mesh follows
 // this even when CharMovement/Havok locomotion is down. Absolute world pose.
 bool teleportVisual(Character* c, float x, float y, float z, float heading);
+// Turn a held work pose without halting movement or restarting its native task.
+bool faceWorkPose(Character* c, const EntityState& e);
 // Write HavokCharacter::position (world units; stored as world/10). False if
 // there is no physics character.
 bool applyHavokPos(Character* c, float x, float y, float z);
@@ -810,6 +814,9 @@ void clearItemTransfers();
 // Inventory guard: full five-word owner identity matches a pending cursor removal,
 // either end of a queued transfer, or a destination awaiting its transfer verdict.
 bool itemTransferPending(const unsigned int ownerHand[5]);
+// Native GUI pickup can detach an item without entering Inventory remove hooks.
+// Never reconcile inventory or commit commerce around that held-cursor state.
+bool nativeInventoryCursorActive();
 bool captureBagContents(Item* bag, std::vector<InvItemEntry>& contents);
 void takeItemTransferContents(unsigned int slot, std::vector<InvItemEntry>& contents);
 bool applyTransferredBagContents(GameWorld* gw, Item* bag,
@@ -882,11 +889,17 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
 struct ItemDropEdge {
     unsigned int   ownerHand[5]; // inventory owner that dropped it (readObjectHand layout)
     unsigned int   itemHand[5];  // the now-grounded item's local engine hand
+    unsigned int   beforeItemHand[5]; // identity before pickup/re-containering
+    void*          physicalItem; // captured reference, never proof of current liveness
+    unsigned char  kind;         // 1 native drop, 2 native floor pickup
     char           stringID[48];
     unsigned int   itemType;     // GameData::type category
     unsigned short quantity;
     unsigned short quality;      // quality*100 (0 if n/a)
-    float          x, y, z;      // world position at the drop frame
+    float          x, y, z;      // world position at the native drop/pickup frame
+    InvItemEntry   item;         // full physical provenance BEFORE native drop
+    bool           metadataValid;
+    bool           positionValid;
 };
 // Detour Inventory::dropItem so every drop is recorded (drained once per tick).
 // Returns true if installed.
@@ -894,6 +907,9 @@ bool installItemDropHook();
 // Drain captured drop edges into out[] (up to maxOut); clears the queue. Returns
 // the number written.
 unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut);
+bool hasPendingPhysicalGroundEdges();
+bool physicalGroundMutationPending(const unsigned int ownerHand[5]);
+void returnItemDrops(const ItemDropEdge* edges, unsigned int count);
 
 // ---- Conservation channel item types (single source of truth) --------------
 // itemType 2 = WEAPON, 3 = ARMOUR/clothing, 46 = worn CONTAINER (backpack). All
@@ -997,19 +1013,46 @@ int itemWorldPos(void* item, float out[3]);
 // copy to loose first if needed. Never fabricates. Returns the number relocated.
 // outDropped (optional): receives the now-grounded Item* so it can be tracked for pickup.
 int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
-                           const char* sid, unsigned int typeCat,
+                           const InvItemEntry& identity,
                            float x, float y, float z, void** outDropped = 0);
 
-// SEH-guarded CONSERVATION BACKSTOP (Phase W2): relocateWeaponToGround found no local copy
-// to move, so rebuild the item from the drop intent's own provenance (quality/manufacturer/
-// material all ride WorldDropPacket) into the owner's bag and drop THAT. Heals the case
-// where the peer's copy was already destroyed - e.g. a bag snapshot that overtook the
-// intent. The caller must first confirm the owner hand resolves locally; weapon
-// fabrication still honours KENSHICOOP_WEAPON_FAB. Returns the number relocated.
-int fabricateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
-                            const char* sid, unsigned int typeCat, int qualityBucket,
-                            const char* manufacturer, const char* material,
-                            float x, float y, float z, void** outDropped = 0);
+// Resolve this exact physical hand and describe only a real free-ground item.
+bool describeGroundItem(const unsigned int itemHand[5], InvItemEntry* out, void** outItem);
+bool readPhysicalItemMetadata(Item* item, InvItemEntry* out, unsigned int outHand[5]);
+bool physicalItemIsOnGround(Item* item);
+bool readPhysicalItemLocation(const unsigned int itemHand[5],
+                              unsigned int inventoryOwner[5], bool* inInventory,
+                              void** outItem);
+bool readPhysicalInventoryRootOwner(RootObject* inventoryOwner, unsigned int out[5]);
+bool validateJoinSquadClaim(GameWorld*, Character*, unsigned playerId, unsigned playerCount);
+// Exhaustive loaded-zone registry, with explicit incomplete/loading/overflow state.
+struct GroundItemRow {
+    unsigned int hand[5];
+    int zoneX, zoneY, floor;
+    float x, y, z;
+};
+struct GroundItemCensusStatus {
+    unsigned int activeZones, loadedZones, loadingZones, noContentZones;
+    unsigned int registryItems, groundItems, written, overflow, unresolved;
+    unsigned int notGround, inventoryItems, equippedItems;
+    bool unavailable, fault, complete;
+};
+unsigned int captureLoadedGroundItems(GameWorld* gw, GroundItemRow* out,
+                                     unsigned int capacity, GroundItemCensusStatus* status);
+struct GroundItemIdentityRow {
+    unsigned int hand[5];
+    InvItemEntry item;
+    unsigned int properOwner[5], inventoryOwner[5], insideBuilding[5];
+    float condition, charges, fullCharge;
+    bool savedInput, identityTruncated, firstTime;
+    char instanceID[256], sourceName[256], instanceRef[128], baseSID[128];
+};
+bool installGroundItemIdentityHooks();
+// Before an actual admitted load, never after save identity has been captured.
+void clearGroundItemIdentityRecords();
+unsigned int groundItemIdentityGeneration();
+bool readGroundItemIdentity(const unsigned int hand[5], GroundItemIdentityRow* out);
+void logLoadedGroundItems(GameWorld* gw);
 
 // SEH-guarded (Phase W3): capture the WEAPON items the object at cHand holds, with their real
 // Item* handles, so the drop detector can track the exact dropped object for a later pickup.
@@ -1244,6 +1287,10 @@ bool endAction(Character* c);
 // host streams as EntityState::rawTask. TASK_NONE if the body has no current
 // task; -1 on fault / unresolved fn. Used by the AI-gating divergence check.
 int readTaskKey(Character* c);
+// Read the subject of the active native task, for full pose-identity comparison.
+bool readTaskSubject(Character* c, ObjectHand& out);
+// Actual canonical NPC capture/drive evidence, including its native body and rendered pose.
+void logPoseObservation(const char* side, const EntityState& wire, Character* local);
 
 // True if 'taskKey' is a NODE-anchored rest pose (STAND_AT_NODE /
 // STAND_AT_SHOPKEEPER_NODE). These sit/idle the body at an AI node whose subject
@@ -1531,8 +1578,11 @@ bool shackleDbgOn();
 // attach and transform are engine-native. Idempotent: already in the desired
 // state = success no-op. On exit (on=false) an unresolvable furnHand falls
 // back to the occupant's own inWhat. SEH-guarded.
+// restOrder is owner-only bed-placement intent: enqueue one native sleep order
+// before attaching. Remote pose reproduction and exits do not create orders.
 bool applyFurniture(GameWorld* gw, Character* occupant,
-                    const unsigned int furnHand[5], int kind, bool on);
+                    const unsigned int furnHand[5], int kind, bool on,
+                    bool restOrder = false);
 // Scenario scaffolds (bed_put / cage_put): resolve the occupant by hand, then
 // applyFurniture against the baked fixture found via findFurnitureNear. Run on
 // the OCCUPANT's owner; the peer asserts the crossing.
@@ -1743,11 +1793,8 @@ bool readWalletByHand(const unsigned int mHand[5], int* outMoney);
 // note there about which wallet this is). Returns true on ok.
 bool writeWalletByHand(const unsigned int mHand[5], int money);
 
-// Purchase observability detour (protocol 22, 1c groundwork): hook Inventory::
-// buyItem so every REAL trade-UI purchase logs a "[shop] BUY-LOCAL" line
-// (seller identity + money, item sid, buyer). Automation cannot reach a real
-// purchase in the test save (lazy vendor inventories, no bound trader), so
-// manual field sessions carry the evidence for the vendor-stock mirror design.
+// Intercept the native player commerce entry before JOIN mutates stock or money.
+// Native price and payer-funds hooks enforce the authorized quote on HOST.
 bool installShopHook();
 
 // ---- Protocol 23: recruitment sync ------------------------------------------
@@ -1830,6 +1877,14 @@ bool readDoorByHand(const unsigned int dHand[5], DoorRead* out);
 // wantLocked < 0 leaves a door lock untouched (not a container operation).
 bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
                      DoorRead* outAfter);
+
+#ifdef KENSHICOOP_HARNESS
+// Disposable chest-lock fixture only: give the exact chest and its enclosing
+// building to the local player, verify ownership, and optionally stage the
+// OWNER's actor beside it. Does not change any lock flag or native AI policy.
+bool prepareNativeLockpickFixture(GameWorld* gw, Character* actor,
+    const unsigned int target[5], unsigned int parent[5], bool stageActor);
+#endif
 
 // ---- Protocol 54: property-deed (building ownership) sync --------------------
 // Buying a house/shop is a state change on a BAKED building: the engine moves
@@ -2120,6 +2175,32 @@ struct ContRead {
 // count written.
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                                 unsigned int maxOut);
+// Includes complete usable fixtures without inventories; inventory census stays separate.
+unsigned int enumFixturesNear(GameWorld* gw, float radius, ContRead* out, unsigned int maxOut);
+struct PoseFixtureRead {
+    ContRead fixture;
+    u32 sourceOwner; // authenticated network namespace; not native faction ownership
+    float heading;
+    int floor;
+    bool ownerPresent, outsideFurniture;
+    char ownerSid[48];
+    unsigned int town[5], inside[5];
+    char townSid[48], insideSid[48];
+    float townX, townY, townZ, insideX, insideY, insideZ;
+};
+bool readPoseFixtureByHand(const unsigned int hand[5], PoseFixtureRead* out);
+// Exact real metadata only: never substitutes player ownership or a missing parent.
+bool poseFixtureMatches(const unsigned int localHand[5], const PoseFixtureRead& descriptor);
+// -1 incomplete/ambiguous, 0 proven loaded absence, 1 unique physical match.
+int findPoseFixtureByDescriptor(GameWorld* gw, const PoseFixtureRead& descriptor,
+                                unsigned int out[5]);
+int materializePoseFixture(GameWorld* gw, const PoseFixtureRead& descriptor,
+                           const unsigned int localInside[5], unsigned int out[5]);
+void clearMaterializedPoseFixtures();
+// Complete native registry in this loaded region; no physics/nearest fallback.
+unsigned int listLoadedObjectHands(GameWorld* gw, unsigned int nativeType,
+                                  float x, float y, float z, float radius,
+                                  unsigned int (*out)[5], unsigned int maxOut, bool* complete);
 // Lootable world NPCs and living traders, excluding player squads. Host-only
 // census: initialize a trader's stock once, never refill a legitimately empty shop.
 // classType = -1; hand is the character's save-stable entity-stream key.
@@ -2274,6 +2355,7 @@ enum SpeedIntentKind {
 // receives SPEED_INTENT_* so the replicator can LWW pause separately
 // from a speed-tier click.
 bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused, int* kind = 0);
+void resetSpeedIntentForWorld(GameWorld* gw);
 
 // Install speed request capture and engine-pause explanation hooks,
 // and seed the intent state from the live engine so the first vote reflects
@@ -2285,6 +2367,8 @@ bool installSpeedIntentHooks(GameWorld* gw);
 // selected states into out (one char per button, '0'/'1', NUL-terminated;
 // cap n-1 buttons). Returns the button count read, -1 when the GUI isn't up.
 int readSpeedButtons(char* out, int n);
+// Read-only MainBar bounds and actual MyGUI cursor in render-client coordinates.
+bool readPauseControls(int* x, int* y, int* width, int* height, int* mouseX, int* mouseY);
 
 // Phase 5: publish own-squad-in-combat (from syncSpeed) so the speed-path
 // diagnostics can attribute an engine-forced change vs a user click. The

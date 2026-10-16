@@ -101,6 +101,8 @@ int probeNativeSnapshot(GameWorld* gw);
 bool probeShopTown(GameWorld* gw, bool waystation, float outPosition[3]);
 bool probeTraderWindow(const unsigned int traderHand[5], unsigned int* outHash,
                        unsigned int* outQuantity, bool keepVisible = false);
+bool probePreparePlayerTrade(GameWorld* gw, const unsigned int traderHand[5],
+                             const unsigned int actorHand[5]);
 
 } // namespace engine
 } // namespace coop

@@ -8,8 +8,6 @@ REM Prereqs (see docs/BUILD_SETUP.md):
 REM   - VC++ 2010 (v100) x64 compiler  (SDK 7.1 + KB2519277)
 REM   - VS2022 Build Tools (for MSBuild.exe)
 REM   - third_party/KenshiLib_deps (deps + Boost) and env vars set
-REM   - third_party/enet/enet patched for C89 (scripts/apply_enet_patch is implicit;
-REM     see third_party/enet/patches/0001-enet-c89-for-loops.patch)
 
 REM Repo root = parent of this script's folder.
 set "REPO=%~dp0.."
@@ -21,7 +19,12 @@ set "VS10=C:\Program Files (x86)\Microsoft Visual Studio 10.0"
 set "VC=%VS10%\VC"
 set "SDK=C:\Program Files\Microsoft SDKs\Windows\v7.1"
 set "KL=%REPO%\third_party\KenshiLib_deps"
-set "ENET=%REPO%\third_party\enet\enet\include"
+set "KENSHILIB_DIR=%KL%\KenshiLib"
+set "BOOST_INCLUDE_PATH=%KL%\boost_1_60_0"
+set "CL="
+set "_CL_="
+set "LINK="
+set "LIBPATH="
 
 REM Locate MSBuild via vswhere (falls back to a common path).
 set "MSBUILD="
@@ -40,8 +43,8 @@ REM Headers: VC10 CRT + Win SDK 7.1 + vc10_compat ammintrin.h shim + our deps.
 REM ...\Include\ogre is needed because the vendored ogre math headers include
 REM each other by bare name ("OgreVector3.h"); vc10_compat also shims the
 REM missing OgreConfig.h/OgrePlatformInformation.h that chain pulls in.
-set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat;%KL%\KenshiLib\Include;%KL%\KenshiLib\Include\ogre;%KL%\boost_1_60_0;%ENET%"
+set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat;%KL%\KenshiLib\Include;%KL%\KenshiLib\Include\kenshi;%KL%\KenshiLib\Include\ogre;%KL%\boost_1_60_0"
 
-REM Libs: VC10 x64 CRT + Win SDK 7.1 x64 + KenshiLib (kenshilib.lib, OgreMain_x64.lib).
-set "LIB=%VC%\lib\amd64;%SDK%\Lib\x64;%KL%\KenshiLib\Libraries"
+REM Libs: VC10/SDK x64 + KenshiLib + the vendored matching vc100 Boost libraries.
+set "LIB=%VC%\lib\amd64;%SDK%\Lib\x64;%KL%\KenshiLib\Libraries;%KL%\boost_1_60_0\stage\lib"
 exit /b 0

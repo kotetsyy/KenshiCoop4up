@@ -136,26 +136,41 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         for (std::deque<InboundSpawnReq>::iterator it = got.begin();
              it != got.end(); ++it) {
             const SpawnReqPacket& rq = it->pkt;
+            if (rq.targetOwner!=ownerId) continue;
             Key k; k.t = rq.hType; k.c = rq.hContainer; k.cs = rq.hContainerSerial;
             k.i = rq.hIndex; k.s = rq.hSerial;
-            std::map<Key, unsigned long>::iterator rt = spawnReplyMs_.find(k);
-            if (rt != spawnReplyMs_.end() && (now - rt->second) < REPLY_THROTTLE_MS)
-                continue;
-            spawnReplyMs_[k] = now;
+            const std::pair<u32,Key> replyKey(rq.ownerId,k);
+            std::map<std::pair<u32,Key>, unsigned long>::iterator rt=spawnReplyMs_.find(replyKey);
+            if (rt!=spawnReplyMs_.end() && now-rt->second<REPLY_THROTTLE_MS) continue;
+            spawnReplyMs_[replyKey]=now;
 
             SpawnInfoPacket pkt;
             memset(&pkt, 0, sizeof(pkt));
             pkt.type    = (u8)PKT_SPAWN_INFO;
             pkt.ownerId = ownerId;
+            pkt.requestorId=rq.ownerId;
             pkt.hType = rq.hType; pkt.hContainer = rq.hContainer;
             pkt.hContainerSerial = rq.hContainerSerial;
             pkt.hIndex = rq.hIndex; pkt.hSerial = rq.hSerial;
-            Character* c = resolveEventChar(k);
+            std::map<Key,ActorHandoff>::const_iterator transfer=actorHandoffs_.find(k);
+            const bool handoff=transfer!=actorHandoffs_.end() &&
+                transfer->second.source==ownerId && transfer->second.destination==rq.ownerId;
+            Character* c=0;
+            if (handoff) {
+                const unsigned int* h=transfer->second.localHand;
+                c=engine::resolveCharByHand(h[3],h[4],h[0],h[1],h[2]);
+                ObjectHand actual;
+                if (c && (!engine::charHandOf(c,actual) ||
+                          !actual.equals(ObjectHand::fromObjOrder(h)))) c=0;
+            } else c=resolveEventChar(k);
             bool dead = false;
             float age = 0.0f;
             bool found = c && engine::describeCharacter(
                 c, pkt.charSid, sizeof(pkt.charSid), pkt.facSid, sizeof(pkt.facSid),
                 &pkt.x, &pkt.y, &pkt.z, &pkt.heading, &dead, &age);
+            if (found && !handoff && (engine::isLocalPlayerChar(gw,c)
+                ? playerActorOwner(k)!=ownerId && !(ownerId==0 && thrown_.count(k))
+                : !weAuthor(gw,ownerId,pkt.x,pkt.z))) continue;
             pkt.found = found ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
             if (found && isHost) engine::readMerchantHome(c,pkt.shopHome,
@@ -168,7 +183,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             // Late join: hostBody_ already holds the down bits so the stream/
             // census edge detector stays silent. Pin the new replica with the
             // same reliable KO/DEATH the live edge would have sent.
-            if (found && pkt.dead != SPAWN_BODY_ALIVE) {
+            if (found && !handoff && pkt.dead != SPAWN_BODY_ALIVE) {
                 EventPacket ev;
                 memset(&ev, 0, sizeof(ev));
                 ev.type = (u8)PKT_EVENT;
@@ -177,10 +192,11 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 ev.sType = k.t; ev.sContainer = k.c; ev.sContainerSerial = k.cs;
                 ev.sIndex = k.i; ev.sSerial = k.s;
                 net.queueEvent(ev);
-                char eb[200]; _snprintf(eb, sizeof(eb) - 1,
-                    "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u actor=%u,%u bs %u->%u",
+                char eb[320]; _snprintf(eb, sizeof(eb) - 1,
+                    "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u actor=%u,%u bs %u->%u owner=%u actor5=%u,%u,%u,%u,%u",
                     ev.eventId, (unsigned)ev.event, k.t, k.c, k.cs, k.i, k.s,
-                    0u, 0u, 0u, (unsigned)bs);
+                    ev.aIndex, ev.aSerial, 0u, (unsigned)bs, ev.ownerId,
+                    ev.aType, ev.aContainer, ev.aContainerSerial, ev.aIndex, ev.aSerial);
                 eb[sizeof(eb) - 1] = '\0'; coop::logLine(eb);
             }
             char b[224]; _snprintf(b, sizeof(b) - 1,
@@ -303,7 +319,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         const SpawnInfoPacket& p = it->pkt;
         Key k; k.t = p.hType; k.c = p.hContainer; k.cs = p.hContainerSerial;
         k.i = p.hIndex; k.s = p.hSerial;
-        SpawnReqState& rq = spawnReq_[k];
+        std::map<Key,SpawnReqState>::iterator request=spawnReq_.find(k);
+        if (p.requestorId!=ownerId || request==spawnReq_.end() ||
+            request->second.targetOwner!=p.ownerId) {
+            it=spawnInfoPend_.erase(it); continue;
+        }
+        SpawnReqState& rq=request->second;
         if (!p.found) {
             rq.deniedMs = now;
             char b[128]; _snprintf(b, sizeof(b) - 1,
@@ -772,6 +793,28 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS)
                 continue;
             SpawnReqState& rq = spawnReq_[k];
+            u32 target=playerActorOwner(k);
+            std::map<Key,Driven>::const_iterator actor=targets_.find(k);
+            if (target==OWNER_ID_ALL) {
+                if (actor!=targets_.end() && peerStreamFresh(k,now))
+                    target=actor->second.streamOwner;
+                else if (it->second.fromCensus && censusHands_.count(k)) {
+                    std::map<Key,CensusPos>::const_iterator cp = censusPos_.find(k);
+                    if (cp != censusPos_.end()) {
+                        const u32 author = authorityFor(gw,cp->second.x,cp->second.z);
+                        if (npcCensusLedger_.fresh(author,now)) target=author;
+                    }
+                }
+            } else if (thrown_.count(k) && actor!=targets_.end() &&
+                       actor->second.streamOwner==0 && peerStreamFresh(k,now)) target=0;
+            std::map<Key,ActorHandoff>::const_iterator handoff=actorHandoffs_.find(k);
+            if (handoff!=actorHandoffs_.end() && handoff->second.destination==ownerId &&
+                handoff->second.source!=ownerId && forceReqHands_.count(k))
+                target=handoff->second.source;
+            if (target>=MAX_PLAYERS || target==ownerId) continue;
+            if (rq.targetOwner!=target) {
+                rq.targetOwner=target; rq.lastSendMs=0; rq.sends=0; rq.deniedMs=0; rq.farMs=0;
+            }
             // Census-sourced hands stay census-marked across retries (the
             // far-mint privilege follows the EXISTENCE authority, not the
             // path a later stream sample happened to arrive by).
@@ -802,6 +845,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             memset(&pkt, 0, sizeof(pkt));
             pkt.type    = (u8)PKT_SPAWN_REQ;
             pkt.ownerId = ownerId;
+            pkt.targetOwner=rq.targetOwner;
             pkt.hType = k.t; pkt.hContainer = k.c; pkt.hContainerSerial = k.cs;
             pkt.hIndex = k.i; pkt.hSerial = k.s;
             net.queueSpawnReq(pkt);
@@ -878,11 +922,85 @@ bool Replicator::pickMintedProxyNear(GameWorld* gw, const unsigned int refHand[5
     return true;
 }
 
-void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
+bool Replicator::resolveFurnitureEventHand(const EventPacket& ev,unsigned int out[5]) const {
+    const Key key=actorKeyOf(ev);
+    if ((int)ev.arg==3) {
+        Character* owner=resolveEventChar(key);
+        return owner && engine::readObjectHand(reinterpret_cast<RootObject*>(owner),out);
+    }
+    // Furniture events name the author's native fixture, never an inventory
+    // key or a receiver-native hand (including on HOST).
+    return localHandForPoseFixtureKey(key,ev.ownerId,out,false)==1;
+}
+
+// 0 waits for an unloaded identity; 1 converged; -1 rejects the lifecycle.
+int Replicator::applyFurnitureEvent(const EventPacket& ev) {
+    Key key; key.t=ev.sType; key.c=ev.sContainer; key.cs=ev.sContainerSerial;
+    key.i=ev.sIndex; key.s=ev.sSerial;
+    Character* occupant=resolveEventChar(key);
+    unsigned int fixture[5];
+    if (!occupant || !resolveFurnitureEventHand(ev,fixture)) return 0;
+    engine::FurnitureRead native;
+    const bool already=engine::readFurniture(occupant,&native) && native.valid &&
+        native.kind==(int)ev.arg && !memcmp(native.furn,fixture,sizeof(fixture));
+    std::map<Key,CarryPlacement>::iterator placement=carryPlacements_.find(key);
+    const bool carriedPlacement=placement!=carryPlacements_.end() &&
+        !placement->second.local && placement->second.released &&
+        placement->second.owner==ev.ownerId;
+    unsigned int local[5];
+    const bool owned=(engine::readObjectHand(reinterpret_cast<RootObject*>(occupant),local) &&
+        ownHands_.count(keyForInvLocalHand(local))) || pinOwned_.count(key) ||
+        (localId_<MAX_PLAYERS && playerActorOwner(key)==localId_);
+    if (owned) {
+        std::map<Key,unsigned long>::const_iterator exited=ownFurnExit_.find(key);
+        const bool veto=exited!=ownFurnExit_.end() && nowMs()-exited->second<10000;
+        // ENTER may resolve before its matching accepted DROP. Keep it pending
+        // without granting a placement until that carry lifecycle is released.
+        if (!veto && placement!=carryPlacements_.end() &&
+            !placement->second.local && placement->second.owner==ev.ownerId &&
+            !placement->second.released) return 0;
+        if (veto || (!carriedPlacement && !coop::bodyIsDown(engine::readBodyState(occupant))))
+            return already ? 1 : -1;
+    }
+    std::map<Key,u32>::const_iterator issued=furnitureEnterApplied_.find(key);
+    const bool attempted=issued!=furnitureEnterApplied_.end() && issued->second==ev.eventId;
+    if (!already && !attempted) {
+        if (!engine::applyFurniture(0,occupant,fixture,(int)ev.arg,true,owned)) return 0;
+        furnitureEnterApplied_[key]=ev.eventId;
+    }
+    // After an accepted native command, retries only observe occupancy; never
+    // reissue sleep while awaiting its exact native attach.
+    engine::FurnitureRead attached;
+    if (!engine::readFurniture(occupant,&attached) || !attached.valid ||
+        attached.kind!=(int)ev.arg ||
+        memcmp(attached.furn,fixture,sizeof(fixture))) return 0;
+    if (owned && carriedPlacement) {
+        // One owner acknowledgment even for conscious poses, whose usual ENTER
+        // edge is suppressed. Remember this occupancy so waking emits EXIT.
+        HostBody& body=hostBody_[key];
+        body.furnKind=(int)ev.arg; memcpy(body.furn,fixture,sizeof(fixture));
+        PendFurnEnter acknowledgment; acknowledgment.occ=key;
+        acknowledgment.kind=(int)ev.arg; memcpy(acknowledgment.furn,fixture,sizeof(fixture));
+        furnPeerPend_.push_back(acknowledgment);
+        carryPlacements_.erase(placement);
+    } else if (placement!=carryPlacements_.end() && placement->second.local &&
+               placement->second.pending && playerActorOwner(key)==ev.ownerId &&
+               !memcmp(placement->second.furn,fixture,sizeof(fixture))) {
+        carryPlacements_.erase(placement);
+    }
+    char log[176]; _snprintf(log,sizeof(log)-1,
+        "[furn] RECV ENTER id=%u occ=%u,%u furn=%u,%u kind=%d ok=1",
+        ev.eventId,key.i,key.s,fixture[3],fixture[4],(int)ev.arg);
+    log[sizeof(log)-1]='\0'; coop::logLine(log);
+    return 1;
+}
+
+void Replicator::applyEvents(GameWorld* gw, Inbound& in, u32 ownerId) {
     std::deque<InboundEvent> got;
     in.drainEvents(got);
     for (std::deque<InboundEvent>::iterator it = got.begin(); it != got.end(); ++it) {
         const EventPacket& ev = it->ev;
+        if (ev.ownerId>=MAX_PLAYERS || it->ownerId!=ev.ownerId || !ev.eventId) continue;
         Key k; k.t = ev.sType; k.c = ev.sContainer; k.cs = ev.sContainerSerial;
         k.i = ev.sIndex; k.s = ev.sSerial;
         Driven& d = targets_[k]; // creates a placeholder if the body isn't streamed yet
@@ -958,6 +1076,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // Works for own-tab, cross-tab, and either direction: each
                 // machine mirrors the relationship between its own instances.
                 if (!carrySync_) break;
+                targets_[actorKeyOf(ev)].carryReleaseOwner = OWNER_ID_ALL;
                 Character* carrier = resolveEventChar(actorKeyOf(ev));
                 // Hand the carried body through the SAME remap. applyPickup
                 // re-resolves from the array, so give it the hand of the local
@@ -971,6 +1090,16 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                     if (engine::charHandOf(carried, lh)) lh.toObjOrder(ch);
                 }
                 bool ok = carrier && engine::applyPickup(0, carrier, ch);
+                engine::CarryRead native;
+                ok=ok && engine::readCarry(carrier,&native) && native.valid &&
+                    native.carrying && !memcmp(native.carried,ch,sizeof(ch));
+                if (ok) {
+                    CarryPlacement& placement=carryPlacements_[k];
+                    placement=CarryPlacement(); placement.owner=ev.ownerId;
+                    pendingFurnitureEvents_.erase(k);
+                    furnitureEnterApplied_.erase(k);
+                    ownFurnExit_.erase(k);
+                }
                 clearThrown(k, "pickup");
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
                     "[carry] RECV PICKUP id=%u carrier=%u,%u carried=%u,%u ok=%d",
@@ -989,6 +1118,20 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // a null `who` is what produced "park=0 raw=0 vis=0 hkset=0" with
                 // the position reading 0,0,0 in the 12:31:09 session.
                 Character* who = resolveEventChar(k);
+                engine::FurnitureRead occupied;
+                const bool inFurniture=who && engine::readFurniture(who,&occupied) &&
+                    occupied.valid && occupied.kind!=0;
+                if (inFurniture) {
+                    Driven& release = targets_[actorKeyOf(ev)];
+                    release.carryReleaseOwner = ev.ownerId;
+                    const unsigned int body[5] = { k.t, k.c, k.cs, k.i, k.s };
+                    memcpy(release.carryReleasedBody, body, sizeof(body));
+                    std::map<Key,CarryPlacement>::iterator placement=carryPlacements_.find(k);
+                    if (ev.arg==0 && placement!=carryPlacements_.end() &&
+                        placement->second.owner==ev.ownerId) placement->second.released=true;
+                    clearThrown(k,"already-in-furniture");
+                    break;
+                }
                 if (ev.arg >= DROP_ARG_LANDING) {
                     char cb[240]; _snprintf(cb, sizeof(cb) - 1,
                         "[carry] RECV LANDING id=%u carried=%u,%u "
@@ -1003,7 +1146,19 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 }
                 Character* carrier = resolveEventChar(actorKeyOf(ev));
                 bool ragdoll = ev.arg >= DROP_ARG_RAGDOLL;
-                bool ok = carrier && engine::applyDrop(carrier, ragdoll);
+                engine::CarryRead held;
+                unsigned int passenger[5];
+                const bool hasPassenger=who &&
+                    engine::readObjectHand(reinterpret_cast<RootObject*>(who),passenger);
+                const bool carrying=carrier && engine::readCarry(carrier,&held) && held.valid;
+                bool ok=carrying && (!held.carrying ||
+                    (hasPassenger && !memcmp(held.carried,passenger,sizeof(passenger)))) &&
+                    engine::applyDrop(carrier,ragdoll);
+                std::map<Key,CarryPlacement>::iterator placement=carryPlacements_.find(k);
+                if (placement!=carryPlacements_.end() && placement->second.owner==ev.ownerId) {
+                    if (ok && ev.arg==0) placement->second.released=true;
+                    else carryPlacements_.erase(placement);
+                }
                 char cb[240]; _snprintf(cb, sizeof(cb) - 1,
                     "[carry] RECV DROP id=%u carrier=%u,%u carried=%u,%u ok=%d "
                     "pose=%u xyz=%.1f,%.1f,%.1f h=%.2f",
@@ -1011,69 +1166,30 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                     ok ? 1 : 0, (unsigned)ev.poseValid,
                     ev.x, ev.y, ev.z, ev.heading);
                 cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
+                if (!ok) break; // a rejected carry relation must not settle another body
+                Driven& release = targets_[actorKeyOf(ev)];
+                release.carryReleaseOwner = ev.ownerId;
+                const unsigned int body[5] = { k.t, k.c, k.cs, k.i, k.s };
+                memcpy(release.carryReleasedBody, body, sizeof(body));
                 settleDroppedBody(k, who, ev.poseValid != 0,
                                   ev.x, ev.y, ev.z, ev.heading, "recv");
                 if (ragdoll) beginThrown(k);
                 break;
             }
-            case EVT_ENTER_FURNITURE: {
-                // Furniture occupancy (protocol 19): subject = the OCCUPANT,
-                // actor = the FURNITURE's save-stable hand (both clients loaded
-                // the same save, so it resolves locally). Run the engine's own
-                // setBedMode/setPrisonMode between the LOCAL pair - the in-bed/
-                // in-cage pose and transform are engine-native here. On a body
-                // we OWN, only a THIRD-PARTY placement is honoured (protocol
-                // 36): the world authority jailed our KO'd body (a guard
-                // action that runs purely on the host sim - our engine never
-                // executed it). Conscious voluntary use stays owner-authored:
-                // for those our engine did the real placement and this event
-                // is just the echo of our own edge.
-                if (!furnSync_) break;
-                if (ownHands_.count(k) || pinOwned_.count(k)) {
-                    Character* own = resolveEventChar(k);
-                    bool down = own && coop::bodyIsDown(engine::readBodyState(own));
-                    engine::FurnitureRead ofr;
-                    bool already = own && engine::readFurniture(own, &ofr) &&
-                                   ofr.valid && ofr.kind == (int)ev.arg;
-                    // Race guard: the host re-authors PEER-ENTER on a 5 s
-                    // cadence, so one can be in flight when we free our own
-                    // body - a recent owner-side exit vetoes the stale enter.
-                    std::map<Key, unsigned long>::iterator ox = ownFurnExit_.find(k);
-                    bool justExited = ox != ownFurnExit_.end() &&
-                                      (nowMs() - ox->second) < 10000;
-                    if (!down || already || justExited) {
-                        char sb[160]; _snprintf(sb, sizeof(sb) - 1,
-                            "[furn] RECV PEER-ENTER own occ=%u,%u SKIP (down=%d already=%d exited=%d)",
-                            k.i, k.s, down ? 1 : 0, already ? 1 : 0,
-                            justExited ? 1 : 0);
-                        sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
-                        break;
-                    }
-                }
-                // Remapped: an occupant the world authority put in a bed or a cage is
-                // often a runtime body, a proxy here under a different hand - the wire
-                // hand named nothing and this reported ok=0 on a 5 s retry forever
-                // (session 19:44: 48 of them for one bed).
-                Character* occ = resolveEventChar(k);
-                unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
-                                       ev.aIndex, ev.aSerial };
-                int kind = (int)ev.arg;
-                bool ok = occ && engine::applyFurniture(0, occ, fh, kind, true);
-                char fb[160]; _snprintf(fb, sizeof(fb) - 1,
-                    "[furn] RECV ENTER id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
-                    ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,
-                    kind, ok ? 1 : 0);
-                fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
+            case EVT_ENTER_FURNITURE:
+                if (furnSync_) pendingFurnitureEvents_[k]=ev;
                 break;
-            }
             case EVT_EXIT_FURNITURE: {
                 // The inverse: release the local occupant. Idempotent - a copy
                 // that never entered locally (lost/late enter) is a no-op success.
                 if (!furnSync_) break;
+                pendingFurnitureEvents_.erase(k);
+                furnitureEnterApplied_.erase(k);
+                if (playerActorOwner(k)==ev.ownerId) carryPlacements_.erase(k);
                 if (ownHands_.count(k) || pinOwned_.count(k)) break;
                 Character* occ = resolveEventChar(k); // same remap as ENTER above
-                unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
-                                       ev.aIndex, ev.aSerial };
+                unsigned int fh[5];
+                if (!resolveFurnitureEventHand(ev,fh)) break;
                 int kind = (int)ev.arg;
                 bool ok = occ && engine::applyFurniture(0, occ, fh, kind, false);
                 char fb[160]; _snprintf(fb, sizeof(fb) - 1,
@@ -1089,6 +1205,12 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (!recruitSync_) break;
                 Key nk; nk.t = ev.aType; nk.c = ev.aContainer;
                 nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
+                const u32 oldOwner=playerActorOwner(k);
+                if (oldOwner!=OWNER_ID_ALL && oldOwner!=ev.ownerId) break;
+                std::map<Key,u32>::const_iterator destination=playerActorOwners_.find(nk);
+                if (destination!=playerActorOwners_.end() && destination->second!=ev.ownerId) break;
+                playerActorOwners_[nk]=ev.ownerId;
+                if (!(k==nk)) playerActorOwners_.erase(k);
                 rekeyPeerBody(gw, k, nk, "recruit");
                 break;
             }
@@ -1102,6 +1224,21 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (!squadSync_) break;
                 Key nk; nk.t = ev.aType; nk.c = ev.aContainer;
                 nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
+                const u32 oldOwner=playerActorOwner(k);
+                const bool identity=nk==k;
+                if (oldOwner!=OWNER_ID_ALL && oldOwner!=ev.ownerId &&
+                    !(oldOwner==0 && identity && ev.arg>=2 && ev.arg<=MAX_PLAYERS &&
+                      ev.arg==(float)(unsigned)ev.arg &&
+                      validInitialPlayerClaim(gw,k,ev.ownerId,(unsigned)ev.arg))) break;
+                if ((nk.t|nk.c|nk.cs|nk.i|nk.s)!=0) {
+                    u32 nextOwner=identity ? ev.ownerId : playerActorOwner(nk);
+                    playerActorOwners_[nk]=nextOwner<MAX_PLAYERS ? nextOwner : ev.ownerId;
+                    if (!identity && playerActorOwners_[nk]==ownerId && ev.ownerId!=ownerId) {
+                        ActorHandoff& handoff=actorHandoffs_[nk];
+                        handoff.source=ev.ownerId; handoff.destination=ownerId;
+                    }
+                }
+                if (!identity) playerActorOwners_.erase(k);
                 // Identity claim: join keeps a local tab but streams the
                 // PRE-claim save-stable hand so we can resolve and drive it.
                 if (nk.t == k.t && nk.c == k.c && nk.cs == k.cs &&
@@ -1143,12 +1280,21 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
             }
             default: break;
         }
-        char b[200]; _snprintf(b, sizeof(b) - 1,
-            "[event] RECV id=%u ev=%u owner=%u hand=%u,%u,%u,%u,%u actor=%u,%u",
+        char b[320]; _snprintf(b, sizeof(b) - 1,
+            "[event] RECV id=%u ev=%u owner=%u hand=%u,%u,%u,%u,%u actor=%u,%u actor5=%u,%u,%u,%u,%u",
             ev.eventId, (unsigned)ev.event, ev.ownerId,
             ev.sType, ev.sContainer, ev.sContainerSerial, ev.sIndex, ev.sSerial,
-            ev.aIndex, ev.aSerial);
+            ev.aIndex, ev.aSerial,
+            ev.aType, ev.aContainer, ev.aContainerSerial, ev.aIndex, ev.aSerial);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    for (std::map<Key,EventPacket>::iterator it=pendingFurnitureEvents_.begin();
+         it!=pendingFurnitureEvents_.end();) {
+        if (applyFurnitureEvent(it->second)!=0) {
+            furnitureEnterApplied_.erase(it->first);
+            pendingFurnitureEvents_.erase(it++);
+        }
+        else ++it;
     }
 }
 
@@ -1477,6 +1623,7 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
         drivenSeen_.erase(c);
         targets_.erase(newK);
         spawnReq_.erase(newK);
+        actorHandoffs_.erase(newK);
         rekeyedOld_[newK] = nowMs();
         std::map<Key, Character*>::iterator px = proxyByKey_.find(newK);
         if (px != proxyByKey_.end()) {

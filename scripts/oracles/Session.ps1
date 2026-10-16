@@ -610,6 +610,7 @@ function Test-SaveResume {
         $h = $hSites[$hand]; $j = $jSites[$hand]
         if ($h.sid -ne $j.sid) { $why += "hand=$hand sid mismatch (host '$($h.sid)' join '$($j.sid)')" }
         elseif ([math]::Abs($h.prog - $j.prog) -gt 0.05) { $why += "hand=$hand progress diverged (host $($h.prog) join $($j.prog))" }
+        elseif ($h.complete -ne $j.complete) { $why += "hand=$hand completion state diverged" }
         else {
             $shared++
             Write-Host "    FINDING: SAME-HAND site hand=$hand sid='$($h.sid)' prog=$($h.prog) on BOTH clients (the baked-identity proof)"
@@ -675,18 +676,33 @@ function Test-LoadSync {
             $why += "join never received/handled PKT_LOAD_GO"
         }
     }
+    if ($null -ne $go -and $null -ne $joinGo) {
+        if ($go.Matches[0].Groups[1].Value -ne $joinGo.Matches[0].Groups[1].Value -or
+            $go.Matches[0].Groups[2].Value -ne $joinGo.Matches[0].Groups[2].Value) {
+            $why += 'LOAD_GO transaction id or fingerprint differs between participants'
+        }
+        if ($null -eq $build -or $null -eq $ackLine -or
+            $build.LineNumber -ge $ackLine.LineNumber -or $ackLine.LineNumber -ge $go.LineNumber) {
+            $why += 'runtime build/save ACK did not precede this load transaction'
+        }
+    }
+    $postSwap = @{}
 
     # 3. both sides swapped worlds and session-reset.
-    foreach ($side in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
-        $file = $side[0]; $tag = $side[1]
-        $swap = Select-String -Path $file -Pattern 'SCENARIO LSSWAPDONE' -ErrorAction SilentlyContinue | Select-Object -First 1
+    foreach ($side in @(@($HostFile, 'host', $go), @($JoinFile, 'join', $joinGo))) {
+        $file = $side[0]; $tag = $side[1]; $transaction = $side[2]
+        $after = if ($null -ne $transaction) { $transaction.LineNumber } else { [int]::MaxValue }
+        $swap = Select-String -Path $file -Pattern 'SCENARIO LSSWAPDONE' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LineNumber -gt $after } | Select-Object -First 1
+        $postSwap[$file] = if ($null -ne $swap) { $swap.LineNumber } else { [int]::MaxValue }
         if ($null -eq $swap) { $why += "$tag never completed its world swap (no LSSWAPDONE)" }
         else {
             $reload = Select-String -Path $file -Pattern '\[load\] WORLD-RELOAD swapMs=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
             if ($null -ne $reload) { Write-Host "    FINDING: $tag world swap took $($reload.Matches[0].Groups[1].Value)ms" }
             else { Write-Host "    FINDING: $tag swap was synchronous (no WORLD-RELOAD edge visible to polling)" }
         }
-        $reset = Select-String -Path $file -Pattern '\[load\] session reset' -ErrorAction SilentlyContinue | Select-Object -First 1
+        $reset = Select-String -Path $file -Pattern '\[load\] session reset' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LineNumber -gt $after } | Select-Object -First 1
         if ($null -eq $reset) { $why += "$tag never ran the protocol-32 session reset" }
     }
 
@@ -695,8 +711,9 @@ function Test-LoadSync {
     function Get-LsSites([string]$File) {
         $out = @{}
         foreach ($m in @(Select-String -Path $File -Pattern $siteRegex -ErrorAction SilentlyContinue)) {
+            if ($m.LineNumber -le $postSwap[$File]) { continue }
             $g = $m.Matches[0].Groups
-            $out[$g[1].Value] = @{ sid = $g[2].Value; prog = [double]$g[3].Value }
+            $out[$g[1].Value] = @{ sid = $g[2].Value; prog = [double]$g[3].Value; complete = [int]$g[4].Value }
         }
         return $out
     }
@@ -704,12 +721,23 @@ function Test-LoadSync {
     $jSites = Get-LsSites $JoinFile
     if ($hSites.Count -eq 0) { $why += "host enumerated no sites post-load" }
     if ($jSites.Count -eq 0) { $why += "join enumerated no sites post-load" }
+    if ($null -ne $build) {
+        $runtimeHand = $build.Matches[0].Groups[3].Value
+        $runtimeSid = $build.Matches[0].Groups[2].Value
+        foreach ($sites in @($hSites,$jSites)) {
+            if (-not $sites.ContainsKey($runtimeHand) -or $sites[$runtimeHand].sid -ne $runtimeSid) {
+                $why += 'actual pre-load runtime site identity absent after this swap'
+            }
+        }
+    }
     $shared = 0
     foreach ($hand in $hSites.Keys) {
         if (-not $jSites.ContainsKey($hand)) { $why += "host site hand=$hand missing on the join post-load (identity diverged)"; continue }
         $h = $hSites[$hand]; $j = $jSites[$hand]
         if ($h.sid -ne $j.sid) { $why += "hand=$hand sid mismatch post-load (host '$($h.sid)' join '$($j.sid)')" }
-        else {
+        elseif ([Math]::Abs($h.prog - $j.prog) -gt 0.05 -or $h.complete -ne $j.complete) {
+            $why += "hand=$hand progress or completion differs post-load"
+        } else {
             $shared++
             Write-Host "    FINDING: SAME-HAND site hand=$hand sid='$($h.sid)' on BOTH clients POST-load (the coordinated-load identity proof)"
         }

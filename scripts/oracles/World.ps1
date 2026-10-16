@@ -547,13 +547,14 @@ function Test-RecruitAuthority {
     param([string]$HostFile, [string]$JoinFile)
     $why = @(); $series = @()
     $rx = 'SCENARIO RECRUIT COMBAT host=(?<host>[01]) t=(?<t>\d+) .*?samples=(?<samples>\d+) blood=(?<blood>-?[\d.]+) .*?damaged=(?<damaged>[01]) owner=(?<owner>\d+) authority=(?<authority>[01]) victim=(?<hand>\d+(?:,\d+){4})'
-    foreach ($side in @(@{ file=$HostFile; owner=2 }, @{ file=$JoinFile; owner=1 })) {
+    foreach ($side in @(@{ file=$HostFile; owner=2; host=1 }, @{ file=$JoinFile; owner=1; host=0 })) {
         $rows = @(
             foreach ($m in @(Select-String -Path $side.file -Pattern $rx)) {
                 $g=$m.Matches[0].Groups
                 if ([int]$g['t'].Value -lt 30000) { continue }
                 [pscustomobject]@{
                     t=[int]$g['t'].Value; blood=[double]$g['blood'].Value
+                    wall=(Get-LogTimeMs -Match $m); victim=$g['hand'].Value; host=[int]$g['host'].Value
                     owner=[int]$g['owner'].Value; authority=[int]$g['authority'].Value
                     samples=[int]$g['samples'].Value; damaged=[int]$g['damaged'].Value
                 }
@@ -561,10 +562,14 @@ function Test-RecruitAuthority {
         )
         $series += ,$rows
         if ($rows.Count -lt 20) { $why += "insufficient native ownership samples: $($side.file)" }
+        if (@($rows | Select-Object -ExpandProperty victim -Unique).Count -ne 1 -or
+            @($rows | Where-Object { $_.host -ne $side.host }).Count) {
+            $why += "inconsistent full victim identity or role: $($side.file)"
+        }
         if (@($rows | Where-Object { $_.owner -ne $side.owner -or $_.authority -ne 1 }).Count) {
             $why += "handoff did not retain one Client author: $($side.file)"
         }
-        if (@(Select-String -Path $side.file -Pattern 'SCENARIO RESULT PASS').Count -ne 1) {
+        if ((Test-ScenarioResultPass -File $side.file -Label $(if ($side.host) { 'host' } else { 'join' }) -Required $true) -ne 'PASS') {
             $why += "native scenario failed: $($side.file)"
         }
     }
@@ -577,12 +582,15 @@ function Test-RecruitAuthority {
         foreach ($jr in @($j | Where-Object { $_.t -ge 45000 -and $_.blood -ge 0 })) {
             $nearest=$null; $dt=751
             foreach ($hr in $h) {
-                $distance=[math]::Abs($hr.t-$jr.t)
-                if ($hr.blood -ge 0 -and $distance -lt $dt) { $nearest=$hr; $dt=$distance }
+                $distance=if ($null -ne $hr.wall -and $null -ne $jr.wall) { [math]::Abs($hr.wall-$jr.wall) } else { 751 }
+                if ($hr.victim -eq $jr.victim -and $hr.blood -ge 0 -and $distance -lt $dt) { $nearest=$hr; $dt=$distance }
             }
             if ($null -ne $nearest) { $deltas += [math]::Abs($nearest.blood-$jr.blood) }
         }
-        $finalDelta=[math]::Abs($h[-1].blood-$last.blood)
+        if ($h[-1].victim -eq $last.victim -and $null -ne $h[-1].wall -and $null -ne $last.wall -and
+            [Math]::Abs($h[-1].wall - $last.wall) -le 750) {
+            $finalDelta=[math]::Abs($h[-1].blood-$last.blood)
+        } else { $why += 'final native blood rows have no aligned full victim identity' }
     }
     $median=-1.0
     if ($deltas.Count -lt 20) { $why += 'insufficient paired native blood observations' }
@@ -619,7 +627,7 @@ function Test-OwnTabReturn {
                 $why += 'shared-tab peer fixture or native round-trip did not occur'
             }
         }
-        if (@(Select-String -Path $side.file -Pattern 'SCENARIO RESULT PASS').Count -ne 1) {
+        if ((Test-ScenarioResultPass -File $side.file -Label $(if ($side.host) { 'host' } else { 'join' }) -Required $true) -ne 'PASS') {
             $why += "native return scenario failed: $($side.file)"
         }
     }
@@ -1046,6 +1054,7 @@ function Get-GTimeSeries {
             paused  = [int]$m.Matches[0].Groups[4].Value
             ok      = [int]$m.Matches[0].Groups[5].Value
             t       = [long]$m.Matches[0].Groups[6].Value
+            wall    = Get-LogTimeMs -Match $m
         })
     }
     return ,$out
@@ -1118,7 +1127,7 @@ function Get-SlewSummary {
     $samples = @()
     foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
-        $samples += @{ t    = [TimeSpan]::Parse($g[1].Value)
+        $samples += @{ t    = Get-LogTimeMs -Match $m
                        off  = [math]::Abs([double]$g[2].Value)
                        slew = [double]$g[3].Value }
     }
@@ -1131,7 +1140,7 @@ function Get-SlewSummary {
     }
     $slewSecs = 0
     if ($engaged.Count -gt 0) {
-        $slewSecs = [math]::Round(($engaged[-1].t - $engaged[0].t).TotalSeconds)
+        $slewSecs = [math]::Round(($engaged[-1].t - $engaged[0].t) / 1000.0)
     }
     $last = $samples[-1]
     return @{ peakOffGh = [math]::Round($peakOff, 4); peakSlew = $peakSlew
@@ -1156,21 +1165,22 @@ function Test-TimeSync {
             }
         }
     }
-    $finalOff = $null
-    if ($h.Count -gt 0 -and $j.Count -gt 0) {
-        # Same-scenario elapsed timers start within the run_test launch skew;
-        # pair samples by nearest t (the series are both 1 Hz).
-        $tail = @($j | Where-Object { $_.t -ge ($j[-1].t - 5000) })
+    $finalOff = $null; $alignedPairs = 0
+    if ($h.Count -gt 0 -and $j.Count -gt 0 -and $null -ne $j[-1].wall) {
+        $tail = @($j | Where-Object { $null -ne $_.wall -and $_.wall -ge ($j[-1].wall - 5000) })
         $worst = 0.0
         foreach ($js in $tail) {
-            $near = $h | Sort-Object { [math]::Abs($_.t - $js.t) } | Select-Object -First 1
-            if ($null -eq $near -or [math]::Abs($near.t - $js.t) -gt 1500) { continue }
+            $near = $h | Where-Object { $null -ne $_.wall } |
+                Sort-Object { [math]::Abs($_.wall - $js.wall) } | Select-Object -First 1
+            if ($null -eq $near -or [math]::Abs($near.wall - $js.wall) -gt 1500) { continue }
+            $alignedPairs++
             $d = [math]::Abs($near.hours - $js.hours)
             if ($d -gt $worst) { $worst = $d }
         }
-        $finalOff = [math]::Round($worst, 5)
+        if ($alignedPairs -gt 0) { $finalOff = [math]::Round($worst, 5) }
+        if ($alignedPairs -ne $tail.Count -or $alignedPairs -lt 5) { $why += 'insufficient aligned clock tail pairs (need every tail row and at least five)' }
         if ($worst -gt $TOL) { $why += "final clock offset $finalOff game-hours exceeds tolerance $TOL" }
-    }
+    } else { $why += 'no timestamped clock tail to compare' }
     # Return-to-normal-speed gate (2026-07-10): catching up is only half the
     # contract - the slew must DISENGAGE once converged, leaving BOTH clients
     # at 1x. Join side: the last [time] OFFSET line must read slew~1.0.
@@ -1197,7 +1207,7 @@ function Test-TimeSync {
     Write-Host "  TIME-SYNC $v - finalOffset=$finalOff (tol=$TOL) $detail"
     Write-Host "    FINDING: catch-up $slewNote"
     return (Add-GateResult -Name "time_sync" -Status $v `
-                -Metrics @{ finalOffset = $finalOff } -Detail $detail)
+                -Metrics @{ finalOffset = $finalOff; alignedPairs = $alignedPairs } -Detail $detail)
 }
 
 # Parse the 1 Hz SCENARIO DOOR census into hand -> ordered samples

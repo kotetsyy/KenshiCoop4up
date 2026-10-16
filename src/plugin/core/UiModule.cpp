@@ -10,6 +10,7 @@
 
 #include "UiModule.h"
 #include "../CoopLog.h"
+#include "../net/RuntimeImages.h"
 
 // Windows SDK 7.0A (v100) predates KB2533623's LoadLibraryEx search flags.
 #ifndef LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
@@ -33,6 +34,11 @@ const DWORD PATH_CAP = 1040;
 
 void COOP_UI_CALL hostLog(const char* utf8, int error) {
     if (!utf8) return;
+    if (std::strstr(utf8, "KCU1")) {
+        if (error) coop::logErrLine("[coop-ui] credential-bearing message redacted");
+        else coop::logLine("[coop-ui] credential-bearing message redacted");
+        return;
+    }
     if (error) coop::logErrLine(utf8);
     else       coop::logLine(utf8);
 }
@@ -116,6 +122,8 @@ bool shutdownSeh(DWORD* code) {
 }
 
 void loadAndInitialize() {
+    updater::RuntimeImageLoadGuard imageLoad(true);
+    if (!imageLoad.allowed()) return; // Never bind a new UI to the mapped old core.
     g_state = UI_DISABLED; // any early return below leaves the UI off for good
     wchar_t path[PATH_CAP];
     if (!providerPath(path, PATH_CAP)) { disable("path could not be resolved", GetLastError()); return; }
@@ -161,34 +169,33 @@ void loadAndInitialize() {
 } // namespace
 
 void tick(const CoopUiSnapshot* state, CoopUiCommand* command) {
-    memset(command, 0, sizeof(*command));
+    if (!command) return;
+    SecureZeroMemory(command, sizeof(*command));
     command->structSize = sizeof(CoopUiCommand);
     command->kind       = COOP_UI_NONE;
+    if (!state || !validSnapshot(*state)) return;
     if (g_state == UI_UNLOADED) loadAndInitialize();
     if (g_state != UI_READY) return;
 
     DWORD code = 0;
     if (!tickSeh(state, command, &code)) {
         disable("faulted in tick", code);
-        memset(command, 0, sizeof(*command));
+        SecureZeroMemory(command, sizeof(*command));
         command->structSize = sizeof(CoopUiCommand);
         // Best effort: hide whatever the provider still has on screen.
         if (!shutdownSeh(&code)) coop::logErrLine("[coop-ui] KenshiCoopUI.dll shutdown after fault also faulted");
         return;
     }
-    if (command->structSize != sizeof(CoopUiCommand) ||
-        command->kind < COOP_UI_NONE || command->kind > COOP_UI_DISCONNECT) {
+    if (!validCommand(*command)) {
         static bool s_warned = false;
         if (!s_warned) {
             s_warned = true;
             coop::logErrLine("[coop-ui] KenshiCoopUI.dll returned a malformed command; ignored");
         }
-        memset(command, 0, sizeof(*command));
+        SecureZeroMemory(command, sizeof(*command));
         command->structSize = sizeof(CoopUiCommand);
         return;
     }
-    command->settings.udpIp[sizeof(command->settings.udpIp) - 1] = '\0';
-    command->settings.playerName[sizeof(command->settings.playerName) - 1] = '\0';
 }
 
 } // namespace uimodule

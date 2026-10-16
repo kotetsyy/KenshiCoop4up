@@ -16,7 +16,7 @@ function Test-InventorySync {
         param($file)
         $arr = @()
         if (Test-Path $file) {
-            foreach ($ln in Get-Content $file) {
+            foreach ($ln in Get-Content $file -Encoding UTF8) {
                 if ($ln -match $rx) {
                     $arr += [pscustomobject]@{ count = [int]$matches[3]; hash = [uint32]$matches[4] }
                 }
@@ -58,7 +58,7 @@ function Test-InventoryBidir {
         param($file)
         $arr = @()
         if (Test-Path $file) {
-            foreach ($ln in Get-Content $file) {
+            foreach ($ln in Get-Content $file -Encoding UTF8) {
                 if ($ln -match $rx) {
                     $arr += [pscustomobject]@{
                         rank = [int]$matches[1]; role = $matches[2]
@@ -75,8 +75,8 @@ function Test-InventoryBidir {
         Write-Host "  INV-BIDIR FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
         return (Add-GateResult -Name "inv_bidir" -Status FAIL -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
     }
-    $pick = { param($S, $rank, $role) @($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
-    $distinct = { param($rows) ($rows | ForEach-Object { $_.hash } | Select-Object -Unique).Count }
+    $pick = { param($S, $rank, $role) ,@($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
+    $distinct = { param($rows) @($rows | ForEach-Object { $_.hash } | Select-Object -Unique).Count }
     $checkDir = {
         param($name, $authorRows, $obsRows)
         if ($authorRows.Count -lt 1 -or $obsRows.Count -lt 1) {
@@ -112,7 +112,7 @@ function Get-InveSeries {
     $rx = 'SCENARIO INVE r=(\d+) (OWN|PEER) t=(\d+) count=(\d+) eq=(\d+) hash=(\d+)'
     $arr = @()
     if (Test-Path $File) {
-        foreach ($ln in Get-Content $File) {
+        foreach ($ln in Get-Content $File -Encoding UTF8) {
             if ($ln -match $rx) {
                 $arr += [pscustomobject]@{
                     rank = [int]$matches[1]; role = $matches[2]
@@ -133,7 +133,7 @@ function Test-InventoryEquip {
         Write-Host "  INV-EQUIP FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
         return (Add-GateResult -Name "inv_equip" -Status FAIL -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
     }
-    $pick = { param($S, $rank, $role) @($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
+    $pick = { param($S, $rank, $role) ,@($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
     $maxEq = { param($rows) ($rows | ForEach-Object { $_.eq } | Measure-Object -Maximum).Maximum }
     $checkDir = {
         param($name, $authorRows, $obsRows)
@@ -174,7 +174,7 @@ function Test-InventoryReequip {
         Write-Host "  INV-REEQUIP FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
         return (Add-GateResult -Name "inv_reequip" -Status FAIL -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
     }
-    $pick = { param($S, $rank, $role) @($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
+    $pick = { param($S, $rank, $role) ,@($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
     $maxEq = { param($rows) ($rows | ForEach-Object { $_.eq } | Measure-Object -Maximum).Maximum }
     $minEq = { param($rows) ($rows | ForEach-Object { $_.eq } | Measure-Object -Minimum).Minimum }
     $checkDir = {
@@ -259,7 +259,7 @@ function Test-TradeProbe {
         param($file)
         $arr = @()
         if (Test-Path $file) {
-            foreach ($ln in Get-Content $file) {
+            foreach ($ln in Get-Content $file -Encoding UTF8) {
                 if ($ln -match $rx) {
                     $arr += [pscustomobject]@{
                         rank = [int]$matches[1]; t = [int]$matches[3]
@@ -393,7 +393,7 @@ function Test-TradePeer {
         param($file)
         $arr = @()
         if (Test-Path $file) {
-            foreach ($ln in Get-Content $file) {
+            foreach ($ln in Get-Content $file -Encoding UTF8) {
                 if ($ln -match $rx) {
                     $arr += [pscustomobject]@{
                         rank = [int]$matches[1]; t = [int]$matches[3]
@@ -670,7 +670,7 @@ function Test-DropProbe {
     Write-Host ("  DROP-PROBE $v - dropped=$dropped before=$before after=$after enumerated=$enumerated")
     if ($seeded) { Write-Host ("  DROP-PROBE   " + $seeded.Line.Trim()) }
     $afterScan = $false
-    foreach ($ln in Get-Content $HostFile) {
+    foreach ($ln in Get-Content $HostFile -Encoding UTF8) {
         if ($ln -match 'SCENARIO DROP AFTER-scan:') { $afterScan = $true; continue }
         if ($afterScan) {
             if ($ln -match 'WORLDITEM (scan|  )') { Write-Host ("  DROP-PROBE   " + ($ln -replace '^.*WORLDITEM', 'WORLDITEM').Trim()) }
@@ -692,7 +692,7 @@ function Test-WorldItemSync {
         param($file, $role)
         $arr = @()
         if (Test-Path $file) {
-            foreach ($ln in Get-Content $file) {
+            foreach ($ln in Get-Content $file -Encoding UTF8) {
                 if ($ln -match $rx -and $matches[1] -eq $role) {
                     $arr += [pscustomobject]@{
                         n = [int]$matches[3]; x = [double]$matches[4]; y = [double]$matches[5]
@@ -760,7 +760,7 @@ function Test-RejoinItems {
         $o = [pscustomobject]@{ base = -1; pre = -1; post = -1; postSeen = $false
                                 swapDone = $false; reload = $false; verdictPass = $null }
         if (Test-Path $file) {
-            foreach ($ln in Get-Content $file) {
+            foreach ($ln in Get-Content $file -Encoding UTF8) {
                 if ($ln -match 'SCENARIO RI BASELINE n=(-?\d+)') { $o.base = [int]$matches[1] }
                 if ($ln -match 'SCENARIO RI PRERELOAD n=(-?\d+)') { $o.pre = [int]$matches[1] }
                 if ($ln -match 'SCENARIO RI POSTRELOAD n=(-?\d+) pre=(-?\d+)') {
@@ -872,86 +872,162 @@ function Test-WpnRelocate {
 # oracle serves both - $GateName picks the verdict label (weapon_drop / armor_drop).
 function Test-WeaponDrop {
     param([string]$HostFile, [string]$JoinFile, [string]$GateName = "weapon_drop")
-    $tag = $GateName.ToUpper().Replace("_", "-")   # WEAPON-DROP / ARMOR-DROP
-    $rxHost = 'WDROP verdict role=host pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invAfter=(-?\d+) grndAfter=(-?\d+)'
-    $rxJoin = 'WDROP verdict role=join pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invMin=(-?\d+) grndMax=(-?\d+) relocated=(\d+)'
-    $hostOk = $false
-    if (Test-Path $HostFile) {
-        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -ne $hl) {
-            $g = $hl.Matches[0].Groups
-            $invBase = [int]$g[3].Value; $invAfter = [int]$g[4].Value; $grnd = [int]$g[5].Value
-            $hostOk = ($invBase -ge 1) -and ($invAfter -le $invBase - 1) -and ($grnd -ge 1)
-            Write-Host ("  $tag [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
-                        " - dropped gear to ground (invBase=$invBase invAfter=$invAfter ground=$grnd)")
-        } else { Write-Host "  $tag [host] FAIL - no host WDROP verdict" }
+    $rx = 'WDROP verdict role=(host|join) pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+)'
+    $conservation = 'WDROP conservation role=(host|join) npc=(\d+) initial=(-?\d+) final=(-?\d+) bag=(-?\d+) ground=(-?\d+) stable=(\d+)'
+    $read = {
+        param($file, $role)
+        if (-not (Test-Path $file)) { return $null }
+        $verdict = Select-String -Path $file -Pattern $rx | Select-Object -Last 1
+        $counts = Select-String -Path $file -Pattern $conservation | Select-Object -Last 1
+        if ($null -eq $verdict -or $null -eq $counts) { return $null }
+        $v = $verdict.Matches[0].Groups; $c = $counts.Matches[0].Groups
+        $base = [int]$v[4].Value; $initial = [int]$c[3].Value
+        $bag = [int]$c[5].Value; $ground = [int]$c[6].Value
+        [pscustomobject]@{
+            Sid = $v[3].Value; Npc = [int]$c[2].Value
+            Ok = $v[1].Value -eq $role -and $c[1].Value -eq $role -and
+                 $v[2].Value -eq '1' -and $c[7].Value -eq '1' -and $base -ge 1 -and
+                 [int]$c[4].Value -eq $initial -and $bag + $ground -eq $initial -and
+                 $bag -eq $base - 1 -and $ground -eq $initial - $base + 1
+            Bag = $bag; Ground = $ground; Initial = $initial
+        }
     }
-    $joinOk = $false
-    if (Test-Path $JoinFile) {
-        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -ne $jl) {
-            $g = $jl.Matches[0].Groups
-            $invBase = [int]$g[3].Value; $invMin = [int]$g[4].Value; $grndMax = [int]$g[5].Value
-            $joinOk = ($invBase -ge 1) -and ($invMin -le $invBase - 1) -and ($grndMax -ge 1)
-            Write-Host ("  $tag [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
-                        " - relocated own copy to ground (invBase=$invBase invMin=$invMin grndMax=$grndMax)")
-            if (-not $joinOk -and $invMin -le $invBase - 1 -and $grndMax -lt 1) {
-                Write-Host "    NOTE: weapon LEFT the bag but never appeared on the ground => destroyed by inv-reconcile, not conserved"
-            }
-        } else { Write-Host "  $tag [join] FAIL - no join WDROP verdict" }
+    $h = & $read $HostFile 'host'; $j = & $read $JoinFile 'join'
+    $trace = $false
+    if ($null -ne $h -and $null -ne $j -and $h.Sid -eq $j.Sid -and $h.Sid) {
+        $sid = [regex]::Escape($h.Sid)
+        $drops = Select-String -Path $HostFile -Pattern "\[wd\] DROP id=(\d+) sid='$sid' owner=(\d+,\d+,\d+,\d+,\d+)"
+        foreach ($drop in $drops) {
+            $g = $drop.Matches[0].Groups
+            $pattern = "\[wd\] APPLY id=$($g[1].Value) sid='$sid' owner=$($g[2].Value) moved=1(?: |$)"
+            if (Select-String -Path $JoinFile -Pattern $pattern -Quiet) { $trace = $true; break }
+        }
     }
-    $authored = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] DROP id=' -Quiet)
-    $applied  = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wd\] APPLY id=\d+ .* moved=1' -Quiet)
-    Write-Host ("  $tag trace: host authored DROP=$authored, join APPLY moved=1=$applied")
-    $ok = $hostOk -and $joinOk
-    Write-Host ("  $tag " + $(if ($ok) { "PASS" } else { "FAIL" }))
-    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
-                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; authored = $authored; applied = $applied })
+    $expectedNpc = [int]($GateName -eq 'npc_gear_drop')
+    $ok = $null -ne $h -and $null -ne $j -and $h.Ok -and $j.Ok -and
+          $h.Sid -eq $j.Sid -and $h.Npc -eq $expectedNpc -and $j.Npc -eq $expectedNpc -and $trace
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { 'PASS' } else { 'FAIL' }) `
+        -Detail 'Exact final native bag/ground conservation on both peers and matching authored/applied drop' `
+        -Metrics @{ host = $h; join = $j; matchingPhysicalTransition = $trace })
 }
 
-# world_pickup_mirror (protocol 47): the W1 CLAIM half. The host drops a non-gear item and
-# the join consumes the resulting proxy; the host's OWN ground copy must then be destroyed.
-# grndPeak>=1 proves the drop landed at all (so grndFinal==0 cannot pass vacuously), and
-# grndFinal==0 is the fix: before the claim existed the author kept its copy forever and the
-# item was duplicated - the "join picked it up but the host still sees it there" report.
+# Final physical witnesses use native quantities sampled together, not an
+# inventory minimum combined with an unrelated historical ground maximum.
+function Get-PhysicalItemVerdict {
+    param([string]$File, [string]$Prefix, [string]$Role, [string[]]$Fields)
+    if ([string]::IsNullOrWhiteSpace($File) -or -not (Test-Path -LiteralPath $File)) { return }
+    $marker = [regex]::Escape($Prefix)
+    $line = Select-String -LiteralPath $File -Pattern "\b$marker verdict role=$Role " -Encoding UTF8 | Select-Object -Last 1
+    if ($null -eq $line) { return }
+    $start = Select-String -LiteralPath $File -Pattern "\b$marker start role=$Role " -Encoding UTF8 |
+        Where-Object { $_.LineNumber -lt $line.LineNumber } | Select-Object -Last 1
+    if ($null -eq $start) { return }
+    $sid = [regex]::Match($line.Line, "\bsid='([^']+)'")
+    $hand = [regex]::Match($line.Line, '\bitemHand=(\d+(?:,\d+){4})(?: |$)')
+    $owner = [regex]::Match($line.Line, '\bdropOwner=(\d+)(?: |$)')
+    $id = [regex]::Match($line.Line, '\bdropId=(\d+)(?: |$)')
+    $source = [regex]::Match($line.Line, '\bsourceHand=(\d+(?:,\d+){4})(?: |$)')
+    $after = [regex]::Match($line.Line, '\bafterItemHand=(\d+(?:,\d+){4})(?: |$)')
+    $recipientField = if ($Prefix -eq 'WGRP') { 'r1' } else { 'hand' }
+    $recipient = [regex]::Match($start.Line, "\b$recipientField=(\d+(?:,\d+){4})(?: |$)")
+    if (-not $sid.Success -or $sid.Groups[1].Value -eq '(none)' -or
+        -not $hand.Success -or $hand.Groups[1].Value -eq '0,0,0,0,0' -or
+        -not $owner.Success -or -not $id.Success -or
+        $id.Groups[1].Value -eq '0' -or -not $after.Success -or
+        $after.Groups[1].Value -eq '0,0,0,0,0' -or -not $recipient.Success -or
+        $recipient.Groups[1].Value -eq '0,0,0,0,0') { return }
+    $record = @{ File=$File; StartLine=$start.LineNumber; Line=$line.LineNumber
+        StartTime=(Get-LogTimeMs -Match $start); Time=(Get-LogTimeMs -Match $line)
+        Sid=$sid.Groups[1].Value; ItemHand=$hand.Groups[1].Value
+        DropOwner=$owner.Groups[1].Value; DropId=$id.Groups[1].Value
+        AfterItemHand=$after.Groups[1].Value; RecipientHand=$recipient.Groups[1].Value
+        SourceHand=$(if ($source.Success) { $source.Groups[1].Value } else { '' }) }
+    if ($null -eq $record.Time -or $null -eq $record.StartTime) { return }
+    foreach ($field in @('pass','type','stable','complete','stableMs','sampleCount') + $Fields) {
+        $value = [regex]::Match($line.Line, "\b$field=(-?\d+)(?: |$)")
+        if (-not $value.Success -or [long]$value.Groups[1].Value -lt 0) { return }
+        $record[$field] = [long]$value.Groups[1].Value
+    }
+    if ($record.pass -ne 1 -or $record.stable -ne 1 -or $record.complete -ne 1 -or
+        $record.stableMs -lt 2000 -or $record.sampleCount -lt 5) { return }
+    return $record
+}
+
+function Get-PhysicalTrace {
+    param($Record, [string]$Pattern)
+    if ($null -eq $Record) { return }
+    Select-String -LiteralPath $Record.File -Pattern $Pattern -Encoding UTF8 | Where-Object {
+        $_.LineNumber -gt $Record.StartLine -and $_.LineNumber -lt $Record.Line
+    }
+}
+
+function Test-PhysicalItemPair {
+    param($HostRecord, $JoinRecord)
+    return ($null -ne $HostRecord -and $null -ne $JoinRecord -and
+        $HostRecord.Sid -eq $JoinRecord.Sid -and $HostRecord.type -eq $JoinRecord.type -and
+        $HostRecord.DropOwner -eq $JoinRecord.DropOwner -and $HostRecord.DropId -eq $JoinRecord.DropId)
+}
+
+function Find-PhysicalDropReceipt {
+    param($HostRecord, $JoinRecord)
+    if (-not (Test-PhysicalItemPair $HostRecord $JoinRecord) -or $HostRecord.SourceHand -eq '' -or
+        $HostRecord.SourceHand -ne $JoinRecord.SourceHand) { return }
+    $sid = [regex]::Escape($HostRecord.Sid); $source = [regex]::Escape($HostRecord.SourceHand)
+    $drops = @(Get-PhysicalTrace $HostRecord "\[wd\] DROP id=$($HostRecord.DropId) sid='$sid' owner=$source .*dropOwner=$($HostRecord.DropOwner) type=$($HostRecord.type) itemhand=$([regex]::Escape($HostRecord.ItemHand))(?: |$)")
+    $applies = @(Get-PhysicalTrace $JoinRecord "\[wd\] APPLY id=$($HostRecord.DropId) sid='$sid' owner=$source moved=1 .*dropOwner=$($JoinRecord.DropOwner) type=$($JoinRecord.type) itemhand=$([regex]::Escape($JoinRecord.ItemHand))(?: |$)")
+    foreach ($drop in $drops) {
+        $time = Get-LogTimeMs -Match $drop
+        foreach ($apply in $applies) {
+            $received = Get-LogTimeMs -Match $apply
+            if ($null -ne $time -and $null -ne $received -and $received -ge $time) {
+                return [pscustomobject]@{ Drop=$drop; Apply=$apply; Time=$time; Received=$received
+                    Ref="$($HostRecord.DropOwner)/$($HostRecord.DropId)" }
+            }
+        }
+    }
+}
+
+# W1 must prove that the claimed native object still exists in the recipient's
+# bag, while its authored ground incarnation was retired by the same claim.
 function Test-WorldPickupMirror {
     param([string]$HostFile, [string]$JoinFile)
-    $rxHost = 'WPMIRROR verdict role=host pass=(\d+) sid=''([^'']*)'' dropped=(-?\d+) grndPeak=(\d+) grndFinal=(-?\d+)'
-    $rxJoin = 'WPMIRROR verdict role=join pass=(\d+) sid=''([^'']*)'' pickedUp=(-?\d+)'
-    $hostOk = $false; $peak = 0; $final = -1; $dropped = 0
-    if (Test-Path $HostFile) {
-        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -ne $hl) {
-            $g = $hl.Matches[0].Groups
-            $dropped = [int]$g[3].Value; $peak = [int]$g[4].Value; $final = [int]$g[5].Value
-            $hostOk = ($dropped -ge 1) -and ($peak -ge 1) -and ($final -eq 0)
-            Write-Host ("  WPICKUP-MIRROR [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
-                        " - ground copy retired (dropped=$dropped peak=$peak final=$final)")
-            if (-not $hostOk -and $peak -ge 1 -and $final -gt 0) {
-                Write-Host "    NOTE: the item stayed on the author's ground after the peer took it => the CLAIM never landed (duplicate)"
+    $counts = @('bagBase','bagFinal','groundBase','groundFinal')
+    $h = Get-PhysicalItemVerdict -File $HostFile -Prefix WPMIRROR -Role host -Fields ($counts + @('dropped','grndPeak','grndFinal'))
+    $j = Get-PhysicalItemVerdict -File $JoinFile -Prefix WPMIRROR -Role join -Fields ($counts + @('pickedUp','claimOwner'))
+    $conserved = (Test-PhysicalItemPair $h $j) -and $h.bagBase -ge 1 -and
+        $h.dropped -eq 1 -and $j.pickedUp -eq 1 -and $h.bagFinal -eq ($h.bagBase - 1) -and
+        $j.bagFinal -eq ($j.bagBase + 1) -and $h.groundBase -eq $j.groundBase -and
+        $h.groundFinal -eq $h.groundBase -and $j.groundFinal -eq $j.groundBase -and
+        $h.grndPeak -eq ($h.groundBase + 1) -and $h.grndFinal -eq $h.groundFinal -and $j.claimOwner -gt 0
+    $trace = $false
+    if ($conserved) {
+        $sid = [regex]::Escape($h.Sid); $hand = [regex]::Escape($j.ItemHand)
+        $sourceHand = [regex]::Escape($h.ItemHand)
+        $sends = @(Get-PhysicalTrace $h "\[wi\] SEND netId=$($h.DropId) sid='$sid' qty=1 .*owner=$($h.DropOwner) type=$($h.type) hand=$sourceHand(?: |$)")
+        $spawns = @(Get-PhysicalTrace $j "\[wi\] SPAWN owner=$($h.DropOwner) netId=$($h.DropId) ok=1 sid='$sid' .*hand=$hand type=$($j.type) qty=1(?: |$)")
+        $claims = @(Get-PhysicalTrace $j "\[wi\] CLAIM author=$($h.DropOwner) netId=$($h.DropId) .*claimOwner=$($j.claimOwner) type=$($j.type) itemhand=$hand complete=1 afterItemhand=$([regex]::Escape($j.AfterItemHand)) recipient=$([regex]::Escape($j.RecipientHand))(?: |$)")
+        $applies = @(Get-PhysicalTrace $h "\[wi\] CLAIM-APPLY netId=$($h.DropId) from=$($j.claimOwner) sid='$sid' destroyed=1 author=$($h.DropOwner) type=$($h.type) itemhand=$sourceHand(?: |$)")
+        foreach ($spawn in $spawns) {
+            $spawnTime = Get-LogTimeMs -Match $spawn
+            if ($null -eq $spawnTime -or -not @($sends | Where-Object {
+                $time = Get-LogTimeMs -Match $_
+                $null -ne $time -and $time -le $spawnTime
+            }).Count) { continue }
+            foreach ($claim in $claims) {
+                if ($claim.LineNumber -le $spawn.LineNumber) { continue }
+                $claimTime = Get-LogTimeMs -Match $claim
+                if ($null -eq $claimTime -or $claimTime -lt $spawnTime) { continue }
+                if (@($applies | Where-Object {
+                    $time = Get-LogTimeMs -Match $_
+                    $null -ne $time -and $time -ge $claimTime
+                }).Count) { $trace = $true; break }
             }
-        } else { Write-Host "  WPICKUP-MIRROR [host] FAIL - no host WPMIRROR verdict" }
-    } else { Write-Host "  WPICKUP-MIRROR [host] FAIL - no log" }
-    $joinOk = $false; $got = 0
-    if (Test-Path $JoinFile) {
-        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -ne $jl) {
-            $g = $jl.Matches[0].Groups
-            $got = [int]$g[3].Value
-            $joinOk = ($got -ge 1)
-            Write-Host ("  WPICKUP-MIRROR [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
-                        " - consumed the proxy (pickedUp=$got)")
-        } else { Write-Host "  WPICKUP-MIRROR [join] FAIL - no join WPMIRROR verdict" }
-    } else { Write-Host "  WPICKUP-MIRROR [join] FAIL - no log" }
-    $claimed = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wi\] CLAIM author=' -Quiet)
-    $applied = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wi\] CLAIM-APPLY netId=\d+ .* destroyed=1' -Quiet)
-    Write-Host ("  WPICKUP-MIRROR trace: join authored CLAIM=$claimed, host CLAIM-APPLY destroyed=1=$applied")
-    $ok = $hostOk -and $joinOk
-    Write-Host ("  WPICKUP-MIRROR " + $(if ($ok) { "PASS" } else { "FAIL" }))
-    return (Add-GateResult -Name "pickup_mirror" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
-                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; dropped = $dropped;
-                            grndPeak = $peak; grndFinal = $final; pickedUp = $got;
-                            claimed = $claimed; applied = $applied })
+            if ($trace) { break }
+        }
+    }
+    return (Add-GateResult -Name pickup_mirror -Status $(if ($conserved -and $trace) { 'PASS' } else { 'FAIL' }) `
+        -Detail 'Stable exact native bag/ground conservation and same full spawned-object claim transaction required' `
+        -Metrics @{ host=$h; join=$j; exactConservation=$conserved; matchingClaim=$trace })
 }
 
 # world_item_stale: the join's proxy is freed by the ENGINE (KENSHICOOP_WI_TEST_STALE
@@ -1026,106 +1102,79 @@ function Test-WorldItemStale {
                             hostDespawned = $h.despawned })
 }
 
-# inv_regear (protocol 47): the ONE-INSTANCE invariant across a full W2 round trip. Both
-# halves must hold, because either alone is satisfied by a broken outcome:
-#   host grndFinal=0  - our ground copy was retired ... but on its own, losing the item does that
-#   host bagR1>=1     - our copy of the peer's bag holds it ... but on its own, so does a duplicate
-# grndPeak>=1 keeps the whole thing honest by proving the item was ever on the ground.
-# The trace also reports REHOME-DUPE-RISK, which is the author declining to destroy a ground
-# copy it could not verify - safe (never loses the item) but still a visible duplicate, so it
-# is surfaced rather than swallowed.
+# W2 re-pickup must leave exactly one transferred quantity: source -1,
+# recipient +1 and unchanged ground, independently measured on both peers.
+# Refusal, retry, dedupe and site recovery must belong to this drop reference.
 function Test-GearRepickup {
-    param([string]$HostFile, [string]$JoinFile,
-          [string]$GateName = "gear_repickup",
-          # inv_regear_refuse only: the run injected a refusal, so converging is not enough -
-          # the retry/verify path must be visible in the log, or the gate would also pass on a
-          # build that went back to re-homing once and giving up.
-          [switch]$RequireRetry,
-          # inv_regear_refuse_all only: every attempt was refused, so convergence must have
-          # come from the verify-then-destroy branch specifically (REHOME-DEDUPE).
-          [switch]$RequireDedupe,
-          # inv_regear_forget only: the author threw its ground track away, so the pickup
-          # arrived named but unmatchable. Converging can then ONLY have come from the
-          # site-anchored recovery, and the gate says so - otherwise it would also pass on the
-          # build that answered "untracked" and left the item lying on the ground.
-          [switch]$RequireSiteRecovery)
-    $rxHost = 'WGRP verdict role=host pass=(\d+) sid=''([^'']*)'' dropped=(-?\d+) grndPeak=(-?\d+) grndFinal=(-?\d+) bagR1=(-?\d+) bagBase=(-?\d+)'
-    $rxJoin = 'WGRP verdict role=join pass=(\d+) sid=''([^'']*)'' pickedUp=(-?\d+) tries=(\d+) bagR1=(-?\d+) bagBase=(-?\d+)'
-    $hostOk = $false; $dropped = 0; $peak = 0; $final = -1; $bag = -1; $base = 0
-    if (Test-Path $HostFile) {
-        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -ne $hl) {
-            $g = $hl.Matches[0].Groups
-            $dropped = [int]$g[3].Value; $peak = [int]$g[4].Value
-            $final = [int]$g[5].Value; $bag = [int]$g[6].Value; $base = [int]$g[7].Value
-            $hostOk = ($dropped -ge 1) -and ($peak -ge 1) -and ($final -eq 0) -and ($bag -eq $base + 1)
-            Write-Host ("  GEAR-REPICKUP [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
-                        " - one instance after the peer's pickup (dropped=$dropped peak=$peak ground=$final bagR1=$bag base=$base)")
-            if ($final -gt 0 -and $bag -gt $base) {
-                Write-Host "    NOTE: DUPLICATE - the item is in the peer's bag AND still on our ground (the manual-session symptom)"
-            } elseif ($final -eq 0 -and $bag -le $base -and $peak -ge 1) {
-                Write-Host "    NOTE: LOST - our ground copy is gone and the bag did not gain it either"
-            } elseif ($bag -gt $base + 1) {
-                Write-Host "    NOTE: DUPLICATE inside the bag - it gained $($bag - $base) copies for one pickup"
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = 'gear_repickup',
+        [switch]$RequireRetry, [switch]$RequireDedupe, [switch]$RequireSiteRecovery)
+    $counts = @('sourceBase','sourceFinal','groundBase','groundFinal','bagR1','bagBase')
+    $h = Get-PhysicalItemVerdict -File $HostFile -Prefix WGRP -Role host -Fields ($counts + @('dropped','grndPeak','grndFinal'))
+    $j = Get-PhysicalItemVerdict -File $JoinFile -Prefix WGRP -Role join -Fields ($counts + @('pickedUp'))
+    $conserved = (Test-PhysicalItemPair $h $j) -and $h.dropped -eq 1 -and $j.pickedUp -eq 1 -and
+        $h.sourceBase -ge 1 -and $h.sourceBase -eq $j.sourceBase -and
+        $h.sourceFinal -eq ($h.sourceBase - 1) -and $j.sourceFinal -eq ($j.sourceBase - 1) -and
+        $h.bagBase -eq $j.bagBase -and $h.bagR1 -eq ($h.bagBase + 1) -and
+        $j.bagR1 -eq ($j.bagBase + 1) -and $h.groundBase -eq $j.groundBase -and
+        $h.groundFinal -eq $h.groundBase -and $j.groundFinal -eq $j.groundBase -and
+        $h.grndPeak -eq ($h.groundBase + 1) -and $h.grndFinal -eq $h.groundFinal
+    $drop = Find-PhysicalDropReceipt $h $j
+    $pickup = $false; $retried = $false; $deduped = $false; $injected = $false
+    $forgot = $false; $recovered = $false; $risk = $false
+    if ($null -ne $drop) {
+        $sid = [regex]::Escape($h.Sid); $reference = [regex]::Escape($drop.Ref)
+        $target = [regex]::Escape($h.RecipientHand)
+        $before = [regex]::Escape($h.ItemHand); $after = [regex]::Escape($h.AfterItemHand)
+        $intents = @(Get-PhysicalTrace $j "\[wd\] PICKUP id=(\d+) sid='$sid' owner=$([regex]::Escape($j.RecipientHand)) ref=$reference .*pickupOwner=(\d+) type=$($j.type) beforeItemhand=$([regex]::Escape($j.ItemHand)) afterItemhand=$([regex]::Escape($j.AfterItemHand))(?: |$)")
+        $rows = @(Get-PhysicalTrace $h '\[wd\] (PICKUP-APPLY|PICKUP-RETRY-OK|REHOME-|TRACK-FORGET-INJECTED)')
+        $rows = @($rows | Where-Object {
+            $_.Line -match "\bsid='$sid'(?: |$)" -and $_.Line -match "\bref=$reference(?: |$)" -and
+            (Get-LogTimeMs -Match $_) -ge $drop.Received
+        })
+        $pickups = @()
+        $injections = @($rows | Where-Object { $_.Line -match '\[wd\] REHOME-REFUSE-INJECTED(?: |$)' })
+        $injected = $injections.Count -gt 0
+        foreach ($intent in $intents) {
+            $intentTime = Get-LogTimeMs -Match $intent
+            if ($null -eq $intentTime -or $intentTime -lt $drop.Received) { continue }
+            $groups = $intent.Matches[0].Groups
+            $applies = @($rows | Where-Object {
+                $_.Line -match "\[wd\] PICKUP-APPLY id=$($groups[1].Value) .*moved=1 .*pickupOwner=$($groups[2].Value) type=$($h.type) target=$target beforeItemhand=$before afterItemhand=$after(?: |$)" -and
+                (Get-LogTimeMs -Match $_) -ge $intentTime
+            })
+            if ($applies.Count) { $pickup=$true; $pickups += $applies }
+            $recoveries = @($rows | Where-Object {
+                $_.Line -match "\[wd\] PICKUP-RETRY-OK .*type=$($h.type) target=$target beforeItemhand=$before afterItemhand=$after(?: |$)" -and
+                (Get-LogTimeMs -Match $_) -ge $intentTime
+            })
+            foreach ($recovery in $recoveries) {
+                $recoveryTime=Get-LogTimeMs -Match $recovery
+                if (@($injections | Where-Object {
+                    $injectionTime=Get-LogTimeMs -Match $_
+                    $_.LineNumber -lt $recovery.LineNumber -and $null -ne $injectionTime -and
+                    $injectionTime -ge $intentTime -and $injectionTime -le $recoveryTime
+                }).Count) {
+                    $retried=$true; $pickup=$true
+                }
             }
-        } else { Write-Host "  GEAR-REPICKUP [host] FAIL - no host WGRP verdict" }
-    } else { Write-Host "  GEAR-REPICKUP [host] FAIL - no log" }
-    $joinOk = $false; $got = 0; $tries = 0; $jbag = -1; $jbase = 0
-    if (Test-Path $JoinFile) {
-        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -ne $jl) {
-            $g = $jl.Matches[0].Groups
-            $got = [int]$g[3].Value; $tries = [int]$g[4].Value
-            $jbag = [int]$g[5].Value; $jbase = [int]$g[6].Value
-            $joinOk = ($got -ge 1) -and ($jbag -eq $jbase + 1)
-            Write-Host ("  GEAR-REPICKUP [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
-                        " - picked the relocated gear up (got=$got tries=$tries bagR1=$jbag base=$jbase)")
-        } else { Write-Host "  GEAR-REPICKUP [join] FAIL - no join WGRP verdict" }
-    } else { Write-Host "  GEAR-REPICKUP [join] FAIL - no log" }
-    $rehomed  = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] PICKUP-APPLY .* moved=1' -Quiet)
-    $retried  = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] REHOME-(RETRY-OK|DEDUPE)' -Quiet)
-    $risk     = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] REHOME-DUPE-RISK' -Quiet)
-    $injected = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] REHOME-REFUSE-INJECTED' -Quiet)
-    Write-Host ("  GEAR-REPICKUP trace: host re-homed on first try=$rehomed, needed retry/dedupe=$retried, unresolved duplicate=$risk, refusal injected=$injected")
-    $deduped = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] REHOME-DEDUPE .* destroyed=1' -Quiet)
-    $ok = $hostOk -and $joinOk
-    if ($RequireRetry -or $RequireDedupe) {
-        if (-not $injected) {
-            Write-Host "  GEAR-REPICKUP FAIL - the refusal lever never fired, so the recovery path was never under test"
-            $ok = $false
-        } elseif (-not $retried) {
-            Write-Host "  GEAR-REPICKUP FAIL - a re-home was refused but nothing retried or deduped it (single-shot re-home = permanent duplicate)"
-            $ok = $false
         }
-    }
-    if ($RequireSiteRecovery) {
-        $forgot    = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] TRACK-FORGET-INJECTED' -Quiet)
-        $recovered = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] PICKUP-APPLY .* moved=1 why=recovered-by-site' -Quiet)
-        $untracked = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] PICKUP-APPLY .* moved=0 why=untracked' -Quiet)
-        Write-Host "  GEAR-REPICKUP site recovery: track forgotten=$forgot, recovered-by-site=$recovered, gave up as untracked=$untracked"
-        if (-not $forgot) {
-            Write-Host "  GEAR-REPICKUP FAIL - the forget lever never fired, so the recovery was never under test"
-            $ok = $false
-        } elseif (-not $recovered) {
-            Write-Host "  GEAR-REPICKUP FAIL - a named pickup could not be matched and nothing recovered it (this is the duplicate the player reported)"
-            $ok = $false
+        $forgetRows = @($rows | Where-Object { $_.Line -match '\[wd\] TRACK-FORGET-INJECTED(?: |$)' })
+        $forgot = $forgetRows.Count -gt 0
+        foreach ($applied in $pickups) {
+            if ($applied.Line -match '\bwhy=recovered-by-site(?: |$)' -and
+                @($forgetRows | Where-Object { $_.LineNumber -lt $applied.LineNumber }).Count) { $recovered = $true }
         }
+        $risk = @($rows | Where-Object { $_.Line -match '\[wd\] REHOME-DUPE-RISK(?: |$)' }).Count -gt 0
     }
-    if ($RequireDedupe) {
-        Write-Host "  GEAR-REPICKUP dedupe branch: REHOME-DEDUPE destroyed=1 = $deduped"
-        if (-not $deduped) {
-            Write-Host "  GEAR-REPICKUP FAIL - with every re-home refused, the ground copy can only be retired by verify-then-destroy, and that branch never ran"
-            $ok = $false
-        }
-    }
-    Write-Host ("  GEAR-REPICKUP " + $(if ($ok) { "PASS" } else { "FAIL" }))
-    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
-                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; dropped = $dropped;
-                            grndPeak = $peak; grndFinal = $final; hostBagR1 = $bag;
-                            hostBagBase = $base; pickedUp = $got; tries = $tries;
-                            joinBagR1 = $jbag; joinBagBase = $jbase;
-                            rehomedFirstTry = $rehomed; retried = $retried; dupeRisk = $risk;
-                            refusalInjected = $injected; deduped = $deduped })
+    $ok = $conserved -and $null -ne $drop -and ($pickup -or $deduped) -and -not $risk
+    if ($RequireRetry -or $RequireDedupe) { $ok = $ok -and $injected -and $retried }
+    if ($RequireDedupe) { $ok = $ok -and $deduped }
+    if ($RequireSiteRecovery) { $ok = $ok -and $forgot -and $recovered }
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { 'PASS' } else { 'FAIL' }) `
+        -Detail 'Stable exact native source/recipient/ground conservation and matching full-identity drop/pickup/recovery transaction required' `
+        -Metrics @{ host=$h; join=$j; exactConservation=$conserved; matchingDrop=($null -ne $drop)
+            pickupApplied=$pickup; retried=$retried; deduped=$deduped; refusalInjected=$injected
+            trackForgotten=$forgot; siteRecovered=$recovered; dupeRisk=$risk })
 }
 
 # world_item_burst: a burst of non-gear drops landing in ONE publish pass must ALL reach the
@@ -1412,7 +1461,7 @@ function Test-NoPhantomPickups {
             Write-Host "  NO-PHANTOM-PICKUPS [$role] FAIL - no log"
             $r.ok = $false; return $r
         }
-        foreach ($ln in (Get-Content -Path $file -ErrorAction SilentlyContinue)) {
+        foreach ($ln in (Get-Content -Path $file -Encoding UTF8 -ErrorAction SilentlyContinue)) {
             if ($ln -match '\[wd\] PICKUP id=') {
                 $r.authored++
                 if ($ln -match 'ref=0/0') { $r.phantomAuthored++ }
@@ -1516,49 +1565,22 @@ function Test-InventoryOverflow {
 # that survived several green runs.
 function Test-InventoryDropFull {
     param([string]$HostFile, [string]$JoinFile)
-    $rxHost = 'SCENARIO INVDF verdict role=host pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invAfter=(-?\d+) grndAfter=(-?\d+) churns=(\d+)'
-    $rxJoin = 'SCENARIO INVDF verdict role=join pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invMin=(-?\d+) grndMax=(-?\d+) conserved=(\d+)'
-    $hostOk = $false; $churns = 0
-    if (Test-Path $HostFile) {
-        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -ne $hl) {
-            $g = $hl.Matches[0].Groups
-            $invBase = [int]$g[3].Value; $invAfter = [int]$g[4].Value; $churns = [int]$g[6].Value
-            $hostOk = ($invBase -ge 1) -and ($invAfter -le $invBase - 1) -and ($churns -gt 0)
-            Write-Host ("  INV-DROPFULL [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
-                        " - dropped gear mid-churn (invBase=$invBase invAfter=$invAfter churns=$churns)")
-        } else { Write-Host "  INV-DROPFULL [host] FAIL - no host INVDF verdict" }
-    } else { Write-Host "  INV-DROPFULL [host] FAIL - no log" }
-    $joinOk = $false
-    if (Test-Path $JoinFile) {
-        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -ne $jl) {
-            $g = $jl.Matches[0].Groups
-            $invBase = [int]$g[3].Value; $invMin = [int]$g[4].Value; $grndMax = [int]$g[5].Value
-            $joinOk = ($invBase -ge 1) -and ($invMin -le $invBase - 1) -and ($grndMax -ge 1)
-            Write-Host ("  INV-DROPFULL [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
-                        " - conserved own copy (invBase=$invBase invMin=$invMin grndMax=$grndMax)")
-            if (-not $joinOk -and $invMin -le $invBase - 1 -and $grndMax -lt 1) {
-                Write-Host "    NOTE: gear LEFT the bag but never reached the ground => the snapshot beat the drop intent and the reconcile destroyed it"
-            }
-        } else { Write-Host "  INV-DROPFULL [join] FAIL - no join INVDF verdict" }
-    } else { Write-Host "  INV-DROPFULL [join] FAIL - no log" }
-    $authored = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] DROP id=' -Quiet)
-    $moved    = $false; $lost = $false; $healed = 0
-    if (Test-Path $JoinFile) {
-        $moved  = [bool](Select-String -Path $JoinFile -Pattern '\[wd\] APPLY id=\d+ .* moved=[1-9]' -Quiet)
-        $lost   = [bool](Select-String -Path $JoinFile -Pattern '\[wd\] APPLY-LOST' -Quiet)
-        $healed = @(Select-String -Path $JoinFile -Pattern '\[wd\] APPLY-HEALED' -ErrorAction SilentlyContinue).Count
-    }
-    Write-Host "  INV-DROPFULL trace: host authored DROP=$authored, join moved>0=$moved, APPLY-LOST=$lost, healed=$healed"
-    if ($healed -gt 0) {
-        Write-Host "    NOTE: $healed drop(s) needed the fabrication backstop, which mints an item the mirror could not find. That is only safe when the item is genuinely absent, and it usually was not: an item stowed in a worn container by a bulk pickup is invisible to a top-level-only search, so the heal leaves the real one in the bag AND a minted copy on the ground. Reported-not-failed here is how that duplicate survived several green runs."
-    }
-    $ok = $hostOk -and $joinOk -and $authored -and $moved -and (-not $lost) -and ($healed -eq 0)
-    Write-Host ("  INV-DROPFULL " + $(if ($ok) { "PASS" } else { "FAIL" }))
-    return (Add-GateResult -Name "inv_dropfull" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
-                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; authored = $authored
-                            moved = $moved; lost = $lost; healed = $healed; churns = $churns })
+    $counts = @('bagBase','bagFinal','groundBase','groundFinal','invBase')
+    $h = Get-PhysicalItemVerdict -File $HostFile -Prefix INVDF -Role host -Fields ($counts + @('churns'))
+    $j = Get-PhysicalItemVerdict -File $JoinFile -Prefix INVDF -Role join -Fields $counts
+    $conserved = (Test-PhysicalItemPair $h $j) -and $h.bagBase -ge 1 -and
+        $h.invBase -eq $h.bagBase -and $j.invBase -eq $j.bagBase -and $h.bagBase -eq $j.bagBase -and
+        $h.bagFinal -eq ($h.bagBase - 1) -and $j.bagFinal -eq ($j.bagBase - 1) -and
+        $h.groundBase -eq $j.groundBase -and $h.groundFinal -eq ($h.groundBase + 1) -and
+        $j.groundFinal -eq ($j.groundBase + 1) -and $h.churns -ge 10
+    $drop = Find-PhysicalDropReceipt $h $j
+    $lost = @(Get-PhysicalTrace $j '\[wd\] APPLY-LOST').Count
+    $healed = @(Get-PhysicalTrace $j '\[wd\] APPLY-HEALED').Count
+    $ok = $conserved -and $null -ne $drop -and $lost -eq 0 -and $healed -eq 0
+    return (Add-GateResult -Name inv_dropfull -Status $(if ($ok) { 'PASS' } else { 'FAIL' }) `
+        -Detail 'Stable simultaneous native quantity conservation and matching full-identity authored/applied drop required; lost/healed drops rejected' `
+        -Metrics @{ host=$h; join=$j; exactConservation=$conserved; matchingDrop=($null -ne $drop)
+            lost=$lost; healed=$healed })
 }
 
 # weapon_loot: the host's owned leader acquires a NOVEL weapon (a sid in no shared-save
@@ -1624,9 +1646,8 @@ function Test-CriticalInventory {
         $name = $start.Matches[0].Groups[1].Value
         if ($scenario -ne "" -and $scenario -ne $name) { $ok = $false }
         $scenario = $name
-        $result = Select-String -Path $file -Pattern 'SCENARIO RESULT (PASS|FAIL)' |
-            Select-Object -Last 1
-        if ($null -eq $result -or $result.Matches[0].Groups[1].Value -ne 'PASS') {
+        $roleLabel = if ($file -eq $HostFile) { 'host' } else { 'join' }
+        if ((Test-ScenarioResultPass -File $file -Label $roleLabel -Required $true -Scenario $name) -ne 'PASS') {
             $ok = $false
         }
         if ($name -eq 'inv_snapshot_cursor') {
@@ -1708,4 +1729,69 @@ function Test-CriticalInventory {
     }
     return (Add-GateResult -Name 'critical_inventory' -Status $(if ($ok) { 'PASS' } else { 'FAIL' }) `
         -Metrics @{ scenario = $scenario } -Detail 'native item conservation and shared lock transitions on both peers')
+}
+
+function Test-GearIdentity {
+    param([string]$HostFile, [string]$JoinFile, [int]$Mode, [string]$GateName)
+    $rx = 'WIDENT verdict role=(host|join) mode=(\d+) pass=(\d+) complete=(\d+) stable=(\d+) actorProof=(\d+) originalLevel=(\d+) variantLevel=(\d+) originalBag=(\d+) originalGround=(\d+) variantBag=(\d+) variantGround=(\d+) originalHand=(\d+,\d+,\d+,\d+,\d+) variantHand=(\d+,\d+,\d+,\d+,\d+)'
+    $verdicts = @{}
+    foreach ($peer in @(@{ File=$HostFile; Role='host' }, @{ File=$JoinFile; Role='join' })) {
+        if (-not (Test-Path $peer.File)) { continue }
+        $row = Select-String -Path $peer.File -Pattern $rx | Select-Object -Last 1
+        if ($null -eq $row) { continue }
+        $g = $row.Matches[0].Groups
+        $bag = [int]($Mode -eq 1); $floor = 1-$bag
+        $verdicts[$peer.Role] = @{
+            OriginalLevel=[int]$g[7].Value; VariantLevel=[int]$g[8].Value
+            Ok=$g[1].Value -eq $peer.Role -and [int]$g[2].Value -eq $Mode -and
+               $g[3].Value -eq '1' -and $g[4].Value -eq '1' -and $g[5].Value -eq '1' -and
+               ($peer.Role -ne 'host' -or $g[6].Value -eq '1') -and
+               $g[7].Value -ne $g[8].Value -and [int]$g[9].Value -eq $bag -and
+               [int]$g[10].Value -eq $floor -and $g[11].Value -eq '1' -and $g[12].Value -eq '0' -and
+               $g[13].Value -ne $g[14].Value
+        }
+    }
+    $trace = $false
+    if ($verdicts.ContainsKey('host') -and $verdicts.ContainsKey('join') -and
+        $verdicts.host.OriginalLevel -eq $verdicts.join.OriginalLevel -and
+        $verdicts.host.VariantLevel -eq $verdicts.join.VariantLevel) {
+        $start = Select-String -Path $HostFile -Pattern "WIDENT start role=host mode=$Mode " | Select-Object -Last 1
+        if ($null -ne $start) {
+            $sidMatch = [regex]::Match($start.Line, "sid='([^']+)'")
+            $ownerMatch = [regex]::Match($start.Line, 'owner=(\d+,\d+,\d+,\d+,\d+)')
+            if ($sidMatch.Success -and $ownerMatch.Success) {
+                $sid = [regex]::Escape($sidMatch.Groups[1].Value); $owner = $ownerMatch.Groups[1].Value
+                $level = $verdicts.host.OriginalLevel
+                $drops = @(Select-String -Path $HostFile -Pattern "\[wd\] DROP id=(\d+) sid='$sid' owner=$owner .* level=$level ")
+                $needDrops = if ($Mode -eq 2) { 2 } else { 1 }
+                $trace = $drops.Count -eq $needDrops
+                foreach ($drop in $drops) {
+                    $id = $drop.Matches[0].Groups[1].Value
+                    $applied = Select-String -Path $JoinFile -Pattern "\[wd\] APPLY id=$id sid='$sid' owner=$owner moved=1(?: |$)" -Quiet
+                    $trace = $trace -and $applied
+                }
+                if ($Mode -in @(1,2) -and $drops.Count) {
+                    $firstId = $drops[0].Matches[0].Groups[1].Value
+                    $pickup = Select-String -Path $HostFile -Pattern "\[wd\] PICKUP id=(\d+) sid='$sid' owner=$owner ref=0/$firstId(?: |$)" | Select-Object -Last 1
+                    if ($null -eq $pickup) { $trace = $false }
+                    else {
+                        $pickupId = $pickup.Matches[0].Groups[1].Value
+                        $trace = $trace -and (Select-String -Path $JoinFile -Pattern "\[wd\] PICKUP-APPLY id=$pickupId sid='$sid' owner=$owner ref=0/$firstId moved=1(?: |$)" -Quiet)
+                    }
+                }
+                $trace = $trace -and (Select-String -Path $HostFile -Pattern "WIDENT native-source mode=$Mode phase=drop role=host dropped=1 transientFloor=1 actorProof=1" -Quiet)
+                if ($Mode -eq 2) {
+                    $trace = $trace -and (Select-String -Path $HostFile -Pattern 'WIDENT native-source mode=2 phase=pickup-drop role=host picked=1 transientBag=1 dropped=1 actorProof=1' -Quiet)
+                }
+                if ($Mode -eq 3) {
+                    $trace = $trace -and (Select-String -Path $HostFile -Pattern 'WIDENT drawn-proof .* held=1 absentSection=1 spareEquipped=1' -Quiet)
+                }
+            }
+        }
+    }
+    $ok = $verdicts.ContainsKey('host') -and $verdicts.ContainsKey('join') -and
+          $verdicts.host.Ok -and $verdicts.join.Ok -and $trace
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { 'PASS' } else { 'FAIL' }) `
+        -Detail 'Distinct physical grades conserved on both peers; exact native transient and matching DROP/PICKUP identities required' `
+        -Metrics @{ nativeIdentity=$verdicts; exactOrderedTransitions=$trace })
 }

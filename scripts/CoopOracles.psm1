@@ -20,14 +20,22 @@
 # clocks disagree. Logs without CLOCKSYNC lines get offset 0 (the legacy
 # same-machine behaviour).
 
+# A PS5.1 child of pwsh can inherit PS7's module search order. Load this
+# engine's data-file/JSON helpers rather than an incompatible Utility module.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+
 # ---- Gate result infrastructure ---------------------------------------------
 
 $script:Gates = New-Object System.Collections.ArrayList
 $script:ClockOffsetCache = @{}
+$script:LogTimelineCache = @{}
+$script:LogTimelineAnchor = $null
 
 function Reset-GateResults {
     $script:Gates = New-Object System.Collections.ArrayList
     $script:ClockOffsetCache = @{}
+    $script:LogTimelineCache = @{}
+    $script:LogTimelineAnchor = $null
 }
 
 # Record one gate verdict. Status: PASS | FAIL | SKIP. Metrics is a hashtable of
@@ -74,6 +82,9 @@ function Merge-Status {
 . (Join-Path $PSScriptRoot 'oracles\Session.ps1')
 . (Join-Path $PSScriptRoot 'oracles\Motion.ps1')
 . (Join-Path $PSScriptRoot 'oracles\Panel.ps1')
+. (Join-Path $PSScriptRoot 'oracles\ProceduralBeds.ps1')
+. (Join-Path $PSScriptRoot 'oracles\EnvironmentItems.ps1')
+. (Join-Path $PSScriptRoot 'oracles\SevenSyncNative.ps1')
 
 # ---- Manifest + top-level analysis ---------------------------------------------------
 
@@ -81,8 +92,21 @@ function Merge-Status {
 function Get-ScenarioManifest {
     param([string]$Path = "")
     if ($Path -eq "") { $Path = Join-Path $PSScriptRoot "scenarios.psd1" }
-    if (-not (Test-Path $Path)) { throw "Scenario manifest not found: $Path" }
-    return Import-PowerShellDataFile -Path $Path
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Scenario manifest not found: $Path" }
+    $manifest = Import-PowerShellDataFile -LiteralPath $Path
+    if ($manifest -isnot [hashtable] -or $manifest.Scenarios -isnot [hashtable]) { throw 'Scenario manifest requires a Scenarios table' }
+    foreach ($name in $manifest.Scenarios.Keys) {
+        $entry = $manifest.Scenarios[$name]
+        if ($entry -isnot [hashtable] -or $entry.Gating -isnot [array] -or $entry.Advisory -isnot [array] -or
+            $entry.PrimaryGate -isnot [string]) { throw "Scenario '$name' requires Gating/Advisory arrays and a PrimaryGate string" }
+        foreach ($gate in $entry.Gating + $entry.Advisory) {
+            if ($gate -isnot [string] -or [string]::IsNullOrWhiteSpace($gate)) { throw "Scenario '$name' contains an invalid gate name" }
+        }
+        if ($entry.PrimaryGate -ne '' -and $entry.Gating -notcontains $entry.PrimaryGate) {
+            throw "Scenario '$name' primary gate '$($entry.PrimaryGate)' must appear in Gating"
+        }
+    }
+    return $manifest
 }
 
 # Gates Invoke-Oracles evaluates ITSELF, before manifest dispatch, because they
@@ -120,6 +144,15 @@ function Invoke-OneOracle {
         "pose"          { return (Test-NpcPose         -HostFile $HostLog -JoinFile $JoinLog) }
         "pose_state"    { return (Test-NpcPoseState    -HostFile $HostLog -JoinFile $JoinLog) }
         "bed_pose"      { return (Test-BedPose         -HostFile $HostLog -JoinFile $JoinLog) }
+        "procedural_beds" { return (Test-ProceduralBeds -HostFile $HostLog -JoinFile $JoinLog) }
+        "carry_bed" { return (Test-CarryBedNative -HostFile $HostLog -JoinFile $JoinLog) }
+        "native_trade_watch" { return (Test-NativeTransactionWatch -HostFile $HostLog -JoinFile $JoinLog) }
+        "native_extraction_watch" { return (Test-NativeTransactionWatch -HostFile $HostLog -JoinFile $JoinLog -Extraction) }
+        "native_extraction_race_watch" { return (Test-NativeTransactionWatch -HostFile $HostLog -JoinFile $JoinLog -Extraction -Race) }
+        "environment_items" { return (Test-EnvironmentItemsGate -HostFile $HostLog -JoinFile $JoinLog) }
+        "environment_items_lifecycle" { return (Test-EnvironmentItemsGate -HostFile $HostLog -JoinFile $JoinLog -Lifecycle) }
+        "chest_lock_native" { return (Test-ChestLockNative -HostFile $HostLog -JoinFile $JoinLog) }
+        "procedural_beds_outside_lifecycle" { return (Test-ProceduralOutsideLifecycle -HostFile $HostLog -JoinFile $JoinLog) }
         "bed_wake"      { return (Test-BedWake         -HostFile $HostLog -JoinFile $JoinLog) }
         "bed_lay"       { return (Test-BedLay          -HostFile $HostLog -JoinFile $JoinLog) }
         "bed_put"       { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 1) }
@@ -204,6 +237,8 @@ function Invoke-OneOracle {
         "npc_carry"     { return (Test-NpcCarry        -HostFile $HostLog -JoinFile $JoinLog) }
         "npc_vitals"    { return (Test-NpcVitals       -HostFile $HostLog -JoinFile $JoinLog) }
         "speed_sync"    { return (Test-SpeedSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "speed_pause_ui" { return (Test-SpeedPauseUi -HostFile $HostLog -JoinFile $JoinLog) }
+        "ambient_pose" { return (Test-AmbientPose -HostFile $HostLog -JoinFile $JoinLog) }
         "speed_probe"   { return (Test-SpeedProbe      -HostFile $HostLog) }
         "shackle_probe" { return (Test-ShackleProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "shackle_sync"  { return (Test-ShackleSync     -HostFile $HostLog -JoinFile $JoinLog) }
@@ -228,6 +263,11 @@ function Invoke-OneOracle {
         "wi_join"       { return (Test-WorldItemSync   -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance -JoinAuthor -GateName "wi_join") }
         "wpn_relocate"  { return (Test-WpnRelocate     -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_drop"   { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog) }
+        "npc_gear_drop" { return (Test-WeaponDrop -HostFile $HostLog -JoinFile $JoinLog -GateName "npc_gear_drop") }
+        "gear_identity" { return (Test-GearIdentity -HostFile $HostLog -JoinFile $JoinLog -Mode 0 -GateName "gear_identity") }
+        "gear_fast_pickup" { return (Test-GearIdentity -HostFile $HostLog -JoinFile $JoinLog -Mode 1 -GateName "gear_fast_pickup") }
+        "gear_fast_cycle" { return (Test-GearIdentity -HostFile $HostLog -JoinFile $JoinLog -Mode 2 -GateName "gear_fast_cycle") }
+        "gear_drawn_identity" { return (Test-GearIdentity -HostFile $HostLog -JoinFile $JoinLog -Mode 3 -GateName "gear_drawn_identity") }
         "armor_drop"    { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "armor_drop") }
         "backpack_drop" { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "backpack_drop") }
         "pickup_mirror" { return (Test-WorldPickupMirror -HostFile $HostLog -JoinFile $JoinLog) }
@@ -306,6 +346,14 @@ function Invoke-RunAnalysis {
     if ($Scenario -ne "" -and $manifest.Scenarios.ContainsKey($Scenario)) {
         $entry = $manifest.Scenarios[$Scenario]
     }
+    # Scenario runs require both participants; only explicit host-only diagnostics
+    # outside a scenario may opt out. A missing filename is never an opt-out.
+    if ($Scenario -ne "") { $JoinExpected = $true }
+    if ($RunInfo.ContainsKey('ownedExitFailures')) {
+        $exitFailures = @($RunInfo.ownedExitFailures)
+        [void](Add-GateResult -Name 'process_exit' -Status $(if ($exitFailures.Count) { 'FAIL' } else { 'PASS' }) `
+            -Metrics @{ failures = $exitFailures.Count } -Detail ($exitFailures -join '; '))
+    }
     if ($WanActive -and $null -ne $entry) {
         if ($entry.ContainsKey("WanTolerance")) {
             Write-Host "  (WAN regime: tolerance $Tolerance -> $($entry.WanTolerance) per manifest)"
@@ -324,7 +372,7 @@ function Invoke-RunAnalysis {
     # gate with no result at all reads as "missing" (a FAIL) rather than "no signal".
     $engineDir = ""
     if ($null -ne $RunInfo -and $RunInfo.ContainsKey("outDir")) { $engineDir = "$($RunInfo.outDir)" }
-    [void](Test-EngineIntegrity -OutDir $engineDir)
+    [void](Test-EngineIntegrity -OutDir $engineDir -JoinExpected $JoinExpected)
 
     # 1b. Clock catch-up visibility (always, advisory). The join closes its
     # load skew by simming at up to 2x (protocol 25); any oracle that scores
@@ -344,8 +392,8 @@ function Invoke-RunAnalysis {
     if ($Scenario -ne "") {
         # 2. In-plugin CHECK lines + SCENARIO RESULT (always, for scenarios).
         [void](Test-NoCheckFail -HostFile $HostLog -JoinFile $JoinLog)
-        [void](Test-ScenarioResultPass -File $HostLog -Label "host" -Required $true)
-        [void](Test-ScenarioResultPass -File $JoinLog -Label "join" -Required $JoinExpected)
+        [void](Test-ScenarioResultPass -File $HostLog -Label "host" -Required $true -Scenario $Scenario)
+        [void](Test-ScenarioResultPass -File $JoinLog -Label "join" -Required $JoinExpected -Scenario $Scenario)
 
         # 3. Scenario oracles per the manifest.
         if ($null -ne $entry) {
@@ -381,7 +429,8 @@ function Invoke-RunAnalysis {
                 $bounds = $merged
             }
             $preRun = Get-PreRunGates
-            foreach ($id in ($gating + $advisory)) {
+            $ids = @(($gating + $advisory + @($primary)) | Where-Object { $_ -ne '' } | Select-Object -Unique)
+            foreach ($id in $ids) {
                 if ($preRun -contains $id) { continue }
                 $b = @{}
                 if ($bounds.ContainsKey($id)) {
@@ -409,22 +458,29 @@ function Invoke-RunAnalysis {
     $byName = @{}
     foreach ($g in $gates) { $byName[$g.gate] = $g }
     $reasons = @()
-    $alwaysOn = @("health_host", "health_join", "check_fail", "result_host", "result_join")
+    $alwaysOn = @("health_host", "health_join", "check_fail", "result_host", "result_join", "process_exit")
     foreach ($n in $alwaysOn) {
         if ($byName.ContainsKey($n) -and $byName[$n].status -eq "FAIL") { $reasons += "$n FAIL" }
     }
     foreach ($n in $gating) {
         if (-not $byName.ContainsKey($n)) { $reasons += "$n missing"; continue }
         if ($byName[$n].status -eq "FAIL") { $reasons += "$n FAIL" }
+        if ($n -eq 'engine_integrity' -and $byName[$n].status -eq 'SKIP') { $reasons += "$n SKIP (required evidence missing)" }
     }
     if ($primary -ne "") {
         if (-not $byName.ContainsKey($primary)) {
             $reasons += "primary gate $primary missing (no signal)"
-        } elseif ($byName[$primary].status -eq "SKIP") {
-            $reasons += "primary gate $primary SKIP (no signal)"
+        } elseif ($byName[$primary].status -ne "PASS") {
+            $reasons += "primary gate $primary $($byName[$primary].status)"
         }
     }
-    $pass = ($reasons.Count -eq 0)
+    $diagnostic = $Scenario -eq '' -or ($null -ne $entry -and
+        ([string]::IsNullOrWhiteSpace($primary) -or $gating.Count -eq 0))
+    $captureOk = $diagnostic -and $Scenario -ne '' -and $reasons.Count -eq 0 -and
+        $byName.ContainsKey('result_host') -and $byName['result_host'].status -eq 'PASS' -and
+        $byName.ContainsKey('result_join') -and $byName['result_join'].status -eq 'PASS'
+    $pass = -not $diagnostic -and $reasons.Count -eq 0
+    if ($diagnostic) { $reasons += 'Diagnostic capture does not certify gameplay' }
 
     # 5. Summary table: every gate with its status (SKIP visible, advisory tagged).
     Write-Host ""
@@ -440,10 +496,12 @@ function Invoke-RunAnalysis {
 
     # 6. verdict.json for trending / offline consumption.
     $verdict = [pscustomobject]@{
-        timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+        timestamp = [DateTime]::UtcNow.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
         scenario  = $Scenario
         tolerance = $Tolerance
         pass      = $pass
+        diagnostic = [bool]$diagnostic
+        captureOk  = [bool]$captureOk
         reasons   = $reasons
         primary   = $primary
         gating    = $gating
@@ -461,7 +519,7 @@ function Invoke-RunAnalysis {
 Export-ModuleMember -Function @(
     "Reset-GateResults", "Add-GateResult", "Get-GateResults", "Merge-Status",
     "Get-PreRunGates",
-    "Get-LogClockOffsetMs", "Get-ClockSyncStats", "Convert-StampToMs",
+    "Get-LogClockOffsetMs", "Get-ClockSyncStats", "Convert-StampToMs", "Get-LogTimeMs",
     "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs",
     "Test-LogHealth", "Test-EngineIntegrity", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
     "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence",
@@ -501,6 +559,7 @@ Export-ModuleMember -Function @(
     "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
     "Test-WorldPickupMirror", "Test-GearRepickup", "Test-NoPhantomPickups", "Test-WorldItemBurst",
     "Test-NestedBag", "Test-DumpAll",
+    "Test-ProceduralBeds",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",

@@ -55,8 +55,8 @@ function Test-CombatOrder {
     }
     if ($seen -lt 1) { Write-Host "  COMBAT-ORDER FAIL - join never received any duelist hand (saw $($duelists.Count) on host)"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "join received no duelists") }
     if ($preTotal -lt 1 -or $postTotal -lt 1) { Write-Host "  COMBAT-ORDER FAIL - insufficient join samples (preTotal=$preTotal postTotal=$postTotal)"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "insufficient join samples") }
-    $preRatio  = [Math]::Round($preCombat  / $preTotal, 3)
-    $postRatio = [Math]::Round($postCombat / $postTotal, 3)
+    $preRatio  = $preCombat / $preTotal
+    $postRatio = $postCombat / $postTotal
     $ok = ($preRatio -le $PreMax -and $postRatio -ge $PostMin)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  COMBAT-ORDER [join] $v - duelists=$($duelists.Count) seen=$seen combat-before $preCombat/$preTotal (ratio=$preRatio<=$PreMax), combat-after $postCombat/$postTotal (ratio=$postRatio>=$PostMin)"
@@ -101,39 +101,32 @@ function Test-CombatKill {
     # actor=1,1348632832, a squad member, three seconds before the scripted
     # takedown). Demanding A made a green run depend on stagecraft; an actor of
     # 0,0 is still a FAIL, because that is the attribution bug itself.
-    $sendPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] SEND id=\d+ ev=(1|2) hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=(\d+),(\d+)'
-    $sends = @(Select-String -Path $HostFile -Pattern $sendPat -ErrorAction SilentlyContinue)
-    $send = $sends | Where-Object { $_.Matches[0].Groups[6].Value -ne '0' -or $_.Matches[0].Groups[7].Value -ne '0' } | Select-Object -First 1
+    $sends = @(Get-ReliableEventRows -File $HostFile -Direction SEND | Where-Object {
+        $_.Event -in @(1,2) -and $_.Hand.EndsWith(",$bi,$bs") })
+    $send = $sends | Where-Object { $_.Actor -ne '0,0' } | Select-Object -First 1
     if ($null -eq $send) {
         $why = if ($sends.Count -gt 0) { "$($sends.Count) KO/death event(s) for B carried actor=0,0" }
                else { "no KO/death event for B at all" }
         Write-Host "  COMBAT-KILL FAIL - host sent no ATTRIBUTED combat KO/death for B=$bi,$bs ($why)"
         return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no attributed KO/death sent")
     }
-    $ev = $send.Matches[0].Groups[5].Value
-    $xi = $send.Matches[0].Groups[6].Value; $xs = $send.Matches[0].Groups[7].Value
+    $ev = "$($send.Event)"
+    $actor = $send.Actor.Split(','); $xi = $actor[0]; $xs = $actor[1]
     $actorIsA = ($xi -eq $ai -and $xs -eq $as)
-    $sendT = Convert-StampToMs -Groups $send.Matches[0].Groups -OffsetMs (Get-LogClockOffsetMs -File $HostFile)
-    $recvPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] RECV id=\d+ ev=' + $ev + ' .*hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=' + $xi + ',' + $xs
-    $recv = Select-String -Path $JoinFile -Pattern $recvPat -ErrorAction SilentlyContinue | Select-Object -First 1
+    $recv = Find-ReliableReceipt -Send $send -Receipts @(Get-ReliableEventRows -File $JoinFile -Direction RECV)
     if ($null -eq $recv) {
-        Write-Host "  COMBAT-KILL FAIL - join never received the reliable combat event (ev=$ev hand=B=$bi,$bs actor=$xi,$xs)"
-        return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "attributed event not received")
+        return (Add-GateResult -Name 'combat_kill' -Status FAIL -Detail 'no ordered receipt with the same event, owner, session, full victim and actor identity')
     }
-    $rg = $recv.Matches[0].Groups
-    $T = Convert-StampToMs -Groups $rg -OffsetMs (Get-LogClockOffsetMs -File $JoinFile)
-    $latMs = $T - $sendT
+    $T = $recv.Time; $latMs = $T - $send.Time
     $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
-    $ids = Get-HandAliases -File $JoinFile -WireIndexSerial "$bi,$bs"
-    $samples = @()
-    foreach ($id in $ids) {
-        foreach ($hand in $J.Keys) { if ($hand -match ('^' + [regex]::Escape($id) + ',')) { $samples += $J[$hand] } }
-    }
-    if ($samples.Count -lt 1) { Write-Host "  COMBAT-KILL FAIL - join logged no body series for victim B=$bi,$bs (tried $($ids -join ' '))"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no victim series on join") }
+    $wire = $send.Hand.Split(',')
+    $wireHand = "$($wire[3]),$($wire[4]),$($wire[0]),$($wire[1]),$($wire[2])"
+    $samples = @(Get-MappedScenarioSamples -Map $J -WireHand $wireHand -File $JoinFile)
+    if ($samples.Count -lt 1) { return (Add-GateResult -Name 'combat_kill' -Status FAIL -Detail 'no full-identity victim series or explicit rekey mapping on join') }
     $post = @($samples | Where-Object { $_.t -ge ($T + $GraceMs) })
     if ($post.Count -lt 1) { Write-Host "  COMBAT-KILL FAIL - no join samples after the event"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no post-event samples") }
     $down = @($post | Where-Object { ($_.bs -band 7) -ne 0 }).Count
-    $ratio = [Math]::Round($down / $post.Count, 3)
+    $ratio = $down / $post.Count
     $ok = ($ratio -ge $MinDown)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     $evName = if ($ev -eq "2") { "DEATH" } else { "KO" }
@@ -418,8 +411,7 @@ function Test-AssaultTravel {
     # series the scenario publishes under the shared canonical hand.
     $par = Get-FightTaskParity -HostFile $HostFile -JoinFile $JoinFile
     if ($RequireMint) {
-        $epar = Get-EnemyStateParity -HostFile $HostFile -JoinFile $JoinFile
-        if ($epar.pairs -gt 0) { $par = $epar }
+        $par = Get-EnemyStateParity -HostFile $HostFile -JoinFile $JoinFile
     }
 
     # 0. Mint variant: the victim must be a body this join had to create locally.
@@ -446,6 +438,7 @@ function Test-AssaultTravel {
         else                { $bad += "host never ordered the join-PC copy (link 4: apply)" }
     }
     if ($fight -lt $MinFight) { $bad += "host-side fight never ran (hostview fight=1 x$fight, need >= $MinFight; link 5)" }
+    if ($par.pairs -lt $MinPairs) { $bad += "only $($par.pairs) aligned full-identity fight pairs (need >= $MinPairs; link 6: parity)" }
     if ($par.pairs -ge $MinPairs -and $par.joinOnlyFrac -gt $MaxJoinOnlyFrac) {
         $worst = if ($par.worstHand) { " (worst hand $($par.worstHand), $($par.worstJoinOnly) samples)" } else { "" }
         $bad += ("one-sided fighting: $($par.joinOnly)/$($par.pairs) paired samples ($($par.joinOnlyFrac)) " +
@@ -512,11 +505,11 @@ function Test-ProxyDrift {
     if ($rows.Count -lt $MinSamples) {
         $m = @{ samples = $rows.Count; lagged = $lagged }
         Write-Host "  PROXY-DRIFT SKIP - only $($rows.Count) judgeable proxy samples of $($all.Count) (need >= $MinSamples; $lagged excluded as owner-in-motion)"
-        return (Add-GateResult -Name 'proxy_drift' -Status PASS -Metrics $m -Detail 'insufficient samples')
+        return (Add-GateResult -Name 'proxy_drift' -Status SKIP -Metrics $m -Detail 'insufficient samples')
     }
     $ds = @($rows | ForEach-Object { $_.d } | Sort-Object)
     $max = $ds[-1]
-    $med = $ds[[int]($ds.Count / 2)]
+    $med = $ds[[int][Math]::Floor($ds.Count / 2)]
     $over = @($rows | Where-Object { $_.d -gt $MaxDrift })
     # The damaging combination: far from where its owner has it AND fighting, so
     # the local AI is acting on a position the other world does not agree with.
@@ -581,12 +574,19 @@ function Test-MintAggro {
     $m = @{ spawned = $nSpawn; closed = $nClose; minted = $minted; issued = $issued.Count
             pairs = $par.pairs; agree = $par.agree
             joinOnly = $par.joinOnly; joinOnlyFrac = $par.joinOnlyFrac
-            hostOnly = $par.hostOnly; hostOnlyFrac = $par.hostOnlyFrac }
+            hostOnly = $par.hostOnly; hostOnlyFrac = $par.hostOnlyFrac
+            sharedHands = $par.sharedHands; bothFighting = $par.bothFighting }
     $bad = @()
     if ($nSpawn -lt 1) { $bad += "the host never spawned the hostile squad (link 1)" }
     elseif ($nClose -lt 1) { $bad += "the squad was never brought to the join (link 1)" }
     if ($minted -lt 1) { $bad += "the join minted nothing, so no body had a fragile identity (link 2)" }
     if ($issued.Count -gt 0) { $bad += "an attack WAS ordered, so any fight here is player-authored (link 3)" }
+    if ($par.sharedHands -lt $nSpawn) {
+        $bad += "only $($par.sharedHands) shared readable full enemy identities for $nSpawn spawned bodies"
+    }
+    if ($par.bothFighting -lt 1) {
+        $bad += "no paired native combat observed on both sides; inert bodies do not certify combat parity"
+    }
     if ($par.pairs -lt $MinPairs) {
         $bad += "only $($par.pairs) paired enemy samples (need >= $MinPairs; the two logs never saw the same body - link 4)"
     } else {
@@ -629,35 +629,43 @@ function Get-TravelMoved {
 # so a mid-fight container rewrite still pairs. Returns counts + the worst hand.
 function Get-FightTaskParity {
     param([string]$HostFile, [string]$JoinFile, [int]$TolMs = 1500)
-    $hostMap = Convert-ToFightSeries -Series (Get-ScenarioSeries -File $HostFile -Kind 'MEMBER')
-    $joinMap = Convert-ToFightSeries -Series (Get-ScenarioSeries -File $JoinFile -Kind 'RECV')
+    $hostSeries = Get-ScenarioSeries -File $HostFile -Kind 'MEMBER'
+    $joinSeries = Get-ScenarioSeries -File $JoinFile -Kind 'RECV'
+    $mappedJoin = @{}
+    foreach ($full in $hostSeries.Keys) {
+        $samples = @(Get-MappedScenarioSamples -Map $joinSeries -WireHand $full -File $JoinFile)
+        if ($samples.Count) { $mappedJoin[$full] = $samples }
+    }
+    $hostMap = Convert-ToFightSeries -Series $hostSeries
+    $joinMap = Convert-ToFightSeries -Series $mappedJoin
     return (Measure-FightDisagreement -HostMap $hostMap -JoinMap $joinMap -TolMs $TolMs)
 }
 
-# The same disagreement count for the ENEMY specifically, from the scenario's
-# "enemystate canon=<i,s> fight=<0|1>" samples. Needed because a minted body has
-# a different LOCAL hand on each client, so the entity series cannot pair it -
-# and the enemy's own state is what the field report was about.
+# Native enemy samples use the full canonical identity; short index/serial pairs
+# can collide after minting or cell reload. Unreadable native state is not peace.
 function Get-EnemyStateParity {
     param([string]$HostFile, [string]$JoinFile, [int]$TolMs = 1500)
-    $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO TRAVELFIGHT enemystate canon=(\d+,\d+) fight=(\d)'
+    $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO TRAVELFIGHT enemystate canon=(\d+,\d+) fight=([01]) read=([01])(?:\s|$)'
     $hostMap = @{}; $joinMap = @{}
     foreach ($pair in @(@($HostFile, $hostMap), @($JoinFile, $joinMap))) {
         $file = $pair[0]; $map = $pair[1]
-        $off = Get-LogClockOffsetMs -File $file
         foreach ($m in (Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue)) {
             $g = $m.Matches[0].Groups
-            $key = $g[5].Value
+            if ($g[7].Value -ne '1') { continue }
+            if ($m.Line -notmatch '\bcanon5=(\d+,\d+,\d+,\d+,\d+)(?:\s|$)') { continue }
+            $key = $Matches[1]
+            $parts = $key.Split(',')
+            if (($parts[3] + ',' + $parts[4]) -ne $g[5].Value) { continue }
             if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.ArrayList }
             [void]$map[$key].Add([pscustomobject]@{
-                t = (Convert-StampToMs -Groups $g -OffsetMs $off); fight = [int]$g[6].Value })
+                t = (Get-LogTimeMs -Match $m); fight = [int]$g[6].Value })
         }
     }
     return (Measure-FightDisagreement -HostMap $hostMap -JoinMap $joinMap -TolMs $TolMs)
 }
 
-# Nearest-sample pairing of two 'hand -> @{t; fight}' maps, counting the fight
-# disagreements in BOTH directions. Direction matters for the diagnosis but not
+# Monotonic one-to-one pairing of two 'hand -> @{t; fight}' maps, counting the
+# fight disagreements in BOTH directions. Direction matters for the diagnosis but not
 # for the verdict: whoever OWNS a body is its combat authority, and cell claims
 # hand ownership of world NPCs to either client (Replicator::authorityFor - the
 # host only wins ties), so "fighting here, at peace over there" is the same
@@ -665,48 +673,54 @@ function Get-EnemyStateParity {
 function Measure-FightDisagreement {
     param($HostMap, $JoinMap, [int]$TolMs = 1500)
     $pairs = 0; $agree = 0; $joinOnly = 0; $hostOnly = 0
+    $sharedHands = 0; $bothFighting = 0
     $worstHand = ''; $worstJoinOnly = 0
     $worstHostHand = ''; $worstHostOnly = 0
     foreach ($hand in $JoinMap.Keys) {
         if (-not $HostMap.ContainsKey($hand)) { continue }
         $jSamples = @($JoinMap[$hand] | Sort-Object t)
         $hSamples = @($HostMap[$hand] | Sort-Object t)
-        $handJoinOnly = 0; $handHostOnly = 0
+        $handJoinOnly = 0; $handHostOnly = 0; $handPairs = 0; $hi = 0
         foreach ($jr in $jSamples) {
-            $best = $null; $bd = [int]::MaxValue
-            foreach ($hr in $hSamples) {
-                $dd = [Math]::Abs([int]$hr.t - [int]$jr.t)
-                if ($dd -lt $bd) { $bd = $dd; $best = $hr }
-            }
-            if ($null -eq $best -or $bd -gt $TolMs) { continue }
-            $pairs++
+            # Match the earliest feasible observations, not the nearest one:
+            # choosing a later HOST can strand an earlier, still usable sample.
+            # An expired HOST cannot match this or any later JOIN; a HOST beyond
+            # the upper bound must wait for a later JOIN. Pairing feasible heads
+            # preserves the maximum ordered pair count, independent of fight state.
+            while ($hi -lt $hSamples.Count -and [int]$hSamples[$hi].t -lt ([int]$jr.t - $TolMs)) { $hi++ }
+            if ($hi -ge $hSamples.Count) { break }
+            if ([int]$hSamples[$hi].t -gt ([int]$jr.t + $TolMs)) { continue }
+            $best = $hSamples[$hi]
+            $hi++ # a host observation may qualify only one join observation
+            $pairs++; $handPairs++
+            if ($jr.fight -eq 1 -and $best.fight -eq 1) { $bothFighting++ }
             if ($jr.fight -eq $best.fight) { $agree++ }
             elseif ($jr.fight -eq 1) { $joinOnly++; $handJoinOnly++ }
             else { $hostOnly++; $handHostOnly++ }
         }
+        if ($handPairs -gt 0) { $sharedHands++ }
         if ($handJoinOnly -gt $worstJoinOnly) { $worstJoinOnly = $handJoinOnly; $worstHand = $hand }
         if ($handHostOnly -gt $worstHostOnly) { $worstHostOnly = $handHostOnly; $worstHostHand = $hand }
     }
-    $jFrac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
-    $hFrac = if ($pairs -gt 0) { [Math]::Round($hostOnly / $pairs, 3) } else { 0 }
+    $jFrac = if ($pairs -gt 0) { $joinOnly / $pairs } else { 0 }
+    $hFrac = if ($pairs -gt 0) { $hostOnly / $pairs } else { 0 }
     return [pscustomobject]@{
         pairs = $pairs; agree = $agree; joinOnly = $joinOnly; hostOnly = $hostOnly
         joinOnlyFrac = $jFrac; hostOnlyFrac = $hFrac
+        sharedHands = $sharedHands; bothFighting = $bothFighting
         worstHand = $worstHand; worstJoinOnly = $worstJoinOnly
         worstHostHand = $worstHostHand; worstHostOnly = $worstHostOnly
     }
 }
 
-# Reduce a Get-ScenarioSeries map (hand 'i,s,t,c,cs' -> samples with task) to
-# 'i,s' -> @{ t; fight }. 65024 = melee, 65025 = queued by the AttackSlotManager;
-# both are "this client has the body in a fight".
+# Preserve the full identity from Get-ScenarioSeries while reducing samples to
+# fight state. 65024 = melee, 65025 = queued by the AttackSlotManager;
+# both mean this client has the body in a fight.
 function Convert-ToFightSeries {
     param($Series)
     $out = @{}
     foreach ($full in $Series.Keys) {
-        $parts = $full.Split(',')
-        if ($parts.Count -lt 2) { continue }
-        $key = $parts[0] + ',' + $parts[1]
+        $key = $full
         if (-not $out.ContainsKey($key)) { $out[$key] = New-Object System.Collections.ArrayList }
         foreach ($s in $Series[$full]) {
             $fight = if ($s.task -eq 65024 -or $s.task -eq 65025) { 1 } else { 0 }
@@ -738,20 +752,13 @@ function Test-PlayerKo {
         # Reliable edges: KO (ev=1) + revive (ev=3) sent by the owner, received by the peer.
         $ev = {
             param($evId, $sinceMs)
-            $sp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] SEND id=\d+ ev=' + $evId + ' hand=\d+,\d+,\d+,' + $hi + ',' + $hs
-            $rp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] RECV id=\d+ ev=' + $evId + ' .*hand=\d+,\d+,\d+,' + $hi + ',' + $hs
-            $so = Get-LogClockOffsetMs -File $d.ownerLog; $ro = Get-LogClockOffsetMs -File $d.peerLog
-            $send = $null
-            foreach ($x in @(Select-String -Path $d.ownerLog -Pattern $sp -ErrorAction SilentlyContinue)) {
-                $ts = Convert-StampToMs -Groups $x.Matches[0].Groups -OffsetMs $so
-                if ($ts -ge $sinceMs) { $send = $ts; break }
-            }
+            $send = Get-ReliableEventRows -File $d.ownerLog -Direction SEND | Where-Object {
+                $_.Event -eq $evId -and $_.Hand.EndsWith(",$hi,$hs") -and $_.Time -ge $sinceMs
+            } | Select-Object -First 1
             if ($null -eq $send) { return $null }
-            foreach ($x in @(Select-String -Path $d.peerLog -Pattern $rp -ErrorAction SilentlyContinue)) {
-                $tr = Convert-StampToMs -Groups $x.Matches[0].Groups -OffsetMs $ro
-                if ($tr -ge $send - 1000) { return ($tr - $send) }
-            }
-            return -1
+            $recv = Find-ReliableReceipt -Send $send -Receipts @(Get-ReliableEventRows -File $d.peerLog -Direction RECV)
+            if ($null -eq $recv) { return -1 }
+            return $recv.Time - $send.Time
         }
         $koLat  = & $ev 1 ($Tdown - 2000)
         $revLat = & $ev 3 ($Trev - 2000)
@@ -767,8 +774,8 @@ function Test-PlayerKo {
         $downWin = @($S[$key] | Where-Object { $_.t -ge ($Tdown + $GraceMs) -and $_.t -lt $Trev })
         $upWin   = @($S[$key] | Where-Object { $_.t -ge ($Trev + $GraceMs) })
         if ($downWin.Count -lt 1 -or $upWin.Count -lt 1) { $bad += "${t}: insufficient peer samples (down=$($downWin.Count) up=$($upWin.Count))"; continue }
-        $downR = [Math]::Round((@($downWin | Where-Object { ($_.bs -band 7) -ne 0 }).Count) / $downWin.Count, 3)
-        $upR   = [Math]::Round((@($upWin   | Where-Object { ($_.bs -band 7) -eq 0 }).Count) / $upWin.Count, 3)
+        $downR = (@($downWin | Where-Object { ($_.bs -band 7) -ne 0 }).Count) / $downWin.Count
+        $upR   = (@($upWin | Where-Object { ($_.bs -band 7) -eq 0 }).Count) / $upWin.Count
         $m["${t}KoLatMs"] = $koLat; $m["${t}RevLatMs"] = $revLat
         $m["${t}DownRatio"] = $downR; $m["${t}UpRatio"] = $upR
         if ($downR -lt $MinRatio) { $bad += "${t}: peer down-ratio $downR < $MinRatio between the edges" }
@@ -869,7 +876,7 @@ function Test-CombatCrowd {
         $sg = $sm.Matches[0].Groups
         $sh = $sg[5].Value + "," + $sg[6].Value
         if ($crowd -notcontains $sh) { continue }
-        $st = Convert-StampToMs -Groups $sg -OffsetMs $joff
+        $st = Get-LogTimeMs -Match $sm
         if ([double]$st -lt ([double]$tIssued + $SettleMs)) { continue }
         $snaps++
         if ($sg[7].Value -eq "1") { $waitSnaps++ }
@@ -917,7 +924,7 @@ function Test-CombatCrowd {
         }
         if ($dists.Count -lt 4) { continue }
         $sorted = $dists | Sort-Object
-        $med = $sorted[[int]($sorted.Count / 2)]
+        $med = $sorted[[int][Math]::Floor($sorted.Count / 2)]
         $judged++
         if ($med -le $Tol) { $tracked++ } else { $mism += "$cr(med=$([Math]::Round($med,1)))" }
         if ($med -gt $worst) { $worst = $med }
@@ -927,7 +934,7 @@ function Test-CombatCrowd {
     if ($judged -lt 3) {
         $bad += "only $judged crowd hand(s) present in both series (need >= 3)"
     } else {
-        $ratio = [Math]::Round($tracked / $judged, 3)
+        $ratio = $tracked / $judged
         $m.trackRatio = $ratio
         if ($ratio -lt $MinTrackRatio) {
             $bad += "only $tracked/$judged crowd copies tracked within ${Tol}u (ratio $ratio < $MinTrackRatio)$(if ($mism.Count) { ': ' + ($mism -join ', ') })"
@@ -986,7 +993,7 @@ function Test-CombatSnapRate {
     # Window end = last combat-drive activity (order/snap/stats) on the join.
     $lastT = $tOrder
     foreach ($lm in (Select-String -Path $JoinFile -Pattern '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] (?:order|snap|stats)' -ErrorAction SilentlyContinue)) {
-        $lt = Convert-StampToMs -Groups $lm.Matches[0].Groups -OffsetMs $joff
+        $lt = Get-LogTimeMs -Match $lm
         if ([double]$lt -gt [double]$lastT) { $lastT = $lt }
     }
     $winSec = ([double]$lastT - $settleEnd) / 1000.0
@@ -1002,7 +1009,7 @@ function Test-CombatSnapRate {
     $persist = @{}; $drifts = @()
     foreach ($sm in (Select-String -Path $JoinFile -Pattern $rx -ErrorAction SilentlyContinue)) {
         $g = $sm.Matches[0].Groups
-        $t = Convert-StampToMs -Groups $g -OffsetMs $joff
+        $t = Get-LogTimeMs -Match $sm
         if ([double]$t -lt $settleEnd) { continue }
         $hand      = $g[5].Value + "," + $g[6].Value
         $drift     = [double]$g[7].Value
@@ -1020,8 +1027,8 @@ function Test-CombatSnapRate {
     }
     $maxPersist = 0
     foreach ($k in $persist.Keys) { if ($persist[$k] -gt $maxPersist) { $maxPersist = $persist[$k] } }
-    $churnRate = [math]::Round($churn / ($winSec / 60.0), 2)
-    $totalRate = [math]::Round($total / ($winSec / 60.0), 2)
+    $churnRate = $churn / ($winSec / 60.0)
+    $totalRate = $total / ($winSec / 60.0)
     $medDrift = 0.0
     if ($drifts.Count -gt 0) {
         $sorted = @($drifts | Sort-Object)
@@ -1160,24 +1167,12 @@ function Test-DeathParity {
         Write-Host "  DEATH-PARITY FAIL - log(s) not found (host=$HostFile join=$JoinFile)"
         return (Add-GateResult -Name "death_parity" -Status FAIL -Detail "missing log")
     }
-    # index,serial are the last two of the 5-field hand (type,container,cs,index,serial):
-    # they SURVIVE a container re-key, so they are the stable identity to match on.
-    $sendRx = [regex]'\[event\] SEND id=\d+ ev=2 hand=\d+,\d+,\d+,(\d+),(\d+)'
-    $recvRx = [regex]'\[event\] RECV id=\d+ ev=2 .*hand=\d+,\d+,\d+,(\d+),(\d+)'
+    $hSends = @(Get-ReliableEventRows -File $HostFile -Direction SEND | Where-Object { $_.Event -eq 2 })
+    $jSends = @(Get-ReliableEventRows -File $JoinFile -Direction SEND | Where-Object { $_.Event -eq 2 })
+    $hRecvs = @(Get-ReliableEventRows -File $HostFile -Direction RECV | Where-Object { $_.Event -eq 2 })
+    $jRecvs = @(Get-ReliableEventRows -File $JoinFile -Direction RECV | Where-Object { $_.Event -eq 2 })
     $latchRx = [regex]'\[event\] REKEY-LATCH .*death=1'
-    $vetoRx  = [regex]'\[death\] veto hand=(\d+,\d+)'
-    $collect = {
-        param($file, $rx)
-        $set = @{}
-        foreach ($mm in (Select-String -Path $file -Pattern $rx -AllMatches).Matches) {
-            $set[$mm.Groups[1].Value + ',' + $mm.Groups[2].Value] = $true
-        }
-        return $set
-    }
-    $hSends = & $collect $HostFile $sendRx
-    $jSends = & $collect $JoinFile $sendRx
-    $hRecvs = & $collect $HostFile $recvRx
-    $jRecvs = & $collect $JoinFile $recvRx
+    $vetoRx = [regex]'\[death\] veto hand=(\d+,\d+)'
     $totalSends = $hSends.Count + $jSends.Count
     if ($totalSends -lt 1) {
         Write-Host "  DEATH-PARITY SKIP - no EVT_DEATH (ev=2) in either log; get a squad member killed so a death is authored"
@@ -1185,8 +1180,16 @@ function Test-DeathParity {
     }
     # 1. Parity: host sends must be received on the join; join sends on the host.
     $unmatched = @()
-    foreach ($k in $hSends.Keys) { if (-not $jRecvs.ContainsKey($k)) { $unmatched += "host->join $k" } }
-    foreach ($k in $jSends.Keys) { if (-not $hRecvs.ContainsKey($k)) { $unmatched += "join->host $k" } }
+    foreach ($pair in @(@{ Sends=$hSends; Receipts=$jRecvs; Label='host->join' },
+                        @{ Sends=$jSends; Receipts=$hRecvs; Label='join->host' })) {
+        $consumed = @{}
+        foreach ($send in $pair.Sends) {
+            $available = @($pair.Receipts | Where-Object { -not $consumed.ContainsKey($_.Line) })
+            $receipt = Find-ReliableReceipt -Send $send -Receipts $available
+            if ($null -eq $receipt) { $unmatched += "$($pair.Label) id=$($send.Id) hand=$($send.Hand)" }
+            else { $consumed[$receipt.Line] = $true }
+        }
+    }
     # 2. Latch carry (informational count).
     $latch = @(Select-String -Path $HostFile -Pattern $latchRx -ErrorAction SilentlyContinue).Count +
              @(Select-String -Path $JoinFile -Pattern $latchRx -ErrorAction SilentlyContinue).Count
@@ -1194,10 +1197,15 @@ function Test-DeathParity {
     $vetoBad = @()
     $vetoTotal = 0
     foreach ($pair in @(@{ f = $HostFile; dead = $hRecvs }, @{ f = $JoinFile; dead = $jRecvs })) {
-        foreach ($vm in (Select-String -Path $pair.f -Pattern $vetoRx -AllMatches).Matches) {
+        foreach ($line in (Select-String -Path $pair.f -Pattern $vetoRx)) {
             $vetoTotal++
-            $is = $vm.Groups[1].Value
-            if ($pair.dead.ContainsKey($is)) { $vetoBad += "$is (owner-dead)" }
+            $wire = [regex]::Match($line.Line, '\bwire5=(\d+(?:,\d+){4})(?: |$)')
+            $time = Get-LogTimeMs -Match $line
+            if (-not $wire.Success -or $null -eq $time) {
+                $vetoBad += "veto at line $($line.LineNumber) lacks full timed wire identity"; continue
+            }
+            $deaths = @($pair.dead | Where-Object { $_.Hand -eq $wire.Groups[1].Value -and $_.Time -le $time })
+            if ($deaths.Count) { $vetoBad += "$($wire.Groups[1].Value) (owner-dead)" }
         }
     }
     $m = @{ hostSends = $hSends.Count; joinSends = $jSends.Count
@@ -1231,7 +1239,7 @@ function Get-CombatParity {
     $hoff = Get-LogClockOffsetMs -File $HostFile
     $hostMap = @{}
     foreach ($m in (Select-String -Path $HostFile -Pattern $rx -ErrorAction SilentlyContinue)) {
-        $g = $m.Matches[0].Groups; $t = Convert-StampToMs -Groups $g -OffsetMs $hoff
+        $g = $m.Matches[0].Groups; $t = Get-LogTimeMs -Match $m
         if ($t -lt $SinceMs) { continue }
         $key = $g[5].Value
         if (-not $hostMap.ContainsKey($key)) { $hostMap[$key] = New-Object System.Collections.ArrayList }
@@ -1240,7 +1248,7 @@ function Get-CombatParity {
     $joff = Get-LogClockOffsetMs -File $JoinFile
     $joinMap = @{}
     foreach ($m in (Select-String -Path $JoinFile -Pattern $rx -ErrorAction SilentlyContinue)) {
-        $g = $m.Matches[0].Groups; $t = Convert-StampToMs -Groups $g -OffsetMs $joff
+        $g = $m.Matches[0].Groups; $t = Get-LogTimeMs -Match $m
         if ($t -lt $SinceMs) { continue }
         $key = $g[5].Value
         if (-not $joinMap.ContainsKey($key)) { $joinMap[$key] = New-Object System.Collections.ArrayList }
@@ -1264,9 +1272,9 @@ function Get-CombatParity {
             elseif ($jr.fight -eq 1) { $joinOnly++ } else { $hostOnly++ }
         }
     }
-    $joinOnlyFrac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
-    $hostOnlyFrac = if ($pairs -gt 0) { [Math]::Round($hostOnly / $pairs, 3) } else { 0 }
-    $churnPerMin  = if ($tSpanMax -gt 0) { [Math]::Round($joinToggles * 60000.0 / $tSpanMax, 1) } else { 0 }
+    $joinOnlyFrac = if ($pairs -gt 0) { $joinOnly / $pairs } else { 0 }
+    $hostOnlyFrac = if ($pairs -gt 0) { $hostOnly / $pairs } else { 0 }
+    $churnPerMin  = if ($tSpanMax -gt 0) { $joinToggles * 60000.0 / $tSpanMax } else { 0 }
     return [pscustomobject]@{
         pairs = $pairs; agree = $agree
         joinOnlyCombat = $joinOnly; joinOnlyFrac = $joinOnlyFrac

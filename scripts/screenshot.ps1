@@ -16,8 +16,11 @@
   reliable discriminator between host and join.
 
 .PARAMETER ProcessId
-  PID of the target process. The largest visible top-level window owned by this
-  PID is captured.
+  PID of the target process, paired with ProcessStartTicks to reject PID reuse.
+  The largest visible top-level window owned by that exact process is captured.
+
+.PARAMETER ProcessStartTicks
+  Process.StartTime.ToUniversalTime().Ticks for the owned target.
 
 .PARAMETER WindowTitle
   Substring to match against window titles (used only when -ProcessId is absent).
@@ -26,11 +29,13 @@
   Output PNG path. Parent directory is created if needed.
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File scripts\screenshot.ps1 -ProcessId 12345 -Out host.png
+  $p = Get-Process -Id 12345
+  .\scripts\screenshot.ps1 -ProcessId $p.Id -ProcessStartTicks $p.StartTime.ToUniversalTime().Ticks -Out host.png
 #>
 [CmdletBinding()]
 param(
     [int]$ProcessId = 0,
+    [long]$ProcessStartTicks = 0,
     [string]$WindowTitle = "",
     [Parameter(Mandatory = $true)][string]$Out,
     [int]$Frames = 1,
@@ -38,8 +43,21 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($ProcessId -gt 0) {
+    if ($ProcessStartTicks -le 0) { throw 'PID capture requires the owned process start-time UTC ticks.' }
+    $script:CaptureProcess=Get-Process -Id $ProcessId -ErrorAction Stop
+    $null=$script:CaptureProcess.Handle
+    if ($script:CaptureProcess.HasExited -or $script:CaptureProcess.StartTime.ToUniversalTime().Ticks -ne $ProcessStartTicks) { throw 'Screenshot process identity changed.' }
+}
 
-Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @"
+$references=if ($PSVersionTable.PSVersion.Major -ge 6) {
+    @('System.Drawing.Common','System.Drawing.Primitives','System.Diagnostics.Process','System.Threading.Thread','System.Runtime.InteropServices','System.ComponentModel.Primitives')
+} else { @('System','System.Core','System.Drawing') }
+if ($PSVersionTable.PSVersion.Major -ge 6) {
+    $references+=@('System.Private.Windows.GdiPlus','System.Private.Windows.Core') |
+        Where-Object { Test-Path -LiteralPath (Join-Path $PSHOME "$_.dll") -PathType Leaf }
+}
+Add-Type -ReferencedAssemblies $references -TypeDefinition @"
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -116,35 +134,35 @@ public static class WinCap
     // Capture window client content; PrintWindow first, BitBlt fallback.
     public static Bitmap Capture(IntPtr hWnd)
     {
-        RECT cr; GetClientRect(hWnd, out cr);
+        RECT cr;
+        if (!GetClientRect(hWnd, out cr)) throw new InvalidOperationException("No capture client bounds.");
         int w = cr.Right - cr.Left, h = cr.Bottom - cr.Top;
-        if (w <= 0 || h <= 0)
-        {
-            RECT wr; GetWindowRect(hWnd, out wr);
-            w = wr.Right - wr.Left; h = wr.Bottom - wr.Top;
-        }
-        if (w <= 0 || h <= 0) return null;
-
+        if (w <= 0 || h <= 0) throw new InvalidOperationException("Empty capture client.");
         Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-        using (Graphics g = Graphics.FromImage(bmp))
-        {
-            IntPtr hdc = g.GetHdc();
-            bool ok = PrintWindow(hWnd, hdc, PW_RENDERFULLCONTENT);
-            g.ReleaseHdc(hdc);
-            if (ok && LooksNonBlank(bmp)) return bmp;
-        }
-
-        // Fallback: BitBlt the window's on-screen DC (requires it be visible).
-        Bitmap bmp2 = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-        using (Graphics g = Graphics.FromImage(bmp2))
-        {
-            IntPtr hdc = g.GetHdc();
-            IntPtr src = GetDC(hWnd);
-            BitBlt(hdc, 0, 0, w, h, src, 0, 0, SRCCOPY);
-            ReleaseDC(hWnd, src);
-            g.ReleaseHdc(hdc);
-        }
-        return bmp2;
+        try {
+            bool ok;
+            using (Graphics g = Graphics.FromImage(bmp)) {
+                IntPtr hdc = g.GetHdc();
+                try { ok = PrintWindow(hWnd, hdc, PW_RENDERFULLCONTENT | 1); }
+                finally { g.ReleaseHdc(hdc); }
+            }
+            if (ok && LooksNonBlank(bmp)) { Bitmap result=bmp; bmp=null; return result; }
+        } finally { if (bmp!=null) bmp.Dispose(); }
+        bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        try {
+            using (Graphics g = Graphics.FromImage(bmp)) {
+                IntPtr hdc = g.GetHdc();
+                try {
+                    IntPtr src = GetDC(hWnd);
+                    if (src==IntPtr.Zero) throw new InvalidOperationException("Capture source DC unavailable.");
+                    try {
+                        if (!BitBlt(hdc, 0, 0, w, h, src, 0, 0, SRCCOPY))
+                            throw new InvalidOperationException("Capture GDI copy failed.");
+                    } finally { ReleaseDC(hWnd, src); }
+                } finally { g.ReleaseHdc(hdc); }
+            }
+            Bitmap result=bmp; bmp=null; return result;
+        } finally { if (bmp!=null) bmp.Dispose(); }
     }
 
     // Capture a short burst of 'frames' bitmaps spaced ~intervalMs apart. Frames
@@ -153,40 +171,53 @@ public static class WinCap
     // target offset; we only sleep when ahead of schedule, so if a single
     // PrintWindow costs more than intervalMs the frames just space out naturally
     // rather than being captured artificially fast.
-    public static Bitmap[] CaptureSequence(IntPtr hWnd, int frames, int intervalMs)
+    public static Bitmap[] CaptureSequence(IntPtr hWnd, System.Diagnostics.Process process, int frames, int intervalMs)
     {
         if (frames < 1) frames = 1;
         Bitmap[] outp = new Bitmap[frames];
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        for (int i = 0; i < frames; i++)
-        {
-            long target = (long)i * intervalMs;
-            long now = sw.ElapsedMilliseconds;
-            if (now < target) System.Threading.Thread.Sleep((int)(target - now));
-            outp[i] = Capture(hWnd);
-        }
-        return outp;
+        try {
+            for (int i = 0; i < frames; i++) {
+                IntPtr held=process.Handle; uint owner;
+                GetWindowThreadProcessId(hWnd,out owner);
+                if (process.HasExited || owner!=(uint)process.Id || !IsWindowVisible(hWnd) || IsIconic(hWnd))
+                    throw new InvalidOperationException("Capture window identity is no longer visible/owned.");
+                long target = (long)i * intervalMs;
+                long now = sw.ElapsedMilliseconds;
+                if (now < target) System.Threading.Thread.Sleep((int)(target - now));
+                GetWindowThreadProcessId(hWnd,out owner);
+                if(process.HasExited || owner!=(uint)process.Id) throw new InvalidOperationException("Capture identity ended between frames.");
+                outp[i] = Capture(hWnd);
+            }
+            return outp;
+        } catch { foreach (Bitmap frame in outp) if(frame!=null) frame.Dispose(); throw; }
     }
 }
 "@
 
 function Resolve-Hwnd {
     if ($ProcessId -gt 0) {
-        $h = [WinCap]::FindMainWindow([uint32]$ProcessId)
-        if ($h -ne [IntPtr]::Zero) { return $h }
-        # Last resort: the process's reported MainWindowHandle.
-        try {
-            $p = Get-Process -Id $ProcessId -ErrorAction Stop
-            if ($p.MainWindowHandle -ne [IntPtr]::Zero) { return $p.MainWindowHandle }
-        } catch {}
-        throw "No visible window found for PID $ProcessId."
+        if ($script:CaptureProcess.HasExited) { throw 'Screenshot process identity ended.' }
+    } elseif ($WindowTitle -ne '') {
+        $matches=@(Get-Process | Where-Object {
+            $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle.IndexOf($WindowTitle,[StringComparison]::OrdinalIgnoreCase) -ge 0
+        })
+        if ($matches.Count -ne 1) { throw "Expected one window matching '$WindowTitle', found $($matches.Count). Use an exact process identity." }
+        $script:CaptureProcess=$matches[0]
+        $null=$script:CaptureProcess.Handle
+    } else { throw 'Provide an exact process identity or an unambiguous WindowTitle.' }
+    $h=[WinCap]::FindMainWindow([uint32]$script:CaptureProcess.Id)
+    if ($h -eq [IntPtr]::Zero) { throw "No visible window found for owned PID $($script:CaptureProcess.Id)." }
+    return $h
+}
+
+function Assert-CaptureTarget {
+    [uint32]$owner=0
+    [void][WinCap]::GetWindowThreadProcessId($hwnd,[ref]$owner)
+    if ($script:CaptureProcess.HasExited -or $owner -ne $script:CaptureProcess.Id -or
+        -not [WinCap]::IsWindowVisible($hwnd) -or [WinCap]::IsIconic($hwnd)) {
+        throw 'Owned screenshot process/window ended or changed.'
     }
-    if ($WindowTitle -ne "") {
-        $p = Get-Process | Where-Object { $_.MainWindowTitle -like "*$WindowTitle*" -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-        if ($null -ne $p) { return $p.MainWindowHandle }
-        throw "No window matching title '*$WindowTitle*'."
-    }
-    throw "Provide -ProcessId or -WindowTitle."
 }
 
 # Must happen before any GetClientRect/GetWindowRect/PrintWindow calls.
@@ -194,33 +225,34 @@ function Resolve-Hwnd {
 
 $hwnd = Resolve-Hwnd
 
+$Out=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
 $dir = Split-Path -Parent $Out
-if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 
 if ($Frames -lt 1) { $Frames = 1 }
 
-$bmps = [WinCap]::CaptureSequence($hwnd, $Frames, $IntervalMs)
-
-if ($Frames -le 1) {
-    # Single-frame: preserve exact original behavior (one file at $Out).
-    $bmp = $bmps[0]
-    if ($null -eq $bmp) { throw "Capture failed (zero-size window)." }
-    $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
-    $bmp.Dispose()
-    Write-Host "Saved screenshot: $Out"
-} else {
-    # Burst: write numbered frames <base>_1..<base>_N alongside $Out, and also
-    # keep frame 1 at the original $Out so tooling reading host.png/join.png works.
-    $dirp = [System.IO.Path]::GetDirectoryName($Out)
-    $base = [System.IO.Path]::GetFileNameWithoutExtension($Out)
-    $ext  = [System.IO.Path]::GetExtension($Out)
-    for ($i = 0; $i -lt $bmps.Length; $i++) {
-        $bmp = $bmps[$i]
-        if ($null -eq $bmp) { Write-Warning "Frame $($i + 1) capture failed (zero-size window)."; continue }
-        $framePath = Join-Path $dirp ("{0}_{1}{2}" -f $base, ($i + 1), $ext)
-        $bmp.Save($framePath, [System.Drawing.Imaging.ImageFormat]::Png)
-        if ($i -eq 0) { $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png) }
-        $bmp.Dispose()
-        Write-Host "Saved frame: $framePath"
+Assert-CaptureTarget
+$bmps = [WinCap]::CaptureSequence($hwnd, $script:CaptureProcess, $Frames, $IntervalMs)
+try {
+    Assert-CaptureTarget
+    if ($Frames -le 1) {
+        $bmp = $bmps[0]
+        if ($null -eq $bmp) { throw 'Capture failed (zero-size window).' }
+        $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+        Write-Host "Saved screenshot: $Out"
+    } else {
+        $dirp = [IO.Path]::GetDirectoryName($Out)
+        $base = [IO.Path]::GetFileNameWithoutExtension($Out)
+        $ext  = [IO.Path]::GetExtension($Out)
+        for ($i = 0; $i -lt $bmps.Length; $i++) {
+            $bmp = $bmps[$i]
+            if ($null -eq $bmp) { throw "Frame $($i + 1) capture failed (zero-size window)." }
+            $framePath = Join-Path $dirp ("{0}_{1}{2}" -f $base, ($i + 1), $ext)
+            $bmp.Save($framePath, [System.Drawing.Imaging.ImageFormat]::Png)
+            if ($i -eq 0) { $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png) }
+            Write-Host "Saved frame: $framePath"
+        }
     }
+} finally {
+    foreach ($bmp in $bmps) { if ($null -ne $bmp) { $bmp.Dispose() } }
 }

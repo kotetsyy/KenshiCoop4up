@@ -182,6 +182,18 @@ bool probeApproachShop(GameWorld* gw, const unsigned int traderHand[5]) {
     return approachShopSeh(gw, traderHand, relocate);
 }
 
+bool probePreparePlayerTrade(GameWorld* gw,const unsigned int traderHand[5],
+                             const unsigned int actorHand[5]) {
+    if (!::gui || !probeApproachShop(gw,traderHand)) return false;
+    __try {
+        RootObject* trader=resolveObjectByHand(traderHand);
+        RootObject* actor=resolveObjectByHand(actorHand);
+        if (!trader || !actor || inventoryOwnerClass(actorHand)!=1) return false;
+        ::gui->showTradeWindow(actor->getHandle(),trader->getHandle(),TW_MONEY_TRADING);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 
 
 // ---- Spike 451: weapon-mint recipe trace ------------------------------------
@@ -383,12 +395,12 @@ Sword* __fastcall swordCtor_hook(Sword* self, GameData* baseData, GameData* comp
 } // namespace
 
 bool installCreateItemTraceHook() {
-    // Base for caller RVAs: createItem6's documented RVA anchors the module base.
+    // Log actual executable RVAs; SDK reference-version RVAs are not live addresses.
     intptr_t a6 = KenshiLib::GetRealAddress(
         static_cast<Item* (RootObjectFactory::*)(GameData*, const hand&, GameData*,
                                                  GameData*, int, Faction*)>(
             &RootObjectFactory::createItem));
-    if (a6) g_mkspyBase = (unsigned __int64)a6 - 0x57FFD0ull;
+    g_mkspyBase = (unsigned __int64)GetModuleHandleA(0);
     intptr_t aS = KenshiLib::GetRealAddress(
         static_cast<Item* (RootObjectFactory::*)(GameData*)>(&RootObjectFactory::createItem));
     intptr_t aC = KenshiLib::GetRealAddress(&RootObjectFactory::copyItem);
@@ -396,6 +408,13 @@ bool installCreateItemTraceHook() {
     intptr_t aW = KenshiLib::GetRealAddress(
         static_cast<Sword* (Sword::*)(GameData*, GameData*, GameData*, hand, int)>(
             &Sword::_CONSTRUCTOR));
+    char addresses[240];
+    _snprintf(addresses, sizeof(addresses) - 1,
+        "[mkspy] live-rvas mk6=0x%I64X swordCtor=0x%I64X setupStats=0x%I64X gearLoad=0x%I64X",
+        (unsigned __int64)a6 - g_mkspyBase, (unsigned __int64)aW - g_mkspyBase,
+        (unsigned __int64)KenshiLib::GetRealAddress(&Sword::setupStats) - g_mkspyBase,
+        (unsigned __int64)KenshiLib::GetRealAddress(&Gear::_NV__loadFromSerialise) - g_mkspyBase);
+    addresses[sizeof(addresses) - 1] = '\0'; coop::logLine(addresses);
     int ok = 0, want = 0;
     if (a6) { ++want; if (KenshiLib::AddHook(a6, (void*)&mk6_hook,  (void**)&g_mk6Orig)   == KenshiLib::SUCCESS) ++ok; }
     if (aS) { ++want; if (KenshiLib::AddHook(aS, (void*)&mkS_hook,  (void**)&g_mkSOrig)   == KenshiLib::SUCCESS) ++ok; }

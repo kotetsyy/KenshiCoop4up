@@ -6,6 +6,7 @@
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
 #include "ScenarioSupport.h"
+#include "../game/EngineLockScenario.h"
 
 namespace coop {
 namespace {
@@ -142,14 +143,21 @@ private:
     unsigned int  sentinelHand_[5];
 };
 
-// Shared stock is not enough: a client's completed lockpick must unlock the
-// same native chest on the host, and host lock changes must cross back.
+// Observe TWO genuine HOST native PICK_LOCK transitions, with an intervening
+// native relock. Direct writes only arrange the locked preconditions, never
+// fabricate successful lockpicking. A fixture/actor unable to pick FAILS.
 class ChestLockScenario : public TimedScenario {
 public:
     ChestLockScenario() : TimedScenario("chest_lock", 500), have_(false),
         seeded_(false), unlocked_(false), relocked_(false), finalUnlock_(false),
-        initialOk_(false), clientOk_(false), hostOk_(false), finalOk_(false) {
+        initialOk_(false), clientOk_(false), hostOk_(false), finalOk_(false),
+        firstOrder_(false), secondOrder_(false), firstActive_(false), secondActive_(false),
+        haveActor_(false), prepared_(false), fixtureReady_(false),
+        secondPrepared_(false), skill_(-1.0f) {
+        memset(actorHand_, 0, sizeof(actorHand_));
+        memset(actorCanonical_, 0, sizeof(actorCanonical_));
         memset(hand_, 0, sizeof(hand_));
+        memset(parentHand_, 0, sizeof(parentHand_));
     }
 
     virtual void onStart(const ScenarioContext& ctx) {
@@ -175,48 +183,159 @@ public:
             "CRIT LOCK ANCHOR host=%d have=%d containers=%u hand=%u.%u.%u.%u.%u",
             ctx.isHost ? 1 : 0, have_ ? 1 : 0, n,
             hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
+        if (best >= 0) {
+            const engine::ContRead& chest = rows[best];
+            char detail[384]; _snprintf(detail, sizeof(detail) - 1,
+                "CRIT LOCK CHEST host=%d hand=%u.%u.%u.%u.%u class=%d complete=%d pos=%.2f,%.2f,%.2f sid='%s' name='%s'",
+                ctx.isHost ? 1 : 0, hand_[0], hand_[1], hand_[2], hand_[3], hand_[4],
+                chest.classType, chest.complete, chest.x, chest.y, chest.z, chest.sid, chest.name);
+            detail[sizeof(detail) - 1] = '\0'; coop::logLine(detail);
+        }
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
+        // Pin the HOST-owned tab leader on both peers; playerCharacters[0] is
+        // not the ownership partition. Only its owner prepares the real stat.
+        if (!haveActor_ && ctx.elapsedMs < 6000) {
+            EntityState squad[64];
+            unsigned int n = engine::captureSquad(ctx.gw, false, squad, 64);
+            int idx = tabLeaderIdx(squad, n, 0);
+            if (idx >= 0 && ctx.queryClaimedActor) {
+                unsigned int candidate[5], canonical[5]; u32 owner = 0;
+                handFromEntity(squad[idx], candidate);
+                if (ctx.queryClaimedActor(candidate, &owner, canonical) && owner == 0) {
+                    memcpy(actorHand_, candidate, sizeof(actorHand_));
+                    memcpy(actorCanonical_, canonical, sizeof(actorCanonical_));
+                    haveActor_ = true;
+                }
+            }
+        }
+        u32 owner = 0;
+        unsigned int canonical[5];
+        bool actorOwned = haveActor_ && ctx.queryClaimedActor &&
+            ctx.queryClaimedActor(actorHand_, &owner, canonical) && owner == 0 &&
+            memcmp(canonical, actorCanonical_, sizeof(canonical)) == 0;
+        Character* actor = actorOwned ? engine::resolveCharByHand(
+            actorHand_[3], actorHand_[4], actorHand_[0], actorHand_[1], actorHand_[2]) : 0;
+        if (ctx.isHost && actor && !prepared_ && ctx.elapsedMs < 8000) {
+            // Lockpicking while sneaking is valid. Exercise the real native mode
+            // so a whole-bodyState!=0 guard cannot silently reject this fixture.
+            prepared_ = engine::raiseSubjectStat(ctx.gw, actorHand_, 37, 100.0f) &&
+                engine::applyStealth(actor, true) && engine::readStealthMode(actor) == 1;
+        }
+        engine::StatsRead stats;
+        skill_ = actor && engine::readStats(actor, &stats) && stats.valid ?
+            stats.stats[37] : -1.0f;
+        if (have_ && actorOwned && actor && !fixtureReady_ && ctx.elapsedMs < 6000)
+            fixtureReady_ = engine::prepareNativeLockpickFixture(
+                ctx.gw, actor, hand_, parentHand_, false);
+        engine::DeedRead chestOwner, parentOwner;
+        bool ownershipOk = fixtureReady_ &&
+            engine::readDeedByHand(ctx.gw, hand_, &chestOwner) && chestOwner.owned &&
+            (!(parentHand_[3] || parentHand_[4]) ||
+             (engine::readDeedByHand(ctx.gw, parentHand_, &parentOwner) && parentOwner.owned));
+        ObjectHand taskSubject;
+        unsigned int subjectHand[5] = { 0, 0, 0, 0, 0 };
+        bool hasTaskSubject = actor && engine::readTaskSubject(actor, taskSubject);
+        if (hasTaskSubject) taskSubject.toObjOrder(subjectHand);
+        // SDK TaskType::PICK_LOCK = 76. Observe the COMPLETE pinned hand, but
+        // instant native success may finish between samples (diagnostic only).
+        bool active = actorOwned && actor && engine::readTaskKey(actor) == 76 &&
+            hasTaskSubject && memcmp(subjectHand, hand_, sizeof(hand_)) == 0;
+        if (ctx.isHost && ctx.elapsedMs >= 8000 && ctx.elapsedMs < 60000 && unlocked_ && active)
+            firstActive_ = true;
+        if (ctx.isHost && ctx.elapsedMs >= 65000 && finalUnlock_ && active)
+            secondActive_ = true;
         if (have_) {
-            if (ctx.isHost && !seeded_) {
+            if (ctx.isHost && ownershipOk && !seeded_) {
                 seeded_ = engine::writeDoorByHand(hand_, 0, 1, 0);
             }
-            if (!ctx.isHost && !unlocked_ && ctx.elapsedMs >= 8000)
-                unlocked_ = engine::writeDoorByHand(hand_, 0, 0, 0);
-            if (ctx.isHost && !relocked_ && ctx.elapsedMs >= 13000)
-                relocked_ = engine::writeDoorByHand(hand_, 0, 1, 0);
-            if (ctx.isHost && !finalUnlock_ && ctx.elapsedMs >= 19000)
-                finalUnlock_ = engine::writeDoorByHand(hand_, 0, 0, 0);
             engine::DoorRead cur;
             bool read = engine::readDoorByHand(hand_, &cur);
             if (ctx.elapsedMs >= 6000 && ctx.elapsedMs < 8000)
                 initialOk_ = read && cur.locked == 1;
-            if (ctx.elapsedMs >= 11000 && ctx.elapsedMs < 13000)
-                clientOk_ = read && cur.locked == 0;
-            if (ctx.elapsedMs >= 16000 && ctx.elapsedMs < 19000)
+            if (ctx.isHost && !firstOrder_ && ctx.elapsedMs >= 8000) {
+                firstOrder_ = true; // one native order, no forced success fallback
+                unlocked_ = actorOwned && ownershipOk && prepared_ && skill_ >= 100.0f &&
+                    engine::prepareNativeLockpickFixture(ctx.gw, actor, hand_, parentHand_, true) &&
+                    engine::orderNativeLockpick(actor, hand_);
+            }
+            if (ctx.elapsedMs >= 8000 && ctx.elapsedMs < 60000 && read && cur.locked == 0 &&
+                (!ctx.isHost || unlocked_))
+                clientOk_ = true;
+            if (ctx.isHost && !relocked_ && ctx.elapsedMs >= 60000 && clientOk_)
+                relocked_ = engine::writeDoorByHand(hand_, 0, 1, 0);
+            if (ctx.elapsedMs >= 63000 && ctx.elapsedMs < 65000)
                 hostOk_ = read && cur.locked == 1;
-            if (ctx.elapsedMs >= 22000)
-                finalOk_ = read && cur.locked == 0;
-            if (evidenceDue(ctx.elapsedMs)) {
+            if (ctx.isHost && !secondOrder_ && ctx.elapsedMs >= 65000 && relocked_) {
+                secondOrder_ = true;
+                secondPrepared_ = actorOwned && ownershipOk &&
+                    engine::prepareNativeLockpickFixture(ctx.gw, actor, hand_, parentHand_, true);
+                finalUnlock_ = actorOwned && ownershipOk && prepared_ && secondPrepared_ &&
+                    skill_ >= 100.0f && engine::orderNativeLockpick(actor, hand_);
+            }
+            if (ctx.elapsedMs >= 65000 && read && cur.locked == 0 &&
+                (!ctx.isHost || finalUnlock_))
+                finalOk_ = true;
+            if (evidenceDue(ctx.elapsedMs) || ctx.elapsedMs>=120000) {
                 char b[176]; _snprintf(b, sizeof(b) - 1,
                     "CRIT LOCK host=%d t=%lu locked=%d initial=%d client=%d hostLeg=%d final=%d",
                     ctx.isHost ? 1 : 0, ctx.elapsedMs, read ? cur.locked : -1,
                     initialOk_ ? 1 : 0, clientOk_ ? 1 : 0, hostOk_ ? 1 : 0, finalOk_ ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                ObjectHand subject;
+                bool hasSubject = actor && engine::readTaskSubject(actor, subject);
+                char native[384]; _snprintf(native, sizeof(native) - 1,
+                    "CRIT LOCK NATIVE host=%d t=%lu order=%d/%d task=%d subject=%u.%u target=%u.%u "
+                    "active=%d/%d subject5=%u.%u.%u.%u.%u target5=%u.%u.%u.%u.%u",
+                    ctx.isHost ? 1 : 0, ctx.elapsedMs, unlocked_ ? 1 : 0, finalUnlock_ ? 1 : 0,
+                    actor ? engine::readTaskKey(actor) : -1,
+                    hasSubject ? subject.index : 0, hasSubject ? subject.serial : 0, hand_[3], hand_[4],
+                    firstActive_ ? 1 : 0, secondActive_ ? 1 : 0,
+                    subjectHand[0], subjectHand[1], subjectHand[2], subjectHand[3], subjectHand[4],
+                    hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
+                native[sizeof(native) - 1] = '\0'; coop::logLine(native);
+                char fixture[384]; _snprintf(fixture, sizeof(fixture) - 1,
+                    "CRIT LOCK ACTOR host=%d t=%lu hand=%u.%u.%u.%u.%u canonical=%u.%u.%u.%u.%u "
+                    "owner=%u owned=%d resolved=%d prepared=%d stat=37 skill=%.3f body=%u",
+                    ctx.isHost ? 1 : 0, ctx.elapsedMs,
+                    actorHand_[0], actorHand_[1], actorHand_[2], actorHand_[3], actorHand_[4],
+                    actorCanonical_[0], actorCanonical_[1], actorCanonical_[2],
+                    actorCanonical_[3], actorCanonical_[4], owner, actorOwned ? 1 : 0,
+                    actor ? 1 : 0, prepared_ ? 1 : 0, skill_,
+                    actor ? (unsigned)engine::readBodyState(actor) : 0);
+                fixture[sizeof(fixture) - 1] = '\0'; coop::logLine(fixture);
+                char setup[384]; _snprintf(setup, sizeof(setup) - 1,
+                    "CRIT LOCK FIXTURE host=%d t=%lu ready=%d ownership=%d staged2=%d "
+                    "target=%u.%u.%u.%u.%u parent=%u.%u.%u.%u.%u chestOwner='%s' parentOwner='%s'",
+                    ctx.isHost ? 1 : 0, ctx.elapsedMs, fixtureReady_ ? 1 : 0,
+                    ownershipOk ? 1 : 0, secondPrepared_ ? 1 : 0,
+                    hand_[0], hand_[1], hand_[2], hand_[3], hand_[4],
+                    parentHand_[0], parentHand_[1], parentHand_[2], parentHand_[3], parentHand_[4],
+                    ownershipOk ? chestOwner.ownerSid : "",
+                    ownershipOk && (parentHand_[3] || parentHand_[4]) ? parentOwner.ownerSid : "");
+                setup[sizeof(setup) - 1] = '\0'; coop::logLine(setup);
             }
         }
-        if (ctx.elapsedMs < 24000) return false;
+        if (ctx.elapsedMs < 120000) return false;
         passed_ = have_ && initialOk_ && clientOk_ && hostOk_ && finalOk_ &&
-                  (ctx.isHost ? (seeded_ && relocked_ && finalUnlock_) : unlocked_);
+                  haveActor_ && actorOwned && ownershipOk &&
+                  (!ctx.isHost || (prepared_ && skill_ >= 100.0f &&
+                      seeded_ && unlocked_ && relocked_ &&
+                      secondPrepared_ && finalUnlock_));
         return true;
     }
 
 private:
     bool have_, seeded_, unlocked_, relocked_, finalUnlock_;
     bool initialOk_, clientOk_, hostOk_, finalOk_;
+    bool firstOrder_, secondOrder_, firstActive_, secondActive_;
     unsigned int hand_[5];
+    bool haveActor_, prepared_, fixtureReady_, secondPrepared_;
+    float skill_;
+    unsigned int actorHand_[5], actorCanonical_[5];
+    unsigned int parentHand_[5];
 };
 
 // deed_probe (protocol 54 phase 0, probe tier; deedSync forced OFF) /

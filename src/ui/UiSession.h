@@ -2,8 +2,43 @@
 #define KENSHICOOP_UI_SESSION_H
 #include "CoopUiApi.h"
 #include <string>
+#include "../plugin/core/SteamId.h"
+#include <cstring>
 
 namespace coopui {
+inline void wipe(void* memory, size_t bytes) {
+    volatile unsigned char* p = static_cast<volatile unsigned char*>(memory);
+    while (bytes--) *p++ = 0;
+}
+class Invitation {
+public:
+    Invitation() : generation_(0), request_(0), pending_(false), result_(-1) { wipe(text_, sizeof(text_)); }
+    ~Invitation() { clear(); }
+    void clear() { wipe(text_, sizeof(text_)); generation_ = 0; request_ = 0; pending_ = false; result_ = -1; }
+    void request(unsigned long long generation, unsigned int id) { clear(); generation_ = generation; request_ = id; pending_ = true; }
+    bool observe(const CoopUiSnapshot& s) {
+        if (!s.running && !s.busy) { clear(); return false; }
+        if (generation_ && s.sessionGeneration != generation_) { clear(); return false; }
+        if (!pending_ || s.sessionGeneration != generation_ || s.inviteRequestId != request_ || s.inviteResult < 0) return false;
+        pending_ = false; result_ = s.inviteResult;
+        if (result_ != 0) return false;
+        if (!s.udpInvite) { result_ = 2; return false; }
+        size_t n = 0; while (n < sizeof(text_) && s.udpInvite[n]) ++n;
+        if (!n || n == sizeof(text_)) { result_ = 2; return false; }
+        std::memcpy(text_, s.udpInvite, n + 1); return true;
+    }
+    const char* text() const { return text_; }
+    bool pending() const { return pending_; }
+    int result() const { return result_; }
+private:
+    char text_[4096];
+    unsigned long long generation_;
+    unsigned int request_;
+    bool pending_;
+    int result_;
+    Invitation(const Invitation&);
+    Invitation& operator=(const Invitation&);
+};
 inline bool hasGuests(const CoopUiSnapshot& s) {
     if (!s.isHost) return false;
     if (s.playerCount > 1) return true;
@@ -28,20 +63,18 @@ inline bool gameReady(const CoopUiSnapshot& s) {
     return guest;
 }
 
-// UI-only identity: invalidate every OBSERVED lifecycle/config replacement.
-// ABI v1 has no session generation or reliable pre-HELLO participant count;
-// a replacement entirely between snapshots cannot be distinguished here.
+// Session generation invalidates confirmation even across unobserved restarts.
 class StopConfirmation {
 public:
     enum Decision { NONE, PROMPT, DISCONNECT };
     StopConfirmation() : seen_(false), active_(false), host_(false), guests_(false),
-        phase_(COOP_OFFLINE), requested_(-1), actual_(-1), port_(0), self_(0), peer_(0),
+        phase_(COOP_OFFLINE), requested_(-1), actual_(-1), port_(0), self_(0), peer_(0), generation_(0),
         open_(false), stopping_(false) {}
     void observe(const CoopUiSnapshot& s) {
         const bool active = s.running || s.busy;
         const char* address = s.udpIp ? s.udpIp : "";
         const bool changed = seen_ && (active != active_ || (s.isHost != 0) != host_ ||
-            s.transportSel != requested_ || s.activeTransport != actual_ ||
+            s.sessionGeneration != generation_ || s.transportSel != requested_ || s.activeTransport != actual_ ||
             s.selfSteamId != self_ || (!s.isHost && s.peerSteamId != peer_) || s.udpPort != port_ ||
             address_ != address || (s.phase == COOP_STARTING && phase_ != COOP_STARTING));
         if (changed || !active) { open_ = false; stopping_ = false; }
@@ -49,6 +82,7 @@ public:
         seen_ = true; active_ = active; host_ = s.isHost != 0; guests_ = hasGuests(s);
         phase_ = s.phase; requested_ = s.transportSel; actual_ = s.activeTransport;
         port_ = s.udpPort; self_ = s.selfSteamId; peer_ = s.peerSteamId;
+        generation_ = s.sessionGeneration;
         if (address_ != address) address_ = address;
     }
     Decision request() {
@@ -73,7 +107,7 @@ public:
 private:
     bool seen_, active_, host_, guests_;
     int phase_, requested_, actual_, port_;
-    unsigned long long self_, peer_;
+    unsigned long long self_, peer_, generation_;
     std::string address_;
     bool open_, stopping_;
 };

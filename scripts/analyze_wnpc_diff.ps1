@@ -21,6 +21,7 @@ param(
     [int]$TopN = 12          # how many offenders to name
 )
 
+Import-Module (Join-Path $PSScriptRoot 'CoopOracles.psm1') -Force
 $hostLog = Join-Path $RunDir "host.log"
 $joinLog = Join-Path $RunDir "join.log"
 foreach ($f in @($hostLog, $joinLog)) {
@@ -34,8 +35,7 @@ function Get-Rows([string]$File) {
     foreach ($m in (Select-String -Path $File -Pattern $pat)) {
         $g = $m.Matches[0].Groups
         if ($g[9].Value -eq "pc") { continue }   # player squad is not world state
-        $t = ([int]$g[1].Value * 3600000) + ([int]$g[2].Value * 60000) +
-             ([int]$g[3].Value * 1000) + [int]$g[4].Value
+        $t = Get-LogTimeMs -Match $m
         [void]$rows.Add([pscustomobject]@{
             t = $t; hand = $g[5].Value
             x = [double]$g[6].Value; y = [double]$g[7].Value; z = [double]$g[8].Value
@@ -59,8 +59,8 @@ function Get-Dumps($rows) {
     return $dumps
 }
 
-$hRows = Get-Rows $hostLog
-$jRows = Get-Rows $joinLog
+$hRows = @(Get-Rows $hostLog)
+$jRows = @(Get-Rows $joinLog)
 $hDumps = @(Get-Dumps $hRows)
 $jDumps = @(Get-Dumps $jRows)
 Write-Host "host: $($hRows.Count) rows in $($hDumps.Count) dumps | join: $($jRows.Count) rows in $($jDumps.Count) dumps"
@@ -104,6 +104,7 @@ foreach ($hd in $hDumps) {
 
 Write-Host ""
 Write-Host "paired dumps: $paired"
+if ($paired -eq 0) { Write-Error 'Insufficient evidence: no clock-aligned roster dump pair'; exit 2 }
 Write-Host "  dumps where the JOIN holds a hand the host does not: $withJoinOnly ($joinOnlyTotal row(s) total)"
 Write-Host "  dumps where the HOST holds a hand the join does not: $withHostOnly ($hostOnlyTotal row(s) total)"
 
