@@ -6,7 +6,7 @@
 - **Обновлены сетевой протокол и формат обмена.** Публичная версия использует протокол **80** и не соединяется со старыми сборками 0.1.x.
 - Сеть обслуживается отдельным native worker. Целевая частота публикации снимков сущностей — **100 Гц**; захват состояния зависит от FPS игры. Это не обещание пинга 1 мс и не перевод всех каналов на 100 Гц.
 - Steam и UDP выбираются явно. Ошибка подключения через Steam **не запускает скрытый переход на UDP**.
-- Убраны ручные allow-листы SteamID и UDP. Проверка подлинности соединения сохранена; для прямого UDP по-прежнему нужны приглашения.
+- **Steam:** ручное добавление SteamID гостей в allow-лист не требуется. **UDP:** индивидуальные приглашения остаются обязательными — хост создаёт отдельное приглашение каждому клиенту. Подключение только по IP:port без приглашения **в этой версии не реализовано**; требование убрать этот ручной допуск пока не выполнено.
 
 ## Исправления
 
@@ -64,7 +64,7 @@
 
 ### Network infrastructure
 
-The old ENet transport has been replaced by a reworked native GameNetworkingSockets / SteamNetworkingSockets infrastructure with separate Steam and direct-UDP modules. The new public protocol **80** is incompatible with 0.1.x and private Harness protocol **81**. Networking runs on a dedicated worker; entity snapshot publication targets 100 Hz, while fresh state capture still depends on game FPS. There is no silent Steam-to-UDP fallback. Manual allow-lists have been removed; connection authentication and UDP invitations remain.
+The old ENet transport has been replaced by a reworked native GameNetworkingSockets / SteamNetworkingSockets infrastructure with separate Steam and direct-UDP modules. The new public protocol **80** is incompatible with 0.1.x and private Harness protocol **81**. Networking runs on a dedicated worker; entity snapshot publication targets 100 Hz, while fresh state capture still depends on game FPS. There is no silent Steam-to-UDP fallback. Steam does not require manually adding guest SteamIDs. Direct UDP still requires a separate host-generated invitation for each client; IP:port-only joining without an invitation is not implemented in this release. Removing that manual admission requirement remains unfinished.
 
 ### Fixes
 
