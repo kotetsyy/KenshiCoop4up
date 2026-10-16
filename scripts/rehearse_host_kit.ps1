@@ -69,9 +69,6 @@ function Invoke-LanSsh {
 
 $runState = New-CoopRunState -GameDirs @("$env:USERPROFILE\Kenshi-Join",'C:\Program Files (x86)\Steam\steamapps\common\Kenshi') -SaveNames @($Save,'coopresume')
 $wanProc = $null
-$inviteRoot = Join-Path $env:LOCALAPPDATA ('KenshiCoop\private\kitrehearsal-' + [Guid]::NewGuid().ToString('N'))
-$inviteFile = Assert-CoopPrivatePath (Join-Path $inviteRoot 'client.invite') (@($runState.GameDirs) + @($repoRoot))
-New-Item -ItemType Directory -Path $inviteRoot | Out-Null
 try {
 Clear-CoopRunEnvironment -State $runState
 $kitTestDir = "C:\KenshiCoopKitTest-" + [Guid]::NewGuid().ToString('N')
@@ -118,28 +115,10 @@ $r = Invoke-LanSsh "powershell -NoProfile -Command `"Expand-Archive -Path $kitTe
 if ("$($r.out)" -notmatch "EXPANDED") { throw "kit expand failed: $($r.out)" }
 Write-Host "  kit expanded -> $kitTestDir"
 
-$native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
-& scp -o BatchMode=yes $native.Files['transport_credentials.exe'] $native.Files['KenshiCoopNetUDP.dll'] "${target}:$kitFwd/"
-if ($LASTEXITCODE -ne 0) { throw 'Private provisioning inputs push failed.' }
-$r = Invoke-LanSsh 'echo %LOCALAPPDATA%'
-$remoteLocal = ("" + (@($r.out) | Select-Object -Last 1)).Trim()
-$remotePrivate = "$remoteLocal\KenshiCoop\private\" + [Guid]::NewGuid().ToString('N')
-$provisionScript = ". '$((Join-Path $kitTestDir 'kit_preflight.ps1').Replace("'","''"))'; [void](New-CoopUdpCredentials -NativeBin '$($kitTestDir.Replace("'","''"))' -ProfilePath '$($remotePrivate.Replace("'","''"))\host.credential' -InviteFile '$($remotePrivate.Replace("'","''"))\client.invite' -GameDirs @('$($cfg.kenshiDir.Replace("'","''"))','$($kitTestDir.Replace("'","''"))'))"
-$provisionEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($provisionScript))
-$r = Invoke-LanSsh "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $provisionEncoded"
-if ($r.exit -ne 0) { throw 'Remote native credential provisioning failed.' }
-& scp -o BatchMode=yes "${target}:$($remotePrivate -replace '\\','/')/client.invite" $inviteFile
-if ($LASTEXITCODE -ne 0) { throw 'Private client invitation import failed.' }
-$acl = New-Object Security.AccessControl.FileSecurity
-$acl.SetAccessRuleProtection($true,$false)
-$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule([Security.Principal.WindowsIdentity]::GetCurrent().User,'FullControl','Allow')))
-$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule('SYSTEM','FullControl','Allow')))
-Set-Acl -LiteralPath $inviteFile -AclObject $acl
-$env:KENSHICOOP_UDP_INVITE_FILE = $inviteFile
 # ---- 3. Run friend_host.ps1 there via a one-off interactive task ------------------------
 Write-Host ""
 Write-Host "=== 3. run friend_host.ps1 on $($cfg.host) ==="
-$action = "& '$kitTestDir\friend_host.ps1' -NoPrompt -KenshiDir '$($cfg.kenshiDir.Replace("'","''"))' -UdpProfilePath '$($remotePrivate.Replace("'","''"))\host.credential' -RunToken '$runToken'"
+$action = "& '$kitTestDir\friend_host.ps1' -NoPrompt -KenshiDir '$($cfg.kenshiDir.Replace("'","''"))' -RunToken '$runToken'"
 $actionEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($action))
 $taskCmd = "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $actionEncoded"
 $r = Invoke-LanSsh "schtasks /create /tn $taskName /tr `"$taskCmd`" /sc once /st 00:00 /it /f && schtasks /run /tn $taskName"
@@ -214,13 +193,13 @@ Expand-Archive -LiteralPath (Join-Path $stampDir $zipName) -DestinationPath $sta
 Write-Host "  collected + expanded: $zipName"
 
 # Cleanup remote kit test artifacts.
-$cleanup = "`$ErrorActionPreference='Stop'; & schtasks /delete /tn '$taskName' /f; if(`$LASTEXITCODE -ne 0){throw 'Task cleanup failed.'}; Remove-Item -LiteralPath '$($kitTestDir.Replace("'","''"))' -Recurse -Force; Remove-Item -LiteralPath '$($remotePrivate.Replace("'","''"))' -Recurse -Force; Write-Output CLEANED"
+$cleanup = "`$ErrorActionPreference='Stop'; & schtasks /delete /tn '$taskName' /f; if(`$LASTEXITCODE -ne 0){throw 'Task cleanup failed.'}; Remove-Item -LiteralPath '$($kitTestDir.Replace("'","''"))' -Recurse -Force; Write-Output CLEANED"
 $cleanupEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanup))
 $r = Invoke-LanSsh "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $cleanupEncoded"
-if ($r.exit -ne 0 -or "$($r.out)" -notmatch 'CLEANED') { throw "Remote run-owned kit/task/credential cleanup failed: $($r.out)" }
+if ($r.exit -ne 0 -or "$($r.out)" -notmatch 'CLEANED') { throw "Remote run-owned kit/task cleanup failed: $($r.out)" }
 
 } finally {
-    Restore-CoopHarnessSession -State $runState -CredentialRoot $inviteRoot -Proxy $wanProc
+    Restore-CoopHarnessSession -State $runState -Proxy $wanProc
 }
 # ---- 6. Judge --------------------------------------------------------------------------------
 Write-Host ""

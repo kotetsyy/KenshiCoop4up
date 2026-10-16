@@ -125,9 +125,6 @@ $modDirFwd = "$dropFwd/mod"
 & scp -o BatchMode=yes @runtime "${target}:$modDirFwd/"
 if ($LASTEXITCODE -ne 0) { throw "scp of staged mod failed" }
 Write-Host "  mod: staged -> $($cfg.dropDir)\mod (installed/restored only by the owner)"
-# Private provision tool is a developer drop asset, not part of the six-file mod.
-& scp -o BatchMode=yes $native.Files['transport_credentials.exe'] "${target}:$dropFwd/"
-if ($LASTEXITCODE -ne 0) { throw 'Private credential tool push failed.' }
 
 # Stage named fixtures outside the game/user save roots. Only the interactive
 # owned runner copies a selected fixture, with encompassing snapshot/restoration.

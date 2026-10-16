@@ -40,7 +40,7 @@ if (-not(Test-Path -LiteralPath (Join-Path $baseDir 'quick.save') -PathType Leaf
 $runState=New-CoopRunState -GameDirs @($HostDir) -SaveNames @()
 $complete=$false
 try {
-    Clear-CoopRunEnvironment -State $runState -PreserveCredentials -PreserveVariables @('KENSHICOOP_SPLITFAR_AT')
+    Clear-CoopRunEnvironment -State $runState -PreserveVariables @('KENSHICOOP_SPLITFAR_AT')
     Add-CoopRunBackup -State $runState -Path $baseDir
     Add-CoopRunBackup -State $runState -Path $bakedDir
     if (-not $SkipDeploy) { Install-CoopHarnessRuntime -RepoRoot $repo -GameDirs @($HostDir) }
@@ -53,7 +53,6 @@ try {
     $env:KENSHICOOP_TEST_SECONDS="$Seconds"; $env:KENSHICOOP_LOG=$log
     $env:KENSHICOOP_ARM_TIMEOUT_MS='1'; $env:KENSHICOOP_TRANSPORT='udp'; $env:KENSHICOOP_STEAM_PEER='0'
     $env:KENSHICOOP_SAVE_SYNC='0'; $env:KENSHICOOP_LOAD_SYNC='0'
-    Set-CoopPrivateCredentials -Mode host -UseSteam $false -GameDirs @($HostDir)
     $out=Start-CoopOwnedGame -State $runState -ScriptDir $scriptDir -ExePath $hostExe -WorkDir $HostDir -TimeoutSec $StartTimeoutSec
     $line=@($out | Where-Object { "$_" -match '^GAMEPID=([1-9][0-9]*)$' })
     if ($line.Count -ne 1 -or "$($line[0])" -notmatch '^GAMEPID=([1-9][0-9]*)$') { throw 'Host failed native process handoff.' }

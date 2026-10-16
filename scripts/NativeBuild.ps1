@@ -67,12 +67,12 @@ function Get-NativeBuild([ValidateSet('Release','Harness','Debug')][string]$Conf
     $path=Join-Path $bin 'native-build.json'
     if(-not(Test-Path -LiteralPath $path -PathType Leaf)){throw "Exact native build receipt not found: $path. Rebuild with build_transports.ps1 or pass -NativeBin."}
     $receipt=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-    Assert-CoopReceiptFiles $receipt @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe','transport_credentials.exe')
-    if(($receipt.transportAbi -isnot [int] -and $receipt.transportAbi -isnot [long]) -or $receipt.transportAbi -ne 2){throw 'Malformed native transport ABI'}
+    Assert-CoopReceiptFiles $receipt @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe')
+    if(($receipt.transportAbi -isnot [int] -and $receipt.transportAbi -isnot [long]) -or $receipt.transportAbi -ne 3){throw 'Malformed native transport ABI'}
     $snapshot=Get-CoopNativeInputSnapshot
-    if($receipt.schema -ne 1 -or $receipt.transportAbi -ne 2 -or $receipt.configuration -cne $logical -or $receipt.checkout -ine $script:NativeRepo -or $receipt.sourceDigest -cne $snapshot.Digest -or ($receipt.dependencies|ConvertTo-Json -Depth 10 -Compress) -cne ($snapshot.Pins|ConvertTo-Json -Depth 10 -Compress)){throw 'Native receipt configuration/checkout/source/dependency mismatch; rebuild providers.'}
+    if($receipt.schema -ne 1 -or $receipt.transportAbi -ne 3 -or $receipt.configuration -cne $logical -or $receipt.checkout -ine $script:NativeRepo -or $receipt.sourceDigest -cne $snapshot.Digest -or ($receipt.dependencies|ConvertTo-Json -Depth 10 -Compress) -cne ($snapshot.Pins|ConvertTo-Json -Depth 10 -Compress)){throw 'Native receipt configuration/checkout/source/dependency mismatch; rebuild providers.'}
     $files=@{}
-    foreach($name in @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe','transport_credentials.exe')) {
+    foreach($name in @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe')) {
         $file=Join-Path $bin $name; $expected=$receipt.files.$name
         if(-not $expected -or -not(Test-Path -LiteralPath $file -PathType Leaf) -or (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected){throw "Native receipt hash mismatch: $name"}
         $files[$name]=$file

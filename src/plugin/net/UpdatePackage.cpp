@@ -1,4 +1,5 @@
 #include "UpdatePackage.h"
+#include "../../transport/TransportApi.h"
 #include <windows.h>
 #include <wincrypt.h>
 #include <map>
@@ -114,7 +115,10 @@ bool parsePackageManifest(const std::string& text,PackageManifest* out,std::stri
         if(!known||values.find(key)!=values.end()) { *error="unknown or duplicate manifest field"; return false; }
         values[key]=value;
     }
-    if(values["schema"]!="2"||values["transportAbi"]!="2"||!version(values["version"])) { *error="requires schema=2, transportAbi=2 and exact MAJOR.MINOR.PATCH"; return false; }
+    char expectedAbi[16];
+    _snprintf(expectedAbi,sizeof(expectedAbi)-1,"%u",(unsigned)COOP_NET_ABI_VERSION);
+    expectedAbi[sizeof(expectedAbi)-1]='\0';
+    if(values["schema"]!="2"||values["transportAbi"]!=expectedAbi||!version(values["version"])) { *error="requires schema=2, matching transport ABI and exact MAJOR.MINOR.PATCH"; return false; }
     out->version=values["version"]; out->proto=values["proto"]; out->notes=values["notes"];
     if(!out->proto.empty()) for(size_t i=0;i<out->proto.size();++i) if(out->proto[i]<'0'||out->proto[i]>'9') { *error="invalid protocol"; return false; }
     if(values.count("allowDowngrade")) { if(values["allowDowngrade"]!="0"&&values["allowDowngrade"]!="1") { *error="invalid allowDowngrade"; return false; } out->allowDowngrade=values["allowDowngrade"]=="1"; }

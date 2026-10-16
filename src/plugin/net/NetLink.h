@@ -33,7 +33,6 @@ struct NetStartOptions {
     int port;
     std::string address;
     u64 remoteSteamId;
-    std::string udpHostProfilePath,udpJoinInvite;
     NetStartOptions();
 };
 struct NetStatus {
@@ -47,8 +46,6 @@ struct NetStatus {
     u32 connectAttempts,pendingHandshakes,memberMask;
     u64 sessionGeneration,selfSteamId;
     int authentication,relayAvailability;
-    u32 inviteRequestId;
-    int inviteResult;
 };
 class NetLink {
 public:
@@ -57,8 +54,6 @@ public:
     bool start(const NetStartOptions&,Inbound*);
     void stop();
     bool pumpMainThread();
-    bool queueMakeUdpInvite(u64 sessionGeneration,u32 requestId);
-    bool copyUdpInvite(u64 sessionGeneration,u32 requestId,char* out,unsigned capacity) const;
     void copyStatus(NetStatus* out) const;
     void setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int count);
     void queueEvent(const EventPacket& ev);
@@ -139,7 +134,6 @@ private:
     bool loadProvider();
     bool startProvider();
     void closeProvider();
-    void processCommands();
     void sampleNativeStats();
     void sendRoster();
     bool queuePayload(const void*,unsigned);
@@ -169,7 +163,6 @@ private:
     bool currentEnvironment(const EnvironmentItemPacket& p,const Peer* peer=0) const;
     struct Publication { std::vector<u8> bytes; u32 epoch,stampMs; u64 sequence; };
     struct Pending { std::vector<u8> bytes; u32 epoch; bool world; };
-    struct Command { u64 generation; u32 requestId,serial; };
     struct StateKey {
         u32 owner,type,hand[5];
         bool operator<(const StateKey& b) const { if(owner!=b.owner)return owner<b.owner; if(type!=b.type)return type<b.type; for(unsigned i=0;i<5;++i)if(hand[i]!=b.hand[i])return hand[i]<b.hand[i]; return false; }
@@ -204,8 +197,6 @@ private:
     bool haveOut_;
     std::deque<Publication> publications_;
     unsigned publicationBytes_;
-    std::deque<Command> commands_;
-    char invite_[COOP_NET_INVITE_CAPACITY];
     mutable CRITICAL_SECTION debugCs_,statusCs_,nameCs_;
     NetDebugStats debugStats_;
     NetStatus status_;
@@ -217,7 +208,6 @@ private:
     std::deque<Delayed> delayed_;
     u32 receivedBytes_,receivedPackets_,sentBytes_,sentPackets_;
     DWORD lastStatsTick_;
-    u32 inviteSerial_;
     NetLink(const NetLink&);
     NetLink& operator=(const NetLink&);
 };

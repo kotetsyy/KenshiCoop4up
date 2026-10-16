@@ -1,5 +1,5 @@
 // Real DLL/real-process prerequisite tests. No game or Steam gameplay certification.
-// Build: C++17, x64, link ws2_32 + advapi32 + crypt32. Do NOT link GNS or either provider.
+// Build: C++17, x64, link ws2_32 + advapi32. Do NOT link GNS or either provider.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
@@ -10,7 +10,6 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <sddl.h>
-#include <wincrypt.h>
 #include "../TransportApi.h"
 #include <algorithm>
 #include <array>
@@ -20,7 +19,6 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -34,6 +32,9 @@ constexpr uint32_t kFrameLimit = 8u * 1024u * 1024u;
 constexpr uint32_t kRpcTimeoutMs = 15000;
 constexpr uint32_t kNetworkTimeoutMs = 45000;
 constexpr uint64_t kHostGeneration = 701;
+constexpr std::array<uint8_t, 32> kEncryptionProbe{{
+    0x91,0x42,0xf3,0x04,0xa5,0x56,0x27,0xd8,0x69,0xba,0x0b,0xec,0x7d,0x3e,0xcf,0x80,
+    0x11,0xe2,0x53,0xa4,0x35,0xc6,0x77,0x08,0xd9,0x6a,0xfb,0x4c,0xbd,0x2e,0x9f,0x50}};
 void require(bool condition, const char* failure);
 void put32(Bytes& bytes, uint32_t value);
 void put64(Bytes& bytes, uint64_t value);
@@ -47,9 +48,9 @@ struct Reader {
     Bytes rest();
     void done();
 };
-enum class Op : uint32_t { Prepare, Invite, Start, Poll, Send, Burst, Stats,
+enum class Op : uint32_t { Start, Poll, Send, Burst, Stats,
     Status, Disconnect, Stop, Modules, Exit, MalformedStart, Pump, HoldEvent, ReleaseHeld, InvalidSend,
-    SetPolling, DelayedSend };
+    SetPolling, DelayedSend, OpenStart };
 struct Reply { int32_t result = COOP_NET_INTERNAL; Bytes bytes; };
 struct Event {
     uint32_t type = 0, connection = 0, traffic = 0;
@@ -61,7 +62,7 @@ struct Event {
 struct StartOptions {
     uint32_t mode = COOP_NET_UDP, port = 0;
     uint64_t generation = 0;
-    std::string address = "127.0.0.1", invite;
+    std::string address = "127.0.0.1";
 };
 struct Child {
     HANDLE process = nullptr, input = nullptr, output = nullptr;
@@ -90,17 +91,10 @@ struct PrivateDirectory {
     PrivateDirectory();
     ~PrivateDirectory();
 };
-struct Envelope { Bytes root, leaf; };
-Envelope decodeProfile(const Bytes& ciphertext);
-Envelope decodeInvitation(const std::string& text);
-std::string hostRoleInvitation(const Envelope& host);
 struct WireAudit {
-    std::vector<Bytes> privateKeys;
     std::atomic<uint64_t> clientCertificates{0}, hostCertificates{0};
-    std::atomic<uint64_t> leakedFields{0}, leakedKeys{0}, malformed{0};
-    void addKeys(const Envelope& envelope, bool privateRoot);
+    std::atomic<uint64_t> leakedFields{0}, plaintextPayloads{0}, malformed{0};
     void observe(const uint8_t* bytes, size_t size) noexcept;
-    ~WireAudit();
 };
 struct Proxy {
     struct Datagram { Bytes bytes; sockaddr_in target{}; Clock::time_point due; };
@@ -116,7 +110,6 @@ struct Proxy {
     void run();
 };
 uint16_t reservePort();
-std::string issueInvite(Child& child);
 uint32_t waitConnected(Child& child, uint64_t generation);
 void waitPeerCount(Child& host, uint32_t count);
 void waitSendDrained(Child& sender, uint32_t connection);
@@ -128,14 +121,12 @@ uint32_t expectMessages(Child& receiver, uint64_t generation, uint32_t traffic,
                     const std::vector<Bytes>& expected, uint32_t timeoutMs = kNetworkTimeoutMs);
 void quietMessages(Child& receiver, uint64_t generation, uint32_t milliseconds);
 void report(const char* name, uint64_t count);
-Bytes readPrivateFile(const std::filesystem::path& path);
-void writePrivateFile(const std::filesystem::path& path, const Bytes& data);
 void observeSteamProcesses();
 int childMain(bool host, const std::wstring& provider, const std::filesystem::path& directory);
 int controller(const std::wstring& executable, const std::wstring& udp, const std::wstring& steam);
 
 // Expectations are authored here, not queried from provider internals. Mutations
-// caught: wrong bytes/lane, silent reliable loss, accepted hostile credentials,
+// caught: wrong bytes/lane, silent reliable loss, credential-only admission,
 // stale epochs, missing admission bound, lane starvation and Steam fallback.
 int controller(const std::wstring& executable, const std::wstring& udp, const std::wstring& steam) {
     PrivateDirectory directory;
@@ -148,31 +139,12 @@ int controller(const std::wstring& executable, const std::wstring& udp, const st
     require(SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) != FALSE,
             "set child cleanup job limits");
     Child host(executable, udp, directory.path / L"host", true, job, "host");
-    Child alien(executable, udp, directory.path / L"alien", true, job, "wrong-host");
-    require(host.rpc(Op::Prepare).result == COOP_NET_OK, "provision private host credential");
-    const auto hostProfile = directory.path / L"host" / L"credential.bin";
-    const Bytes originalProfile = readPrivateFile(hostProfile);
-    require(!originalProfile.empty(), "provisioned host credential file is empty");
-    const Envelope decodedHost = decodeProfile(originalProfile);
+    Bytes openPort; put32(openPort, reservePort());
+    require(host.rpc(Op::OpenStart, openPort).result == COOP_NET_OK,
+            "numeric endpoint-only UDP host requires credentials or reports authenticated principal");
+    host.proveModules(true);
+    report("endpoint-only-host-start-without-authenticated-principal", 1);
     WireAudit audit;
-    audit.addKeys(decodedHost, true);
-    const std::string wrongRoleInvite = hostRoleInvitation(decodedHost);
-    require(host.rpc(Op::Prepare).result == COOP_NET_OK, "existing valid profile cannot be reused");
-    require(readPrivateFile(hostProfile) == originalProfile, "prepareHost replaces valid persisted host credential");
-    Child damaged(executable, udp, directory.path / L"damaged", true, job, "damaged-profile");
-    const auto damagedProfile = directory.path / L"damaged" / L"credential.bin";
-    const Bytes garbageProfile{0x44, 0x45, 0x41, 0x44, 0x00, 0xff, 0x19};
-    writePrivateFile(damagedProfile, garbageProfile);
-    require(damaged.rpc(Op::Prepare).result != COOP_NET_OK, "prepareHost silently replaces invalid existing profile");
-    require(readPrivateFile(damagedProfile) == garbageProfile, "invalid existing profile was mutated");
-    damaged.finish();
-    report("credential-idempotence-and-invalid-profile-preservation", 2);
-    require(alien.rpc(Op::Prepare).result == COOP_NET_OK, "provision independent wrong-host credential");
-    const std::string wrongHostInvite = issueInvite(alien);
-    audit.addKeys(decodeProfile(readPrivateFile(directory.path / L"alien" / L"credential.bin")), true);
-    audit.addKeys(decodeInvitation(wrongHostInvite), false);
-    alien.proveModules(true);
-    alien.finish();
     const uint16_t hostPort = reservePort();
     StartOptions hosting;
     hosting.port = hostPort;
@@ -191,60 +163,42 @@ int controller(const std::wstring& executable, const std::wstring& udp, const st
     require(host.start(concurrent) == COOP_NET_INVALID, "active provider accepts concurrent start");
     require(host.status().generation == kHostGeneration && host.status().listening == 1,
             "rejected concurrent start mutates running network");
-    require(readPrivateFile(hostProfile) == originalProfile, "network start mutates persisted credential");
     report("malformed-config-and-concurrent-start-rejection", 6);
     report("network-created", 1);
 
     std::vector<std::unique_ptr<Child>> clients;
     std::vector<std::unique_ptr<Proxy>> proxies;
-    std::vector<std::string> invites;
-    for (unsigned i = 0; i < 4; ++i) {
-        invites.push_back(issueInvite(host));
-        for (unsigned earlier = 0; earlier < i; ++earlier)
-            require(invites[i] != invites[earlier], "host reissued identical per-client invitation");
-        audit.addKeys(decodeInvitation(invites.back()), false);
-    }
-    // Secret-key vector is immutable before starting capture threads.
     for (unsigned i = 0; i < 4; ++i) {
         proxies.emplace_back(std::make_unique<Proxy>(hostPort, audit));
         clients.emplace_back(std::make_unique<Child>(executable, udp,
             directory.path / (L"client" + std::to_wstring(i)), false, job, "client"));
     }
     StartOptions joining;
-    joining.port = proxies[0]->port;
-    joining.generation = 101;
-    joining.invite = "not-an-invitation";
-    rejectJoin(*clients[0], joining);
-    joining.generation = 102;
-    joining.invite = wrongHostInvite;
-    rejectJoin(*clients[0], joining);
-    joining.generation = 103;
-    joining.invite = invites[0];
-    // Change a byte without changing credential length. Both replacement
-    // characters are valid in hex/base64, so this is not just a size test.
-    const size_t corruptAt = joining.invite.size() * 3 / 4;
-    joining.invite[corruptAt] = joining.invite[corruptAt] == '0' ? '1' : '0';
-    rejectJoin(*clients[0], joining);
-    joining.generation = 104;
-    joining.invite = wrongRoleInvite;
-    rejectJoin(*clients[0], joining);
-    waitPeerCount(host, 0);
-    report("invalid-wrong-host-corrupted-wrong-role-invites-rejected", 4);
 
     std::array<uint32_t, 3> connections{};
     std::array<uint64_t, 3> generations{{201, 301, 401}};
     for (unsigned i = 0; i < 3; ++i) {
         joining.port = proxies[i]->port;
         joining.generation = generations[i];
-        joining.invite = invites[i];
-        require(clients[i]->start(joining) == COOP_NET_OK, "start invited UDP client");
+        require(clients[i]->start(joining) == COOP_NET_OK, "start endpoint-only UDP client");
         connections[i] = waitConnected(*clients[i], generations[i]);
         waitPeerCount(host, i + 1);
+        const auto connected = clients[i]->status();
+        require(connected.selfSteamId == 0 && connected.authentication != 100,
+                "open UDP guest claims an authenticated principal");
     }
-    // Child four has a genuinely valid, unique host-issued certificate, not a bad invite.
+    const Bytes encryptionProbe(kEncryptionProbe.begin(), kEncryptionProbe.end());
+    for (unsigned i = 0; i < 3; ++i) {
+        require(clients[i]->send(connections[i], GAME_RELIABLE, encryptionProbe) == COOP_NET_OK,
+                "send captured encryption probe");
+        expectMessages(host, kHostGeneration, GAME_RELIABLE, {encryptionProbe});
+    }
+    require(host.status().selfSteamId == 0 && host.status().authentication != 100,
+            "open UDP host claims an authenticated principal");
+    report("same-IP-three-endpoint-only-guests-without-authenticated-principals", 3);
+    // A fourth endpoint-only guest must fail solely because all seats are full.
     joining.port = proxies[3]->port;
     joining.generation = 501;
-    joining.invite = invites[3];
     rejectJoin(*clients[3], joining);
     waitPeerCount(host, 3);
     report("three-admitted-fourth-rejected", 4);
@@ -383,13 +337,13 @@ int controller(const std::wstring& executable, const std::wstring& udp, const st
     require(observedDisconnect, "explicit disconnect not visible to remote consumer");
     waitPeerCount(host, 2);
     clients[2]->stop();
-    joining.port = proxies[2]->port; joining.invite = invites[2]; joining.generation = 402;
+    joining.port = proxies[2]->port; joining.generation = 402;
     require(clients[2]->start(joining) == COOP_NET_OK, "restart explicitly disconnected client");
     connections[2] = waitConnected(*clients[2], 402);
     waitPeerCount(host, 3);
     report("explicit-remote-disconnect-and-rejoin", 1);
 
-    // Same process/context and same imported identity, new consumer generation.
+    // Same process/context, new consumer generation.
     const uint32_t staleConnection = connections[0];
     clients[0]->stop();
     require(clients[0]->status().connections == 0, "client stop leaves connections active");
@@ -397,9 +351,8 @@ int controller(const std::wstring& executable, const std::wstring& udp, const st
             "stopped connection still sends");
     waitPeerCount(host, 2);
     joining.port = proxies[0]->port;
-    joining.invite = invites[0];
     joining.generation = 202;
-    require(clients[0]->start(joining) == COOP_NET_OK, "reconnect same context/profile");
+    require(clients[0]->start(joining) == COOP_NET_OK, "reconnect same endpoint-only context");
     connections[0] = waitConnected(*clients[0], 202);
     waitPeerCount(host, 3);
     require(clients[0]->send(connections[0], GAME_RELIABLE, exact) == COOP_NET_OK, "reconnected reliable send");
@@ -462,21 +415,19 @@ int controller(const std::wstring& executable, const std::wstring& udp, const st
     require(audit.clientCertificates.load() > 0 && audit.hostCertificates.load() > 0,
             "actual client and host handshake certificates were not captured");
     require(audit.malformed.load() == 0, "bounded native wire certificate decoding failed");
-    require(audit.leakedFields.load() == 0 && audit.leakedKeys.load() == 0,
-            "actual UDP datagram leaked SignedCert.private_key_data or native private key bytes");
+    require(audit.leakedFields.load() == 0 && audit.plaintextPayloads.load() == 0,
+            "actual UDP datagram exposed native private-key field or plaintext game payload");
     report("actual-client-handshake-certificates-with-no-private-key-field", audit.clientCertificates.load());
     report("actual-host-handshake-certificates-with-no-private-key-field", audit.hostCertificates.load());
-    report("native-private-key-non-disclosure-on-actual-UDP-wire", audit.privateKeys.size());
+    report("open-encrypted-UDP-no-plaintext-game-payload", packets);
     // Direct native UDP children isolate ownership/lifecycle from the wire
     // impairment fixture. The same DLL/context/process is reused throughout.
     {
         Child lifecycleHost(executable, udp, directory.path / L"lifecycle-host", true, job, "lifecycle-host");
         Child lifecycleClient(executable, udp, directory.path / L"lifecycle-client", false, job, "lifecycle-client");
-        require(lifecycleHost.rpc(Op::Prepare).result == COOP_NET_OK, "provision lifecycle host");
         StartOptions hostCycle, clientCycle;
         hostCycle.port = reservePort(); hostCycle.generation = 10000;
         clientCycle.port = hostCycle.port; clientCycle.generation = 20000;
-        clientCycle.invite = issueInvite(lifecycleHost);
         require(lifecycleHost.start(hostCycle) == COOP_NET_OK, "start lifecycle host");
         require(lifecycleClient.start(clientCycle) == COOP_NET_OK, "start lifecycle client");
         uint32_t clientConnection = waitConnected(lifecycleClient, clientCycle.generation);
@@ -618,16 +569,13 @@ int controller(const std::wstring& executable, const std::wstring& udp, const st
     const CoopNetStatus unavailable = steamChild.status();
     require(unavailable.mode == COOP_NET_STEAM && unavailable.connections == 0 && unavailable.listening == 0,
             "Steam unavailability falls back to UDP or creates network");
-    require(steamChild.rpc(Op::Prepare).result == COOP_NET_INVALID,
-            "Steam provider offers UDP credential provisioning");
-    require(steamChild.rpc(Op::Invite).result == COOP_NET_INVALID, "Steam provider offers UDP invitation creation");
     steamChild.proveModules(false);
     steamChild.finish();
     report("steam-absent-runtime-explicitly-unavailable-no-fallback", 1);
     std::error_code cleanupError;
     std::filesystem::remove_all(directory.path, cleanupError);
-    require(!cleanupError && !std::filesystem::exists(directory.path), "private credential cleanup failed");
-    report("private-credential-cleanup", 1);
+    require(!cleanupError && !std::filesystem::exists(directory.path), "private test directory cleanup failed");
+    report("private-test-directory-cleanup", 1);
     std::puts("PASS standalone transport prerequisites only; NOT Steam connectivity or four-player gameplay certification.");
     return 0;
 }
@@ -637,7 +585,7 @@ void require(bool condition, const char* failure) {
     if (!condition) throw std::runtime_error(failure);
 }
 // Independent bounded readers for the pinned public wire formats, not linked
-// provider/protobuf helpers. No decoded credential or packet bytes are printed.
+// provider/protobuf helpers. No decoded packet bytes are printed.
 struct ProtoField {
     uint32_t number = 0, wire = 0;
     size_t begin = 0, end = 0, data = 0, length = 0;
@@ -689,137 +637,16 @@ const ProtoField* findField(const std::vector<ProtoField>& fields, uint32_t numb
     const ProtoField* found = nullptr;
     for (const auto& field : fields) {
         if (field.number == number) {
-            require(!found, "duplicate singleton credential protobuf field");
+            require(!found, "duplicate singleton wire protobuf field");
             found = &field;
         }
     }
     return found;
 }
-Bytes fieldBytes(const Bytes& bytes, const std::vector<ProtoField>& fields, uint32_t number, size_t exactSize = 0) {
-    const auto* field = findField(fields, number);
-    require(field && field->wire == 2 && (!exactSize || field->length == exactSize),
-            "required credential protobuf byte field absent or malformed");
-    return Bytes(bytes.begin() + field->data, bytes.begin() + field->data + field->length);
-}
-Bytes privateKey(const Bytes& signedCert) {
-    require(signedCert.size() <= 1024, "signed credential exceeds bound");
-    const auto fields = protoFields(signedCert.data(), signedCert.size());
-    Bytes key = fieldBytes(signedCert, fields, 1, 32);
-    const Bytes certificate = fieldBytes(signedCert, fields, 4);
-    const auto certFields = protoFields(certificate.data(), certificate.size());
-    const auto* keyType = findField(certFields, 1);
-    require(keyType && keyType->wire == 0 && keyType->integer == 1, "credential is not native Ed25519");
-    require(fieldBytes(certificate, certFields, 2, 32) != key, "private/public credential key fixture is invalid");
-    return key;
-}
-Envelope decodeEnvelope(const Bytes& bytes) {
-    require(bytes.size() >= 12 && bytes.size() <= 2048 &&
-            bytes[0] == 'K' && bytes[1] == 'C' && bytes[2] == 'U' && bytes[3] == '1',
-            "invalid bounded native credential envelope");
-    Reader reader{bytes};
-    reader.at = 4;
-    const uint32_t rootLength = reader.u32(), leafLength = reader.u32();
-    require(rootLength > 0 && rootLength <= 1024 && leafLength > 0 && leafLength <= 1024 &&
-            uint64_t(rootLength) + leafLength + 12 == bytes.size(), "invalid bounded credential envelope lengths");
-    Envelope envelope;
-    envelope.root.assign(bytes.begin() + 12, bytes.begin() + 12 + rootLength);
-    envelope.leaf.assign(bytes.begin() + 12 + rootLength, bytes.end());
-    const auto leafFields = protoFields(envelope.leaf.data(), envelope.leaf.size());
-    require(fieldBytes(envelope.leaf, leafFields, 6, 64).size() == 64, "native leaf certificate is not signed");
-    return envelope;
-}
-Envelope decodeProfile(const Bytes& ciphertext) {
-    require(!ciphertext.empty() && ciphertext.size() <= 8192, "DPAPI profile exceeds strict bound");
-    DATA_BLOB encrypted{static_cast<DWORD>(ciphertext.size()), const_cast<BYTE*>(ciphertext.data())};
-    DATA_BLOB plain{};
-    require(CryptUnprotectData(&encrypted, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &plain) != FALSE,
-            "decrypt current-user private host test fixture");
-    struct FreePlain {
-        DATA_BLOB& blob;
-        ~FreePlain() { if (blob.pbData) { SecureZeroMemory(blob.pbData, blob.cbData); LocalFree(blob.pbData); } }
-    } freePlain{plain};
-    require(plain.pbData && plain.cbData >= 12 && plain.cbData <= 2048, "decrypted host profile exceeds strict bound");
-    Bytes bytes(plain.pbData, plain.pbData + plain.cbData);
-    struct WipeBytes { Bytes& bytes; ~WipeBytes() { if (!bytes.empty()) SecureZeroMemory(bytes.data(), bytes.size()); } } wipe{bytes};
-    return decodeEnvelope(bytes);
-}
-std::string encodeBase64(const Bytes& bytes) {
-    constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string result;
-    result.reserve((bytes.size() + 2) / 3 * 4);
-    for (size_t i = 0; i < bytes.size(); i += 3) {
-        const uint32_t value = uint32_t(bytes[i]) << 16 |
-            (i + 1 < bytes.size() ? uint32_t(bytes[i + 1]) << 8 : 0) |
-            (i + 2 < bytes.size() ? uint32_t(bytes[i + 2]) : 0);
-        result += alphabet[(value >> 18) & 63]; result += alphabet[(value >> 12) & 63];
-        result += i + 1 < bytes.size() ? alphabet[(value >> 6) & 63] : '=';
-        result += i + 2 < bytes.size() ? alphabet[value & 63] : '=';
-    }
-    return result;
-}
-Envelope decodeInvitation(const std::string& text) {
-    require(text.size() > 5 && text.size() < COOP_NET_INVITE_CAPACITY && text.compare(0, 5, "KCU1:") == 0,
-            "invalid bounded invitation prefix");
-    constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const std::string encoded = text.substr(5);
-    require(encoded.size() % 4 == 0 && encoded.size() <= 2732, "invalid bounded invitation base64 length");
-    Bytes bytes;
-    bytes.reserve(encoded.size() / 4 * 3);
-    for (size_t i = 0; i < encoded.size(); i += 4) {
-        uint32_t value = 0;
-        unsigned padding = 0;
-        for (unsigned j = 0; j < 4; ++j) {
-            const char ch = encoded[i + j];
-            if (ch == '=') {
-                require(i + 4 == encoded.size() && j >= 2, "invalid invitation base64 padding");
-                ++padding; value <<= 6;
-            } else {
-                require(!padding, "invitation base64 data after padding");
-                const char* found = std::strchr(alphabet, ch);
-                require(ch != '\0' && found != nullptr, "invalid invitation base64 character");
-                value = (value << 6) | static_cast<uint32_t>(found - alphabet);
-            }
-        }
-        require(padding <= 2 && (padding != 1 || (value & 0xffu) == 0) &&
-                (padding != 2 || (value & 0xffffu) == 0), "noncanonical invitation base64 pad bits");
-        bytes.push_back(static_cast<uint8_t>(value >> 16));
-        if (padding < 2) bytes.push_back(static_cast<uint8_t>(value >> 8));
-        if (!padding) bytes.push_back(static_cast<uint8_t>(value));
-    }
-    require(encodeBase64(bytes) == encoded, "noncanonical invitation base64 encoding");
-    return decodeEnvelope(bytes);
-}
-std::string hostRoleInvitation(const Envelope& host) {
-    const auto fields = protoFields(host.root.data(), host.root.size());
-    Bytes publicRoot;
-    for (const auto& field : fields) {
-        if (field.number != 1)
-            publicRoot.insert(publicRoot.end(), host.root.begin() + field.begin, host.root.begin() + field.end);
-    }
-    require(!publicRoot.empty() && publicRoot.size() < host.root.size(), "strip host root private credential for wrong-role fixture");
-    Bytes envelope{'K', 'C', 'U', '1'};
-    put32(envelope, static_cast<uint32_t>(publicRoot.size()));
-    put32(envelope, static_cast<uint32_t>(host.leaf.size()));
-    envelope.insert(envelope.end(), publicRoot.begin(), publicRoot.end());
-    envelope.insert(envelope.end(), host.leaf.begin(), host.leaf.end());
-    require(envelope.size() <= 2048, "wrong-role native credential envelope exceeds bound");
-    const std::string text = "KCU1:" + encodeBase64(envelope);
-    return text;
-}
-void WireAudit::addKeys(const Envelope& envelope, bool privateRoot) {
-    const auto rootFields = protoFields(envelope.root.data(), envelope.root.size());
-    require(privateRoot == (findField(rootFields, 1) != nullptr), "profile/invitation root private-key contract mismatch");
-    if (privateRoot) privateKeys.push_back(privateKey(envelope.root));
-    privateKeys.push_back(privateKey(envelope.leaf));
-}
-WireAudit::~WireAudit() {
-    for (auto& key : privateKeys) if (!key.empty()) SecureZeroMemory(key.data(), key.size());
-}
 void WireAudit::observe(const uint8_t* bytes, size_t size) noexcept {
     try {
-        for (const auto& key : privateKeys) {
-            if (std::search(bytes, bytes + size, key.begin(), key.end()) != bytes + size) ++leakedKeys;
-        }
+        if (std::search(bytes, bytes + size, kEncryptionProbe.begin(), kEncryptionProbe.end()) != bytes + size)
+            ++plaintextPayloads;
         if (size <= 1 || (bytes[0] != 34 && bytes[0] != 35)) return;
         // Pinned native UDP SendMsg is message-ID byte + unpadded protobuf.
         // ConnectRequest.cert is field4; ConnectOK.cert is field8.
@@ -834,24 +661,6 @@ void WireAudit::observe(const uint8_t* bytes, size_t size) noexcept {
         if (bytes[0] == 34) ++clientCertificates;
         else ++hostCertificates;
     } catch (...) { ++malformed; }
-}
-Bytes readPrivateFile(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    require(file.good(), "open private credential fixture");
-    const auto length = file.tellg();
-    require(length >= 0 && length <= static_cast<std::streamoff>(1024 * 1024), "private credential fixture exceeds bound");
-    Bytes result(static_cast<size_t>(length));
-    file.seekg(0);
-    if (!result.empty()) file.read(reinterpret_cast<char*>(result.data()), static_cast<std::streamsize>(result.size()));
-    require(file.good(), "read private credential fixture");
-    return result;
-}
-void writePrivateFile(const std::filesystem::path& path, const Bytes& data) {
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    require(file.good(), "open damaged private credential fixture");
-    file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-    file.close();
-    require(file.good(), "write damaged private credential fixture");
 }
 void observeSteamProcesses() {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -934,7 +743,7 @@ PrivateDirectory::PrivateDirectory() {
     const DWORD length = GetTempPathW(static_cast<DWORD>(temporary.size()), temporary.data());
     require(length > 0 && length < temporary.size(), "locate temporary directory");
     OwnerSecurity security;
-    // No credentials in the directory name or process command line.
+    // Keep the test work directory and named-pipe endpoints account-private.
     for (unsigned attempt = 0; attempt < 100; ++attempt) {
         path = std::filesystem::path(temporary.data()) / (L"KenshiCoop-transport-private-" +
             std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) +
@@ -947,7 +756,7 @@ PrivateDirectory::PrivateDirectory() {
 PrivateDirectory::~PrivateDirectory() {
     std::error_code error;
     std::filesystem::remove_all(path, error);
-    if (error) std::fputs("WARNING private temporary directory cleanup failed (path/credentials withheld).\n", stderr);
+    if (error) std::fputs("WARNING private temporary directory cleanup failed (path withheld).\n", stderr);
 }
 
 // Parent pipe handles are overlapped: even a hung or crashed child cannot leave
@@ -1086,7 +895,7 @@ Reply Child::rpc(Op op, const Bytes& payload) {
 int32_t Child::start(const StartOptions& options) {
     Bytes payload;
     put32(payload, options.mode); put32(payload, options.port); put64(payload, options.generation);
-    putString(payload, options.address); putString(payload, options.invite);
+    putString(payload, options.address);
     const Reply response = rpc(Op::Start, payload);
     if (response.result != COOP_NET_OK && !response.bytes.empty()) {
         Reader diagnostic{response.bytes};
@@ -1139,6 +948,7 @@ CoopNetStatus Child::status() {
     CoopNetStatus status{};
     status.size = sizeof(status); status.mode = reader.u32(); status.generation = reader.u64();
     status.selfSteamId = reader.u64(); status.listening = reader.u32(); status.connections = reader.u32();
+    status.authentication = static_cast<int32_t>(reader.u32());
     reader.done();
     return status;
 }
@@ -1191,15 +1001,6 @@ void Child::proveModules(bool udp) {
     reader.done();
     require(selected, "selected provider absent from module snapshot");
 }
-std::string issueInvite(Child& child) {
-    const Reply reply = child.rpc(Op::Invite);
-    require(reply.result == COOP_NET_OK, "issue per-client invitation");
-    Reader reader{reply.bytes};
-    const std::string invitation = reader.string();
-    reader.done();
-    require(!invitation.empty() && invitation.size() < COOP_NET_INVITE_CAPACITY, "invalid invitation length");
-    return invitation;
-}
 void report(const char* name, uint64_t count) {
     std::printf("PASS %s count=%llu\n", name, static_cast<unsigned long long>(count));
 }
@@ -1210,14 +1011,14 @@ uint32_t waitConnected(Child& child, uint64_t generation) {
         if (!event.type) { Sleep(2); continue; }
         require(event.generation == generation, "fresh/reconnected client receives old-generation event");
         require(event.type != COOP_NET_EVENT_DISCONNECTED && event.type != COOP_NET_EVENT_ERROR,
-                "invited client connection fails");
+                "endpoint-only client connection fails");
         if (event.type == COOP_NET_EVENT_CONNECTED) {
             require(event.connection != 0, "connected event has no connection handle");
             return event.connection;
         }
         require(event.type != COOP_NET_EVENT_MESSAGE, "message arrives before client connection event");
     }
-    throw std::runtime_error("invited client connection timeout");
+    throw std::runtime_error("endpoint-only client connection timeout");
 }
 void waitPeerCount(Child& host, uint32_t count) {
     const auto deadline = Clock::now() + std::chrono::milliseconds(kNetworkTimeoutMs);
@@ -1249,12 +1050,7 @@ uint64_t privateUsage(const Child& child) {
     return static_cast<uint64_t>(counters.PrivateUsage);
 }
 void rejectJoin(Child& child, const StartOptions& options) {
-    const int32_t start = child.start(options);
-    if (start != COOP_NET_OK) {
-        require(start == COOP_NET_INVALID || start == COOP_NET_AUTH_FAILED, "bad invitation fails for unrelated reason");
-        child.stop();
-        return;
-    }
+    require(child.start(options) == COOP_NET_OK, "capacity probe cannot start endpoint-only client");
     bool rejected = false;
     const auto deadline = Clock::now() + std::chrono::milliseconds(kNetworkTimeoutMs);
     while (Clock::now() < deadline) {
@@ -1262,7 +1058,7 @@ void rejectJoin(Child& child, const StartOptions& options) {
         if (!event.type) { Sleep(2); continue; }
         require(event.generation == options.generation, "rejected join has stale generation");
         require(event.type != COOP_NET_EVENT_CONNECTED && event.type != COOP_NET_EVENT_MESSAGE,
-                "unadmitted/wrong-host/corrupt invitation connects or receives data");
+                "capacity-rejected guest connects or receives data");
         if (event.type == COOP_NET_EVENT_DISCONNECTED || event.type == COOP_NET_EVENT_ERROR) {
             require(event.reason != 0, "rejected join supplies no failure reason");
             rejected = true;
@@ -1422,10 +1218,10 @@ void Proxy::run() {
 std::string utf8(const std::wstring& value) {
     const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()),
                                            nullptr, 0, nullptr, nullptr);
-    require(length > 0, "convert UTF-8 credential path");
+    require(length > 0, "convert UTF-8 module name");
     std::string result(length, '\0');
     require(WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()),
-            result.data(), length, nullptr, nullptr) == length, "convert UTF-8 credential path bytes");
+            result.data(), length, nullptr, nullptr) == length, "convert UTF-8 module name bytes");
     return result;
 }
 Bytes moduleNames() {
@@ -1520,7 +1316,7 @@ struct LoadedProvider {
                 "consumer API handshake accepts unsupported version or NULL table");
         require(api.version == COOP_NET_ABI_VERSION && api.size >= sizeof(api) && api.create && api.start && api.poll &&
                 api.send && api.releaseEvent && api.disconnect && api.stop && api.destroy && api.status &&
-                api.peerStats && api.prepareHost && api.makeInvite && api.pumpMainThread,
+                api.peerStats && api.pumpMainThread,
                 "selected provider lacks required consumer operations");
         char error[COOP_NET_ERROR_CAPACITY]{};
         context = api.create(error, sizeof(error));
@@ -1542,6 +1338,7 @@ Bytes encodeEvent(const CoopNetEvent& event) {
     Bytes answer;
     put32(answer, event.type); put32(answer, event.connection); put32(answer, event.traffic);
     put64(answer, event.generation); put32(answer, static_cast<uint32_t>(event.reason));
+    require(event.remoteSteamId == 0, "open UDP event exposes an unverified Steam principal");
     putString(answer, event.detail);
     if (event.type == COOP_NET_EVENT_MESSAGE) {
         require(event.data && event.message && event.dataSize <= COOP_NET_MAX_MESSAGE,
@@ -1551,11 +1348,10 @@ Bytes encodeEvent(const CoopNetEvent& event) {
     } else require(event.dataSize == 0, "non-message event contains message bytes");
     return answer;
 }
-int childMain(bool hostRole, const std::wstring& providerPath, const std::filesystem::path& directory) {
+int childMain(bool hostRole, const std::wstring& providerPath, const std::filesystem::path&) {
     ModuleWatch moduleWatch(_wcsicmp(std::filesystem::path(providerPath).filename().c_str(), L"KenshiCoopNetUDP.dll") == 0);
     LoadedProvider provider(providerPath);
     const HANDLE input = GetStdHandle(STD_INPUT_HANDLE), output = GetStdHandle(STD_OUTPUT_HANDLE);
-    const std::string profile = utf8((directory / L"credential.bin").wstring());
     std::deque<Bytes> queued;
     size_t queuedBytes = 0;
     const auto lifetimeDeadline = Clock::now() + std::chrono::seconds(240);
@@ -1579,37 +1375,33 @@ int childMain(bool hostRole, const std::wstring& providerPath, const std::filesy
             Bytes answer;
             char error[COOP_NET_ERROR_CAPACITY]{};
             switch (op) {
-            case Op::Prepare:
+            case Op::OpenStart: {
+                const uint32_t port = reader.u32();
                 reader.done();
-                result = provider.api.prepareHost(profile.c_str(), error, sizeof(error));
-                break;
-            case Op::Invite: {
-                reader.done();
-                std::array<char, COOP_NET_INVITE_CAPACITY> invitation{};
-                result = provider.api.makeInvite(profile.c_str(), invitation.data(), static_cast<uint32_t>(invitation.size()),
-                                                  error, sizeof(error));
+                CoopNetConfig config{};
+                config.size = sizeof(config); config.mode = COOP_NET_UDP; config.host = 1;
+                config.address = "127.0.0.1"; config.port = port; config.generation = 700;
+                result = provider.api.start(provider.context, &config, error, sizeof(error));
                 if (result == COOP_NET_OK) {
-                    const auto end = std::find(invitation.begin(), invitation.end(), '\0');
-                    require(end != invitation.end(), "invitation output has no terminating NUL");
-                    putString(answer, std::string(invitation.begin(), end));
+                    CoopNetStatus status{}; status.size = sizeof(status);
+                    require(provider.api.status(provider.context, &status) == COOP_NET_OK &&
+                            status.listening == 1 && status.selfSteamId == 0 && status.authentication != 100,
+                            "open UDP reports authenticated principal or fails to listen");
                 }
-                // Deliberately never emit provider error/detail: credentials can
-                // appear in badly implemented diagnostics, including on failure.
+                provider.api.stop(provider.context);
                 break;
             }
             case Op::Start: {
                 CoopNetConfig config{};
                 config.size = sizeof(config); config.mode = reader.u32(); config.host = hostRole ? 1 : 0;
                 config.port = reader.u32(); config.generation = reader.u64();
-                const std::string address = reader.string(), invitation = reader.string();
+                const std::string address = reader.string();
                 reader.done();
                 config.connectTimeoutMs = 7000; config.connectedTimeoutMs = 15000;
                 config.sendBufferBytes = 1048576; config.bulkQueueBytes = 600000;
                 config.maxPeers = 3;
                 if (config.mode == COOP_NET_UDP) {
                     config.address = address.c_str();
-                    config.profilePath = hostRole ? profile.c_str() : nullptr;
-                    config.joinInvite = hostRole || invitation.empty() ? nullptr : invitation.c_str();
                 } else {
                     // Valid selected-mode config: fail only because the
                     // game-owned Steam runtime is absent, not UDP fields.
@@ -1682,6 +1474,7 @@ int childMain(bool hostRole, const std::wstring& providerPath, const std::filesy
                 if (result == COOP_NET_OK) {
                     put32(answer, status.mode); put64(answer, status.generation); put64(answer, status.selfSteamId);
                     put32(answer, status.listening); put32(answer, status.connections);
+                    put32(answer, static_cast<uint32_t>(status.authentication));
                 }
                 break;
             }
@@ -1709,7 +1502,7 @@ int childMain(bool hostRole, const std::wstring& providerPath, const std::filesy
                 CoopNetConfig config{};
                 config.size = sizeof(config); config.mode = COOP_NET_UDP; config.host = hostRole ? 1 : 0;
                 config.port = 39001; config.generation = 9901;
-                config.address = "127.0.0.1"; config.profilePath = profile.c_str();
+                config.address = "127.0.0.1";
                 config.maxPeers = 3; config.sendBufferBytes = 1048576; config.bulkQueueBytes = 600000;
                 config.connectTimeoutMs = 7000; config.connectedTimeoutMs = 15000;
                 require(provider.api.start(provider.context, nullptr, error, sizeof(error)) == COOP_NET_INVALID,
@@ -1726,6 +1519,20 @@ int childMain(bool hostRole, const std::wstring& providerPath, const std::filesy
                 config.port = 39001; config.address = "definitely-not-a-numeric-address";
                 require(provider.api.start(provider.context, &config, error, sizeof(error)) == COOP_NET_INVALID,
                         "nonnumeric UDP address accepted");
+                config.address = "127.0.0.1:39001";
+                require(provider.api.start(provider.context, &config, error, sizeof(error)) == COOP_NET_INVALID,
+                        "embedded UDP address port accepted");
+                for (const char* address : {"127.0.0.1:0", "[::1]:0"}) {
+                    config.address = address;
+                    require(provider.api.start(provider.context, &config, error, sizeof(error)) == COOP_NET_INVALID,
+                            "embedded zero UDP address port accepted");
+                }
+                config.address = "127.0.0.1"; config.port = 0;
+                require(provider.api.start(provider.context, &config, error, sizeof(error)) == COOP_NET_INVALID,
+                        "zero UDP port accepted");
+                config.port = 39001; config.remoteSteamId = 76561198000000001ull;
+                require(provider.api.start(provider.context, &config, error, sizeof(error)) == COOP_NET_INVALID,
+                        "UDP silently accepts Steam identity");
                 CoopNetStatus status{};
                 status.size = sizeof(status);
                 require(provider.api.status(provider.context, &status) == COOP_NET_OK &&
@@ -1816,7 +1623,7 @@ int childMain(bool hostRole, const std::wstring& providerPath, const std::filesy
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    // Credentials never occur in arguments. Only DLL/directory paths and mode.
+    // Arguments contain only DLL/directory paths and the selected role.
     bool controllerMode = false, hostMode = false, clientMode = false;
     std::wstring udp, steam, provider;
     std::filesystem::path work;
@@ -1846,7 +1653,7 @@ int wmain(int argc, wchar_t** argv) {
         require(length > 0 && length < path.size(), "locate integration executable");
         return controller(path.data(), udp, steam);
     } catch (const std::exception& error) {
-        // Never echo a DLL-generated diagnostic, argument, path or invitation.
+        // Never echo a DLL-generated diagnostic, argument or path.
         if (controllerMode) std::fprintf(stderr, "FAIL transport prerequisite: %s\n", error.what());
         return 1;
     } catch (...) {

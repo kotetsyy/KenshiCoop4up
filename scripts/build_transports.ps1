@@ -92,7 +92,8 @@ function Get-PinnedSource([string]$Name, $Pin,[switch]$Verified,[switch]$Snapsho
     $Cache = Join-Path $BuildRoot 'sources'
     Assert-SourceAncestors $Cache
     New-Item -ItemType Directory -Force -Path $Cache | Out-Null
-    $Destination = Join-Path $Cache "$Name-$($Pin.commit)"
+    # Do not reuse or modify cached trees from the former locally-patched build.
+    $Destination = Join-Path $Cache "$Name-$($Pin.commit)-original"
     $Marker = Join-Path $Destination '.kenshicoop-source-sha256'
     # A marker is bookkeeping, not proof of mutable extracted source contents.
     if(Test-Path -LiteralPath $Destination) {
@@ -118,23 +119,17 @@ function Get-PinnedSource([string]$Name, $Pin,[switch]$Verified,[switch]$Snapsho
         Move-Item -LiteralPath $Partial -Destination $Archive
     }
     $archiveHandle=Open-VerifiedSourceInput $Archive $Pin.sha256
-    # Derive the expected tree anew from the verified archive and approved patch.
+    # Derive the expected tree anew from the verified, unpatched archive.
     # Never repair/delete an existing user cache or trust a self-written tree hash.
     $Extracting = "$Destination.verify-$([guid]::NewGuid().ToString('N'))"
-    $keepSnapshot=$false;$patchHandle=$null
+    $keepSnapshot=$false
     try {
         New-Item -ItemType Directory -Path $Extracting | Out-Null
         & tar.exe -xzf $Archive -C $Extracting --strip-components 1
         if ($LASTEXITCODE -ne 0) { throw "Source extraction failed: $Name" }
-        if($Name -ceq 'gns') {
-            $patch=Join-Path $Source $Pin.patch
-            $patchHandle=Open-VerifiedSourceInput $patch $Pin.patchSha256
-            & git -C $Extracting apply $patch
-            if($LASTEXITCODE -ne 0){throw 'Cannot apply pinned GNS authentication patch'}
-        }
         $expected=Get-SourceTreeHash $Extracting
         if(Test-Path -LiteralPath $Destination) {
-            if((Get-SourceTreeHash $Destination) -cne $expected){throw "Cached source tree differs from verified archive/approved patch; preserved for inspection: $Destination"}
+            if((Get-SourceTreeHash $Destination) -cne $expected){throw "Cached source tree differs from verified archive; preserved for inspection: $Destination"}
         } else {
             Set-Content -LiteralPath (Join-Path $Extracting '.kenshicoop-source-sha256') -Value $Pin.sha256 -Encoding ascii
             Move-Item -LiteralPath $Extracting -Destination $Destination
@@ -144,7 +139,6 @@ function Get-PinnedSource([string]$Name, $Pin,[switch]$Verified,[switch]$Snapsho
         if($Verified){return [pscustomobject]@{Path=$Destination;ExpectedHash=$expected}}
         return $Destination
     } finally {
-        if($null -ne $patchHandle){$patchHandle.Dispose()}
         $archiveHandle.Dispose()
         if(-not $keepSnapshot -and (Test-Path -LiteralPath $Extracting)){Remove-Item -LiteralPath $Extracting -Recurse -Force}
     }
@@ -205,12 +199,12 @@ $Bin = Join-Path $NativeBuild 'bin'
 if ($SourceDigest -cne (Get-CoopDigest Native)) { throw 'Native sources changed during build; receipt not written.' }
 if($ProtobufTree -cne (Get-SourceTreeHash $ProtobufSource) -or $GnsTree -cne (Get-SourceTreeHash $GnsSource)){throw 'Dependency sources changed during build; receipt not written.'}
 $Files = @{}
-foreach ($Name in @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe','transport_credentials.exe')) {
+foreach ($Name in @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe')) {
     if((Get-Item -LiteralPath (Join-Path $Bin $Name)).LastWriteTimeUtc -lt $providerBuildStarted){throw "Native output was not freshly rebuilt: $Name"}
     $Files[$Name] = (Get-FileHash -LiteralPath (Join-Path $Bin $Name) -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 if ($SourceDigest -cne (Get-CoopDigest Native)) { throw 'Native sources changed before receipt write.' }
-$Receipt = [ordered]@{schema=1;transportAbi=2;checkout=$script:NativeRepo;configuration=$Configuration;sourceDigest=$SourceDigest;dependencies=$Pins;files=$Files}
+$Receipt = [ordered]@{schema=1;transportAbi=3;checkout=$script:NativeRepo;configuration=$Configuration;sourceDigest=$SourceDigest;dependencies=$Pins;files=$Files}
 Assert-SourceAncestors $PublishBin
 $outputNames=@($Files.Keys)+@('KenshiCoopSteamProbe.dll')
 $receiptPath=Join-Path $PublishBin 'native-build.json'

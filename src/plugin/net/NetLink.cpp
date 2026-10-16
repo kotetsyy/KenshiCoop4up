@@ -88,11 +88,11 @@ NetStartOptions::NetStartOptions():isHost(true),transport(NET_TRANSPORT_UDP),por
 NetLink::NetLink():isHost_(false),steamMode_(false),port_(0),inbound_(0),providerModule_(0),context_(0),mainThreadId_(0),
     sessionGeneration_(0),providerGeneration_(0),incarnation_(0),sessionToken_(0),worldToken_(0),latestLoadId_(0),latestLoadWorld_(0),localReady_(false),serverConnection_(0),
     outOwner_(0),outStampMs_(0),outEpoch_(0),captureSequence_(0),outSequence_(0),haveOut_(false),publicationBytes_(0),thread_(0),running_(0),stopFlag_(0),myId_(0),sendEpoch_(0),
-    simDelayMs_(0),simJitterMs_(0),simLossPct_(0),receivedBytes_(0),receivedPackets_(0),sentBytes_(0),sentPackets_(0),lastStatsTick_(0),inviteSerial_(0) {
+    simDelayMs_(0),simJitterMs_(0),simLossPct_(0),receivedBytes_(0),receivedPackets_(0),sentBytes_(0),sentPackets_(0),lastStatsTick_(0) {
     InitializeCriticalSection(&outCs_); InitializeCriticalSection(&nameCs_); InitializeCriticalSection(&debugCs_); InitializeCriticalSection(&statusCs_); InitializeCriticalSection(&pumpCs_);
     memset(ownerIncarnation_,0,sizeof(ownerIncarnation_)); memset(&api_,0,sizeof(api_)); memset(&status_,0,sizeof(status_)); memset(&debugStats_,0,sizeof(debugStats_));
-    memset(localName_,0,sizeof(localName_)); memset(peerName_,0,sizeof(peerName_)); memset(invite_,0,sizeof(invite_)); memset(pendingBytes_,0,sizeof(pendingBytes_));
-    status_.phase=NET_IDLE; status_.requested=status_.active=NET_TRANSPORT_NONE; status_.inviteResult=-1;
+    memset(localName_,0,sizeof(localName_)); memset(peerName_,0,sizeof(peerName_)); memset(pendingBytes_,0,sizeof(pendingBytes_));
+    status_.phase=NET_IDLE; status_.requested=status_.active=NET_TRANSPORT_NONE;
 }
 NetLink::~NetLink() {
     stop(); DeleteCriticalSection(&pumpCs_); DeleteCriticalSection(&statusCs_); DeleteCriticalSection(&debugCs_); DeleteCriticalSection(&nameCs_); DeleteCriticalSection(&outCs_);
@@ -110,7 +110,7 @@ bool NetLink::start(const NetStartOptions& o,Inbound* inbound) {
 bool NetLink::launchThread() {
     clearDebugStats(); NativeLock nativeLock91_statusCs_(&statusCs_); memset(&status_,0,sizeof(status_));
     status_.phase=NET_STARTING; status_.host=isHost_; status_.requested=options_.transport; status_.active=NET_TRANSPORT_NONE;
-    status_.sessionGeneration=sessionGeneration_; status_.inviteResult=-1; status_.phaseSinceTick=GetTickCount(); nativeLock91_statusCs_.unlock();
+    status_.sessionGeneration=sessionGeneration_; status_.phaseSinceTick=GetTickCount(); nativeLock91_statusCs_.unlock();
     InterlockedExchange(&stopFlag_,0); InterlockedExchange(&running_,1);
     thread_=CreateThread(0,0,&NetLink::threadEntry,this,0,0);
     if (!thread_) { InterlockedExchange(&running_,0); setError(NET_ERR_THREAD,GetLastError(),"native worker launch failed"); setPhase(NET_FAILED); return false; }
@@ -119,14 +119,14 @@ bool NetLink::launchThread() {
 void NetLink::stop() {
     if(thread_) { InterlockedExchange(&stopFlag_,1); WaitForSingleObject(thread_,INFINITE); CloseHandle(thread_); thread_=0; }
     InterlockedExchange(&running_,0);
-    NativeLock nativeLock102_outCs_(&outCs_); publications_.clear(); publicationBytes_=0; commands_.clear(); out_.clear(); haveOut_=false;
+    NativeLock nativeLock102_outCs_(&outCs_); publications_.clear(); publicationBytes_=0; out_.clear(); haveOut_=false;
     peers_.clear();serverConnection_=0;stateSeen_.clear();delayed_.clear();memset(ownerIncarnation_,0,sizeof(ownerIncarnation_));
     for(unsigned lane=0;lane<3;++lane){pending_[lane].clear();pendingBytes_[lane]=0;}
     receivedBytes_=receivedPackets_=sentBytes_=sentPackets_=0;lastStatsTick_=0;
-    SecureZeroMemory(invite_,sizeof(invite_)); options_.udpJoinInvite.assign(options_.udpJoinInvite.size(),'\0'); options_.udpJoinInvite.clear(); nativeLock102_outCs_.unlock();
+    nativeLock102_outCs_.unlock();
     NativeLock nativeLock107_nameCs_(&nameCs_); memset(peerName_,0,sizeof(peerName_)); nativeLock107_nameCs_.unlock();
     clearDebugStats(); NativeLock nativeLock108_statusCs_(&statusCs_); status_.phase=NET_IDLE; status_.active=NET_TRANSPORT_NONE; status_.memberMask=0;
-    status_.pendingHandshakes=0; status_.inviteResult=-1; status_.inviteRequestId=0; status_.phaseSinceTick=GetTickCount(); nativeLock108_statusCs_.unlock();
+    status_.pendingHandshakes=0; status_.phaseSinceTick=GetTickCount(); nativeLock108_statusCs_.unlock();
 }
 bool NetLink::pumpMainThread() {
     if(GetCurrentThreadId()!=mainThreadId_ || !steamMode_)return false;
@@ -153,18 +153,13 @@ bool NetLink::loadProvider() {
     if(!module) { setError(NET_ERR_PROVIDER_LOAD,GetLastError(),"selected native companion could not be loaded from module directory"); return false; }
     CoopNetGetApiFn getter=(CoopNetGetApiFn)GetProcAddress(module,"KenshiCoopNet_GetApi"); CoopNetApi table; memset(&table,0,sizeof(table));
     if(!getter || getter(COOP_NET_ABI_VERSION,sizeof(table),&table)!=COOP_NET_OK || table.version!=COOP_NET_ABI_VERSION || table.size!=sizeof(table) ||
-       !table.create || !table.start || !table.poll || !table.send || !table.releaseEvent || !table.disconnect || !table.stop || !table.destroy || !table.status || !table.peerStats || !table.makeInvite || !table.prepareHost || !table.pumpMainThread) {
+       !table.create || !table.start || !table.poll || !table.send || !table.releaseEvent || !table.disconnect || !table.stop || !table.destroy || !table.status || !table.peerStats || !table.pumpMainThread) {
         FreeLibrary(module); setError(NET_ERR_PROVIDER_ABI,0,"selected native companion ABI mismatch"); return false;
     }
     NativeLock nativeLock131_pumpCs_(&pumpCs_);providerModule_=module;api_=table;nativeLock131_pumpCs_.unlock();setError(NET_ERR_NONE,0,0);return true;
 }
 bool NetLink::startProvider() {
     char error[COOP_NET_ERROR_CAPACITY]={0};
-    if(!steamMode_ && isHost_) {
-        int provision=api_.prepareHost(options_.udpHostProfilePath.c_str(),error,sizeof(error));
-        SecureZeroMemory(error,sizeof(error));
-        if(provision!=COOP_NET_OK) {setError(provision==COOP_NET_AUTH_FAILED?NET_ERR_PROVIDER_AUTH:NET_ERR_PROVIDER_START,provision,"private UDP host credential could not be prepared");return false;}
-    }
     if(!context_)context_=api_.create(error,sizeof(error));
     if(!context_) { setError(NET_ERR_PROVIDER_START,0,"native context creation failed");return false; }
     CoopNetConfig c; memset(&c,0,sizeof(c)); c.size=sizeof(c); c.mode=options_.transport; c.host=isHost_; c.port=port_;
@@ -175,8 +170,6 @@ bool NetLink::startProvider() {
     c.connectTimeoutMs=NATIVE_CONNECT_TIMEOUT_MS; c.connectedTimeoutMs=15000; c.sendBufferBytes=2*1024*1024; c.bulkQueueBytes=1024*1024; c.maxPeers=MAX_JOINS;
     if(!steamMode_) {
         c.address=isHost_?0:ip_.c_str();
-        c.profilePath=isHost_?options_.udpHostProfilePath.c_str():0;
-        c.joinInvite=isHost_?0:options_.udpJoinInvite.c_str();
     }
     if(steamMode_)netLog(isHost_?"Steam native HOST start":"Steam native JOIN start");
     NativeLock startPumpLock(&pumpCs_);
@@ -239,29 +232,6 @@ void NetLink::bumpSessionEpoch(bool rotateHostWorld) {
 bool NetLink::canQueueSaveBytes(unsigned bytes) const {
     NativeLock nativeLock200_outCs_((CRITICAL_SECTION*)&outCs_); const bool ok=bytes<128*1024 && publicationBytes_+pendingBytes_[SAVE_BULK]<256*1024;
     nativeLock200_outCs_.unlock(); NetDebugStats s; copyDebugStats(&s); return ok && s.pendingBulkBytes<512*1024;
-}
-bool NetLink::queueMakeUdpInvite(u64 generation,u32 request) {
-    NativeLock nativeLock210_outCs_(&outCs_);
-    if(!running_ || !isHost_ || steamMode_ || generation!=sessionGeneration_ || !request || commands_.size()>=32) { nativeLock210_outCs_.unlock();return false; }
-    Command c;c.generation=generation;c.requestId=request;c.serial=++inviteSerial_;commands_.push_back(c);SecureZeroMemory(invite_,sizeof(invite_));
-    NativeLock nativeLock213_statusCs_(&statusCs_);status_.inviteRequestId=request;status_.inviteResult=-1;nativeLock213_statusCs_.unlock();nativeLock210_outCs_.unlock();return true;
-}
-bool NetLink::copyUdpInvite(u64 generation,u32 request,char* out,unsigned cap) const {
-    if(!out || !cap)return false;out[0]=0;
-    NativeLock nativeLock217_outCs_((CRITICAL_SECTION*)&outCs_); NetStatus s;copyStatus(&s);
-    bool ok=generation==sessionGeneration_ && request==s.inviteRequestId && s.inviteResult==COOP_NET_OK && invite_[0] && strlen(invite_)<cap;
-    if(ok)strcpy(out,invite_);nativeLock217_outCs_.unlock();return ok;
-}
-void NetLink::processCommands() {
-    std::deque<Command> q;NativeLock nativeLock222_outCs_(&outCs_);q.swap(commands_);nativeLock222_outCs_.unlock();
-    for(size_t i=0;i<q.size();++i) {
-        const Command& c=q[i];if(c.generation!=sessionGeneration_)continue;
-        char secret[COOP_NET_INVITE_CAPACITY]={0},error[COOP_NET_ERROR_CAPACITY]={0};
-        int r=api_.makeInvite(options_.udpHostProfilePath.c_str(),secret,sizeof(secret),error,sizeof(error));
-        NativeLock nativeLock228_outCs_(&outCs_);NativeLock nativeLock228_statusCs_(&statusCs_);
-        if(c.serial==inviteSerial_ && status_.inviteRequestId==c.requestId && status_.sessionGeneration==c.generation) {status_.inviteResult=r;if(r==COOP_NET_OK)memcpy(invite_,secret,sizeof(invite_));}
-        nativeLock228_statusCs_.unlock();nativeLock228_outCs_.unlock();SecureZeroMemory(secret,sizeof(secret));SecureZeroMemory(error,sizeof(error));
-    }
 }
 void NetLink::setLocalName(const char* name) {
     NativeLock nativeLock242_nameCs_(&nameCs_);
@@ -762,7 +732,7 @@ void NetLink::threadLoop() {
 #endif
     setHandshakeCounts(connectAttempts,0);
     while(!stopFlag_) {
-        processCommands();drainPending();
+        drainPending();
         if(stopFlag_)break;
         const DWORD attemptNow=GetTickCount();
         if(!isHost_ && !serverConnection_ && nativeAttemptActive && attemptNow-lastConnectAttempt>=NATIVE_CONNECT_TIMEOUT_MS) {

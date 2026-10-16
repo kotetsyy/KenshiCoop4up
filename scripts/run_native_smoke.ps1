@@ -20,13 +20,11 @@ New-Item -ItemType Directory -Path $Evidence | Out-Null
 $Originals=@($RunState.Backups | ForEach-Object {
     [PSCustomObject]@{Path=$_.Path;Existed=$_.Existed;Hash=$(if($_.Existed){(Get-FileHash -LiteralPath $_.Path -Algorithm SHA256).Hash}else{''})}
 })
-$Profile=Join-Path $Evidence 'udp-host.private'
 $Ready=$false
 try {
     Install-CoopRuntime -Files $Inputs -Installations @($GameRoot)
     foreach ($Variable in @(Get-ChildItem Env: | Where-Object Name -like 'KENSHICOOP_*')) { Remove-Item -LiteralPath "Env:$($Variable.Name)" }
     $env:KENSHICOOP_LOG=Join-Path $Evidence 'KenshiCoop_native_smoke.log'
-    $env:KENSHICOOP_UDP_PROFILE_PATH=$Profile
     $env:KENSHICOOP_AUTOCONNECT=$(if($AutoConnect){'1'}else{'0'})
     $env:KENSHICOOP_ROLE='host'
     $env:KENSHICOOP_TRANSPORT='udp'
@@ -58,8 +56,7 @@ try {
         if ((Get-FileHash -LiteralPath (Join-Path $ModRoot $Name)).Hash -cne (Get-FileHash -LiteralPath $Inputs[$Name]).Hash) { throw 'Installed runtime changed during controlled native smoke.' }
     }
 } finally {
-    try { Restore-CoopRunState -State $RunState }
-    finally { if (Test-Path -LiteralPath $Profile) { Remove-Item -LiteralPath $Profile -Force } }
+    Restore-CoopRunState -State $RunState
     foreach ($Original in $Originals) {
         if ($Original.Existed) {
             if ((Get-FileHash -LiteralPath $Original.Path -Algorithm SHA256).Hash -cne $Original.Hash) { throw "Exact original runtime/config restore failed: $($Original.Path)" }

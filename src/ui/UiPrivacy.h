@@ -38,13 +38,6 @@ inline std::string steam(unsigned long long id, bool report) {
     return report ? std::string("[Steam ID]") : coop::maskSteamId64(id);
 }
 inline std::string line(std::string s, const CoopUiSnapshot& st, bool report) {
-    // Defense in depth: native credentials are opaque and consume their token.
-    size_t secret = 0;
-    while ((secret = s.find("KCU1", secret)) != std::string::npos) {
-        size_t end = s.find_first_of(" \t\r\n'\"", secret);
-        s.replace(secret, end == std::string::npos ? s.size() - secret : end - secret, "[invitation]");
-        secret += 12;
-    }
     const size_t colon = s.find(": ");
     const std::string key = colon == std::string::npos ? std::string() : s.substr(0, colon);
     // Diagnostic payloads can lag an edited endpoint. Mask the address field

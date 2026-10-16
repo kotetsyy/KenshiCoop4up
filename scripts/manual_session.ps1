@@ -220,7 +220,6 @@ if ($TitleScreen) {
 
 $ownedDirs = @(Get-CoopManualGameDirs -HostDir $HostDir -JoinDir $JoinDir -NoJoin ([bool]$NoJoin))
 $runState = New-CoopRunState -GameDirs $ownedDirs -PreserveSaves
-$credentials = $null
 $repoRoot = Split-Path -Parent $scriptDir
 $dest = Join-Path $repoRoot ('tools\manual-sessions\' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
 try {
@@ -251,8 +250,6 @@ if (-not $SkipDeploy) {
     Write-Host "=== deploy SKIPPED (-SkipDeploy): installs keep their current DLL ==="
 }
 
-$native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
-$credentials = New-CoopLocalCredentials -NativeBin $native.Bin -GameDirs $ownedDirs
 
 if ($Sync -and $NoJoin) {
     Write-Host 'Skipping -Sync: no join game is owned in host-only mode.'
@@ -281,7 +278,6 @@ function Set-CoopEnv {
     # the file. For a real two-machine Steam test, use the in-game F2 panel instead.
     $env:KENSHICOOP_TRANSPORT    = "udp"
     $env:KENSHICOOP_STEAM_PEER   = "0"
-    Set-CoopPrivateCredentials -Mode $Mode -UseSteam $false -GameDirs $ownedDirs -ProfilePath $credentials.Profile -InviteFile $credentials.Invite
     # Auto-connect at load using the env role/transport above. EXCEPTION: with
     # -JoinFromMenu the JOIN must WAIT at the main menu so the user can bring up
     # the F2 panel and go ONLINE by hand (the whole point of that mode - the join
@@ -408,5 +404,5 @@ foreach ($client in @(@{Dir=$HostDir;Role='host'},@{Dir=$JoinDir;Role='join'})) 
 }
 Write-Host "Manual session artifacts: $dest"
 } finally {
-    Restore-CoopHarnessSession -State $runState -CredentialRoot $(if ($credentials) { $credentials.Root } else { '' })
+    Restore-CoopHarnessSession -State $runState
 }

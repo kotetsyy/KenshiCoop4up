@@ -82,6 +82,5 @@ echo   2) Deploy explicitly: scripts\deploy.cmd "%SRC%" Harness nomirror
 echo                        scripts\deploy.cmd "%DST%" Harness nomirror
 echo   3) Launch HOST: scripts\launch_host.cmd
 echo   4) Launch JOIN: scripts\launch_join.cmd
-echo   UDP JOIN requires its own private invitation FILE outside both game trees.
-echo   Set KENSHICOOP_UDP_INVITE_FILE to that file; never copy a host signing profile.
+echo   UDP JOIN needs only the host numeric IP and port; no invitation or key.
 endlocal

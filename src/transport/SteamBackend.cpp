@@ -154,13 +154,4 @@ bool authorizeRemote(const NativeBackend& backend, const CoopNetConfig& config,
     }
     return true;
 }
-
-int32_t prepareHostCredential(const char*, char* error, uint32_t capacity) {
-    return fail(error, capacity, COOP_NET_INVALID, "Host credential provisioning is UDP-only");
-}
-int32_t createClientInvite(const char*, char* invite, uint32_t inviteCapacity,
-                           char* error, uint32_t capacity) {
-    if (invite && inviteCapacity) invite[0] = 0;
-    return fail(error, capacity, COOP_NET_INVALID, "Client credential invitations are UDP-only");
-}
 }

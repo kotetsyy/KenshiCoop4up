@@ -222,7 +222,6 @@ $joinPng = Join-Path $OutDir "join.png"
 $fixtureNames = @($Save)
 if (-not $PreserveFixtureOutput) { $fixtureNames += 'coopresume' }
 $runState = New-CoopRunState -GameDirs @($HostDir,$JoinDir) -SaveNames $fixtureNames
-$credentials = $null
 try {
 $preserve = if ($Scenario -eq 'spike') { @('KENSHICOOP_SPIKE') } else { @() }
 Clear-CoopRunEnvironment -State $runState -PreserveVariables $preserve
@@ -232,7 +231,6 @@ if ($Scenario -eq 'spike') {
 }
 $native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
 Install-CoopHarnessRuntime -RepoRoot $repoRoot -GameDirs @($HostDir,$JoinDir) -NativeBin $native.Bin
-$credentials = New-CoopLocalCredentials -NativeBin $native.Bin -GameDirs @($HostDir,$JoinDir)
 # ---- WAN Winsock proxy (below-native-GNS delay/jitter/loss) ----------------------
 $wanProc = $null
 $wanSeed  = $null
@@ -359,7 +357,6 @@ function Set-CoopEnv {
     # runner (run_lan_test.ps1) and are unaffected.
     $env:KENSHICOOP_TRANSPORT    = "udp"
     $env:KENSHICOOP_STEAM_PEER   = "0"
-    Set-CoopPrivateCredentials -Mode $Mode -UseSteam $false -GameDirs @($HostDir,$JoinDir) -ProfilePath $credentials.Profile -InviteFile $credentials.Invite
     # The join connects through the WAN proxy when one is active.
     $env:KENSHICOOP_PORT         = if ($Mode -eq "join") { "$joinPort" } else { "$Port" }
     $env:KENSHICOOP_IP           = if ($Mode -eq "join") { $joinIp } else { $Ip }
@@ -622,7 +619,7 @@ if ($Frames -gt 1) {
     }
     throw
 } finally {
-    try { Restore-CoopHarnessSession -State $runState -CredentialRoot $(if ($credentials) { $credentials.Root } else { '' }) -Proxy $wanProc }
+    try { Restore-CoopHarnessSession -State $runState -Proxy $wanProc }
     catch {
         $ownedExitFailures += "Restoration failed: $($_.Exception.Message)"
         if ($null -ne $runJson) {

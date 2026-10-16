@@ -1,3 +1,13 @@
+## Локальные изменения после v0.2.0 — ещё не опубликованы
+
+- Прямой UDP теперь использует только IP:port: без ключей, паролей, индивидуальных приглашений и ручного допуска.
+- Из F2 убраны создание/копирование UDP-приглашений и дополнительное поле клиента; хост задаёт порт, клиент — адрес с портом.
+- Удалены профиль допуска, генератор приглашений и прежний authenticated-IP patch. Сохранены GNS, шифрование, лимит HOST + 3 JOIN, проверка пакетов и барьер готовности мира. Steam-аутентификация не отключена.
+- У открытого UDP нет проверки личности: любой, кто достиг порта, может занять свободное место. Шифрование не заменяет аутентификацию; обход NAT/CGNAT не добавлен.
+- Локальная версия **0.2.1**, Release **82** / Harness **83**, native ABI3 / UI API4. Всем участникам нужен полный одинаковый комплект; переход с v0.2.0 устанавливается вручную, поскольку старый updater не принимает новый ABI.
+
+<details><summary>Опубликованный v0.2.0: изменения и известные ограничения</summary>
+
 ## Новая сетевая инфраструктура
 
 Это крупный переход со старой сетевой ветки, а не только исправление торговли.
@@ -81,5 +91,7 @@ Procedural scope snapshots/reconciliation, environment items, resource container
 ### Installation
 
 The first upgrade from 0.1.x must be manual: close Kenshi and install the six files from **`KenshiCoop-kit.zip`** into `<Kenshi>/mods/KenshiCoop/`. RE_Kenshi is required. Preserve config and saves. Subsequent updates replace all four DLLs together; `.mod` and `RE_Kenshi.json` come from the full kit. Harness auto-updates are disabled.
+
+</details>
 
 </details>

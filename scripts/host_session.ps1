@@ -74,7 +74,7 @@ $upnp = $null
 
 $runState = New-CoopRunState -GameDirs @($HostDir) -SaveNames @($Save,'coopresume') -PreserveSaves:$isFree
 try {
-Clear-CoopRunEnvironment -State $runState -PreserveCredentials
+Clear-CoopRunEnvironment -State $runState
 if (-not $SkipBuild) {
     Write-Host "=== build + deploy ==="
     & cmd.exe /c "`"$scriptDir\build_plugin.cmd`""
@@ -163,7 +163,6 @@ if ($useSteam) {
     $env:KENSHICOOP_TRANSPORT  = "udp"
     $env:KENSHICOOP_STEAM_PEER = "0"
 }
-Set-CoopPrivateCredentials -Mode host -UseSteam $useSteam -GameDirs @($HostDir)
 
     Write-Host "Launching HOST (save '$Save', scenario '$Scenario', port $Port) ..."
     $out = Start-CoopOwnedGame -State $runState -ScriptDir $scriptDir -ExePath (Join-Path $HostDir 'kenshi_x64.exe') -WorkDir $HostDir -TimeoutSec $prof.StartTimeoutSec -NativeOutput $NativeBin

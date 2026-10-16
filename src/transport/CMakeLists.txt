@@ -38,27 +38,6 @@ set(USE_CRYPTO BCrypt CACHE STRING "" FORCE)
 set(USE_CRYPTO25519 Reference CACHE STRING "" FORCE)
 FetchContent_Declare(gns URL "${GNS_URL}" URL_HASH "SHA256=${GNS_SHA}" DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(gns)
-# Standalone GNS rejects strict IP listeners even with an imported valid
-# certificate. This pinned patch fixes admission startup, not peer verification.
-string(JSON GNS_PATCH GET "${COOP_PINS}" gns patch)
-string(JSON GNS_PATCH_SHA GET "${COOP_PINS}" gns patchSha256)
-set(GNS_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/${GNS_PATCH}")
-file(SHA256 "${GNS_PATCH}" GNS_PATCH_ACTUAL_SHA)
-if(NOT GNS_PATCH_ACTUAL_SHA STREQUAL GNS_PATCH_SHA)
-    message(FATAL_ERROR "Pinned GNS authentication patch SHA-256 mismatch")
-endif()
-find_package(Git REQUIRED)
-execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${gns_SOURCE_DIR}" apply --reverse --check "${GNS_PATCH}"
-    RESULT_VARIABLE GNS_PATCH_ALREADY_APPLIED OUTPUT_QUIET ERROR_QUIET)
-if(NOT GNS_PATCH_ALREADY_APPLIED EQUAL 0)
-    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${gns_SOURCE_DIR}" apply "${GNS_PATCH}"
-        RESULT_VARIABLE GNS_PATCH_RESULT ERROR_VARIABLE GNS_PATCH_ERROR)
-    if(NOT GNS_PATCH_RESULT EQUAL 0)
-        message(FATAL_ERROR "Cannot apply pinned GNS authentication patch: ${GNS_PATCH_ERROR}")
-    endif()
-endif()
-target_compile_definitions(GameNetworkingSockets_s PRIVATE
-    STEAMNETWORKINGSOCKETS_ALLOW_DYNAMIC_SELFSIGNED_CERTS)
 
 function(coop_native_target target steam)
     target_compile_definitions(${target} PRIVATE
@@ -77,16 +56,10 @@ add_library(KenshiCoopNetSteam SHARED Provider.cpp SteamBackend.cpp)
 coop_native_target(KenshiCoopNetSteam 1)
 # No steam_api import library: borrow only the game's initialized context.
 
-add_library(KenshiCoopNetUDP SHARED Provider.cpp UdpBackend.cpp Credentials.cpp)
+add_library(KenshiCoopNetUDP SHARED Provider.cpp UdpBackend.cpp)
 coop_native_target(KenshiCoopNetUDP 0)
-target_compile_definitions(KenshiCoopNetUDP PRIVATE
-    STEAMNETWORKINGSOCKETS_OPENSOURCE STEAMNETWORKINGSOCKETS_ALLOW_DYNAMIC_SELFSIGNED_CERTS
-    VALVE_CRYPTO_ENABLE_25519 VALVE_CRYPTO_BCRYPT VALVE_CRYPTO_25519_DONNA ED25519_HASH_BCRYPT)
-target_include_directories(KenshiCoopNetUDP PRIVATE
-    "${gns_SOURCE_DIR}/src" "${gns_SOURCE_DIR}/src/common"
-    "${gns_SOURCE_DIR}/src/public" "${gns_BINARY_DIR}/src"
-    "${gns_SOURCE_DIR}/src/steamnetworkingsockets" "${COOP_PROTOBUF_ROOT}/include")
-target_link_libraries(KenshiCoopNetUDP PRIVATE GameNetworkingSockets::static advapi32 crypt32)
+target_compile_definitions(KenshiCoopNetUDP PRIVATE STEAMNETWORKINGSOCKETS_OPENSOURCE)
+target_link_libraries(KenshiCoopNetUDP PRIVATE GameNetworkingSockets::static)
 
 # Sanctioned RE_Kenshi-loaded probe; no injection or replacement Steam DLL.
 add_library(KenshiCoopSteamProbe SHARED SteamProbe.cpp SteamBackend.cpp Provider.cpp)
@@ -95,9 +68,4 @@ target_link_libraries(KenshiCoopSteamProbe PRIVATE user32)
 
 add_executable(transport_integration tests/TransportIntegration.cpp)
 coop_native_target(transport_integration 0)
-target_link_libraries(transport_integration PRIVATE ws2_32 advapi32 psapi crypt32)
-
-# Private credential provisioning tool: invokes the real ABI, no game core.
-add_executable(transport_credentials tools/TransportCredentials.cpp)
-coop_native_target(transport_credentials 0)
-target_link_libraries(transport_credentials PRIVATE advapi32)
+target_link_libraries(transport_integration PRIVATE ws2_32 advapi32 psapi)

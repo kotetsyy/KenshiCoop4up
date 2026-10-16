@@ -84,8 +84,7 @@ $JoinDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPa
 
 $runState = New-CoopRunState -GameDirs @($JoinDir) -SaveNames @($Save,'coopresume') -PreserveSaves:$isFree
 try {
-Clear-CoopRunEnvironment -State $runState -PreserveCredentials
-Set-CoopPrivateCredentials -Mode join -UseSteam $useSteam -GameDirs @($JoinDir)
+Clear-CoopRunEnvironment -State $runState
 if (-not $SkipBuild) {
     Write-Host "=== build + deploy ==="
     & cmd.exe /c "`"$scriptDir\build_plugin.cmd`""
@@ -127,7 +126,6 @@ if ($useSteam) {
     $env:KENSHICOOP_TRANSPORT  = "udp"
     $env:KENSHICOOP_STEAM_PEER = "0"
 }
-Set-CoopPrivateCredentials -Mode join -UseSteam $useSteam -GameDirs @($JoinDir)
 
 $target = if ($useSteam) { "steam:$(ConvertTo-SteamId64 $HostSteamId)" } else { "${HostIp}:$Port" }
 Write-Host "Launching JOIN -> $target (save '$Save', scenario '$Scenario') ..."

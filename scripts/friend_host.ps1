@@ -51,7 +51,6 @@ param(
     # baked save. BOTH sides must resume. Defaults to free play (no scenario).
     [switch]$Resume,
     # Save name the coordinated-save flow writes (must match the join's).
-    [string]$UdpProfilePath = $env:KENSHICOOP_UDP_PROFILE_PATH,
     [string]$RunToken = [Guid]::NewGuid().ToString('N'),
     [string]$ResumeSave = "coopresume"
 )
@@ -227,8 +226,7 @@ if ((Test-Path -LiteralPath $outDir) -or (Test-Path -LiteralPath $completionFile
 New-Item -ItemType Directory -Path $outDir | Out-Null
 try {
 $runState = New-CoopRunState -GameDirs @($KenshiDir) -SaveNames $ownedSaveNames -PreserveSaves:($Resume -and $Scenario -eq '')
-Clear-CoopRunEnvironment -State $runState -PreserveCredentials
-Set-CoopPrivateCredentials -Mode host -UseSteam $useSteam -GameDirs @($KenshiDir,$kitDir) -ProfilePath $UdpProfilePath
+Clear-CoopRunEnvironment -State $runState
 # ---- Install mod + save ------------------------------------------------------------
 $modDst = Join-Path $KenshiDir "mods\KenshiCoop"
 New-Item -ItemType Directory -Force -Path $modDst | Out-Null
@@ -337,7 +335,6 @@ if ($useSteam) {
     $env:KENSHICOOP_TRANSPORT  = "udp"
     $env:KENSHICOOP_STEAM_PEER = "0"
 }
-Set-CoopPrivateCredentials -Mode host -UseSteam $useSteam -GameDirs @($KenshiDir,$kitDir) -ProfilePath $UdpProfilePath
 
 $game = $null
 

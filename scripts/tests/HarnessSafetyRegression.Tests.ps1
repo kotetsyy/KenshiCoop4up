@@ -36,7 +36,7 @@ try {
     if($env:KENSHICOOP_CELL_AUTH -ne '0'){throw 'Scripted baseline not pinned'}
     [void](Set-CoopDiagEnv @{DiagEnv=@{KENSHICOOP_CELL_AUTH='1'}})
     if($env:KENSHICOOP_CELL_AUTH -ne '1'){throw 'Explicit manifest lost priority'}
-    $environmentState=@{Environment=@{KENSHICOOP_SPIKE='401';KENSHICOOP_UDP_PROFILE_PATH='private-profile'}}
+    $environmentState=@{Environment=@{KENSHICOOP_SPIKE='401'}}
     foreach ($none in @(@{Value=$null},@{Value=@()})) {
         $env:KENSHICOOP_MODE='stale'
         $env:KENSHICOOP_SPIKE='402'
@@ -45,10 +45,10 @@ try {
             $null -ne [Environment]::GetEnvironmentVariable('KENSHICOOP_SPIKE')) {throw 'No-preserve run retained inherited scenario environment'}
     }
     $env:KENSHICOOP_SPIKE='402'
-    $env:KENSHICOOP_UDP_PROFILE_PATH='stale-profile'
+    $env:KENSHICOOP_FIXTURE_STALE='stale-control'
     Clear-CoopRunEnvironment -State $environmentState -PreserveVariables @('KENSHICOOP_SPIKE')
     if ($env:KENSHICOOP_SPIKE -ne '401' -or
-        $null -ne [Environment]::GetEnvironmentVariable('KENSHICOOP_UDP_PROFILE_PATH')) {throw 'Explicit spike preservation retained stale credentials or lost captured scenario'}
+        $null -ne [Environment]::GetEnvironmentVariable('KENSHICOOP_FIXTURE_STALE')) {throw 'Explicit spike preservation retained stale controls or lost captured scenario'}
     Reject {New-CoopRunState -GameDirs @($root) -SaveNames @('../fixture')} 'invalid save before any topology/snapshot'
     $hostInstall=Join-Path $root 'Host'
     Reject {Assert-CoopPeerInstallationDisjoint -GameDir $hostInstall -PeerExecutable (Join-Path $hostInstall 'kenshi_x64.exe')} 'peer root executable installation'
@@ -121,12 +121,10 @@ public sealed class OwnedRollbackDelayedLock : IDisposable {
         if([IO.File]::ReadAllText((Join-Path $external 'existing.cfg')) -ne 'external' -or -not (Test-Path -LiteralPath $state.Root)){throw 'Restore followed redirected parent'}
     } finally {[IO.Directory]::Delete($parent)}
     $state=Snapshot 'uncertain-cleanup'; Add-CoopRunBackup $state $live
-    $credentials=Join-Path $root 'credentials'; New-Item -ItemType Directory -Path $credentials | Out-Null
-    [IO.File]::WriteAllText((Join-Path $credentials 'host.credential'),'private-fixture')
     $unassociated=New-Object Diagnostics.Process; $state.Processes[123]=$unassociated
     $state.Environment['KENSHICOOP_FIXTURE_ORIGINAL']='captured'; $env:KENSHICOOP_FIXTURE_ORIGINAL='replacement'; $env:KENSHICOOP_FIXTURE_NEW='new'
-    try {Reject {Restore-CoopHarnessSession $state $credentials} 'uncertain closure'} finally {$unassociated.Dispose()}
-    if(-not (Test-Path -LiteralPath $credentials) -or -not (Test-Path -LiteralPath $state.Root) -or $env:KENSHICOOP_FIXTURE_ORIGINAL -ne 'captured' -or $null -ne [Environment]::GetEnvironmentVariable('KENSHICOOP_FIXTURE_NEW')){throw 'Uncertain cleanup lost credentials/backups/environment'}
+    try {Reject {Restore-CoopHarnessSession -State $state} 'uncertain closure'} finally {$unassociated.Dispose()}
+    if(-not (Test-Path -LiteralPath $state.Root) -or $env:KENSHICOOP_FIXTURE_ORIGINAL -ne 'captured' -or $null -ne [Environment]::GetEnvironmentVariable('KENSHICOOP_FIXTURE_NEW')){throw 'Uncertain cleanup lost backups/environment'}
     # Setter must preserve every unrelated byte, BOM and newline, even bracket paths.
     $cfgDir=Join-Path $root 'config[owned]'; New-Item -ItemType Directory -Path $cfgDir | Out-Null
     $setter=Join-Path $scripts 'set_video_mode.ps1'; $cfg=Join-Path $cfgDir 'kenshi.cfg'

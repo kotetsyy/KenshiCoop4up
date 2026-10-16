@@ -7,12 +7,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define COOP_NET_ABI_VERSION 2u
+#define COOP_NET_ABI_VERSION 3u
 #define COOP_NET_MAX_MESSAGE (512u * 1024u)
 /* Pinned GNS silently makes larger "unreliable" messages reliable. */
 #define COOP_NET_MAX_STATE_MESSAGE 16500u
 #define COOP_NET_ERROR_CAPACITY 256u
-#define COOP_NET_INVITE_CAPACITY 4096u
 #define COOP_NET_MAX_PEERS 3u
 
 #if defined(_WIN32)
@@ -70,12 +69,9 @@ typedef struct CoopNetConfig {
     uint32_t sendBufferBytes;
     uint32_t bulkQueueBytes;
     uint32_t maxPeers;
-    /* UTF-8, borrowed for start only. UDP address is numeric IPv4/IPv6;
-       profilePath is a private local host credential, never a shipped asset.
-       joinInvite is an out-of-band per-client credential; never log its bytes. */
+    /* UTF-8, borrowed for start only. UDP address is numeric IPv4/IPv6.
+       Direct UDP admission uses the endpoint alone, without credentials. */
     const char* address;
-    const char* profilePath;
-    const char* joinInvite;
 } CoopNetConfig;
 
 typedef struct CoopNetEvent {
@@ -144,13 +140,6 @@ typedef struct CoopNetApi {
     int32_t (COOP_NET_CALL *status)(void* context, CoopNetStatus* status);
     int32_t (COOP_NET_CALL *peerStats)(void* context, uint32_t connection,
                                      CoopNetPeerStats* stats);
-    /* UDP only. Private host profile provision and per-client invite issue
-       use Valve's certificate/crypto implementation, not a custom cipher. */
-    int32_t (COOP_NET_CALL *prepareHost)(const char* profilePath,
-                                      char* error, uint32_t errorCapacity);
-    int32_t (COOP_NET_CALL *makeInvite)(const char* profilePath, char* invite,
-                                     uint32_t inviteCapacity, char* error,
-                                     uint32_t errorCapacity);
     /* Steam only, MAIN GAME THREAD ONLY. The shared Steam interface may
        dispatch callbacks owned by the game. Never call this from the worker.
        No context parameter: backend pointer publication/lifetime is owned

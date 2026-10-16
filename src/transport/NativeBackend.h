@@ -6,15 +6,12 @@
 #include "TransportApi.h"
 #include <steam/isteamnetworkingsockets.h>
 #include <steam/isteamnetworkingutils.h>
-#include <string>
 
 namespace coopnet {
 struct NativeBackend {
     ISteamNetworkingSockets* sockets = nullptr;
     ISteamNetworkingUtils* utils = nullptr;
     uint64_t selfSteamId = 0;
-    std::string expectedHostIdentity;
-    std::string clientIdentityPrefix;
     bool initialized = false;
 };
 
@@ -29,16 +26,11 @@ int32_t pumpBackendMainThread();
 /* Raw allocated-message send after the provider's validation/pressure gates. */
 int32_t sendNativePayload(NativeBackend& backend, uint32_t handle, uint32_t traffic,
                           const void* data, uint32_t size);
-/* Called before accepting an incoming peer and after authenticated CONNECTED.
-   Must validate identity/role/expected host; the common session enforces
-   maxPeers without a manual Steam ID allowlist. */
+/* Called before accepting an incoming peer and at CONNECTED. Steam validates
+   its authenticated identity; UDP requires encrypted, non-relayed connections.
+   The common session enforces maxPeers without a manual allowlist. */
 bool authorizeRemote(const NativeBackend& backend, const CoopNetConfig& config,
                      const SteamNetConnectionInfo_t& info, char* error,
                      uint32_t errorCapacity);
-int32_t prepareHostCredential(const char* profilePath, char* error,
-                              uint32_t errorCapacity);
-int32_t createClientInvite(const char* profilePath, char* invite,
-                           uint32_t inviteCapacity, char* error,
-                           uint32_t errorCapacity);
 }
 #endif

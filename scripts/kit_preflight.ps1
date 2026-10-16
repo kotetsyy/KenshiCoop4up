@@ -144,8 +144,7 @@ function Wait-PluginLoaded {
     return $false
 }
 
-# Private harness helpers. Runtime assets and credential material have separate
-# roots: neither a host signing profile nor a client invitation belongs in a kit.
+# Private harness helpers retain runtime, process and save ownership boundaries.
 function Assert-CoopRuntime {
     param([string]$ModDir)
     $names = @('KenshiCoop.dll','KenshiCoopUI.dll','KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','KenshiCoop.mod','RE_Kenshi.json')
@@ -161,92 +160,6 @@ function Assert-CoopRuntime {
     }
 }
 
-function Assert-CoopPrivatePath {
-    param([string]$Path, [string[]]$GameDirs)
-    if (-not $Path -or $Path -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)') { throw 'Credential path must be an absolute file path.' }
-    $full = [IO.Path]::GetFullPath($Path)
-    $ancestor = $full
-    while ($ancestor) {
-        if (Test-Path -LiteralPath $ancestor) {
-            if ((Get-Item -LiteralPath $ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                throw 'Credential paths must not traverse reparse points.'
-            }
-        }
-        $ancestor = [IO.Path]::GetDirectoryName($ancestor)
-    }
-    foreach ($dir in (@($GameDirs) + @((Join-Path $env:LOCALAPPDATA 'kenshi\save')))) {
-        if (-not $dir) { continue }
-        $root = [IO.Path]::GetFullPath($dir).TrimEnd('\') + '\'
-        if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Private credentials must be outside game and kit trees.'
-        }
-    }
-    return $full
-}
-
-function Set-CoopPrivateCredentials {
-    param([string]$Mode, [bool]$UseSteam, [string[]]$GameDirs, [string]$ProfilePath = $env:KENSHICOOP_UDP_PROFILE_PATH, [string]$InviteFile = $env:KENSHICOOP_UDP_INVITE_FILE)
-    $env:KENSHICOOP_UDP_PROFILE_PATH = $null
-    $env:KENSHICOOP_UDP_INVITE_FILE = $null
-    if ($UseSteam) {
-        if ($Mode -eq 'host') {
-            $env:KENSHICOOP_STEAM_PEER = '0'
-        }
-        return
-    }
-    if ($Mode -eq 'host') {
-        if (-not $ProfilePath) { $ProfilePath = Join-Path $env:LOCALAPPDATA 'KenshiCoop\private\udp-host.credential' }
-        $env:KENSHICOOP_UDP_PROFILE_PATH = Assert-CoopPrivatePath $ProfilePath $GameDirs
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $env:KENSHICOOP_UDP_PROFILE_PATH) | Out-Null
-    } else {
-        $env:KENSHICOOP_UDP_INVITE_FILE = Assert-CoopPrivatePath $InviteFile $GameDirs
-        if (-not (Test-Path -LiteralPath $env:KENSHICOOP_UDP_INVITE_FILE -PathType Leaf)) { throw 'Import this client''s private UDP invitation file before joining.' }
-        $size = (Get-Item -LiteralPath $env:KENSHICOOP_UDP_INVITE_FILE).Length
-        if ($size -lt 6 -or $size -ge 4096) { throw 'Invalid invitation file size.' }
-        $file = Get-Item -LiteralPath $env:KENSHICOOP_UDP_INVITE_FILE
-        if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Invitation file cannot be a reparse point.' }
-        $allowed = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,'S-1-5-18')
-        foreach ($rule in (Get-Acl -LiteralPath $file.FullName).Access) {
-            if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin $allowed) {
-                throw 'Invitation file must grant access only to this Windows user and SYSTEM.'
-            }
-        }
-    }
-}
-
-function New-CoopUdpCredentials {
-    param([string]$NativeBin, [string]$ProfilePath, [string]$InviteFile, [string[]]$GameDirs)
-    # Validate BOTH paths before directory mutation or the real provider call.
-    $profile = Assert-CoopPrivatePath $ProfilePath $GameDirs
-    $invite = Assert-CoopPrivatePath $InviteFile $GameDirs
-    if (Test-Path -LiteralPath $invite) { throw 'A new private invitation file is required.' }
-    $tool = Join-Path $NativeBin 'transport_credentials.exe'
-    $provider = Join-Path $NativeBin 'KenshiCoopNetUDP.dll'
-    foreach ($file in @($tool,$provider)) {
-        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw 'Complete private native provisioning inputs required.' }
-    }
-    foreach ($dir in @((Split-Path -Parent $profile),(Split-Path -Parent $invite)) | Select-Object -Unique) {
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    }
-    & $tool --udp $provider --profile $profile --invite-file $invite | ForEach-Object { Write-Host "$_" }
-    if ($LASTEXITCODE -ne 0) { throw 'Native credential provisioning failed.' }
-    return @{ Profile=$profile; Invite=$invite }
-}
-
-function New-CoopLocalCredentials {
-    param([string]$NativeBin, [string[]]$GameDirs)
-    $root = Join-Path $env:LOCALAPPDATA ('KenshiCoop\private\harness-' + [Guid]::NewGuid().ToString('N'))
-    try {
-        $result = New-CoopUdpCredentials -NativeBin $NativeBin -ProfilePath (Join-Path $root 'host.credential') -InviteFile (Join-Path $root 'client.invite') -GameDirs $GameDirs
-        return @{ Root=$root; Profile=$result.Profile; Invite=$result.Invite }
-    } catch {
-        if (Test-Path -LiteralPath $root) {
-            Assert-CoopOwnedPath -Path $root -Recurse
-            Remove-Item -LiteralPath $root -Recurse -Force
-        }
-        throw
-    }
-}
 
 function Get-CoopWindowPlacement {
     param($Work,[int]$Slot,[int]$Columns,[int]$Width,[int]$Height,[int]$Gap=20)
@@ -368,13 +281,12 @@ function Get-CoopManualGameDirs {
 
 
 function Clear-CoopRunEnvironment {
-    param($State, [switch]$PreserveCredentials, [string[]]$PreserveVariables = @())
+    param($State, [string[]]$PreserveVariables = @())
     if (-not $State) { throw 'An environment snapshot is required before clearing the run.' }
     foreach ($variable in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'KENSHICOOP_*' })) {
         [Environment]::SetEnvironmentVariable($variable.Name,[NullString]::Value,'Process')
     }
     $names=@($PreserveVariables) -ne $null
-    if ($PreserveCredentials) { $names+=@('KENSHICOOP_UDP_PROFILE_PATH','KENSHICOOP_UDP_INVITE_FILE') }
     foreach ($name in $names) {
         if ($State.Environment.ContainsKey($name)) {
             [Environment]::SetEnvironmentVariable($name,[string]$State.Environment[$name],'Process')
@@ -727,17 +639,11 @@ function Restore-CoopRunState {
 }
 
 function Restore-CoopHarnessSession {
-    param($State, [string]$CredentialRoot = '', $Proxy = $null)
+    param($State, $Proxy = $null)
     try {
         if ($null -ne $Proxy -and -not $Proxy.HasExited) { $Proxy.Kill(); $Proxy.WaitForExit() }
     } finally {
-        try { Restore-CoopRunState $State }
-        finally {
-            if ($State -and $State.CleanupOwned -and $CredentialRoot -and (Test-Path -LiteralPath $CredentialRoot)) {
-                Assert-CoopOwnedPath -Path $CredentialRoot -Recurse
-                Remove-Item -LiteralPath $CredentialRoot -Recurse -Force -ErrorAction Stop
-            }
-        }
+        Restore-CoopRunState $State
     }
 }
 

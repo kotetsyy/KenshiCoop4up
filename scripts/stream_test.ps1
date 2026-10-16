@@ -93,7 +93,6 @@ Write-Host "  seconds:    $Seconds (self-exit)"
 Write-Host "  out dir:    $OutDir"
 
 $runState = New-CoopRunState -GameDirs @($HostDir,$JoinDir)
-$credentials = $null
 try {
 $encoding = [Text.Encoding]::GetEncoding(28591)
 $pattern = '(?m)^(\s*User save location\s*=\s*)[01](\s*)$'
@@ -126,8 +125,6 @@ if (-not $SkipDeploy) {
     Install-CoopHarnessRuntime -RepoRoot $repoRoot -GameDirs @($HostDir,$JoinDir) -NativeBin $NativeBin
 }
 
-$native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
-$credentials = New-CoopLocalCredentials -NativeBin $native.Bin -GameDirs @($HostDir,$JoinDir)
 function Set-CoopEnv {
     param([string]$Mode, [string]$SaveName, [string]$Log, [string]$ForceStream)
     Clear-CoopRunEnvironment -State $runState
@@ -135,7 +132,6 @@ function Set-CoopEnv {
     # Same-machine loopback: force direct UDP (Steam P2P can't self-connect).
     $env:KENSHICOOP_TRANSPORT     = "udp"
     $env:KENSHICOOP_STEAM_PEER    = "0"
-    Set-CoopPrivateCredentials -Mode $Mode -UseSteam $false -GameDirs @($HostDir,$JoinDir) -ProfilePath $credentials.Profile -InviteFile $credentials.Invite
     $env:KENSHICOOP_PORT          = "$Port"
     $env:KENSHICOOP_IP            = $Ip
     $env:KENSHICOOP_SAVE          = $SaveName   # host: real save; join: "" (menu)
@@ -226,7 +222,7 @@ $healthHost = Test-LogHealth -File $hostLog -Label 'host' -Required $true -Clean
 $healthJoin = Test-LogHealth -File $joinLog -Label 'join' -Required $true -CleanPattern 'test duration elapsed; exiting'
 $ok = $status -eq 'PASS' -and $healthHost -eq 'PASS' -and $healthJoin -eq 'PASS' -and $ownedExitFailures.Count -eq 0
 } finally {
-    Restore-CoopHarnessSession -State $runState -CredentialRoot $(if ($credentials) { $credentials.Root } else { '' })
+    Restore-CoopHarnessSession -State $runState
 }
 Write-Host ("STREAM-TEST RESULT: " + $(if ($ok) { 'PASS' } else { 'FAIL' }))
 if ($ok) { exit 0 } else { exit 1 }

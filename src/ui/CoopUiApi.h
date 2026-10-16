@@ -2,7 +2,7 @@
 #ifndef KENSHICOOP_UI_API_H
 #define KENSHICOOP_UI_API_H
 
-#define COOP_UI_API_VERSION 3u
+#define COOP_UI_API_VERSION 4u
 #define COOP_UI_CALL __cdecl
 
 // Do not inherit packing from an engine/wire header included by a consumer.
@@ -53,14 +53,10 @@ typedef struct CoopUiSnapshot {
     int playerCount;
     CoopUiPlayer players[4];
     unsigned long long sessionGeneration;
-    unsigned int inviteRequestId;
-    int inviteResult;              // -1 pending/none; native result on completion
-    const char* udpInvite;         // secret, explicit successful request only
 } CoopUiSnapshot;
 
 typedef enum CoopUiCommandKind {
-    COOP_UI_NONE, COOP_UI_REMEMBER, COOP_UI_CONNECT, COOP_UI_DISCONNECT,
-    COOP_UI_MAKE_UDP_INVITE
+    COOP_UI_NONE, COOP_UI_REMEMBER, COOP_UI_CONNECT, COOP_UI_DISCONNECT
 } CoopUiCommandKind;
 
 typedef struct CoopUiSettings {
@@ -79,9 +75,6 @@ typedef struct CoopUiCommand {
     int kind;
     CoopUiSettings settings;
     unsigned long long sessionGeneration;
-    unsigned int inviteRequestId;
-    // Credential is never part of remembered settings; CONNECT UDP-join only.
-    char udpJoinInvite[4096];
 } CoopUiCommand;
 
 typedef struct CoopUiHost {

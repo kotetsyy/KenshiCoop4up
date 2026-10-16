@@ -36,6 +36,11 @@
 > Steam P2P между двумя реальными аккаунтами ещё не сертифицирован;
 > реальные сессии на 3–4 игроков и устранение всех рассинхронов не подтверждены.
 
+> **Локальная v0.2.1 ещё не опубликована:** UDP подключается только по IP:port,
+> без ключей и приглашений. Release — протокол **82**, Harness — **83**,
+> native ABI3/UI API4. Переход с v0.2.0 — вручную полным комплектом на всех машинах;
+> старый updater не принимает новый ABI. Доступ к порту открыт без проверки личности.
+
 ## Разработка KenshiCoop4up
 
 - **Автообновление.** Все игроки обязаны использовать одну версию. После ручного
@@ -142,6 +147,8 @@ READY подтверждает текущий `LOAD_GO` и полное согл
 Панель работает и в **главном меню**, и в игре, так что подключающемуся не нужно
 ничего предварительно загружать.
 
+Ниже описана локальная v0.2.1. Опубликованный v0.2.0 ещё требует UDP-приглашения.
+
 1. Нажмите **F2**.
 2. **Введите ник** в поле. Поддерживаются кириллица, выделение, редактирование
    и **Ctrl+V**. Поле ника занимает всю ширину строки, отдельной кнопки вставки нет.
@@ -150,12 +157,12 @@ READY подтверждает текущий `LOAD_GO` и полное согл
    Ручное добавление SteamID гостей в список разрешённых не требуется.
 5. **Steam, клиент:** введите SteamID64 хоста и подключитесь; хост создаёт сессию
    и загружает свой мир. Native-допуск не равен завершённой загрузке/READY.
-6. **UDP, хост:** выберите порт (по умолчанию `27800`), создайте сессию и отдельное
-   приглашение каждому гостю. Copy копирует чувствительное приглашение явно.
-7. **UDP, клиент:** введите числовой IPv4/IPv6 endpoint и вставьте приглашение
-   в маскированное поле. Через интернет нужен доступный порт хоста; Steam/NAT
-   сервис здесь не используется. Приглашения не сохраняются в обычный конфиг,
-   логи или отчёты; приватный профиль хоста нельзя пересылать клиентам.
+6. **UDP, хост:** выберите порт (по умолчанию `27800`) и создайте сессию.
+7. **UDP, клиент:** введите числовой IPv4/IPv6 адрес с портом, например
+   `192.168.1.10:27800` или `[2001:db8::10]:27800`, и подключитесь.
+   Ключи, пароли и отдельные приглашения не нужны. Для интернета нужен доступный
+   порт хоста; автоматического обхода NAT/CGNAT нет. Транспорт шифруется, но не
+   удостоверяет личность: к свободному месту может подключиться любой, кто достиг порта.
 
 **Tab** переключает поля; **Enter** в поле запускает выбранное подключение.
 Пустой или неверный ник/адрес/порт блокирует запуск и показывает причину.
@@ -193,7 +200,8 @@ READY подтверждает текущий `LOAD_GO` и полное согл
 `scripts\build_plugin.cmd Harness` собирает согласованную пару
 `KenshiCoop.dll` и `KenshiCoopUI.dll`. Это оптимизированная сборка с
 `KENSHICOOP_NET_DIAG`, а не конфигурация VS Debug с отладочной CRT.
-Публичный Release v0.2.0 использует протокол **80**, приватный Harness — **81**.
+Локальные исходники v0.2.1 используют Release **82** / Harness **83**;
+опубликованный v0.2.0 остаётся на протоколах **80** / **81**.
 Все участники должны использовать все четыре DLL из одной сборки;
 Release и Harness не соединяются друг с другом. Harness принудительно отключает
 публичный апдейтер, даже если в `coop_config.json` стоит `"updateEnabled": true`.
@@ -279,6 +287,11 @@ shared save, streamed to both machines automatically.
 > Migrating from 0.1.x requires manual installation of the complete kit.
 > Actual two-account Steam P2P is not yet certified; real 3–4-player sessions
 > and resolution of all desynchronization reports remain unverified.
+
+> **Local v0.2.1 is not published:** direct UDP uses only IP:port, without keys or
+> invitations. Release protocol **82**, Harness **83**, native ABI3/UI API4.
+> Install the full matching kit manually on every machine when migrating from
+> v0.2.0; its updater rejects the new ABI. Reachable peers are not authenticated.
 
 ## KenshiCoop4up development
 
@@ -367,6 +380,8 @@ with updates disabled. Release and Harness cannot connect to each other.
 The Co-op panel works at the **main menu** as well as in-game, so a joining
 player does not need to load anything first.
 
+These steps describe local v0.2.1; published v0.2.0 still requires UDP invitations.
+
 1. Press **F2**.
 2. **Type your nick** in the field. Cyrillic, selection, editing and **Ctrl+V**
    are supported. The nickname field uses the full row width, without a Paste button.
@@ -375,12 +390,12 @@ player does not need to load anything first.
    No manual guest SteamID allow-list is required.
 5. **Steam client:** enter the host SteamID64 and connect; host creates the session
    and loads its world. Native admission is not gameplay handshake/world READY.
-6. **UDP host:** select port (default `27800`), create the session, then generate
-   one sensitive invitation per guest. Copy is an explicit clipboard action.
-7. **UDP client:** enter a numeric IPv4/IPv6 endpoint and paste the invitation into
-   the masked field. Internet UDP needs a reachable host port; no Steam/NAT
-   service is used. Invitations never belong in normal config/logs/reports;
-   never send the host's private profile to a client.
+6. **UDP host:** select a port (default `27800`) and create the session.
+7. **UDP client:** enter a numeric IPv4/IPv6 endpoint such as `192.168.1.10:27800`
+   or `[2001:db8::10]:27800`, then connect. No keys, passwords or invitations.
+   Internet UDP needs a reachable host port; there is no automatic NAT/CGNAT bypass.
+   Transport is encrypted but identities are unauthenticated: any reachable peer
+   can occupy a free seat.
 
 **Tab** moves between fields; **Enter** starts the selected connection.
 Empty or invalid fields prevent a start and show the reason. Game controls

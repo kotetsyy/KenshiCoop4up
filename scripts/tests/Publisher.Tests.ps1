@@ -29,9 +29,9 @@ try {
     Put-Fixture (Join-Path $root 'dist\mods\KenshiCoop\KenshiCoop.mod') 'fixture-mod'
     $nativeBin=Join-Path $root 'native\bin';$nativeFiles=@{};$coreFiles=@{}
     foreach($pair in @(@('KenshiCoop.dll','plugin'),@('KenshiCoopUI.dll','ui'))){$p=Join-Path $root "src\$($pair[1])\x64\Release\$($pair[0])";Put-Fixture $p "MZ-fixture-$($pair[0])";$coreFiles[$pair[0]]=(Get-FileHash -LiteralPath $p).Hash.ToLowerInvariant()}
-    foreach($name in @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe','transport_credentials.exe')){$p=Join-Path $nativeBin $name;Put-Fixture $p "MZ-fixture-$name";$nativeFiles[$name]=(Get-FileHash -LiteralPath $p).Hash.ToLowerInvariant()}
+    foreach($name in @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe')){$p=Join-Path $nativeBin $name;Put-Fixture $p "MZ-fixture-$name";$nativeFiles[$name]=(Get-FileHash -LiteralPath $p).Hash.ToLowerInvariant()}
     . (Join-Path $root 'scripts\NativeBuild.ps1') -Configuration Release
-    Put-Fixture (Join-Path $nativeBin 'native-build.json') (@{schema=1;transportAbi=2;configuration='Release';checkout=$root;sourceDigest=(Get-CoopDigest Native);dependencies=(Get-CoopNativeInputSnapshot).Pins;files=$nativeFiles}|ConvertTo-Json -Depth 10)
+    Put-Fixture (Join-Path $nativeBin 'native-build.json') (@{schema=1;transportAbi=3;configuration='Release';checkout=$root;sourceDigest=(Get-CoopDigest Native);dependencies=(Get-CoopNativeInputSnapshot).Pins;files=$nativeFiles}|ConvertTo-Json -Depth 10)
     Put-Fixture (Join-Path $root 'dist\build-receipts\core-Release.json') (@{schema=1;configuration='Release';checkout=$root;sourceDigest=(Get-CoopDigest Core);files=$coreFiles}|ConvertTo-Json -Depth 5)
     . (Join-Path $root 'scripts\RuntimeDistribution.ps1') -Configuration Release -NativeBin $nativeBin
     $files=Get-CoopRuntimeFiles Release $nativeBin
@@ -70,7 +70,7 @@ try {
         foreach($line in ($text -split "`r?`n")){if($line -match '^([A-Za-z0-9]+)=(.*)$'){$values[$Matches[1]]=$Matches[2]}}
         $expectedKeys=@('schema','transportAbi','version','proto','notes','coreSha256','coreUrl','uiSha256','uiUrl','steamSha256','steamUrl','udpSha256','udpUrl')
         if(Compare-Object $expectedKeys @($values.Keys) -CaseSensitive){throw 'Manifest fields differ from schema-2 native contract'}
-        if($values.schema -cne '2' -or $values.transportAbi -cne '2' -or $values.version -cne '0.2.0' -or $values.proto -cne '76'){throw 'Release identity/protocol selection wrong'}
+        if($values.schema -cne '2' -or $values.transportAbi -cne '3' -or $values.version -cne '0.2.0' -or $values.proto -cne '76'){throw 'Release identity/protocol selection wrong'}
         $components=@{core='KenshiCoop.dll';ui='KenshiCoopUI.dll';steam='KenshiCoopNetSteam.dll';udp='KenshiCoopNetUDP.dll'}
         foreach($key in $components.Keys){$name=$components[$key];if($values["${key}Sha256"] -cne (Get-FileHash $files[$name]).Hash.ToLowerInvariant() -or $values["${key}Url"] -cne "https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.0/$name"){throw "Wrong manifest component: $key"}}
         if($text -notmatch 'UNEXECUTED: gh release create v0.2.0'){throw 'Local release command not shown'}

@@ -27,7 +27,7 @@ typedef std::vector<unsigned char> Bytes;
 const DWORD RPC_MS = 20000, NETWORK_MS = 45000;
 const unsigned ENTITY_COUNT = 64, SAVE_CHUNKS = 512;
 const u32 SAVE_ID = 701, LOAD_ID = 702;
-enum Op { START = 1, STATUS, INVITE, PUBLISH, EVENTS, SAVE, SAMPLE,
+enum Op { START = 1, STATUS, PUBLISH, EVENTS, SAVE, SAMPLE,
           STOP, RESET_WORLD, READY_WORLD, SIM, EXIT_ACTOR, LOAD_WORLD, BUILD_REPLAY, INVALID_EVENT, CENSUS, SPAWN_LOOKUP, SPAWN_REPLY,
           SPEED_CLICK, SPEED_EFFECTIVE, SPEED_HEARTBEAT, INVENTORY_CONTROLS, DEBUG_STATS };
 void require(bool value, const char* error) {
@@ -77,13 +77,6 @@ void writeFrame(HANDLE h, const Bytes& bytes) {
     u32 size = u32(bytes.size()); writeAll(h, &size, sizeof(size));
     if (size) writeAll(h, &bytes[0], size);
 }
-std::string utf8(const std::wstring& text) {
-    if (text.empty()) return std::string();
-    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.c_str(), int(text.size()), 0, 0, 0, 0);
-    require(n > 0, "private path encoding failed"); std::string out(n, '\0');
-    require(WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.c_str(), int(text.size()), &out[0], n, 0, 0) == n,
-            "private path encoding failed"); return out;
-}
 std::wstring executablePath() {
     wchar_t path[32768]; DWORD n = GetModuleFileNameW(0, path, 32768);
     require(n && n < 32768, "test executable path unavailable"); return std::wstring(path, n);
@@ -102,7 +95,7 @@ struct PrivateRuntime {
         require(made != FALSE, "private test directory creation failed");
     }
     ~PrivateRuntime() {
-        const wchar_t* files[] = { L"core_native_tests.exe", L"KenshiCoopNetUDP.dll", L"KenshiCoopNetSteam.dll", L"host.credential" };
+        const wchar_t* files[] = { L"core_native_tests.exe", L"KenshiCoopNetUDP.dll", L"KenshiCoopNetSteam.dll" };
         for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); ++i) DeleteFileW((path + L"\\" + files[i]).c_str());
         RemoveDirectoryW(path.c_str());
     }
@@ -146,15 +139,13 @@ struct Child {
     Bytes rpc(Op op, const Bytes& payload = Bytes()) { beginRpc(op, payload); return finishRpc(); }
     NetStatus status() { Bytes b = rpc(STATUS); Reader r(b); NetStatus s = r.get<NetStatus>(); r.done(); return s; }
     NetDebugStats debugStats(u32* playerId = 0) { Bytes b = rpc(DEBUG_STATS); Reader r(b); u32 id = r.get<u32>(); if (playerId) *playerId = id; NetDebugStats s = r.get<NetDebugStats>(); r.done(); return s; }
-    void start(bool host, bool steam, u32 port, const std::string& profile, const std::string& invite) {
-        Bytes b; put(b, u32(host)); put(b, u32(steam)); put(b, port); putString(b, profile); putString(b, invite);
+    void start(bool host, bool steam, u32 port) {
+        Bytes b; put(b, u32(host)); put(b, u32(steam)); put(b, port);
         Bytes reply = rpc(START, b); Reader r(reply); require(r.get<u32>() == 1, "NetLink start not accepted"); r.done();
-        if (!b.empty()) SecureZeroMemory(&b[0], b.size());
     }
     void publish(u32 base) { Bytes b; put(b, base); rpc(PUBLISH, b); }
     void events(u32 base, u32 count) { Bytes b; put(b, base); put(b, count); rpc(EVENTS, b); }
     void sim(u32 delay) { Bytes b; put(b, delay); rpc(SIM, b); }
-    std::string invite(u32 id) { Bytes b; put(b, id); Bytes reply = rpc(INVITE, b); Reader r(reply); std::string out = r.string(); r.done(); if (!reply.empty()) SecureZeroMemory(&reply[0], reply.size()); return out; }
     void finish() { rpc(EXIT_ACTOR); require(WaitForSingleObject(process, 5000) == WAIT_OBJECT_0, "actor shutdown timeout"); DWORD exit = 1; require(GetExitCodeProcess(process, &exit) && exit == 0, "actor shutdown failed"); }
 };
 struct StateKey {
@@ -428,23 +419,12 @@ int actor() {
                 isHost = options.isHost;
                 options.transport = r.get<u32>() ? NET_TRANSPORT_STEAM : NET_TRANSPORT_UDP; options.port = int(r.get<u32>());
                 options.address = options.transport == NET_TRANSPORT_UDP ? "127.0.0.1" : "";
-                options.udpHostProfilePath = r.string(); options.udpJoinInvite = r.string(); r.done();
+                r.done();
                 net.setLocalName(options.isHost ? "CoreHost" : "CoreJoin"); put(result, u32(net.start(options, &inbound)));
-                if (!options.udpJoinInvite.empty()) SecureZeroMemory(&options.udpJoinInvite[0], options.udpJoinInvite.size());
                 break;
             }
             case STATUS: { r.done(); NetStatus s; net.copyStatus(&s); put(result, s); break; }
             case DEBUG_STATS: { r.done(); put(result, net.localId()); NetDebugStats s; net.copyDebugStats(&s); put(result, s); break; }
-            case INVITE: {
-                u32 request = r.get<u32>(); r.done(); NetStatus s; net.copyStatus(&s);
-                require(net.queueMakeUdpInvite(s.sessionGeneration, request), "native host invitation request not accepted");
-                DWORD begin = GetTickCount(); do { net.copyStatus(&s); require(GetTickCount() - begin < RPC_MS - 1000, "native invite completion timeout"); Sleep(2); }
-                    while (s.inviteRequestId != request || s.inviteResult < 0);
-                require(s.inviteResult == COOP_NET_OK, "native private invitation provisioning failed");
-                char invite[COOP_NET_INVITE_CAPACITY]; std::memset(invite, 0, sizeof(invite));
-                require(net.copyUdpInvite(s.sessionGeneration, request, invite, sizeof(invite)), "native invitation result mismatch");
-                putString(result, invite); SecureZeroMemory(invite, sizeof(invite)); break;
-            }
             case PUBLISH: {
                 u32 base = r.get<u32>(); r.done(); EntityState entities[ENTITY_COUNT]; std::memset(entities, 0, sizeof(entities));
                 for (u32 i = 0; i < ENTITY_COUNT; ++i) { entities[i].hType = 1; entities[i].hContainer = 41; entities[i].hContainerSerial = 3;
@@ -595,14 +575,12 @@ int controller(const std::wstring& udp, const std::wstring& steam) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits; std::memset(&limits, 0, sizeof(limits)); limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     require(SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) != FALSE, "core consumer cleanup job configuration failed");
     Child host(exe, runtime.path, job); const u32 port = reservePort();
-    host.start(true, false, port, utf8(runtime.path + L"\\host.credential"), ""); waitPhase(host, NET_LISTENING);
-    std::string invitations[MAX_JOINS];
-    for (u32 i = 0; i < MAX_JOINS; ++i) invitations[i] = host.invite(i + 1);
+    host.start(true, false, port); waitPhase(host, NET_LISTENING);
     Child first(exe, runtime.path, job), second(exe, runtime.path, job), third(exe, runtime.path, job);
     Child* clients[MAX_JOINS] = { &first, &second, &third };
     for (u32 i = 0; i < MAX_JOINS; ++i) {
         Bytes simulation; put(simulation, u32(i == 0 ? 125 : 0)); clients[i]->rpc(SIM, simulation);
-        clients[i]->start(false, false, port, "", invitations[i]); waitPhase(*clients[i], NET_CONNECTED);
+        clients[i]->start(false, false, port); waitPhase(*clients[i], NET_CONNECTED);
     }
     DWORD rosterStart = GetTickCount(); NetStatus hs = host.status();
     while (hs.memberMask != 15) {
@@ -659,7 +637,7 @@ int controller(const std::wstring& udp, const std::wstring& steam) {
                 "valid host-only inventory control disconnected a guest");
     std::printf("PASS host+3 host-only inventory controls and ordinary inventory/op0 relay\n");
     // Empty -> populated -> empty exercises the exact post-load disconnect and
-    // clearing a prior existence claim, through real authenticated star relay.
+    // clearing a prior existence claim, through real encrypted star relay.
     Child* censusPeers[MAX_PLAYERS] = { &host, &first, &second, &third };
     for (u32 round = 0; round < 3; ++round) {
         const u32 rows = round == 1 ? 1 : 0; Bytes census; put(census, rows);
@@ -696,7 +674,7 @@ int controller(const std::wstring& udp, const std::wstring& steam) {
         require(clients[i]->status().phase == NET_CONNECTED && clients[i]->status().connectAttempts == 1,
                 "cell-authority spawn lookup caused a reconnect");
     std::printf("PASS author-targeted distributed SPAWN_REQ/INFO, recipient isolation and no reconnect\n");
-    // Real authenticated NetLink packets, consumed by the SAME admission gate
+    // Real encrypted NetLink packets, consumed by the SAME admission gate
     // syncSpeed uses. No mocked sockets or fabricated receive/echo callbacks.
     Bytes resumed, paused; put(resumed, u32(0)); put(paused, u32(1));
     host.rpc(SPEED_EFFECTIVE, resumed);
@@ -727,7 +705,7 @@ int controller(const std::wstring& udp, const std::wstring& steam) {
     const u32 firstId = first.status().memberMask & 2 ? 1 : 0;
     require(firstId == 1, "first join roster missing assigned seat");
     first.publish(20000); expectStates(host, firstId, 20000); expectStates(second, firstId, 20000); expectStates(third, firstId, 20000);
-    std::printf("PASS 64 independent entity streams and authenticated star relay\n");
+    std::printf("PASS 64 independent entity streams and encrypted star relay\n");
     first.events(200, 24); expectEvents(host, firstId, 199, 25); expectEvents(second, firstId, 199, 25); expectEvents(third, firstId, 199, 25);
     first.events(200, 24); first.events(224, 1);
     expectEvents(host, firstId, 199, 26); expectEvents(second, firstId, 199, 26); expectEvents(third, firstId, 199, 26);
@@ -783,7 +761,7 @@ int controller(const std::wstring& udp, const std::wstring& steam) {
     first.rpc(STOP); begin = GetTickCount();
     while (host.status().memberMask & 2) { require(GetTickCount() - begin < NETWORK_MS, "departed native guest seat not released"); Sleep(10); }
     Bytes reconnectSimulation; put(reconnectSimulation, u32(750)); first.rpc(SIM, reconnectSimulation);
-    host.publish(30000); first.start(false, false, port, "", invitations[0]); waitPhase(first, NET_CONNECTED);
+    host.publish(30000); first.start(false, false, port); waitPhase(first, NET_CONNECTED);
     DWORD rejoinStarted = GetTickCount(); waitHostAdmission(host, first, 0, 703, rejoinStarted);
     Bytes rejoinGo; put(rejoinGo, u32(703)); host.rpc(LOAD_WORLD, rejoinGo);
     for (u32 i = 0; i < MAX_JOINS; ++i) {
@@ -849,7 +827,7 @@ int controller(const std::wstring& udp, const std::wstring& steam) {
     require(host.status().phase == NET_LISTENING && second.status().phase == NET_CONNECTED && third.status().phase == NET_CONNECTED,
             "native remaining-peer lifecycle failed after departure during save");
     std::printf("PASS departure during bulk preserves healthy guests' exact data and reliable gameplay\n");
-    first.start(false, false, port, "", invitations[0]); waitPhase(first, NET_CONNECTED);
+    first.start(false, false, port); waitPhase(first, NET_CONNECTED);
     DWORD rejectionStarted = GetTickCount(); waitHostAdmission(host, first, 0, 705, rejectionStarted);
     Bytes rejectionWorld; put(rejectionWorld, u32(705)); host.rpc(LOAD_WORLD, rejectionWorld);
     for (u32 i = 0; i < MAX_JOINS; ++i) {
@@ -860,17 +838,17 @@ int controller(const std::wstring& udp, const std::wstring& steam) {
     for (;;) {
         NetStatus rejected = host.status();
         require(rejected.phase != NET_FAILED && GetTickCount() - begin < NETWORK_MS,
-                "malformed authenticated guest was not retired without failing host");
+                "malformed connected guest was not retired without failing host");
         if (rejected.error == NET_ERR_PROTOCOL && !(rejected.memberMask & 2)) break;
         Sleep(10);
     }
     first.rpc(STOP); host.events(7, 3);
     expectEvents(second, 0, 1, 9); expectEvents(third, 0, 1, 9);
     require(second.status().phase == NET_CONNECTED && third.status().phase == NET_CONNECTED,
-            "rejecting one authenticated malformed guest disconnected healthy guests");
-    std::printf("PASS authenticated malformed-event rejection frees seat and preserves host/healthy guests\n");
+            "rejecting one malformed connected guest disconnected healthy guests");
+    std::printf("PASS malformed-event rejection frees seat and preserves host/healthy guests\n");
     Child awaiting(exe, runtime.path, job);
-    awaiting.start(false, false, reservePort(), "", invitations[0]);
+    awaiting.start(false, false, reservePort());
     waitPhase(awaiting, NET_CONNECTING);
     DWORD attemptStarted = GetTickCount(); bool observedConnecting = false;
     do {
@@ -883,9 +861,8 @@ int controller(const std::wstring& udp, const std::wstring& steam) {
     require(observedConnecting, "real pending native connection attempt was not observed");
     awaiting.finish();
     std::printf("PASS real native connection attempt remains live beyond the old two-second restart boundary\n");
-    for (u32 i = 0; i < MAX_JOINS; ++i) if (!invitations[i].empty()) SecureZeroMemory(&invitations[i][0], invitations[i].size());
     first.finish(); second.finish(); third.finish(); host.finish();
-    Child unavailable(exe, runtime.path, job); unavailable.start(true, true, port, "", "");
+    Child unavailable(exe, runtime.path, job); unavailable.start(true, true, port);
     begin = GetTickCount(); while (unavailable.status().phase != NET_FAILED) { require(GetTickCount() - begin < RPC_MS, "unavailable Steam did not fail explicitly"); Sleep(10); }
     require(unavailable.status().active == NET_TRANSPORT_NONE, "unavailable Steam silently fell back to UDP"); unavailable.finish();
     std::printf("PASS unavailable real Steam explicit failure, no UDP fallback\n");

@@ -74,28 +74,21 @@ try {
     if([IO.File]::ReadAllText((Join-Path $outside 'outside.cpp')) -cne 'preserve-outside-source'){throw 'External source was modified'}
     Remove-Item -LiteralPath (Join-Path $destination 'through-junction.cpp') -Force
     [IO.Directory]::Delete($junction)
-    # A pin-approved patch is included in the comparison, not treated as tampering.
-    $Source=Join-Path $root 'patch-source';New-Item -ItemType Directory -Path $Source|Out-Null
-    $patch=Join-Path $Source 'sanctioned.patch'
-    [IO.File]::WriteAllText($patch,"diff --git a/source.cpp b/source.cpp`n--- a/source.cpp`n+++ b/source.cpp`n@@ -1 +1 @@`n-pinned-source`n+sanctioned-source`n",[Text.Encoding]::ASCII)
-    $patchPin=[pscustomobject]@{commit='patchedcommit';sha256=$pin.sha256;url=$pin.url;patch='sanctioned.patch';patchSha256=(Get-FileHash -LiteralPath $patch).Hash.ToLowerInvariant()}
-    $heldPatch=Open-VerifiedSourceInput $patch $patchPin.patchSha256
-    try{
-        $rejected=$false;try{[IO.File]::AppendAllText($patch,'race')}catch{$rejected=$true}
-        if(-not $rejected){throw 'Approved patch can change before Git consumption'}
-        & git -C $destination apply --check $patch
-        if($LASTEXITCODE -ne 0){throw 'Git cannot read held approved patch'}
-    }finally{$heldPatch.Dispose()}
-    Copy-Item -LiteralPath $archive -Destination (Join-Path $cache 'gns-patchedcommit.tar.gz')
-    $patched=Get-PinnedSource 'gns' $patchPin
-    if((Get-PinnedSource 'gns' $patchPin) -cne $patched){throw 'Sanctioned patched source reuse rejected'}
-    # The approved patch must affect the accepted tree, independent of Git EOL settings.
-    $patchedFile=Join-Path $patched 'source.cpp';$approvedBytes=[IO.File]::ReadAllBytes($patchedFile)
-    [IO.File]::WriteAllText($patchedFile,"pinned-source`n",[Text.Encoding]::ASCII)
-    $rejected=$false;try{Get-PinnedSource 'gns' $patchPin|Out-Null}catch{$rejected=$true}
-    if(-not $rejected){throw 'Unpatched source accepted for a pin requiring the approved patch'}
-    if([IO.File]::ReadAllText($patchedFile) -cne "pinned-source`n"){throw 'Rejected unpatched source evidence was modified'}
-    [IO.File]::WriteAllBytes($patchedFile,$approvedBytes)
+    # GNS uses the same verified, unpatched archive contract as other sources.
+    Copy-Item -LiteralPath $archive -Destination (Join-Path $cache 'gns-testcommit.tar.gz')
+    $legacyGns=Join-Path $cache 'gns-testcommit'
+    New-Item -ItemType Directory -Path $legacyGns|Out-Null
+    [IO.File]::WriteAllText((Join-Path $legacyGns 'source.cpp'),"legacy-patched-source`n",[Text.Encoding]::ASCII)
+    [IO.File]::WriteAllText((Join-Path $legacyGns '.kenshicoop-source-sha256'),$pin.sha256,[Text.Encoding]::ASCII)
+    $gns=Get-PinnedSource 'gns' $pin
+    if([IO.File]::ReadAllText((Join-Path $gns 'source.cpp')) -cne "pinned-source`n"){throw 'Legacy patched GNS source reused'}
+    if([IO.File]::ReadAllText((Join-Path $legacyGns 'source.cpp')) -cne "legacy-patched-source`n"){throw 'Legacy source cache was modified'}
+    if((Get-PinnedSource 'gns' $pin) -cne $gns){throw 'Verified GNS source reuse rejected'}
+    $gnsFile=Join-Path $gns 'source.cpp'
+    [IO.File]::WriteAllText($gnsFile,"modified-source`n",[Text.Encoding]::ASCII)
+    $rejected=$false;try{Get-PinnedSource 'gns' $pin|Out-Null}catch{$rejected=$true}
+    if(-not $rejected){throw 'Modified GNS source accepted'}
+    if([IO.File]::ReadAllText($gnsFile) -cne "modified-source`n"){throw 'Rejected GNS source evidence was modified'}
     $external=Join-Path $root 'external-cache';New-Item -ItemType Directory -Path $external|Out-Null
     Copy-Item $archive (Join-Path $external 'fixture-testcommit.tar.gz')
     $aliasRoot=Join-Path $root 'alias-build';New-Item -ItemType Directory -Path $aliasRoot|Out-Null
@@ -112,5 +105,5 @@ try {
     }finally{$BuildRoot=$savedBuildRoot;[IO.Directory]::Delete($cacheAlias)}
     [IO.File]::AppendAllText($archive,'corrupt-archive')
     $rejected=$false;try{Get-PinnedSource 'fixture' $pin|Out-Null}catch{$rejected=$true};if(-not $rejected){throw 'Cached archive tampering accepted despite intact source marker'}
-    Write-Host 'Dependency cache fixtures: production verified archive/tree/tamper rejection/approved patch/user-cache preservation PASS'
+    Write-Host 'Dependency cache fixtures: production verified archive/tree/tamper rejection/unpatched GNS/user-cache preservation PASS'
 } finally {Remove-Item -LiteralPath $root -Recurse -Force}

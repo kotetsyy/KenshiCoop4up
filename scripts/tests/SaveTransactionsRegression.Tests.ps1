@@ -103,7 +103,7 @@ try {
     $baselineLatest=Join-Path $sandbox 'tools\baseline\latest.json'
     Put-ReceiptFixture $baselineLatest 'unchanged-baseline'
     $nativeBin=Join-Path $sandbox 'native\bin'; $nativeHashes=@{}; $coreHashes=@{}
-    foreach ($name in @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe','transport_credentials.exe')) {
+    foreach ($name in @('KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll','transport_integration.exe')) {
         $path=Join-Path $nativeBin $name; Put-ReceiptFixture $path ('receipt-bytes-'+$name)
         $nativeHashes[$name]=(Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant()
     }
@@ -113,7 +113,7 @@ try {
     }
     . (Join-Path $sandboxScripts 'NativeBuild.ps1') -Configuration Release
     $pins=Get-Content -LiteralPath (Join-Path $sandbox 'src\transport\dependencies.json') -Raw | ConvertFrom-Json
-    Put-ReceiptFixture (Join-Path $nativeBin 'native-build.json') (@{schema=1;transportAbi=2;configuration='Release';checkout=$sandbox;sourceDigest=(Get-CoopDigest Native);dependencies=$pins;files=$nativeHashes}|ConvertTo-Json -Depth 10)
+    Put-ReceiptFixture (Join-Path $nativeBin 'native-build.json') (@{schema=1;transportAbi=3;configuration='Release';checkout=$sandbox;sourceDigest=(Get-CoopDigest Native);dependencies=$pins;files=$nativeHashes}|ConvertTo-Json -Depth 10)
     Put-ReceiptFixture (Join-Path $sandbox 'dist\build-receipts\core-Release.json') (@{schema=1;configuration='Release';checkout=$sandbox;sourceDigest=(Get-CoopDigest Core);files=$coreHashes}|ConvertTo-Json -Depth 5)
     function Reject-Baseline([string]$DllPath,[string]$ReasonPattern) {
         try {

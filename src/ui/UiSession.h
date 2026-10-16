@@ -3,42 +3,8 @@
 #include "CoopUiApi.h"
 #include <string>
 #include "../plugin/core/SteamId.h"
-#include <cstring>
 
 namespace coopui {
-inline void wipe(void* memory, size_t bytes) {
-    volatile unsigned char* p = static_cast<volatile unsigned char*>(memory);
-    while (bytes--) *p++ = 0;
-}
-class Invitation {
-public:
-    Invitation() : generation_(0), request_(0), pending_(false), result_(-1) { wipe(text_, sizeof(text_)); }
-    ~Invitation() { clear(); }
-    void clear() { wipe(text_, sizeof(text_)); generation_ = 0; request_ = 0; pending_ = false; result_ = -1; }
-    void request(unsigned long long generation, unsigned int id) { clear(); generation_ = generation; request_ = id; pending_ = true; }
-    bool observe(const CoopUiSnapshot& s) {
-        if (!s.running && !s.busy) { clear(); return false; }
-        if (generation_ && s.sessionGeneration != generation_) { clear(); return false; }
-        if (!pending_ || s.sessionGeneration != generation_ || s.inviteRequestId != request_ || s.inviteResult < 0) return false;
-        pending_ = false; result_ = s.inviteResult;
-        if (result_ != 0) return false;
-        if (!s.udpInvite) { result_ = 2; return false; }
-        size_t n = 0; while (n < sizeof(text_) && s.udpInvite[n]) ++n;
-        if (!n || n == sizeof(text_)) { result_ = 2; return false; }
-        std::memcpy(text_, s.udpInvite, n + 1); return true;
-    }
-    const char* text() const { return text_; }
-    bool pending() const { return pending_; }
-    int result() const { return result_; }
-private:
-    char text_[4096];
-    unsigned long long generation_;
-    unsigned int request_;
-    bool pending_;
-    int result_;
-    Invitation(const Invitation&);
-    Invitation& operator=(const Invitation&);
-};
 inline bool hasGuests(const CoopUiSnapshot& s) {
     if (!s.isHost) return false;
     if (s.playerCount > 1) return true;

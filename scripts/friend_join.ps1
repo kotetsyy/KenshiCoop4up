@@ -167,8 +167,7 @@ if ((Test-Path -LiteralPath $outDir) -or (Test-Path -LiteralPath $completionFile
 New-Item -ItemType Directory -Path $outDir | Out-Null
 try {
 $runState = New-CoopRunState -GameDirs @($KenshiDir) -SaveNames $ownedSaveNames -PreserveSaves:($Resume -and $Scenario -eq '') -AllowedPeerTokens $OwnedPeerTokens -PreserveUserSaveRoot:($OwnedPeerTokens.Count -gt 0)
-Clear-CoopRunEnvironment -State $runState -PreserveCredentials
-Set-CoopPrivateCredentials -Mode join -UseSteam $useSteam -GameDirs @($KenshiDir,$kitDir)
+Clear-CoopRunEnvironment -State $runState
 # ---- Install mod + save ------------------------------------------------------------
 $modDst = Join-Path $KenshiDir "mods\KenshiCoop"
 New-Item -ItemType Directory -Force -Path $modDst | Out-Null
@@ -236,7 +235,6 @@ if ($useSteam) {
     $env:KENSHICOOP_TRANSPORT  = "udp"
     $env:KENSHICOOP_STEAM_PEER = "0"
 }
-Set-CoopPrivateCredentials -Mode join -UseSteam $useSteam -GameDirs @($KenshiDir,$kitDir)
 
 $target = if ($useSteam) { "steam:$(ConvertTo-SteamId64 $HostSteamId)" } else { "${HostIp}:$Port" }
 Write-Host ""

@@ -136,6 +136,7 @@ void process(Context& c,const SteamNetConnectionStatusChangedCallback_t& change)
         if(members(c)>=c.config.maxPeers || !allowed(c,change.m_info,error)) {
             c.backend.sockets->CloseConnection(change.m_hConn,2001,"Peer admission denied",false); return;
         }
+#if COOP_PROVIDER_STEAM
         // Forbid duplicate authenticated principals from occupying multiple seats.
         for(const auto& existing:c.peers) if(existing.admitted) {
             SteamNetConnectionInfo_t old{};
@@ -143,9 +144,10 @@ void process(Context& c,const SteamNetConnectionStatusChangedCallback_t& change)
                 c.backend.sockets->CloseConnection(change.m_hConn,2001,"Duplicate peer identity",false); return;
             }
         }
+#endif
         p=emptyPeer(c);
         if(!p) { c.backend.sockets->CloseConnection(change.m_hConn,2001,"Session guest limit",false); return; }
-        p->handle=change.m_hConn; p->steamId=change.m_info.m_identityRemote.GetSteamID64();
+        p->handle=change.m_hConn; p->steamId=COOP_PROVIDER_STEAM ? change.m_info.m_identityRemote.GetSteamID64() : 0;
         if(!lanes(c,p->handle) || c.backend.sockets->AcceptConnection(p->handle)!=k_EResultOK) {
             closePeer(c,*p,2002,"Native peer admission failed",false); return;
         }
@@ -157,9 +159,10 @@ void process(Context& c,const SteamNetConnectionStatusChangedCallback_t& change)
     } else if(state==k_ESteamNetworkingConnectionState_FindingRoute) {
         queue(c,COOP_NET_EVENT_FINDING_ROUTE,p->handle,p->steamId,0,"Finding route");
     } else if(state==k_ESteamNetworkingConnectionState_Connected) {
-        if(!allowed(c,change.m_info,error)) { closePeer(c,*p,2001,"Authenticated peer identity rejected",true); return; }
-        p->admitted=true; p->connected=true; p->steamId=change.m_info.m_identityRemote.GetSteamID64();
-        queue(c,COOP_NET_EVENT_CONNECTED,p->handle,p->steamId,0,"Authenticated connection established");
+        if(!allowed(c,change.m_info,error)) { closePeer(c,*p,2001,"Peer security policy rejected",true); return; }
+        p->admitted=true; p->connected=true; p->steamId=COOP_PROVIDER_STEAM ? change.m_info.m_identityRemote.GetSteamID64() : 0;
+        queue(c,COOP_NET_EVENT_CONNECTED,p->handle,p->steamId,0,
+            COOP_PROVIDER_STEAM ? "Authenticated connection established" : "Encrypted direct UDP established; peer unauthenticated");
     } else if(state==k_ESteamNetworkingConnectionState_ClosedByPeer || state==k_ESteamNetworkingConnectionState_ProblemDetectedLocally) {
         // Do not expose native peer-supplied debug text through the public ABI.
         closePeer(c,*p,change.m_info.m_eEndReason,"Native connection closed",true);
@@ -195,17 +198,20 @@ bool validate(const CoopNetConfig* config,char* error,uint32_t cap) {
         detail(error,cap,"Invalid provider configuration or selected-mode mismatch"); return false;
     }
 #if COOP_PROVIDER_STEAM
-    if(config->profilePath || config->joinInvite || config->address || (!config->host && !config->remoteSteamId)) {
-        detail(error,cap,"Steam mode requires Steam identities, not UDP credentials"); return false;
+    if(config->address || (!config->host && !config->remoteSteamId)) {
+        detail(error,cap,"Steam mode requires Steam identities, not UDP addresses"); return false;
     }
 #else
-    if(config->remoteSteamId || !config->port ||
-        (config->host ? (!config->profilePath || config->joinInvite) : (!config->joinInvite || config->profilePath))) {
-        detail(error,cap,"UDP mode requires an explicit host profile or client invite, not Steam IDs"); return false;
+    if(config->remoteSteamId || !config->port) {
+        detail(error,cap,"UDP mode requires a numeric address and port, not Steam IDs"); return false;
     }
     if(config->address) {
         size_t n=strnlen_s(config->address,129); SteamNetworkingIPAddr addr; addr.Clear();
         if(!n || n>128 || !addr.ParseString(config->address) || addr.m_port) { detail(error,cap,"UDP address must be numeric without a port"); return false; }
+        const char* colon=strchr(config->address,':');
+        if((colon && !strchr(colon+1,':')) || (config->address[0]=='[' && config->address[n-1]!=']')) {
+            detail(error,cap,"UDP address must be numeric without a port"); return false;
+        }
     } else if(!config->host) { detail(error,cap,"UDP client requires a numeric address"); return false; }
 #endif
     return true;
@@ -234,7 +240,7 @@ int32_t COOP_NET_CALL start(void* opaque,const CoopNetConfig* config,char* error
         c->config.sendBufferBytes=config->sendBufferBytes ? config->sendBufferBytes : 2u*1024u*1024u;
         c->config.bulkQueueBytes=config->bulkQueueBytes ? config->bulkQueueBytes : (std::min)(1024u*1024u,c->config.sendBufferBytes);
         const int32_t result=initializeBackend(c->backend,c->config,error,cap);
-        c->config.address=nullptr; c->config.profilePath=nullptr; c->config.joinInvite=nullptr;
+        c->config.address=nullptr;
         if(result!=COOP_NET_OK) { stopContext(*c); return result; }
         c->group=c->backend.sockets->CreatePollGroup();
         if(!c->group) { detail(error,cap,"Native receive pollgroup allocation failed"); stopContext(*c); return COOP_NET_INTERNAL; }
@@ -247,7 +253,7 @@ int32_t COOP_NET_CALL start(void* opaque,const CoopNetConfig* config,char* error
         options[count++].SetInt32(k_ESteamNetworkingConfig_RecvBufferSize,int32_t(kBorrowedBytes));
         options[count++].SetInt32(k_ESteamNetworkingConfig_RecvMaxMessageSize,int32_t(COOP_NET_MAX_MESSAGE));
         options[count++].SetInt32(k_ESteamNetworkingConfig_RecvBufferMessages,256);
-        options[count++].SetInt32(k_ESteamNetworkingConfig_IP_AllowWithoutAuth,0);
+        options[count++].SetInt32(k_ESteamNetworkingConfig_IP_AllowWithoutAuth,COOP_PROVIDER_STEAM ? 0 : 2);
         options[count++].SetInt32(k_ESteamNetworkingConfig_IPLocalHost_AllowWithoutAuth,0);
         options[count++].SetInt32(k_ESteamNetworkingConfig_Unencrypted,0);
         {
@@ -362,8 +368,8 @@ int32_t COOP_NET_CALL status(void* opaque,CoopNetStatus* out) try {
     *out={}; out->size=sizeof(*out); out->mode=kMode; out->generation=c->config.generation;
     if(!c->running) { detail(out->detail,sizeof(out->detail),"Stopped"); return COOP_NET_OK; }
     out->selfSteamId=c->backend.selfSteamId; out->listening=c->listener ? 1 : 0; out->connections=members(*c);
-    SteamNetAuthenticationStatus_t auth{}; out->authentication=int32_t(c->backend.sockets->GetAuthenticationStatus(&auth));
 #if COOP_PROVIDER_STEAM
+    SteamNetAuthenticationStatus_t auth{}; out->authentication=int32_t(c->backend.sockets->GetAuthenticationStatus(&auth));
     SteamRelayNetworkStatus_t relay{}; out->relayAvailability=int32_t(c->backend.utils->GetRelayNetworkStatus(&relay));
     if (!c->config.host && c->peers[0].handle && !c->peers[0].connected) {
         SteamNetConnectionInfo_t pending{};
@@ -374,8 +380,12 @@ int32_t COOP_NET_CALL status(void* opaque,CoopNetStatus* out) try {
             return COOP_NET_OK;
         }
     }
-#endif
     detail(out->detail,sizeof(out->detail),"Selected native transport active"); return COOP_NET_OK;
+#else
+    // Direct IP transport has encryption, not an authenticated principal.
+    out->authentication=int32_t(k_ESteamNetworkingAvailability_Unknown);
+    detail(out->detail,sizeof(out->detail),"Open UDP active; peers are unauthenticated"); return COOP_NET_OK;
+#endif
 } catch(...) { return COOP_NET_INTERNAL; }
 int32_t COOP_NET_CALL peerStats(void* opaque,uint32_t handle,CoopNetPeerStats* out) try {
     auto* c=lookup(opaque); if(!c || !out || out->size!=sizeof(*out)) return COOP_NET_INVALID;
@@ -390,13 +400,6 @@ int32_t COOP_NET_CALL peerStats(void* opaque,uint32_t handle,CoopNetPeerStats* o
     out->inboundBytesPerSec=status.m_flInBytesPerSec; out->outboundBytesPerSec=status.m_flOutBytesPerSec;
     out->localQuality=status.m_flConnectionQualityLocal; out->remoteQuality=status.m_flConnectionQualityRemote; return COOP_NET_OK;
 } catch(...) { return COOP_NET_INTERNAL; }
-int32_t COOP_NET_CALL prepareHost(const char* path,char* error,uint32_t cap) {
-    try { return prepareHostCredential(path,error,cap); } catch(...) { detail(error,cap,"Host credential provision failed"); return COOP_NET_INTERNAL; }
-}
-int32_t COOP_NET_CALL makeInvite(const char* path,char* invite,uint32_t inviteCap,char* error,uint32_t cap) {
-    try { return createClientInvite(path,invite,inviteCap,error,cap); } catch(...) {
-        if(invite && inviteCap) invite[0]=0; detail(error,cap,"Client invitation provision failed"); return COOP_NET_INTERNAL; }
-}
 int32_t COOP_NET_CALL pumpMainThread() try { return pumpBackendMainThread(); } catch(...) { return COOP_NET_INTERNAL; }
 }
 }
@@ -409,6 +412,6 @@ extern "C" COOP_EXPORT int32_t COOP_NET_CALL KenshiCoopNet_GetApi(uint32_t versi
     if(!out || version!=COOP_NET_ABI_VERSION || size!=sizeof(CoopNetApi)) return COOP_NET_INVALID;
     const CoopNetApi api={COOP_NET_ABI_VERSION,sizeof(CoopNetApi),coopnet::create,coopnet::start,coopnet::poll,
         coopnet::send,coopnet::releaseEvent,coopnet::disconnect,coopnet::stop,coopnet::destroy,coopnet::status,
-        coopnet::peerStats,coopnet::prepareHost,coopnet::makeInvite,coopnet::pumpMainThread};
+        coopnet::peerStats,coopnet::pumpMainThread};
     *out=api; return COOP_NET_OK;
 }

@@ -124,9 +124,6 @@ Write-Host "  out dir:     $OutDir"
 
 
 $runState = New-CoopRunState -GameDirs @($JoinDir) -SaveNames @($Save,'coopresume')
-$inviteRoot = Join-Path $env:LOCALAPPDATA ('KenshiCoop\private\lan-' + [Guid]::NewGuid().ToString('N'))
-$inviteFile = Assert-CoopPrivatePath (Join-Path $inviteRoot 'client.invite') @($JoinDir,$repoRoot,$OutDir)
-New-Item -ItemType Directory -Path $inviteRoot | Out-Null
 $wanProc = $null
 try {
 Clear-CoopRunEnvironment -State $runState
@@ -139,7 +136,6 @@ if (-not $SkipBuild) {
     Install-CoopHarnessRuntime -RepoRoot $repoRoot -GameDirs @($JoinDir) -NativeBin $NativeBin
 }
 $runtime = Get-CoopHarnessRuntime -RepoRoot $repoRoot -NativeBin $NativeBin
-$native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
 $runnerScripts = @('lan_host_run.ps1','start_kenshi.ps1','set_video_mode.ps1','kit_preflight.ps1','screenshot.ps1','CoopHarness.psm1','CoopOracles.psm1') | ForEach-Object { Join-Path $scriptDir $_ }
 foreach ($file in $runnerScripts) { if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw 'Complete current remote runner inputs required before mutation.' } }
 $r = Invoke-LanSsh "mkdir `"$($cfg.dropDir)\owner.lock`" && > `"$($cfg.dropDir)\owner.lock\token.txt`" echo $runId && echo RESERVED"
@@ -154,24 +150,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Current remote runner staging failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Remote oracle staging failed.' }
 & scp -o BatchMode=yes @runtime "${target}:$dropFwd/mod/"
 if ($LASTEXITCODE -ne 0) { throw 'Complete runtime staging failed.' }
-& scp -o BatchMode=yes $native.Files['transport_credentials.exe'] $native.Files['KenshiCoopNetUDP.dll'] "${target}:$dropFwd/"
-if ($LASTEXITCODE -ne 0) { throw 'Native private provision inputs push failed.' }
-$r = Invoke-LanSsh "echo %LOCALAPPDATA%"
-$remoteLocal = ("" + (@($r.out) | Select-Object -Last 1)).Trim()
-$remotePrivate = "$remoteLocal\KenshiCoop\private\lan-$runId"
-$provisionScript = ". '$((Join-Path $cfg.dropDir 'kit_preflight.ps1').Replace("'","''"))'; [void](New-CoopUdpCredentials -NativeBin '$($cfg.dropDir.Replace("'","''"))' -ProfilePath '$($remotePrivate.Replace("'","''"))\host.credential' -InviteFile '$($remotePrivate.Replace("'","''"))\client.invite' -GameDirs @('$($cfg.kenshiDir.Replace("'","''"))','$($cfg.dropDir.Replace("'","''"))'))"
-$provisionEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($provisionScript))
-$r = Invoke-LanSsh "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $provisionEncoded"
-if ($r.exit -ne 0) { throw 'Remote native credential provisioning failed.' }
-& scp -o BatchMode=yes "${target}:$($remotePrivate -replace '\\','/')/client.invite" $inviteFile
-if ($LASTEXITCODE -ne 0) { throw 'Private invitation import failed.' }
-# Restrict the imported private file immediately; do not add it to run metadata.
-$acl = New-Object Security.AccessControl.FileSecurity
-$acl.SetAccessRuleProtection($true,$false)
-$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule([Security.Principal.WindowsIdentity]::GetCurrent().User,'FullControl','Allow')))
-$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule('SYSTEM','FullControl','Allow')))
-Set-Acl -LiteralPath $inviteFile -AclObject $acl
-
 # Stage only the named fixture; the interactive owner snapshots/restores targets.
 [void](Invoke-LanSsh "mkdir `"$($cfg.dropDir)\save`" 2>nul & echo OK")
 $r = Invoke-LanSsh "if exist `"$($cfg.dropDir)\save\$Save`" rmdir /S /Q `"$($cfg.dropDir)\save\$Save`""
@@ -197,7 +175,6 @@ $shotWait = if ($manifestEntry -and $manifestEntry.ContainsKey('ShotWaitSec')) {
 $joinShotDelay = if ($manifestEntry -and $manifestEntry.ContainsKey('ShotDelaySec')) { [int]$manifestEntry.ShotDelaySec } else { 1 }
 $runArgs = [pscustomobject]@{
     runId        = $runId
-    udpProfilePath = "$remotePrivate\host.credential"
     seconds      = $Seconds
     anchor       = $(if ($Scenario -ne "") { $hostAnchor } else { "" })
     startTimeoutSec = [int]$prof.StartTimeoutSec
@@ -309,7 +286,6 @@ try {
     $env:KENSHICOOP_ARM_TIMEOUT_MS     = "$armTimeoutMs"
     $env:KENSHICOOP_TRANSPORT = 'udp'
     $env:KENSHICOOP_STEAM_PEER = '0'
-    Set-CoopPrivateCredentials -Mode join -UseSteam $false -GameDirs @($JoinDir) -InviteFile $inviteFile
 
     Write-Host "Launching local JOIN -> ${joinIp}:$joinPort ..."
     $out = Start-CoopOwnedGame -State $runState -ScriptDir $scriptDir -ExePath $joinExe -WorkDir $JoinDir -TimeoutSec $prof.StartTimeoutSec -NativeOutput $NativeBin
@@ -388,7 +364,7 @@ Write-Host "  join log: $joinLog"
             if ($r.exit -ne 0) { throw "Remote admission cleanup failed: $($r.out)" }
         }
     } finally {
-        try { Restore-CoopHarnessSession -State $runState -CredentialRoot $inviteRoot -Proxy $wanProc }
+        try { Restore-CoopHarnessSession -State $runState -Proxy $wanProc }
         catch { $ownedExitFailures += "join restoration: $($_.Exception.Message)" }
     }
 }

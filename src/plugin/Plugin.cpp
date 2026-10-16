@@ -321,18 +321,16 @@ void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 // Session connect/disconnect (F2 panel commands + inbound Steam invites).
 // Defined after startNetworking(), which coopUiConnect reuses; forward-declared
 // here so the panel driver can execute the queued UI command.
-void startNetworking(const char* udpJoinInvite = 0);
+void startNetworking();
 // Defined further down; coopUiConnect re-emits it after switching the log file
 // to the role actually being played, so the new file is self-contained.
 void logStartupBanner();
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId,
-                   const CoopUiSettings* ui, const char* udpJoinInvite = 0);
+                   const CoopUiSettings* ui);
 void coopUiDisconnect();
 void failWorldSync(const char* reason);
 void rememberUiSettings(const CoopUiSettings& ui);
 void steamInviteConnect(unsigned long long peerId);
-unsigned long long g_uiInviteGeneration = 0;
-unsigned int g_uiInviteRequest = 0;
 
 // This safe point is independent of all GUI/scenario/world/title load gates.
 void pumpNetworkingMainThread() {
@@ -1183,10 +1181,10 @@ std::string panelErrorText(const coop::NetStatus& ns, int wp) {
         case coop::NET_ERR_PROVIDER_ABI:
             return "Native transport ABI does not match the core. Install matched core/UI/providers.";
         case coop::NET_ERR_PROVIDER_START:
-            return "Selected native transport could not start. Check endpoint/profile and provider status.";
+            return "Selected native transport could not start. Check endpoint and provider status.";
         case coop::NET_ERR_PROVIDER_AUTH:
             return steam ? "Steam native authentication failed; no UDP fallback."
-                         : "UDP host/client authentication failed. Import a valid private host invitation.";
+                         : "UDP encrypted direct connection failed; private invitations are not used.";
         case coop::NET_ERR_PROVIDER_POLL:
             return "Selected native transport reported a polling failure.";
         case coop::NET_ERR_QUEUE_FULL:
@@ -1200,7 +1198,7 @@ std::string panelErrorText(const coop::NetStatus& ns, int wp) {
                           (unsigned)ns.errorArg);
             else
                 _snprintf(b, sizeof(b) - 1,
-                          "UDP host %s%s%s:%d did not respond (attempts: %u). Check endpoint and host invitation.",
+                          "UDP host %s%s%s:%d did not respond (attempts: %u). Check the address, port and firewall.",
                           g_cfg.ip.find(':') != std::string::npos ? "[" : "",
                           g_cfg.ip.c_str(), g_cfg.ip.find(':') != std::string::npos ? "]" : "",
                           g_cfg.port, (unsigned)ns.errorArg);
@@ -1316,9 +1314,9 @@ std::string panelDiagnostics(const CoopUiSnapshot& ps, const coop::NetStatus& ns
         _snprintf(b, sizeof(b) - 1, "\xD0\x9F\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB0 \xD0\xBC\xD0\xB8\xD1\x80\xD0\xB0: -\n");
     b[sizeof(b) - 1] = '\0'; r += b;
     _snprintf(b, sizeof(b) - 1, "Native authentication: %d; relay availability: %d\n"
-              "Native byte rates/queue measurements; packet rates are not supplied by provider ABI1.\n"
-              "Real two-account Steam P2P remains unverified in this local build.",
-              ns.authentication, ns.relayAvailability);
+              "Native byte rates/queue measurements; packet rates are not supplied by provider ABI%u.\n"
+              "Direct UDP is encrypted without identity authentication; two-account Steam P2P remains unverified.",
+              ns.authentication, ns.relayAvailability, (unsigned)COOP_NET_ABI_VERSION);
     b[sizeof(b) - 1] = '\0'; r += b;
     return r;
 }
@@ -1364,12 +1362,6 @@ void coopPanelDrive() {
     ps.worldPhase      = panelWorldPhase(ns);
     fillPanelPlayers(ps, ns);
     ps.sessionGeneration = ns.sessionGeneration;
-    ps.inviteRequestId = ns.inviteRequestId;
-    ps.inviteResult = ns.inviteResult;
-    char invite[4096] = {0};
-    if (ns.sessionGeneration == g_uiInviteGeneration && ns.inviteRequestId == g_uiInviteRequest &&
-        ns.inviteResult == 0 && g_net.copyUdpInvite(ns.sessionGeneration, ns.inviteRequestId, invite, sizeof(invite)))
-        ps.udpInvite = invite;
 
     // World-sync progress. Byte counts only while the host's world streams in.
     std::string transfer;
@@ -1473,7 +1465,6 @@ void coopPanelDrive() {
     coop::uimodule::tick(&ps, &cmd);
     cmd.settings.udpIp[sizeof(cmd.settings.udpIp) - 1] = '\0';
     cmd.settings.playerName[sizeof(cmd.settings.playerName) - 1] = '\0';
-    cmd.udpJoinInvite[sizeof(cmd.udpJoinInvite) - 1] = '\0';
     switch (cmd.kind) {
         case COOP_UI_REMEMBER:
             rememberUiSettings(cmd.settings);
@@ -1481,25 +1472,14 @@ void coopPanelDrive() {
         case COOP_UI_CONNECT:
             if (!g_net.isRunning())
                 coopUiConnect(cmd.settings.isHost != 0, cmd.settings.useSteam != 0, 0,
-                              &cmd.settings, cmd.udpJoinInvite);
+                              &cmd.settings);
             else
                 coopErr("[coop-ui] ignored CONNECT while a session is live");
             break;
         case COOP_UI_DISCONNECT:
             coopUiDisconnect();
             break;
-        case COOP_UI_MAKE_UDP_INVITE:
-            if (!g_net.queueMakeUdpInvite(cmd.sessionGeneration, cmd.inviteRequestId)) {
-                g_panelStartError = "UDP invitation request rejected (stale/busy/not a UDP host).";
-            } else {
-                g_panelStartError.clear();
-                g_uiInviteGeneration = cmd.sessionGeneration;
-                g_uiInviteRequest = cmd.inviteRequestId;
-            }
-            break;
     }
-    SecureZeroMemory(invite, sizeof(invite));
-    SecureZeroMemory(cmd.udpJoinInvite, sizeof(cmd.udpJoinInvite));
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
@@ -2594,7 +2574,7 @@ void titleUpdate_hook(TitleScreen* self) {
     }
 }
 
-void startNetworking(const char* udpJoinInvite) {
+void startNetworking() {
     // Debug WAN simulation: when configured, hold/drop inbound entity batches so the
     // loopback harness exercises the real-latency path (interp + local enforcement)
     // instead of the ~0 ms same-frame delivery we'd otherwise validate against.
@@ -2633,33 +2613,19 @@ void startNetworking(const char* udpJoinInvite) {
             g_panelStartError = "Enter the host's individual SteamID64."; return;
         }
         if (!g_cfg.isHost) options.remoteSteamId = g_cfg.steamPeer;
-    } else {
-        if (g_cfg.isHost) {
-            // Empty native bind address means ANY; remembered JOIN target is never a host bind.
-            options.udpHostProfilePath = coop::udpHostProfilePath();
-            if (options.udpHostProfilePath.empty()) {
-                g_panelStartError = "Private UDP host profile path is unavailable."; return;
-            }
-        } else {
-            std::string ip; int port = 0;
-            if (!coop::parseUdpEndpoint(g_cfg.ip, ip, port)) {
-                g_panelStartError = "Enter a numeric IPv4/IPv6 host endpoint."; return;
-            }
-            options.address = ip;
-            if (port) options.port = port;
-            if (udpJoinInvite && udpJoinInvite[0]) options.udpJoinInvite = udpJoinInvite;
-            else if (!coop::readUdpJoinInviteFile(options.udpJoinInvite)) {
-                g_panelStartError = "Import the host invitation in F2 or a private KENSHICOOP_UDP_INVITE_FILE."; return;
-            }
+    } else if (!g_cfg.isHost) {
+        std::string ip; int port = 0;
+        if (!coop::parseUdpEndpoint(g_cfg.ip, ip, port)) {
+            g_panelStartError = "Enter a numeric IPv4/IPv6 host endpoint."; return;
         }
+        options.address = ip;
+        if (port) options.port = port;
     }
     coopLog(g_cfg.isHost ? "KenshiCoop: starting native HOST" : "KenshiCoop: starting native CLIENT");
     bool ok = g_net.start(options, &g_inbound);
     coop::engine::configureInventoryTransactions(g_cfg.isHost,
         ok && g_cfg.invSync && (g_cfg.moneySync || g_cfg.storeSync),
         ok && g_cfg.invSync && g_cfg.moneySync);
-    if (!options.udpJoinInvite.empty()) SecureZeroMemory(&options.udpJoinInvite[0], options.udpJoinInvite.size());
-    options.udpJoinInvite.clear();
     if (!ok) coopErr("KenshiCoop: selected native networking failed to start (no fallback)");
 }
 
@@ -2722,7 +2688,7 @@ void rememberUiSettings(const CoopUiSettings& ui) {
 // peerId: a Steam ID resolved by an invite (0 = none). ui: the panel's settings
 // when the panel asked (0 for an invite).
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId,
-                   const CoopUiSettings* ui, const char* udpJoinInvite) {
+                   const CoopUiSettings* ui) {
     if (g_net.isRunning()) return;
     if (coop::updater::restartRequired()) {
         g_panelStartError = "Runtime updated; restart Kenshi before connecting.";
@@ -2789,7 +2755,7 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId,
               g_cfg.ownRanksFromEnv ? "env" : "role");
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
-    startNetworking(udpJoinInvite);
+    startNetworking();
 }
 
 // Called only after callback pumps return, and never destroys a live session.
@@ -2804,7 +2770,6 @@ void coopUiDisconnect() {
     coop::engine::configureInventoryTransactions(g_cfg.isHost,false,false);
     g_panelStartError.clear();
     coop::steaminvite::reset(); // leave any Steam lobby
-    g_uiInviteGeneration = 0; g_uiInviteRequest = 0;
     // World stays live on a manual disconnect: despawn minted proxies before
     // clearing maps so nothing lingers as a duplicate or gets baked into a save.
     sessionResetForUi();

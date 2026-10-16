@@ -62,7 +62,6 @@ $JoinDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPa
 if ($HostDir.TrimEnd('\') -ieq $JoinDir.TrimEnd('\') -or $HostDir.StartsWith($JoinDir.TrimEnd('\')+'\', [StringComparison]::OrdinalIgnoreCase) -or $JoinDir.StartsWith($HostDir.TrimEnd('\')+'\', [StringComparison]::OrdinalIgnoreCase)) { throw 'HOST and JOIN require disjoint installations.' }
 
 $runState = New-CoopRunState -GameDirs @($HostDir,$JoinDir) -SaveNames @($Save,'coopresume')
-$credentials = $null
 $wanProc = $null
 try {
 Clear-CoopRunEnvironment -State $runState
@@ -93,8 +92,6 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $hostFixture) -Force | Ou
 Copy-Item -LiteralPath (Join-Path $kitDir "save\$Save") -Destination $hostFixture -Recurse
 Set-CoopSaveLocation -GameDir $HostDir -UserLocation 0
 
-$native = Get-NativeBuild -Configuration Harness -NativeBin $NativeBin
-$credentials = New-CoopLocalCredentials -NativeBin $native.Bin -GameDirs @($HostDir,$JoinDir)
 # ---- 3. WAN proxy ------------------------------------------------------------------
 Write-Host ""
 Write-Host "=== 3. WAN relay proxy ($Wan) ==="
@@ -139,7 +136,6 @@ try {
     $env:KENSHICOOP_ARM_TIMEOUT_MS = "$($prof.ArmTimeoutMs)"
     $env:KENSHICOOP_TRANSPORT = 'udp'
     $env:KENSHICOOP_STEAM_PEER = '0'
-    Set-CoopPrivateCredentials -Mode host -UseSteam $false -GameDirs @($HostDir,$JoinDir) -ProfilePath $credentials.Profile
     $out = Start-CoopOwnedGame -State $runState -ScriptDir $scriptDir -ExePath (Join-Path $HostDir 'kenshi_x64.exe') -WorkDir $HostDir -TimeoutSec $prof.StartTimeoutSec -NativeOutput $NativeBin
     $out | ForEach-Object { Write-Host "    $_" }
     $hostGamePid = 0
@@ -154,7 +150,6 @@ try {
     # ---- 5. Kit join, exactly as the friend runs it -----------------------------------
     Write-Host ""
     Write-Host "=== 5. run the kit's friend_join.ps1 (as the friend would) ==="
-    $env:KENSHICOOP_UDP_INVITE_FILE = $credentials.Invite
     $friendToken = [Guid]::NewGuid().ToString('N')
     $peerTokens = @($runState.Processes.Values | Where-Object { -not $_.HasExited -and $_.ProcessName -ieq 'kenshi_x64' } | ForEach-Object { "$($_.Id):$($_.StartTime.ToUniversalTime().Ticks)" })
     $peerLiteral = (@($peerTokens | ForEach-Object { "'$_'" }) -join ',')
@@ -186,7 +181,7 @@ try {
     }
 }
 } finally {
-    Restore-CoopHarnessSession -State $runState -CredentialRoot $(if ($credentials) { $credentials.Root } else { '' }) -Proxy $wanProc
+    Restore-CoopHarnessSession -State $runState -Proxy $wanProc
 }
     $verdict = Invoke-RunAnalysis -HostLog $hostLog -JoinLog $joinLog -Scenario $Scenario `
                   -Tolerance $manifest.Scenarios[$Scenario].Tolerance -JoinExpected $true `

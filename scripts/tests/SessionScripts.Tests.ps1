@@ -14,15 +14,7 @@ $original = @{}
 Get-ChildItem Env: | Where-Object { $_.Name -like 'KENSHICOOP_*' } | ForEach-Object { $original[$_.Name] = $_.Value }
 try {
     New-Item -ItemType Directory -Path $root | Out-Null
-    $invite = Join-Path $root 'client.invite'
-    [IO.File]::WriteAllText($invite, 'isolated-invitation-fixture')
-    $acl = New-Object Security.AccessControl.FileSecurity
-    $acl.SetAccessRuleProtection($true,$false)
-    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule([Security.Principal.WindowsIdentity]::GetCurrent().User,'FullControl','Allow')))
-    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule('SYSTEM','FullControl','Allow')))
-    Set-Acl -LiteralPath $invite -AclObject $acl
     $ownedDirs = @((Join-Path $root 'game'))
-    $credentials = @{ Profile=(Join-Path $root 'host.credential'); Invite=$invite }
     $runState = @{ Environment=@{} }
     $dest = Join-Path $root 'artifacts'
     New-Item -ItemType Directory -Path $dest | Out-Null

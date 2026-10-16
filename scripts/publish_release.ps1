@@ -22,7 +22,7 @@ Assert-CoopRuntimeZip -Zip $kitPath -Files $files
 $runtimeHashes=Get-CoopRuntimeHashes $files
 $notesPath=if([IO.Path]::IsPathRooted($ReleaseNotes)){$ReleaseNotes}else{Join-Path $root $ReleaseNotes}
 if(-not(Test-Path -LiteralPath $notesPath -PathType Leaf)){throw 'Release notes missing.'}
-$tag="v$version";$lines=@('# Schema 2: old updaters deliberately reject before download.','schema=2','transportAbi=2',"version=$version","proto=$proto")
+$tag="v$version";$lines=@('# Schema 2: old updaters deliberately reject before download.','schema=2','transportAbi=3',"version=$version","proto=$proto")
 $keys=@('core','ui','steam','udp');$names=@('KenshiCoop.dll','KenshiCoopUI.dll','KenshiCoopNetSteam.dll','KenshiCoopNetUDP.dll')
 for($i=0;$i -lt 4;++$i){$lines+="$($keys[$i])Sha256=$($runtimeHashes[$names[$i]])";$lines+="$($keys[$i])Url=https://github.com/$Owner/$Repo/releases/download/$tag/$($names[$i])"}
 $lines+="notes=$Notes";$manifest=($lines -join "`n")+"`n"

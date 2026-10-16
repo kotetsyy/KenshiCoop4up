@@ -151,7 +151,7 @@ $psCmd = if ($Role -eq "host") {
     else           { "powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostIp <the host's public IP>" }
 }
 if (-not $steamKit) {
-    $psCmd += ' (JOIN additionally requires $env:KENSHICOOP_UDP_INVITE_FILE pointing to your private per-client invitation outside the kit/game; HOST creates invitations through F2.)'
+    $psCmd += ' (UDP uses only the host numeric IP and selected port; anyone who can reach it may join an available seat.)'
 }
 
 $sessionArgs = "-Port $Port -Save '$($Save.Replace("'","''"))' -Scenario '$(if ($Scenario) { $Scenario } else { 'free' })'"

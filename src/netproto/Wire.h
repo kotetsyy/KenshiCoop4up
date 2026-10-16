@@ -22,12 +22,12 @@ typedef float          f32;
 typedef double         f64;
 
 // Protocol version is checked at handshake; a mismatch is rejected (no back-compat).
-// Public 80 adds inventory operation revisions and native door parent identity.
+// Public 82 uses the credential-free direct-IP transport contract (native ABI 3).
 #ifdef KENSHICOOP_NET_DIAG
-// Private 81 additionally carries bounded, reliable join-log chunks.
-const u16 PROTOCOL_VERSION = 81;
+// Private 83 additionally carries bounded, reliable join-log chunks.
+const u16 PROTOCOL_VERSION = 83;
 #else
-const u16 PROTOCOL_VERSION = 80;
+const u16 PROTOCOL_VERSION = 82;
 #endif
 
 // RELEASE id - a different axis from PROTOCOL_VERSION, and the two are routinely
@@ -48,7 +48,7 @@ const u16 PROTOCOL_VERSION = 80;
 // introduced ordering, which is the only moment it was free: those clients
 // install whatever the manifest names regardless of order, so they follow the
 // renumber, and every build after this one is ordered and monotonic.
-const char* const COOP_BUILD_VERSION = "0.2.0";
+const char* const COOP_BUILD_VERSION = "0.2.1";
 
 // Host + joins. Player ids: host = 0, joins = 1..MAX_JOINS.
 const u32 MAX_PLAYERS = 4;

@@ -31,7 +31,7 @@ foreach ($dir in @($HostDir,$JoinDir)) {
 foreach ($path in $protected) { if (Test-CoopSavePathOverlap $OutDir $path) { throw "Resume artifacts overlap protected input/output: $path" } }
 $runState=New-CoopRunState -GameDirs @($HostDir,$JoinDir) -SaveNames @()
 try {
-    Clear-CoopRunEnvironment -State $runState -PreserveCredentials
+    Clear-CoopRunEnvironment -State $runState
     foreach ($root in $saveRoots) { Add-CoopRunBackup -State $runState -Path (Join-Path $root 'coopresume') }
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $stage1Dir=Join-Path $OutDir 'stage1'; $stage2Dir=Join-Path $OutDir 'stage2'

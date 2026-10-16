@@ -722,8 +722,8 @@ Use that registry rather than a historical two-scenario list.
 
 [`src/netproto/Wire.h`](../src/netproto/Wire.h) — namespace `coop`. Plain C++03,
 little-endian, one-byte-packed structs sent as raw bytes. The handshake checks
-`PROTOCOL_VERSION`: unpublished local Release uses **80**; Harness with
-`KENSHICOOP_NET_DIAG` uses **81** and adds bounded reliable join-log chunks.
+`PROTOCOL_VERSION`: unpublished local Release uses **82**; Harness with
+`KENSHICOOP_NET_DIAG` uses **83** and adds bounded reliable join-log chunks.
 Mismatched protocols are rejected; the build/release version is a separate axis.
 
 The live packet set covers owner-tagged entity batches and transition events,
@@ -797,31 +797,33 @@ historical packet table, define the precise packet shapes.
 
 [`src/plugin/net/NetLink.h`](../src/plugin/net/NetLink.h) — namespace `coop`.
 Owns only the selected real `KenshiCoopNetSteam.dll` or `KenshiCoopNetUDP.dll`
-through `src/transport/TransportApi.h` ABI1 on a dedicated worker. There is no
+through `src/transport/TransportApi.h` ABI3 on a dedicated worker. There is no
 ENet shim or fallback. Inbound carries owned validated messages to the game.
 
 - `bool start(const NetStartOptions&, Inbound*)` — Stop/reap the previous worker
   and asynchronously start the selected provider. Options contain role,
-  transport, numeric UDP endpoint/port, remote SteamID64, up to three allowed
-  guest SteamID64s, private UDP host profile path or join invitation. True means
-  **launch accepted**, not native admission, gameplay handshake or world READY.
-- `void pumpMainThread()` — Steam provider callback pump on the main game thread
+  transport, numeric UDP address/port or remote SteamID64. No invitation/profile
+  or allow-list is supplied. True means **launch accepted**, not native connection,
+  gameplay handshake or world READY.
+- `bool pumpMainThread()` — Steam provider callback pump on the main game thread
   only, outside GUI/scenario/title/loading early-return gates; UDP does not pump Steam.
-- `bool queueAllowSteamPeer(u64 sessionGeneration, u64 steamId)` — Generation-fenced
-  host admission command. Queueing is not success; inspect `admissionResult`.
-- `bool queueMakeUdpInvite(u64 sessionGeneration, u32 requestId)` and
-  `bool copyUdpInvite(u64 sessionGeneration, u32 requestId, char*, unsigned) const`
-  — Explicit generation/request-fenced invitation generation/copy; never status/log secret.
-- `void stop()` — Stop/reap/reset lifecycle and wipe ephemeral invitations.
+- `void stop()` — Stop/reap/reset lifecycle.
 - `void copyStatus(NetStatus*) const` — Coherent transport/lifecycle/membership,
-  session generation, Steam identity/auth/relay and actual admission/invite
-  request/result facts. Raw native connections are not accepted gameplay players.
+  session generation and Steam identity/auth/relay facts. Direct UDP reports no
+  authenticated principal. Raw native connections are not accepted gameplay players.
 - `void setOwnedEntities(u32, const EntityState*, unsigned)` — Locked snapshot publication.
 - `void queueEvent(const EventPacket&)` — Reliable one-shot publication.
 - `bool isRunning() const`, `u32 localId() const` — Worker state/assigned player ID,
   not world readiness.
 - `void copyDebugStats(NetDebugStats*) const` — Per-lane pending reliable/state/bulk
   and unacknowledged reliable bytes; stop resets facts, missing metrics stay unknown.
+
+UDP requires only numeric address and port. The native provider uses original
+pinned GNS with `IP_AllowWithoutAuth=2` and `Unencrypted=0`; negotiated unencrypted
+or relayed direct-UDP peers are rejected. Connection handles distinguish guests
+from the same IP; only Steam deduplicates authenticated principals. Encryption
+does not authenticate UDP identity or prevent an active intermediary. Reachable
+strangers can occupy a free seat; the host+3 bound and wire/READY checks remain.
 
 GAME_RELIABLE, GAME_STATE and SAVE_BULK are independent native lanes. Reliable
 control has higher priority; state and bulk share the next priority with weights
@@ -835,7 +837,7 @@ Connection/session incarnation, accepted origin and host-coordinated world token
 fence messages before dispatch/relay and after simulated delay. Entity/stream
 chronology is not a single global unreliable sequence. LOAD_GO/READY still
 refer to the specific completed world load, not merely native connection.
-NPC census is bidirectional under presence authority: each authenticated owner
+NPC census is bidirectional under presence authority: each accepted gameplay owner
 may publish its own census, and the host relays guest census with the original
 owner intact. An empty census clears that owner's prior existence claim; it is
 not a protocol error. Owner/origin equality, reliable lane, exact row lengths,
@@ -848,7 +850,7 @@ signatures and ordering contracts live there.
 ### Updater and distribution
 
 `net/UpdatePackage.h/.cpp` is the production schema parser and four-image disk
-transaction used by Updater and disposable `updater_tests.exe`. Schema2/ABI2
+transaction used by Updater and disposable `updater_tests.exe`. Schema2/ABI3
 requires all core/UI/Steam/UDP hashes and exact fixed release URLs; legacy
 `sha256`/`url`, duplicate/unknown keys and malformed version/hash/URL reject
 before fetch/mutation. Same-version checks compare all four. Flushed/rehashed
@@ -1099,7 +1101,7 @@ in-game input; OIS is the lower layer beneath it.
 
 ## 16. Native UI companion C ABI
 
-[`src/ui/CoopUiApi.h`](../src/ui/CoopUiApi.h) is a Windows x64 POD C contract, API version 2, with
+[`src/ui/CoopUiApi.h`](../src/ui/CoopUiApi.h) is a Windows x64 POD C contract, API version 4, with
 explicit 8-byte packing and `__cdecl`. No STL, engine pointers, ownership
 transfer or network hooks cross this boundary.
 
@@ -1111,14 +1113,11 @@ transfer or network hooks cross this boundary.
   rows. Borrowed strings are valid during `tick` only; retained text is copied.
   Player membership is independent of whether a nickname has arrived. Unknown
   world readiness is not treated as ready.
-- `CoopUiCommand` returns at most one `NONE`, `REMEMBER`, `CONNECT`, `DISCONNECT`,
-  `ALLOW_STEAM_PEER` or `MAKE_UDP_INVITE`. Commands carry session generation,
-  admission SteamID64/request ID and ephemeral UDP invitation; Settings retain
-  ordinary endpoint/role/nick and up to three allowed SteamID64s, never credentials.
+- `CoopUiCommand` returns at most one `NONE`, `REMEMBER`, `CONNECT` or `DISCONNECT`.
+  Commands and snapshots retain session generation; Settings contain only the
+  ordinary endpoint, role, transport and nickname, with no invitation or allow-list.
+  UDP host requires its listening port; UDP join requires a numeric endpoint.
   Widget callbacks only queue POD actions; core executes after tick on main thread.
-  Snapshot results expose completed admission/invite facts. Borrowed `udpInvite`
-  is present only for matching explicit successful request and copied ephemerally
-  into masked UI storage. Reports/logs/remembered Settings never receive secrets.
   Live sessions reject a new CONNECT and changes to role/transport/endpoint.
 - `shutdown` hides the UI and blocks later ticks; it never disconnects or
   destroys the native widget hierarchy.

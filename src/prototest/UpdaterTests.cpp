@@ -13,7 +13,7 @@ using namespace coop::updater;
 static std::string readFile(const std::string& p) { std::ifstream f(p.c_str(), std::ios::binary); return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); }
 static void put(const std::string& p, const std::string& s) { std::ofstream f(p.c_str(),std::ios::binary); f << s; f.close(); assert(f.good()); }
 static std::string manifest(const std::string* hashes) {
-    std::string s="schema=2\ntransportAbi=2\nversion=0.2.0\nproto=72\n";
+    std::string s="schema=2\ntransportAbi=3\nversion=0.2.0\nproto=72\n";
     const char* keys[]={"core","ui","steam","udp"};
     for(int i=0;i<4;++i) s+=std::string(keys[i])+"Sha256="+hashes[i]+"\n"+keys[i]+"Url=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.0/"+kComponentNames[i]+"\n";
     return s;
@@ -268,9 +268,9 @@ int main(int argc,char** argv) {
     for(int i=0;i<4;++i) { bytes[i]=std::string("MZactual-new-")+kComponentNames[i]; hashes[i]=packageHash(bytes[i].data(),bytes[i].size()); }
     PackageManifest m; const std::string good=manifest(hashes);
     assert(parsePackageManifest(good,&m,&error));
-    const char* invalid[]={"schema=1\n","transportAbi=2\n","sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n","url=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.0/KenshiCoop.dll\n","coreSha256=bad\n","version=0.2.0\n","unknown=value\n"};
+    const char* invalid[]={"schema=1\n","transportAbi=3\n","sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n","url=https://github.com/kotetsyy/KenshiCoop4up/releases/download/v0.2.0/KenshiCoop.dll\n","coreSha256=bad\n","version=0.2.0\n","unknown=value\n"};
     for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);++i) assert(!parsePackageManifest(good+invalid[i],&m,&error));
-    for(char abi='1';abi<='3';abi+=2) {
+    for(char abi='1';abi<='2';++abi) {
         std::string incompatible=good;
         incompatible[incompatible.find("transportAbi=")+13]=abi;
         assert(!parsePackageManifest(incompatible,&m,&error));

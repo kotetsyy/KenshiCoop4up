@@ -590,9 +590,6 @@ void loadConfig(Config& out);
 
 // Strict ordinary configuration/admission parsing (no clipboard digit extraction).
 bool validSteamPeerId(unsigned long long id);
-// Private runtime inputs only; never persisted to coop_config.json or logged.
-bool readUdpJoinInviteFile(std::string& invite);
-std::string udpHostProfilePath();
 
 // Re-read join target, explicit host allowlist and endpoint before Connect.
 // Env overrides still win; missing/empty allowlist means deny-all, never hidden grants.
@@ -600,7 +597,7 @@ void reloadPeerFromFile(Config& c);
 
 // Remember ordinary role/transport, JOIN Steam target, UDP ip/port and nick.
 // An empty JOIN Steam target explicitly clears its persisted value.
-// Private invitations/profile paths are never written here. Other keys are kept.
+// Other keys are kept.
 // No-op if the path cannot be written.
 void saveConnectMemory(const Config& c);
 

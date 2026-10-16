@@ -46,7 +46,6 @@ try {
         [Environment]::SetEnvironmentVariable($property.Name,$value,'Process')
     }
     $env:KENSHICOOP_LOG = $hostLog
-    Set-CoopPrivateCredentials -Mode host -UseSteam $false -GameDirs @($kenshiDir,$dropDir) -ProfilePath "$($runArgs.udpProfilePath)"
     $out = Start-CoopOwnedGame -State $runState -ScriptDir $dropDir -ExePath (Join-Path $kenshiDir 'kenshi_x64.exe') -WorkDir $kenshiDir -TimeoutSec ([int]$runArgs.startTimeoutSec)
     $out | ForEach-Object { Add-Content -LiteralPath (Join-Path $resultsDir 'launcher.log') -Value "$_" }
     $line = $out | Where-Object { "$_" -match 'GAMEPID=(\d+)' } | Select-Object -First 1

@@ -48,14 +48,10 @@ void inspect(FILE* log, coopnet::NativeBackend& backend) {
     CoopNetConfig wrongMode{};
     wrongMode.size = sizeof(wrongMode);
     wrongMode.mode = COOP_NET_UDP;
-    char invite[8] = "private";
     const bool negativeChecks =
         coopnet::initializeBackend(rejected, wrongMode, error, sizeof(error)) == COOP_NET_INVALID &&
-        !rejected.initialized && !rejected.sockets && !rejected.utils &&
-        coopnet::prepareHostCredential(nullptr, error, sizeof(error)) == COOP_NET_INVALID &&
-        coopnet::createClientInvite(nullptr, invite, sizeof(invite), error, sizeof(error)) == COOP_NET_INVALID &&
-        invite[0] == 0;
-    logLine(log, "negative mode/UDP-only checks=%s", negativeChecks ? "PASS" : "FAIL");
+        !rejected.initialized && !rejected.sockets && !rejected.utils;
+    logLine(log, "negative transport mode check=%s", negativeChecks ? "PASS" : "FAIL");
     if (!negativeChecks) return;
     const int result = coopnet::inspectSteamBackend(backend, error, sizeof(error));
     logLine(log, "inspect result=%d detail=%s", result, error);

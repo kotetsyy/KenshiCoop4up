@@ -2,12 +2,12 @@
 
 ## Scope: unpublished local native gameplay cutover
 
-This checkout targets **0.2.0**, public protocol **80**, private Harness protocol
-**81**. The selected real native provider carries gameplay: Steamworks P2P or
-authenticated direct UDP, never ENet or a fallback. This is a local test build,
-not a published release. The existing stable v0.1.31 feed and published notes
-remain unchanged. The user explicitly waived the two-account Steam pre-core
-gate for local integration; **real two-account Steam P2P remains unverified**.
+This checkout targets unpublished **0.2.1**, Release protocol **82**, private
+Harness protocol **83**. The selected real native provider carries gameplay:
+Steamworks P2P or encrypted direct UDP, never ENet or an automatic fallback.
+The published v0.2.0 binaries, protocol80/81 and stable feed are unchanged.
+The user waived the two-account Steam pre-core gate for local integration;
+**real two-account Steam P2P remains unverified**.
 Provider tests/interface acquisition do not establish gameplay or Internet reachability.
 
 ## Prerequisites
@@ -22,7 +22,7 @@ Provider tests/interface acquisition do not establish gameplay or Internet reach
 
 VS2022 orchestrates MSBuild, not the engine C++ ABI. Core/UI remain v100 with
 the game-compatible release STL/CRT layout. No STL, exceptions, SDK objects or
-cross-CRT frees cross `CoopUiApi.h` (ABI3) or `TransportApi.h` (ABI2).
+cross-CRT frees cross `CoopUiApi.h` (API4) or `TransportApi.h` (ABI3).
 The providers use v143 **static CRT**, with pinned static GNS/protobuf contained
 in the UDP DLL. No modern runtime/dependency DLL accompanies the runtime kit.
 
@@ -70,16 +70,16 @@ can select incompatible PS7 hashing/JSON commands and prevent real native builds
 |---|---|---|
 | GameNetworkingSockets | 1.6.1 / `d534c19aa760df3fb75fd20db13ba1932b8a5463` | `099d4b0ff1837f0f27c83d4ce05869ec1d32136866f69a3336cc137e951189ab` |
 | protobuf | 21.12 / `f0dc78d7e6e331b8c6bb2d5283e06aa26883ca7c` | `d594b561fb41bf243233d8f411c7f2b7d913e5c9c1be4ca439baf7e48384c893` |
-| authenticated-IP patch | `src/transport/patches/gns-authenticated-ip.patch` | `03f1df288dc04e64c00f64055a3af288144a075fe2a0c4937d377a753d402f11` |
 
-Archive hashes verify before extraction; CMake checks the patch hash and applies
-it with Git. Cached extracted dependencies are private build inputs, not source
-extras in the ZIP. Do not manually modify those cached inputs.
+Archive hashes verify before extraction. GNS uses the original pinned archive,
+without the former authenticated-IP patch. Original source trees use a separate
+`-original` cache namespace; older patched caches are preserved, never silently
+reused or repaired. Cached dependencies are private build inputs, not ZIP extras.
 
-The output contains two providers, the sanctioned Steam probe, real
-`transport_integration.exe` and private `transport_credentials.exe`. A
-`native-build.json` receipt records the exact checkout, logical configuration,
-source digest, pins, ABI and hashes of providers/controller/credential tool.
+The output contains two providers, the sanctioned Steam probe and real
+`transport_integration.exe`; no credential tool is built. A `native-build.json`
+receipt records checkout, logical configuration, source digest, pins, ABI and
+hashes of providers/controller.
 `NativeBuild.ps1` resolves only that canonical output or an explicit `-NativeBin`;
 it rejects missing/mismatched receipts, changed sources and changed DLLs.
 It never picks the newest directory or an installed DLL. Receipts are not shipped.
@@ -115,28 +115,26 @@ Direct UDP never loads Steam, uses no Steam IDs/relay/NAT service, and requires 
 reachable numeric IPv4/IPv6 host endpoint, firewall allowance and any necessary
 router port forwarding.
 
-## Credentials and F2
+## Connections and F2
 
 Steam HOST shares its own SteamID64; no guest ID list or Allow command is required.
 Up to three guests may connect using authenticated, encrypted Steam identities.
-JOIN still verifies the expected host identity. Native admission is separate
+JOIN still verifies the expected host identity. Native connection is separate
 from the gameplay handshake and load-specific READY barrier.
 
-This change removes fields/functions from the provider and UI contracts:
-install the complete matching six-file kit on every peer with Kenshi closed.
-Do not mix the new provider ABI2/UI ABI3 with older DLLs. Old `steamAllow` config
-entries are ignored; UDP still requires a private signed invitation, not an IP list.
+UDP HOST selects its listening port; JOIN enters a numeric IPv4/IPv6 endpoint.
+No private profile, invitation, credential file, password or allow-list is used.
+Removed controls and request/state APIs are not retained as compatibility shims.
+GNS requires encryption, but UDP identities are unauthenticated: encryption does
+not establish a trusted host identity or protect against an active intermediary.
+Anyone who can reach the listening port can join an available seat. Internet
+UDP still needs firewall/router reachability; it does not bypass CGNAT.
 
-UDP host keeps its DPAPI/ACL-protected private host profile under its own Windows
-account. F2 creates a separate invitation for each guest and copies it only by
-an explicit action. UDP join requires both the numeric endpoint and masked
-invitation. Invitations are sensitive `KCU1:` credentials, not ordinary config:
-never put them in argv, logs, reports, source control, screenshots or kits.
-Do not mirror a host profile to a join. Invitations expire within seven days,
-bounded by root expiry; expiry checks apply to new handshakes, not live revocation.
-Private runners can use `transport_credentials.exe --udp <absolute-provider>
---profile <private-outside-game-file> --invite-file <new-private-file>`; file contents
-stay out of arguments and output. No invitation-discovery or CGNAT bypass is promised.
+Install the complete matching six-file kit on every peer with Kenshi closed.
+Native ABI3/UI API4 and protocol82/83 cannot be mixed with v0.2.0 DLLs.
+The ABI2 updater in v0.2.0 rejects an ABI3 manifest, so this transition requires
+manual full-kit installation rather than an automatic in-place ABI migration.
+Old private files are neither required nor deleted; config and saves are preserved.
 
 ## Unified game-independent verification
 
@@ -367,7 +365,7 @@ The initial migration must be installed as the full kit, not through an old upda
 
 ## Four-component updater and non-mutating publisher
 
-Schema2 requires `transportAbi=2`, `version`, and all four
+Schema2 requires `transportAbi=3`, `version`, and all four
 `coreSha256/coreUrl`, `uiSha256/uiUrl`, `steamSha256/steamUrl`,
 `udpSha256/udpUrl` pairs. **No legacy sha256/url fields**: the published old
 parser rejects before fetching/replacing the core. Hashes are lowercase SHA-256;

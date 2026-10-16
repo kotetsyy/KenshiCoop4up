@@ -206,7 +206,7 @@ try {
                 $runState=@{Root=$restoreRoot;Backups=@();Processes=@{};Environment=$originalEnvironment}
                 Add-CoopRunBackup -State $runState -Path $restoreFile
                 Remove-Item -LiteralPath $runState.Backups[0].Backup -Force
-                $inviteRoot=''; $wanProc=$null
+                $wanProc=$null
                 . $restoreBoundary
             }
             default {
@@ -237,14 +237,14 @@ try {
         $status=@{runToken=$runToken;success=$true;restored=$restored;zip=$zipName}
         if(-not $restored){Assert-Rejected { . $receipt } 'unrestored cleanup authorization'}else{. $receipt}
     }
-    $kitTestDir=Join-Path $root 'remote-kit'; $remotePrivate=Join-Path $root 'remote-private'; $taskName="KenshiCoopKitHost-$runToken"
+    $kitTestDir=Join-Path $root 'remote-kit'; $taskName="KenshiCoopKitHost-$runToken"
     $unrelatedPrivate=Join-Path $root 'other-private'
-    New-Item -ItemType Directory -Path $kitTestDir,$remotePrivate,$unrelatedPrivate | Out-Null
+    New-Item -ItemType Directory -Path $kitTestDir,$unrelatedPrivate | Out-Null
     . (Get-SessionStatement $hostAst '^\$cleanup\s*=' ([Management.Automation.Language.AssignmentStatementAst]))
     function schtasks { if(($args -join ' ') -cne "/delete /tn $taskName /f"){throw 'Wrong run task cleanup.'}; $global:LASTEXITCODE=0 }
     . ([scriptblock]::Create($cleanup))
     Remove-Item Function:schtasks
-    if((Test-Path -LiteralPath $remotePrivate) -or (Test-Path -LiteralPath $kitTestDir) -or -not (Test-Path -LiteralPath $unrelatedPrivate)){throw 'Remote cleanup leaked its credentials or deleted unrelated credentials.'}
+    if((Test-Path -LiteralPath $kitTestDir) -or -not (Test-Path -LiteralPath $unrelatedPrivate)){throw 'Remote cleanup leaked its kit or deleted unrelated private files.'}
     # Execute the actual three fixture preparation boundaries, with AppData,
     # package and stale install catalogs deliberately different.
     $Save='fixture'; $kitDir=Join-Path $root 'immutable-kit'

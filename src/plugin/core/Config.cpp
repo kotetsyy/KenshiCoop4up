@@ -9,9 +9,7 @@
 #include <fstream>
 #include <iterator>
 #include <windows.h>
-#include <aclapi.h>
 #include <cstring>
-#pragma comment(lib, "advapi32.lib")
 
 namespace coop {
 namespace {
@@ -186,14 +184,6 @@ bool validSteamPeerId(unsigned long long id) {
 
 
 namespace {
-bool utf8Path(const char* path, std::wstring& out) {
-    if (!path || !path[0] || strlen(path) > 32700) return false;
-    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, 0, 0);
-    if (!n) return false;
-    out.resize(n);
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, &out[0], n)) return false;
-    out.resize(n - 1); return true;
-}
 void readSteamSettings(Config& c, const std::string& peer) {
     c.steamPeer = 0;
     const size_t first = peer.find_first_not_of(" \t\r\n");
@@ -207,78 +197,6 @@ void readSteamSettings(Config& c, const std::string& peer) {
 }
 }
 
-bool readUdpJoinInviteFile(std::string& invite) {
-    invite.clear();
-    std::wstring path;
-    if (!utf8Path(getenv("KENSHICOOP_UDP_INVITE_FILE"), path)) return false;
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | READ_CONTROL, FILE_SHARE_READ,
-                             0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, 0);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    BY_HANDLE_FILE_INFORMATION info;
-    LARGE_INTEGER size;
-    bool ok = GetFileInformationByHandle(file, &info) && GetFileSizeEx(file, &size) &&
-              !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
-              size.QuadPart > 0 && size.QuadPart < 4096;
-    HANDLE token = 0;
-    DWORD needed = 0;
-    std::vector<unsigned char> user;
-    PACL dacl = 0;
-    PSECURITY_DESCRIPTOR sd = 0;
-    unsigned char systemSid[SECURITY_MAX_SID_SIZE];
-    DWORD systemSize = sizeof(systemSid);
-    ok = ok && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) != FALSE;
-    if (ok) {
-        GetTokenInformation(token, TokenUser, 0, 0, &needed);
-        user.resize(needed);
-        ok = needed && GetTokenInformation(token, TokenUser, &user[0], needed, &needed) &&
-             CreateWellKnownSid(WinLocalSystemSid, 0, systemSid, &systemSize) &&
-             GetSecurityInfo(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, 0, 0, &dacl, 0, &sd) == ERROR_SUCCESS &&
-             dacl != 0;
-    }
-    for (DWORD i = 0; ok && i < dacl->AceCount; ++i) {
-        void* ace = 0;
-        ok = GetAce(dacl, i, &ace) != FALSE;
-        if (!ok) break;
-        ACE_HEADER* header = (ACE_HEADER*)ace;
-        if (header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
-        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) { ok = false; break; }
-        PSID sid = (PSID)&((ACCESS_ALLOWED_ACE*)ace)->SidStart;
-        ok = EqualSid(sid, ((TOKEN_USER*)&user[0])->User.Sid) || EqualSid(sid, systemSid);
-    }
-    if (ok) {
-        char bytes[4096] = {0};
-        DWORD got = 0;
-        ok = ReadFile(file, bytes, (DWORD)size.QuadPart, &got, 0) && got == (DWORD)size.QuadPart;
-        if (ok) {
-            while (got && (bytes[got-1] == '\r' || bytes[got-1] == '\n')) --got;
-            ok = got && memchr(bytes, 0, got) == 0;
-            if (ok) invite.assign(bytes, got);
-        }
-        SecureZeroMemory(bytes, sizeof(bytes));
-    }
-    if (sd) LocalFree(sd);
-    if (token) CloseHandle(token);
-    CloseHandle(file);
-    return ok;
-}
-
-std::string udpHostProfilePath() {
-    const char* explicitPath = getenv("KENSHICOOP_UDP_PROFILE_PATH");
-    if (explicitPath && explicitPath[0]) return explicitPath;
-    wchar_t path[32768];
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", path, 32768);
-    if (!n || n >= 32768) return std::string();
-    std::wstring directory(path, n);
-    directory += L"\\KenshiCoop";
-    if (!CreateDirectoryW(directory.c_str(), 0) && GetLastError() != ERROR_ALREADY_EXISTS)
-        return std::string();
-    directory += L"\\udp-host.private";
-    int bytes = WideCharToMultiByte(CP_UTF8, 0, directory.c_str(), -1, 0, 0, 0, 0);
-    if (!bytes) return std::string();
-    std::string out(bytes, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, directory.c_str(), -1, &out[0], bytes, 0, 0);
-    out.resize(bytes - 1); return out;
-}
 
 void loadConfig(Config& c) {
     // coop_config.json (next to the DLL) supplies the interactive-install

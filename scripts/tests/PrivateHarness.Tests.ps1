@@ -24,22 +24,8 @@ try {
     }
     [IO.File]::WriteAllText((Join-Path $mod 'RE_Kenshi.json'),'{"Plugins":["KenshiCoop.dll","KenshiCoopNetUDP.dll"]}')
     Assert-Throws {Assert-CoopRuntime $mod} 'direct provider loader entry'
-    Assert-Throws {Assert-CoopPrivatePath (Join-Path $root 'client.invite') @($root)} 'credential under copied tree'
-    Assert-Throws {Assert-CoopPrivatePath 'client.invite' @($root)} 'relative credential path'
-    Assert-Throws {Assert-CoopPrivatePath 'C:client.invite' @($root)} 'drive-relative credential path'
-    Assert-Throws {Assert-CoopPrivatePath (Join-Path $env:LOCALAPPDATA 'kenshi\save\client.invite') @($root)} 'credential in bundled save tree'
-    # Production provisioning must reject the real junction before mkdir/tool.
     $game=Join-Path $root 'copied-game'
-    $junction=Join-Path $root 'private-junction'
     New-Item -ItemType Directory -Path $game | Out-Null
-    New-Item -ItemType Junction -Path $junction -Target $game | Out-Null
-    try {
-        $rejected=$false
-        try {
-            New-CoopUdpCredentials -NativeBin (Join-Path $root 'absent-bin') -ProfilePath (Join-Path $junction 'keys\host.credential') -InviteFile (Join-Path $junction 'keys\client.invite') -GameDirs @($game)
-        } catch { if($_.Exception.Message -notmatch 'reparse'){throw}; $rejected=$true }
-        if(-not $rejected -or (Test-Path -LiteralPath (Join-Path $game 'keys'))){throw 'Provisioning mutated a copied game through a junction'}
-    } finally { [IO.Directory]::Delete($junction) }
     $missingJoin=Join-Path $root 'missing-join'
     $ownedDirs=@(Get-CoopManualGameDirs -HostDir $game -JoinDir $missingJoin -NoJoin $true)
     if($ownedDirs.Count -ne 1 -or $ownedDirs[0] -cne $game -or (Test-Path -LiteralPath $missingJoin)){throw 'Host-only ownership included or mutated the absent join tree'}
@@ -66,16 +52,15 @@ try {
     if([IO.File]::ReadAllText((Join-Path $unrelated 'quick.save')) -cne 'user-owned'){throw 'Unrelated user save was modified'}
     # A real unassociated Process throws on HasExited; later cleanup still runs.
     $backupRoot=Join-Path $root 'cleanup-backup'
-    $credentialRoot=Join-Path $root 'ephemeral-credentials'
-    New-Item -ItemType Directory -Path $backupRoot,$credentialRoot | Out-Null
+    New-Item -ItemType Directory -Path $backupRoot | Out-Null
     $backup=Join-Path $backupRoot 'config'
     [IO.File]::WriteAllText($backup,'original-after-proxy-error')
     [IO.File]::WriteAllText($config,'changed-before-proxy-error')
     $state=@{Root=$backupRoot;Processes=@{};Environment=$environment;Backups=@(@{Path=$config;Backup=$backup;Existed=$true})}
     $unassociatedProxy=New-Object Diagnostics.Process
-    try { Assert-Throws {Restore-CoopHarnessSession -State $state -CredentialRoot $credentialRoot -Proxy $unassociatedProxy} 'real proxy object cleanup error' }
+    try { Assert-Throws {Restore-CoopHarnessSession -State $state -Proxy $unassociatedProxy} 'real proxy object cleanup error' }
     finally {$unassociatedProxy.Dispose()}
-    if([IO.File]::ReadAllText($config) -cne 'original-after-proxy-error' -or (Test-Path -LiteralPath $credentialRoot)){throw 'Proxy error skipped config restoration or private credential removal'}
+    if([IO.File]::ReadAllText($config) -cne 'original-after-proxy-error' -or (Test-Path -LiteralPath $backupRoot)){throw 'Proxy error skipped config restoration or backup cleanup'}
     Write-Output 'Private harness preflight/restoration behavior passed; NOT gameplay/Steam certification.'
 } finally {
     if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}
